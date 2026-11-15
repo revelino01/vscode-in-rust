@@ -154,8 +154,7 @@ fn set_nested_value(target_map: &mut serde_json::Map<String, Value>, path: &str,
     }
 
     let mut cur: &mut serde_json::Map<String, Value> = target_map;
-    for i in 0..parts.len() - 1 {
-        let key = parts[i];
+    for &key in parts.iter().take(parts.len().saturating_sub(1)) {
         if !cur.contains_key(key) || !cur[key].is_object() {
             cur.insert(key.to_string(), Value::Object(serde_json::Map::new()));
         }
@@ -241,8 +240,7 @@ pub fn strip_json_comments(s: &str) -> String {
             result.push(c);
         } else if c == ',' {
             let mut is_trailing = false;
-            for j in (i + 1)..len {
-                let nc = chars_vec[j];
+            for &nc in chars_vec.iter().take(len).skip(i + 1) {
                 if nc.is_whitespace() {
                     continue;
                 }

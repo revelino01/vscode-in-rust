@@ -115,8 +115,13 @@ impl FileSystemService {
         content: &str,
     ) -> Result<FileMetadata, FileSystemError> {
         let target = path.as_ref();
-        let parent = target.parent().unwrap_or_else(|| Path::new("."));
-        tokio::fs::create_dir_all(parent).await?;
+        let parent = match target.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        if parent != Path::new(".") {
+            tokio::fs::create_dir_all(parent).await?;
+        }
 
         let file_stem = target
             .file_name()
@@ -168,8 +173,13 @@ impl FileSystemService {
         use std::io::Write;
 
         let target = path.as_ref();
-        let parent = target.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent)?;
+        let parent = match target.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        if parent != Path::new(".") {
+            std::fs::create_dir_all(parent)?;
+        }
 
         let file_stem = target
             .file_name()
@@ -359,6 +369,9 @@ impl FileSystemWatcher {
 impl Disposable for FileSystemWatcher {
     fn dispose(&mut self) {
         self.watcher.take();
+        if let Some(handle) = self._worker_thread.take() {
+            let _ = handle.join();
+        }
     }
 }
 
@@ -452,5 +465,24 @@ mod tests {
 
         watcher.dispose();
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_relative_paths() {
+        let fs = FileSystemService::new();
+        let filename = format!(".test_rel_{}.txt", uuid::Uuid::new_v4().simple());
+        let content = "Relative file atomic persistence";
+
+        // Sync write
+        let meta_sync = fs.write_atomic_sync(&filename, content).unwrap();
+        assert_eq!(meta_sync.size, content.len() as u64);
+        assert_eq!(FileSystemService::read_to_string_sync(&filename).unwrap(), content);
+        let _ = std::fs::remove_file(&filename);
+
+        // Async write
+        let meta_async = fs.write_atomic(&filename, content).await.unwrap();
+        assert_eq!(meta_async.size, content.len() as u64);
+        assert_eq!(FileSystemService::read_to_string(&filename).await.unwrap(), content);
+        let _ = tokio::fs::remove_file(&filename).await;
     }
 }

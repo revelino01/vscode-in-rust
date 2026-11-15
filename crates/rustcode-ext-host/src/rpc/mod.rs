@@ -52,9 +52,11 @@ impl RpcMessage {
     }
 }
 
+type PendingResponseMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
 pub struct RpcBridge {
     next_id: AtomicU64,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
+    pending: PendingResponseMap,
 }
 
 impl Default for RpcBridge {

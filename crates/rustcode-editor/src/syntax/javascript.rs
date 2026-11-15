@@ -68,7 +68,7 @@ fn tokenize_js_ts(
         let mut closed = false;
         while i < len {
             if bytes[i] == b'\\' {
-                i += 2;
+                i = (i + 2).min(len);
             } else if bytes[i] == b'`' {
                 i += 1;
                 closed = true;
@@ -77,7 +77,7 @@ fn tokenize_js_ts(
                 i += 1;
             }
         }
-        tokens.push(TokenSpan::new(start, i, SyntaxScope::StringTemplate, lang_id));
+        tokens.push(TokenSpan::new(start, i.min(len), SyntaxScope::StringTemplate, lang_id));
         if !closed {
             return (tokens, Some(GrammarState::TemplateLiteral));
         }
@@ -87,18 +87,20 @@ fn tokenize_js_ts(
     // 2. Resume multi-line block comment
     if let Some(GrammarState::BlockComment { mut depth }) = current_state {
         let start = i;
-        while i + 1 < len {
-            if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+        let mut closed = false;
+        while i < len {
+            if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
                 depth = depth.saturating_sub(1);
                 i += 2;
                 if depth == 0 {
+                    closed = true;
                     break;
                 }
             } else {
                 i += 1;
             }
         }
-        if i >= len && depth > 0 {
+        if !closed {
             tokens.push(TokenSpan::new(start, len, SyntaxScope::CommentBlock, lang_id));
             return (tokens, Some(GrammarState::BlockComment { depth }));
         } else {
@@ -148,7 +150,7 @@ fn tokenize_js_ts(
             let mut closed = false;
             while i < len {
                 if bytes[i] == b'\\' {
-                    i += 2;
+                    i = (i + 2).min(len);
                 } else if bytes[i] == b'`' {
                     i += 1;
                     closed = true;
@@ -157,7 +159,7 @@ fn tokenize_js_ts(
                     i += 1;
                 }
             }
-            tokens.push(TokenSpan::new(start, i, SyntaxScope::StringTemplate, lang_id));
+            tokens.push(TokenSpan::new(start, i.min(len), SyntaxScope::StringTemplate, lang_id));
             if !closed {
                 return (tokens, Some(GrammarState::TemplateLiteral));
             }
@@ -171,7 +173,7 @@ fn tokenize_js_ts(
             i += 1;
             while i < len {
                 if bytes[i] == b'\\' {
-                    i += 2;
+                    i = (i + 2).min(len);
                 } else if bytes[i] == quote {
                     i += 1;
                     break;
@@ -179,7 +181,7 @@ fn tokenize_js_ts(
                     i += 1;
                 }
             }
-            tokens.push(TokenSpan::new(start, i, SyntaxScope::String, lang_id));
+            tokens.push(TokenSpan::new(start, i.min(len), SyntaxScope::String, lang_id));
             continue;
         }
 
@@ -203,11 +205,19 @@ fn tokenize_js_ts(
             continue;
         }
 
+        let ch = line[i..].chars().next().unwrap();
+        let ch_len = ch.len_utf8();
+
         // Identifiers, keywords, functions
-        if b.is_ascii_alphabetic() || b == b'_' || b == b'$' {
+        if ch.is_alphabetic() || ch == '_' || ch == '$' {
             let start = i;
-            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') {
-                i += 1;
+            while i < len {
+                let next_ch = line[i..].chars().next().unwrap();
+                if next_ch.is_alphanumeric() || next_ch == '_' || next_ch == '$' {
+                    i += next_ch.len_utf8();
+                } else {
+                    break;
+                }
             }
             let word = &line[start..i];
 
@@ -254,8 +264,8 @@ fn tokenize_js_ts(
         // Operators & Punctuation
         let start = i;
         if i + 1 < len {
-            let op2 = &line[i..i + 2];
-            if matches!(op2, "=>" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "++" | "--" | "?." | "??" | "+=" | "-=" | "*=" | "/=") {
+            let op2 = &bytes[i..i + 2];
+            if matches!(op2, b"=>" | b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" | b"++" | b"--" | b"?." | b"??" | b"+=" | b"-=" | b"*=" | b"/=") {
                 tokens.push(TokenSpan::new(start, start + 2, SyntaxScope::Operator, lang_id));
                 i += 2;
                 continue;
@@ -270,8 +280,8 @@ fn tokenize_js_ts(
             }
             _ => SyntaxScope::Plain,
         };
-        tokens.push(TokenSpan::new(start, start + 1, scope, lang_id));
-        i += 1;
+        tokens.push(TokenSpan::new(start, start + ch_len, scope, lang_id));
+        i += ch_len;
     }
 
     (tokens, None)
@@ -320,6 +330,42 @@ mod tests {
         assert!(ts_tokens.iter().any(|t| t.scope == SyntaxScope::Keyword && &ts_line[t.start..t.end] == "interface"));
         assert!(ts_tokens.iter().any(|t| t.scope == SyntaxScope::Type && &ts_line[t.start..t.end] == "number"));
         assert!(ts_tokens.iter().any(|t| t.scope == SyntaxScope::Type && &ts_line[t.start..t.end] == "string"));
+    }
+
+    #[test]
+    fn test_js_multiline_block_comment_continuation() {
+        let js = JavaScriptGrammar;
+        let line1 = "/* start comment";
+        let (_, state1) = js.tokenize_line(line1, None);
+        assert_eq!(state1, Some(GrammarState::BlockComment { depth: 1 }));
+
+        let line2 = "middle line without closing";
+        let (tokens2, state2) = js.tokenize_line(line2, state1.as_ref());
+        assert_eq!(state2, Some(GrammarState::BlockComment { depth: 1 }));
+        assert_eq!(tokens2.len(), 1);
+        assert_eq!(tokens2[0].scope, SyntaxScope::CommentBlock);
+
+        let line3 = "end comment */ const x = 1;";
+        let (tokens3, state3) = js.tokenize_line(line3, state2.as_ref());
+        assert_eq!(state3, None);
+        assert_eq!(tokens3[0].scope, SyntaxScope::CommentBlock);
+        assert!(tokens3.iter().any(|t| t.scope == SyntaxScope::Keyword && &line3[t.start..t.end] == "const"));
+    }
+
+    #[test]
+    fn test_js_unicode_identifiers_and_boundaries() {
+        let js = JavaScriptGrammar;
+        let line = "const π = 3.14; // café";
+        let (tokens, state) = js.tokenize_line(line, None);
+        assert_eq!(state, None);
+
+        for t in &tokens {
+            assert!(line.is_char_boundary(t.start));
+            assert!(line.is_char_boundary(t.end));
+        }
+
+        let pi_token = tokens.iter().find(|t| t.scope == SyntaxScope::Variable).unwrap();
+        assert_eq!(&line[pi_token.start..pi_token.end], "π");
     }
 }
 

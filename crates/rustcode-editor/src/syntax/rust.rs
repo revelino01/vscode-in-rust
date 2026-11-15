@@ -32,21 +32,23 @@ impl Grammar for RustGrammar {
         // 1. Resume from multi-line block comment
         if let Some(GrammarState::BlockComment { mut depth }) = current_state {
             let start = i;
-            while i + 1 < len {
-                if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let mut closed = false;
+            while i < len {
+                if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
                     depth += 1;
                     i += 2;
-                } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
                     depth -= 1;
                     i += 2;
                     if depth == 0 {
+                        closed = true;
                         break;
                     }
                 } else {
                     i += 1;
                 }
             }
-            if i >= len && depth > 0 {
+            if !closed {
                 tokens.push(TokenSpan::new(start, len, SyntaxScope::CommentBlock, lang_id));
                 return (tokens, Some(GrammarState::BlockComment { depth }));
             } else {
@@ -78,21 +80,23 @@ impl Grammar for RustGrammar {
                     let start = i;
                     let mut depth = 1;
                     i += 2;
-                    while i + 1 < len {
-                        if bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    let mut closed = false;
+                    while i < len {
+                        if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
                             depth += 1;
                             i += 2;
-                        } else if bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                        } else if i + 1 < len && bytes[i] == b'*' && bytes[i + 1] == b'/' {
                             depth -= 1;
                             i += 2;
                             if depth == 0 {
+                                closed = true;
                                 break;
                             }
                         } else {
                             i += 1;
                         }
                     }
-                    if depth > 0 {
+                    if !closed {
                         tokens.push(TokenSpan::new(start, len, SyntaxScope::CommentBlock, lang_id));
                         return (tokens, Some(GrammarState::BlockComment { depth }));
                     } else {
@@ -144,7 +148,7 @@ impl Grammar for RustGrammar {
                 i += 1;
                 while i < len {
                     if bytes[i] == b'\\' {
-                        i += 2;
+                        i = (i + 2).min(len);
                     } else if bytes[i] == b'"' {
                         i += 1;
                         break;
@@ -152,7 +156,7 @@ impl Grammar for RustGrammar {
                         i += 1;
                     }
                 }
-                tokens.push(TokenSpan::new(start, i, SyntaxScope::String, lang_id));
+                tokens.push(TokenSpan::new(start, i.min(len), SyntaxScope::String, lang_id));
                 continue;
             }
 
@@ -216,11 +220,20 @@ impl Grammar for RustGrammar {
                 continue;
             }
 
+            // Decode current character for Unicode-aware identifier / fallback handling
+            let ch = line[i..].chars().next().unwrap();
+            let ch_len = ch.len_utf8();
+
             // Identifiers, keywords, types, functions, macros
-            if b.is_ascii_alphabetic() || b == b'_' {
+            if ch.is_alphabetic() || ch == '_' {
                 let start = i;
-                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
+                while i < len {
+                    let next_ch = line[i..].chars().next().unwrap();
+                    if next_ch.is_alphanumeric() || next_ch == '_' {
+                        i += next_ch.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
                 let word = &line[start..i];
 
@@ -265,8 +278,8 @@ impl Grammar for RustGrammar {
             // Operators & Punctuation
             let start = i;
             if i + 1 < len {
-                let op2 = &line[i..i + 2];
-                if matches!(op2, "->" | "=>" | "::" | "==" | "!=" | "<=" | ">=" | "&&" | "||" | "+=" | "-=" | "*=" | "/=") {
+                let op2 = &bytes[i..i + 2];
+                if matches!(op2, b"->" | b"=>" | b"::" | b"==" | b"!=" | b"<=" | b">=" | b"&&" | b"||" | b"+=" | b"-=" | b"*=" | b"/=") {
                     tokens.push(TokenSpan::new(start, start + 2, SyntaxScope::Operator, lang_id));
                     i += 2;
                     continue;
@@ -281,8 +294,8 @@ impl Grammar for RustGrammar {
                 }
                 _ => SyntaxScope::Plain,
             };
-            tokens.push(TokenSpan::new(start, start + 1, scope, lang_id));
-            i += 1;
+            tokens.push(TokenSpan::new(start, start + ch_len, scope, lang_id));
+            i += ch_len;
         }
 
         (tokens, None)
@@ -341,5 +354,50 @@ mod tests {
         assert_eq!(tokens2[0].scope, SyntaxScope::CommentBlock);
         assert!(tokens2.iter().any(|t| t.scope == SyntaxScope::Keyword && &line2[t.start..t.end] == "let"));
         assert!(tokens2.iter().any(|t| t.scope == SyntaxScope::Number && &line2[t.start..t.end] == "42"));
+    }
+
+    #[test]
+    fn test_rust_multiline_block_comments_continuation() {
+        let grammar = RustGrammar;
+        let line1 = "/* start block";
+        let (_tokens1, state1) = grammar.tokenize_line(line1, None);
+        assert_eq!(state1, Some(GrammarState::BlockComment { depth: 1 }));
+
+        let line2 = "middle of block without closing";
+        let (tokens2, state2) = grammar.tokenize_line(line2, state1.as_ref());
+        assert_eq!(state2, Some(GrammarState::BlockComment { depth: 1 }));
+        assert_eq!(tokens2.len(), 1);
+        assert_eq!(tokens2[0].start, 0);
+        assert_eq!(tokens2[0].end, line2.len());
+        assert_eq!(tokens2[0].scope, SyntaxScope::CommentBlock);
+
+        // Nested block comment across lines
+        let line3 = "nested /* level 2 */ still level 1";
+        let (_tokens3, state3) = grammar.tokenize_line(line3, state2.as_ref());
+        assert_eq!(state3, Some(GrammarState::BlockComment { depth: 1 }));
+
+        let line4 = "close */ let active = true;";
+        let (tokens4, state4) = grammar.tokenize_line(line4, state3.as_ref());
+        assert_eq!(state4, None);
+        assert_eq!(tokens4[0].scope, SyntaxScope::CommentBlock);
+        assert!(tokens4.iter().any(|t| t.scope == SyntaxScope::Keyword && &line4[t.start..t.end] == "let"));
+    }
+
+    #[test]
+    fn test_rust_unicode_identifiers_and_boundaries() {
+        let grammar = RustGrammar;
+        let line = "let café_π = 42; // 🚀 emoji";
+        let (tokens, state) = grammar.tokenize_line(line, None);
+        assert_eq!(state, None);
+
+        // Check that all spans fall on char boundaries
+        for t in &tokens {
+            assert!(line.is_char_boundary(t.start), "start {} not char boundary", t.start);
+            assert!(line.is_char_boundary(t.end), "end {} not char boundary", t.end);
+        }
+
+        // café_π is parsed as a single variable
+        let var_token = tokens.iter().find(|t| t.scope == SyntaxScope::Variable).unwrap();
+        assert_eq!(&line[var_token.start..var_token.end], "café_π");
     }
 }

@@ -52,7 +52,7 @@ impl ProviderRegistry {
         if let Some(list) = guard.get(&provider_type) {
             list.iter()
                 .filter(|p| {
-                    p.language_selector.as_deref().map_or(true, |sel| sel == lang || sel == "*")
+                    p.language_selector.as_deref().is_none_or(|sel| sel == lang || sel == "*")
                 })
                 .cloned()
                 .collect()

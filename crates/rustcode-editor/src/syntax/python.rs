@@ -35,13 +35,16 @@ impl Grammar for PythonGrammar {
             let start = i;
             let target = [quote as u8, quote as u8, quote as u8];
             let mut closed = false;
-            while i + 2 < len {
-                if bytes[i] == target[0] && bytes[i + 1] == target[1] && bytes[i + 2] == target[2] {
+            while i < len {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(len);
+                } else if i + 2 < len && bytes[i] == target[0] && bytes[i + 1] == target[1] && bytes[i + 2] == target[2] {
                     i += 3;
                     closed = true;
                     break;
+                } else {
+                    i += 1;
                 }
-                i += 1;
             }
             if !closed {
                 tokens.push(TokenSpan::new(start, len, SyntaxScope::String, lang_id));
@@ -71,19 +74,22 @@ impl Grammar for PythonGrammar {
                 let start = i;
                 i += 3;
                 let mut closed = false;
-                while i + 2 < len {
-                    if bytes[i] == b && bytes[i + 1] == b && bytes[i + 2] == b {
+                while i < len {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(len);
+                    } else if i + 2 < len && bytes[i] == b && bytes[i + 1] == b && bytes[i + 2] == b {
                         i += 3;
                         closed = true;
                         break;
+                    } else {
+                        i += 1;
                     }
-                    i += 1;
                 }
                 if !closed {
                     tokens.push(TokenSpan::new(start, len, SyntaxScope::String, lang_id));
                     return (tokens, Some(GrammarState::MultiLineString { quote }));
                 } else {
-                    tokens.push(TokenSpan::new(start, i, SyntaxScope::String, lang_id));
+                    tokens.push(TokenSpan::new(start, i.min(len), SyntaxScope::String, lang_id));
                     continue;
                 }
             }
@@ -102,7 +108,7 @@ impl Grammar for PythonGrammar {
                 i += 1;
                 while i < len {
                     if bytes[i] == b'\\' {
-                        i += 2;
+                        i = (i + 2).min(len);
                     } else if bytes[i] == quote {
                         i += 1;
                         break;
@@ -110,7 +116,7 @@ impl Grammar for PythonGrammar {
                         i += 1;
                     }
                 }
-                tokens.push(TokenSpan::new(start, i, SyntaxScope::String, lang_id));
+                tokens.push(TokenSpan::new(start, i.min(len), SyntaxScope::String, lang_id));
                 continue;
             }
 
@@ -138,11 +144,19 @@ impl Grammar for PythonGrammar {
                 continue;
             }
 
+            let ch = line[i..].chars().next().unwrap();
+            let ch_len = ch.len_utf8();
+
             // Identifier or keyword
-            if b.is_ascii_alphabetic() || b == b'_' {
+            if ch.is_alphabetic() || ch == '_' {
                 let start = i;
-                while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
+                while i < len {
+                    let next_ch = line[i..].chars().next().unwrap();
+                    if next_ch.is_alphanumeric() || next_ch == '_' {
+                        i += next_ch.len_utf8();
+                    } else {
+                        break;
+                    }
                 }
                 let word = &line[start..i];
 
@@ -179,8 +193,8 @@ impl Grammar for PythonGrammar {
             // Operators & Punctuation
             let start = i;
             if i + 1 < len {
-                let op2 = &line[i..i + 2];
-                if matches!(op2, "==" | "!=" | "<=" | ">=" | "//" | "**" | "->" | "+=" | "-=" | "*=" | "/=") {
+                let op2 = &bytes[i..i + 2];
+                if matches!(op2, b"==" | b"!=" | b"<=" | b">=" | b"//" | b"**" | b"->" | b"+=" | b"-=" | b"*=" | b"/=") {
                     tokens.push(TokenSpan::new(start, start + 2, SyntaxScope::Operator, lang_id));
                     i += 2;
                     continue;
@@ -193,8 +207,8 @@ impl Grammar for PythonGrammar {
                 b'+' | b'-' | b'*' | b'/' | b'%' | b'=' | b'<' | b'>' => SyntaxScope::Operator,
                 _ => SyntaxScope::Plain,
             };
-            tokens.push(TokenSpan::new(start, start + 1, scope, lang_id));
-            i += 1;
+            tokens.push(TokenSpan::new(start, start + ch_len, scope, lang_id));
+            i += ch_len;
         }
 
         (tokens, None)
@@ -234,6 +248,41 @@ mod tests {
         assert!(tokens.iter().any(|t| t.scope == SyntaxScope::Type && &line[t.start..t.end] == "int"));
         assert!(tokens.iter().any(|t| t.scope == SyntaxScope::Type && &line[t.start..t.end] == "bool"));
         assert!(tokens.iter().any(|t| t.scope == SyntaxScope::CommentLine));
+    }
+
+    #[test]
+    fn test_python_multiline_docstring_continuation() {
+        let py = PythonGrammar;
+        let line1 = r#""""start docstring"#;
+        let (_, state1) = py.tokenize_line(line1, None);
+        assert_eq!(state1, Some(GrammarState::MultiLineString { quote: '"' }));
+
+        let line2 = "middle of docstring without end";
+        let (tokens2, state2) = py.tokenize_line(line2, state1.as_ref());
+        assert_eq!(state2, Some(GrammarState::MultiLineString { quote: '"' }));
+        assert_eq!(tokens2.len(), 1);
+        assert_eq!(tokens2[0].scope, SyntaxScope::String);
+
+        let line3 = r#"end docstring""" + "more""#;
+        let (tokens3, state3) = py.tokenize_line(line3, state2.as_ref());
+        assert_eq!(state3, None);
+        assert_eq!(tokens3[0].scope, SyntaxScope::String);
+    }
+
+    #[test]
+    fn test_python_unicode_identifiers_and_boundaries() {
+        let py = PythonGrammar;
+        let line = "café_val = 100 # π";
+        let (tokens, state) = py.tokenize_line(line, None);
+        assert_eq!(state, None);
+
+        for t in &tokens {
+            assert!(line.is_char_boundary(t.start));
+            assert!(line.is_char_boundary(t.end));
+        }
+
+        let var_token = tokens.iter().find(|t| t.scope == SyntaxScope::Variable).unwrap();
+        assert_eq!(&line[var_token.start..var_token.end], "café_val");
     }
 }
 

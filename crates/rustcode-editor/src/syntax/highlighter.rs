@@ -71,6 +71,11 @@ impl SyntaxHighlighter {
         self.cache.clear();
     }
 
+    /// Number of cached lines.
+    pub fn cache_len(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Retrieve token spans for a line, tokenizing incrementally if not cached.
     pub fn get_line_tokens(&mut self, line_idx: usize, line_text: &str) -> &[TokenSpan] {
         let text_hash = hash_content(line_text);
@@ -246,6 +251,26 @@ mod tests {
         highlighter.invalidate_from(0);
         let tokens3 = highlighter.get_line_tokens(0, "let updated = 1;");
         assert_eq!(tokens3.len(), 5);
+    }
 
+    #[test]
+    fn test_syntax_highlighter_multiline_block_comments() {
+        let grammar = Arc::new(RustGrammar);
+        let theme = ThemeService::default_dark_theme();
+        let mut highlighter = SyntaxHighlighter::new(grammar, theme);
+
+        let line0 = "/* multiline start";
+        let line1 = "middle comment line";
+        let line2 = "end of comment */ let x = 10;";
+
+        let t0 = highlighter.get_line_tokens(0, line0);
+        assert_eq!(t0[0].scope, SyntaxScope::CommentBlock);
+
+        let t1 = highlighter.get_line_tokens(1, line1);
+        assert_eq!(t1[0].scope, SyntaxScope::CommentBlock);
+
+        let t2 = highlighter.get_line_tokens(2, line2);
+        assert_eq!(t2[0].scope, SyntaxScope::CommentBlock);
+        assert!(t2.iter().any(|t| t.scope == SyntaxScope::Keyword));
     }
 }

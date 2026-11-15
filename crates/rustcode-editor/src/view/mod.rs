@@ -466,6 +466,21 @@ impl View for EditorView {
         // 5. Render visible lines
         let text_area_x = bounds.min_x() + gutter_w + 8.0;
 
+        // Warm up tokenizer cache sequentially up to start_line so multiline state is preserved
+        {
+            let mut highlighter_guard = self.syntax_highlighter.lock();
+            if let Some(highlighter) = highlighter_guard.as_mut() {
+                let last_cached = highlighter.cache_len();
+                if last_cached < start_line {
+                    for l in last_cached..start_line {
+                        if let Some(content) = buf.get_line_content(l) {
+                            highlighter.get_line_tokens(l, &content);
+                        }
+                    }
+                }
+            }
+        }
+
         for line_idx in start_line..end_line {
             let line_y = bounds.min_y() + (line_idx as f32 - self.scroll_top) * font.line_height;
 
@@ -524,8 +539,15 @@ impl View for EditorView {
                         rendered_tokens = true;
                         let mut last_byte = 0;
                         for span in tokens {
-                            if span.start > last_byte && span.start <= line_content.len() {
-                                let gap_text = &line_content[last_byte..span.start];
+                            let span_start = span.start.min(line_content.len());
+                            let span_end = span.end.min(line_content.len());
+
+                            // Emit gap if valid char boundaries
+                            if span_start > last_byte
+                                && line_content.is_char_boundary(last_byte)
+                                && line_content.is_char_boundary(span_start)
+                            {
+                                let gap_text = &line_content[last_byte..span_start];
                                 let gap_start_vis = line_content[..last_byte].chars().count();
                                 let gap_vis_w = gap_text.chars().count() as f32 * font.char_width;
                                 let gap_x = text_area_x + (gap_start_vis as f32 - self.scroll_left) * font.char_width;
@@ -536,11 +558,17 @@ impl View for EditorView {
                                     theme.editor_foreground,
                                     font.font_size,
                                 ));
+                                last_byte = span_start;
                             }
 
-                            if span.end <= line_content.len() && span.start < span.end {
-                                let span_text = &line_content[span.start..span.end];
-                                let span_start_vis = line_content[..span.start].chars().count();
+                            // Emit token span if valid
+                            if span_end > last_byte
+                                && span_start >= last_byte
+                                && line_content.is_char_boundary(span_start)
+                                && line_content.is_char_boundary(span_end)
+                            {
+                                let span_text = &line_content[span_start..span_end];
+                                let span_start_vis = line_content[..span_start].chars().count();
                                 let span_vis_w = span_text.chars().count() as f32 * font.char_width;
                                 let span_x = text_area_x + (span_start_vis as f32 - self.scroll_left) * font.char_width;
                                 let span_color = span.color.unwrap_or(theme.editor_foreground);
@@ -558,11 +586,16 @@ impl View for EditorView {
                                         span.metadata.is_underline(),
                                     ),
                                 );
-                                last_byte = span.end;
+                                last_byte = span_end;
+                            } else {
+                                last_byte = last_byte.max(span_end);
                             }
                         }
 
-                        if last_byte < line_content.len() {
+                        // Emit remaining tail text
+                        if last_byte < line_content.len()
+                            && line_content.is_char_boundary(last_byte)
+                        {
                             let tail_text = &line_content[last_byte..];
                             let tail_start_vis = line_content[..last_byte].chars().count();
                             let tail_vis_w = tail_text.chars().count() as f32 * font.char_width;
@@ -991,6 +1024,38 @@ mod tests {
         assert_eq!(meta.path, file_path);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_editor_view_unicode_rendering_and_scrolled_multiline_comment() {
+        use rustcode_platform::render::Rgba;
+        use rustcode_platform::theme::ThemeService;
+
+        let content = "/* start block\nmiddle line without end\nend block */\nlet café_π = \"☕\";\n";
+        let mut view = EditorView::from_str(content);
+        let registry = GrammarRegistry::new();
+        let theme = ThemeService::default_dark_theme();
+        view.set_language("rust", theme.clone(), &registry);
+
+        let font = FontMetrics::default_monospace();
+        let theme_styles = WorkbenchThemeStyles::from_theme(&theme);
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Test normal rendering
+        let mut scene = Scene::new();
+        view.render(bounds, &theme_styles, &font, &mut scene);
+
+        let comment_color = Rgba::from_hex("#6A9955").unwrap();
+        let keyword_color = Rgba::from_hex("#C586C0").unwrap();
+
+        assert!(scene.glyph_runs().iter().any(|r| r.color == comment_color));
+        assert!(scene.glyph_runs().iter().any(|r| r.color == keyword_color));
+
+        // Test scrolling down: starting from line 1 (middle line of comment)
+        view.scroll_top = 1.0;
+        let mut scene2 = Scene::new();
+        view.render(bounds, &theme_styles, &font, &mut scene2);
+        assert!(scene2.glyph_runs().iter().any(|r| r.color == comment_color));
     }
 }
 

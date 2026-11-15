@@ -115,7 +115,7 @@ impl ContextKeyExpr {
                     Some(Value::Bool(b)) => b,
                     Some(Value::Null) | None => false,
                     Some(Value::String(s)) => !s.is_empty(),
-                    Some(Value::Number(n)) => n.as_f64().map_or(false, |v| v != 0.0),
+                    Some(Value::Number(n)) => n.as_f64().is_some_and(|v| v != 0.0),
                     Some(Value::Array(a)) => !a.is_empty(),
                     Some(Value::Object(o)) => !o.is_empty(),
                 }
@@ -217,10 +217,10 @@ fn split_binary<'a>(s: &'a str, op: &str) -> Option<(&'a str, &'a str)> {
 }
 
 fn unquote(s: &str) -> String {
-    if (s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')) {
-        if s.len() >= 2 {
-            return s[1..s.len() - 1].to_string();
-        }
+    if ((s.starts_with('\'') && s.ends_with('\'')) || (s.starts_with('"') && s.ends_with('"')))
+        && s.len() >= 2
+    {
+        return s[1..s.len() - 1].to_string();
     }
     s.to_string()
 }

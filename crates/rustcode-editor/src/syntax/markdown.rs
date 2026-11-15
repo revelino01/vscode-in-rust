@@ -101,22 +101,31 @@ impl Grammar for MarkdownGrammar {
                 let delim = b;
                 let start = i;
                 i += 2;
-                while i + 1 < len && !(bytes[i] == delim && bytes[i + 1] == delim) {
+                let mut closed = false;
+                while i + 1 < len {
+                    if bytes[i] == delim && bytes[i + 1] == delim {
+                        i += 2;
+                        closed = true;
+                        break;
+                    }
                     i += 1;
                 }
-                if i + 1 < len && bytes[i] == delim && bytes[i + 1] == delim {
-                    i += 2;
+                if closed {
+                    tokens.push(TokenSpan::with_style(
+                        start,
+                        i,
+                        SyntaxScope::MarkdownBold,
+                        lang_id,
+                        true,
+                        false,
+                        false,
+                    ));
+                    continue;
+                } else {
+                    tokens.push(TokenSpan::new(start, start + 2, SyntaxScope::Punctuation, lang_id));
+                    i = start + 2;
+                    continue;
                 }
-                tokens.push(TokenSpan::with_style(
-                    start,
-                    i,
-                    SyntaxScope::MarkdownBold,
-                    lang_id,
-                    true,
-                    false,
-                    false,
-                ));
-                continue;
             }
 
             // Italic *...* or _..._
@@ -124,58 +133,83 @@ impl Grammar for MarkdownGrammar {
                 let delim = b;
                 let start = i;
                 i += 1;
-                while i < len && bytes[i] != delim {
+                let mut closed = false;
+                while i < len {
+                    if bytes[i] == delim {
+                        i += 1;
+                        closed = true;
+                        break;
+                    }
                     i += 1;
                 }
-                if i < len && bytes[i] == delim {
-                    i += 1;
+                if closed {
+                    tokens.push(TokenSpan::with_style(
+                        start,
+                        i,
+                        SyntaxScope::MarkdownItalic,
+                        lang_id,
+                        false,
+                        true,
+                        false,
+                    ));
+                    continue;
+                } else {
+                    tokens.push(TokenSpan::new(start, start + 1, SyntaxScope::Punctuation, lang_id));
+                    i = start + 1;
+                    continue;
                 }
-                tokens.push(TokenSpan::with_style(
-                    start,
-                    i,
-                    SyntaxScope::MarkdownItalic,
-                    lang_id,
-                    false,
-                    true,
-                    false,
-                ));
-                continue;
             }
 
             // Link [text](url)
             if b == b'[' {
                 let start = i;
                 i += 1;
-                while i < len && bytes[i] != b']' {
+                let mut closed_bracket = false;
+                while i < len {
+                    if bytes[i] == b']' {
+                        closed_bracket = true;
+                        break;
+                    }
                     i += 1;
                 }
-                if i < len && bytes[i] == b']' && i + 1 < len && bytes[i + 1] == b'(' {
+                if closed_bracket && i + 1 < len && bytes[i + 1] == b'(' {
                     i += 2;
-                    while i < len && bytes[i] != b')' {
+                    let mut closed_paren = false;
+                    while i < len {
+                        if bytes[i] == b')' {
+                            i += 1;
+                            closed_paren = true;
+                            break;
+                        }
                         i += 1;
                     }
-                    if i < len && bytes[i] == b')' {
-                        i += 1;
+                    if closed_paren {
+                        tokens.push(TokenSpan::with_style(
+                            start,
+                            i,
+                            SyntaxScope::MarkdownLink,
+                            lang_id,
+                            false,
+                            false,
+                            true,
+                        ));
+                        continue;
                     }
-                    tokens.push(TokenSpan::with_style(
-                        start,
-                        i,
-                        SyntaxScope::MarkdownLink,
-                        lang_id,
-                        false,
-                        false,
-                        true,
-                    ));
-                    continue;
                 }
+                tokens.push(TokenSpan::new(start, start + 1, SyntaxScope::Punctuation, lang_id));
+                i = start + 1;
+                continue;
             }
 
-            // Regular word / text
+            // Regular word / text with unicode support
             let start = i;
             while i < len && !matches!(bytes[i], b'`' | b'*' | b'_' | b'[') {
-                i += 1;
+                let ch = line[i..].chars().next().unwrap();
+                i += ch.len_utf8();
             }
-            tokens.push(TokenSpan::new(start, i, SyntaxScope::Plain, lang_id));
+            if i > start {
+                tokens.push(TokenSpan::new(start, i, SyntaxScope::Plain, lang_id));
+            }
         }
 
         (tokens, None)
@@ -200,6 +234,21 @@ mod tests {
         let (fence_tokens, state) = grammar.tokenize_line(fence, None);
         assert!(fence_tokens.iter().any(|t| t.scope == SyntaxScope::MarkdownCode));
         assert!(matches!(state, Some(GrammarState::CodeBlock { .. })));
+    }
+
+    #[test]
+    fn test_markdown_unclosed_and_unicode() {
+        let grammar = MarkdownGrammar;
+        let line = "Here is **unclosed bold with 🦀 emoji and [unclosed link";
+        let (tokens, state) = grammar.tokenize_line(line, None);
+        assert_eq!(state, None);
+
+        for t in &tokens {
+            assert!(line.is_char_boundary(t.start));
+            assert!(line.is_char_boundary(t.end));
+            assert!(t.start < t.end);
+            assert!(t.end <= line.len());
+        }
     }
 }
 

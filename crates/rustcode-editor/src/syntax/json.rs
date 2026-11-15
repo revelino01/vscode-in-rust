@@ -48,7 +48,7 @@ impl Grammar for JsonGrammar {
                 i += 1;
                 while i < len {
                     if bytes[i] == b'\\' {
-                        i += 2;
+                        i = (i + 2).min(len);
                     } else if bytes[i] == b'"' {
                         i += 1;
                         break;
@@ -68,7 +68,7 @@ impl Grammar for JsonGrammar {
                     SyntaxScope::String
                 };
 
-                tokens.push(TokenSpan::new(start, i, scope, lang_id));
+                tokens.push(TokenSpan::new(start, i.min(len), scope, lang_id));
                 continue;
             }
 
@@ -101,14 +101,16 @@ impl Grammar for JsonGrammar {
                 continue;
             }
 
-            // Punctuation
-            let scope = match b {
-                b'{' | b'}' | b'[' | b']' => SyntaxScope::PunctuationBracket,
-                b':' | b',' => SyntaxScope::PunctuationDelimiter,
+            // Punctuation and unicode-safe fallback
+            let ch = line[i..].chars().next().unwrap();
+            let ch_len = ch.len_utf8();
+            let scope = match ch {
+                '{' | '}' | '[' | ']' => SyntaxScope::PunctuationBracket,
+                ':' | ',' => SyntaxScope::PunctuationDelimiter,
                 _ => SyntaxScope::Plain,
             };
-            tokens.push(TokenSpan::new(i, i + 1, scope, lang_id));
-            i += 1;
+            tokens.push(TokenSpan::new(i, i + ch_len, scope, lang_id));
+            i += ch_len;
         }
 
         (tokens, None)
@@ -130,6 +132,20 @@ mod tests {
         assert!(tokens.iter().any(|t| t.scope == SyntaxScope::Number && &line[t.start..t.end] == "100"));
         assert!(tokens.iter().any(|t| t.scope == SyntaxScope::ConstantLanguage && &line[t.start..t.end] == "true"));
         assert!(tokens.iter().any(|t| t.scope == SyntaxScope::ConstantLanguage && &line[t.start..t.end] == "null"));
+    }
+
+    #[test]
+    fn test_json_unicode_and_escapes() {
+        let grammar = JsonGrammar;
+        let line = r#"  "café_key": "emoji 🚀", "val": "\"#;
+        let (tokens, state) = grammar.tokenize_line(line, None);
+        assert_eq!(state, None);
+
+        for t in &tokens {
+            assert!(line.is_char_boundary(t.start));
+            assert!(line.is_char_boundary(t.end));
+            assert!(t.end <= line.len());
+        }
     }
 }
 

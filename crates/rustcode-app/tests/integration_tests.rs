@@ -285,7 +285,7 @@ async fn test_end_to_end_syntax_highlighting_and_file_io() {
     let uri = format!("file://{}", file_path.display());
 
     let fs = FileSystemService::new();
-    let initial_code = "pub fn add(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    sum\n}\n";
+    let initial_code = "/* multi-line\n   comment */\npub fn add(a: i32, b: i32) -> i32 {\n    let sum_π = a + b;\n    sum_π\n}\n";
 
     // 1. Write file atomically
     let meta = fs.write_atomic(&file_path, initial_code).await.unwrap();
@@ -313,10 +313,13 @@ async fn test_end_to_end_syntax_highlighting_and_file_io() {
     let mut surface = MockRenderSurface::new(1024.0, 768.0);
     let scene = window.render(&mut surface);
 
-    // Verify syntax colors present: keyword purple (#C586C0)
+    // Verify syntax colors present: keyword purple (#C586C0) and comment green (#6A9955)
     let keyword_color = Rgba::from_hex("#C586C0").unwrap();
+    let comment_color = Rgba::from_hex("#6A9955").unwrap();
     assert!(scene.glyph_runs().iter().any(|r| r.color == keyword_color));
+    assert!(scene.glyph_runs().iter().any(|r| r.color == comment_color));
     assert!(scene.contains_text("pub fn add"));
+    assert!(scene.contains_text("sum_π"));
 
     // 6. Edit file in editor
     let editor = window.view.editor_area.active_editor_mut().unwrap();

@@ -4,6 +4,7 @@ members = [
     "crates/rustcode-base",
     "crates/rustcode-editor",
     "crates/rustcode-platform",
+    "crates/rustcode-ext-host",
 ]
 
 [profile.release]

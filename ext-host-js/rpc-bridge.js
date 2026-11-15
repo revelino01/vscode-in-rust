@@ -71,13 +71,21 @@ const rpc = {
   },
 
   // Register an extension provider proxy object so Rust Core can invoke provider methods
-  registerObjectProxy(type, id, provider, methods) {
+  registerObjectProxy(type, id, provider, methods, metadata = {}) {
     const key = `${type}:${id}`;
-    objectProxies.set(key, { provider, methods });
+    objectProxies.set(key, { provider, methods, metadata });
 
     if (ops.op_register_provider) {
-      ops.op_register_provider(type, id, JSON.stringify(methods));
+      ops.op_register_provider(type, id, JSON.stringify(methods), JSON.stringify(metadata));
     }
+
+    rpc.call('extHost.registerProvider', {
+      type,
+      id,
+      methods,
+      selector: metadata.selector || '*',
+      triggerCharacters: metadata.triggerCharacters || [],
+    });
 
     return {
       dispose() {
@@ -85,6 +93,7 @@ const rpc = {
         if (ops.op_unregister_provider) {
           ops.op_unregister_provider(type, id);
         }
+        rpc.call('extHost.unregisterProvider', { type, id });
       }
     };
   },

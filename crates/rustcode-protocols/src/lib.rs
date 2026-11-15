@@ -6,12 +6,63 @@ use std::path::PathBuf;
 pub mod lsp {
     use super::*;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
     pub enum DiagnosticSeverity {
         Error = 1,
         Warning = 2,
         Information = 3,
         Hint = 4,
+    }
+
+    impl<'de> serde::Deserialize<'de> for DiagnosticSeverity {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            struct SeverityVisitor;
+            impl<'de> serde::de::Visitor<'de> for SeverityVisitor {
+                type Value = DiagnosticSeverity;
+
+                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                    formatter.write_str("an integer severity (0-4) or severity name")
+                }
+
+                fn visit_u64<E>(self, value: u64) -> Result<DiagnosticSeverity, E>
+                where
+                    E: serde::de::Error,
+                {
+                    match value {
+                        0 | 1 => Ok(DiagnosticSeverity::Error),
+                        2 => Ok(DiagnosticSeverity::Warning),
+                        3 => Ok(DiagnosticSeverity::Information),
+                        4 => Ok(DiagnosticSeverity::Hint),
+                        _ => Err(E::custom(format!("invalid diagnostic severity: {}", value))),
+                    }
+                }
+
+                fn visit_i64<E>(self, value: i64) -> Result<DiagnosticSeverity, E>
+                where
+                    E: serde::de::Error,
+                {
+                    self.visit_u64(value as u64)
+                }
+
+                fn visit_str<E>(self, value: &str) -> Result<DiagnosticSeverity, E>
+                where
+                    E: serde::de::Error,
+                {
+                    match value.to_ascii_lowercase().as_str() {
+                        "error" => Ok(DiagnosticSeverity::Error),
+                        "warning" => Ok(DiagnosticSeverity::Warning),
+                        "information" | "info" => Ok(DiagnosticSeverity::Information),
+                        "hint" => Ok(DiagnosticSeverity::Hint),
+                        _ => Err(E::custom(format!("invalid diagnostic severity string: {}", value))),
+                    }
+                }
+            }
+
+            deserializer.deserialize_any(SeverityVisitor)
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,5 +169,14 @@ mod tests {
             is_staged: true,
         };
         assert!(entry.is_staged);
+
+        // Test VS Code API 0-indexed severity and string severity deserialization
+        let vscode_sev_json = r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":0,"message":"err"}"#;
+        let d0: LspDiagnostic = serde_json::from_str(vscode_sev_json).unwrap();
+        assert_eq!(d0.severity, Some(DiagnosticSeverity::Error));
+
+        let str_sev_json = r#"{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":"warning","message":"warn"}"#;
+        let d_str: LspDiagnostic = serde_json::from_str(str_sev_json).unwrap();
+        assert_eq!(d_str.severity, Some(DiagnosticSeverity::Warning));
     }
 }

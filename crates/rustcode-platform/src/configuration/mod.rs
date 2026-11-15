@@ -170,9 +170,9 @@ fn set_nested_value(target_map: &mut serde_json::Map<String, Value>, path: &str,
     }
 }
 
-/// Simple JSONC comment stripper (handles // and /* ... */).
+/// JSONC comment & trailing comma stripper (handles //, /* ... */, and trailing commas).
 pub fn strip_json_comments(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
+    let mut no_comments = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     let mut in_string = false;
     let mut string_char = '"';
@@ -180,7 +180,7 @@ pub fn strip_json_comments(s: &str) -> String {
 
     while let Some(c) = chars.next() {
         if in_string {
-            result.push(c);
+            no_comments.push(c);
             if escaped {
                 escaped = false;
             } else if c == '\\' {
@@ -192,13 +192,13 @@ pub fn strip_json_comments(s: &str) -> String {
             if c == '"' || c == '\'' {
                 in_string = true;
                 string_char = c;
-                result.push(c);
+                no_comments.push(c);
             } else if c == '/' && chars.peek() == Some(&'/') {
                 // Line comment
                 chars.next();
                 for next_c in chars.by_ref() {
                     if next_c == '\n' {
-                        result.push('\n');
+                        no_comments.push('\n');
                         break;
                     }
                 }
@@ -212,8 +212,50 @@ pub fn strip_json_comments(s: &str) -> String {
                     }
                 }
             } else {
+                no_comments.push(c);
+            }
+        }
+    }
+
+    // Second pass: remove trailing commas before } or ]
+    let mut result = String::with_capacity(no_comments.len());
+    let chars_vec: Vec<char> = no_comments.chars().collect();
+    in_string = false;
+    escaped = false;
+    let len = chars_vec.len();
+
+    for i in 0..len {
+        let c = chars_vec[i];
+        if in_string {
+            result.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == string_char {
+                in_string = false;
+            }
+        } else if c == '"' || c == '\'' {
+            in_string = true;
+            string_char = c;
+            result.push(c);
+        } else if c == ',' {
+            let mut is_trailing = false;
+            for j in (i + 1)..len {
+                let nc = chars_vec[j];
+                if nc.is_whitespace() {
+                    continue;
+                }
+                if nc == '}' || nc == ']' {
+                    is_trailing = true;
+                }
+                break;
+            }
+            if !is_trailing {
                 result.push(c);
             }
+        } else {
+            result.push(c);
         }
     }
 
@@ -251,10 +293,10 @@ mod tests {
         let auto_save: String = config.get("files.autoSave").unwrap();
         assert_eq!(auto_save, "afterDelay");
 
-        // Workspace settings override user settings
+        // Workspace settings override user settings with trailing commas
         let ws_settings = r#"
         {
-            "editor.fontSize": 20
+            "editor.fontSize": 20,
         }
         "#;
         config.load_workspace_settings(ws_settings).unwrap();

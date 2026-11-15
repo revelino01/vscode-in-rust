@@ -28,7 +28,8 @@
 - [x] `ext-host-js`: JavaScript `vscode.*` API shim (`types.js`, `commands.js`, `window.js`, `workspace.js`, `languages.js`, `env.js`, `rpc-bridge.js`)
 - [x] `ext-host-js`: Node.js compatibility layer (`events.js`, `path.js`, `fs.js`)
 - [x] Resources: VS Code Dark+ & Light+ default themes, Linux keymaps, sample Hello World extension
-- [x] Test Suite: 29 unit and integration tests passing (`cargo test --workspace`)
+- [x] Test Suite: 33 unit and integration tests passing (`cargo test --workspace`)
+- [x] Robustness & Edge Cases: Fixed PieceTable trailing newline indexing, UTF-8 char boundary splitting, ContextKeyExpr parentheses & negation precedence, non-deadlocking event & command handlers, JSONC comment/trailing comma stripping, and terminal manager tab shift
 
 ### Phase 1: Minimal Editor & File Workflows
 - [x] Configuration loading (`settings.json`)

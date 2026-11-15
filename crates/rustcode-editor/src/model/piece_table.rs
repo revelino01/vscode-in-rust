@@ -190,6 +190,33 @@ impl PieceTable {
         count_line_feeds(slice)
     }
 
+    /// Align an offset to a valid UTF-8 character boundary.
+    pub fn floor_char_boundary(&self, offset: usize) -> usize {
+        if offset >= self.len() {
+            return self.len();
+        }
+        let mut pieces = Vec::new();
+        self.collect_pieces(&self.root, &mut pieces);
+        let mut cur = 0;
+        for piece in pieces {
+            let next = cur + piece.length;
+            if offset >= cur && offset < next {
+                let rel = offset - cur;
+                let slice = match piece.source {
+                    PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
+                    PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
+                };
+                let mut aligned_rel = rel;
+                while aligned_rel > 0 && !slice.is_char_boundary(aligned_rel) {
+                    aligned_rel -= 1;
+                }
+                return cur + aligned_rel;
+            }
+            cur = next;
+        }
+        self.len()
+    }
+
     /// Insert text at a specific character offset.
     pub fn insert(&mut self, offset: usize, text: &str) {
         if text.is_empty() {
@@ -197,7 +224,7 @@ impl PieceTable {
         }
 
         let total_len = self.len();
-        let target_offset = std::cmp::min(offset, total_len);
+        let target_offset = self.floor_char_boundary(std::cmp::min(offset, total_len));
 
         let add_start = self.add_buffer.len();
         self.add_buffer.push_str(text);
@@ -266,7 +293,11 @@ impl PieceTable {
             return String::new();
         }
 
-        let del_end = std::cmp::min(offset + length, self.len());
+        let offset = self.floor_char_boundary(offset);
+        let del_end = self.floor_char_boundary(std::cmp::min(offset + length, self.len()));
+        if offset >= del_end {
+            return String::new();
+        }
         let deleted_text = self.get_range(offset, del_end);
 
         let mut pieces = Vec::new();
@@ -407,6 +438,8 @@ impl PieceTable {
 
         if found_start {
             Some((line_start, self.len()))
+        } else if cur_line == line_index {
+            Some((self.len(), self.len()))
         } else {
             None
         }
@@ -449,7 +482,24 @@ impl PieceTable {
     /// Convert (line, column) Position to 0-indexed byte offset.
     pub fn position_to_offset(&self, line: usize, col: usize) -> usize {
         match self.get_line_offsets(line) {
-            Some((start, end)) => std::cmp::min(start + col, end),
+            Some((start, end)) => {
+                let content_end = if end > start {
+                    let end_str = self.get_range(end.saturating_sub(1), end);
+                    if end_str == "\n" {
+                        let prev_str = if end >= 2 { self.get_range(end - 2, end - 1) } else { String::new() };
+                        if prev_str == "\r" {
+                            end - 2
+                        } else {
+                            end - 1
+                        }
+                    } else {
+                        end
+                    }
+                } else {
+                    end
+                };
+                std::cmp::min(start + col, content_end)
+            }
             None => self.len(),
         }
     }
@@ -560,5 +610,34 @@ mod tests {
         let ref_del: String = reference.drain(5..15).collect();
         assert_eq!(del_text, ref_del);
         assert_eq!(table.to_string(), reference);
+    }
+
+    #[test]
+    fn test_piece_table_trailing_newlines_and_utf8() {
+        // Test trailing newline handling
+        let table = PieceTable::from_str("line 1\nline 2\n");
+        assert_eq!(table.line_count(), 3);
+        assert_eq!(table.get_line_content(0), Some("line 1".to_string()));
+        assert_eq!(table.get_line_content(1), Some("line 2".to_string()));
+        assert_eq!(table.get_line_content(2), Some("".to_string()));
+        assert_eq!(table.get_line_content(3), None);
+
+        // Empty file
+        let empty = PieceTable::new();
+        assert_eq!(empty.line_count(), 1);
+        assert_eq!(empty.get_line_content(0), Some("".to_string()));
+
+        // Multibyte UTF-8 characters (emoji, CJK) across piece edits
+        let mut utf8_table = PieceTable::from_str("Hello 🚀 世界!\n");
+        assert_eq!(utf8_table.line_count(), 2);
+        assert_eq!(utf8_table.get_line_content(0), Some("Hello 🚀 世界!".to_string()));
+
+        // Insert within multibyte text
+        utf8_table.insert(utf8_table.len() - 1, " 🦀");
+        assert_eq!(utf8_table.get_line_content(0), Some("Hello 🚀 世界! 🦀".to_string()));
+
+        // Delete without panic even on unaligned boundary
+        let _ = utf8_table.delete(6, 3);
+        assert!(utf8_table.len() > 0);
     }
 }

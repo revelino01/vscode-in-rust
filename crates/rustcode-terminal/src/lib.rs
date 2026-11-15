@@ -79,6 +79,8 @@ impl TerminalManager {
             } else if let Some(active) = self.active_index {
                 if active >= self.terminals.len() {
                     self.active_index = Some(self.terminals.len() - 1);
+                } else if active > pos {
+                    self.active_index = Some(active - 1);
                 }
             }
             true
@@ -116,5 +118,16 @@ mod tests {
         mgr.close_terminal(&t2_id);
         assert_eq!(mgr.terminals().len(), 1);
         assert_eq!(mgr.active_terminal().unwrap().title, "bash");
+
+        // Test closing preceding terminal preserves active terminal
+        let t1_id = mgr.terminals()[0].id.clone();
+        let _t3 = mgr.create_terminal(Some("fish"), Some("/bin/fish"), None);
+        assert_eq!(mgr.active_terminal().unwrap().title, "fish");
+        assert_eq!(mgr.terminals().len(), 2);
+
+        // Close preceding terminal (t1)
+        mgr.close_terminal(&t1_id);
+        assert_eq!(mgr.terminals().len(), 1);
+        assert_eq!(mgr.active_terminal().unwrap().title, "fish");
     }
 }

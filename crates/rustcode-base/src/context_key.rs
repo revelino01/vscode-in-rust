@@ -38,12 +38,12 @@ pub enum ContextKeyError {
 impl ContextKeyExpr {
     /// Parse a VS Code `when` clause string into an expression tree.
     pub fn parse(expr: &str) -> Result<Self, ContextKeyError> {
-        let trimmed = expr.trim();
+        let trimmed = unwrap_parens(expr.trim());
         if trimmed.is_empty() {
             return Ok(ContextKeyExpr::True);
         }
 
-        // Handle OR expressions (lower precedence than AND)
+        // Handle OR expressions (lowest precedence)
         // Split by || if not inside parens/regex
         let or_parts = split_top_level(trimmed, "||");
         if or_parts.len() > 1 {
@@ -51,11 +51,17 @@ impl ContextKeyExpr {
             return Ok(ContextKeyExpr::Or(parsed_parts?));
         }
 
-        // Handle AND expressions
+        // Handle AND expressions (second lowest precedence)
         let and_parts = split_top_level(trimmed, "&&");
         if and_parts.len() > 1 {
             let parsed_parts: Result<Vec<_>, _> = and_parts.into_iter().map(Self::parse).collect();
             return Ok(ContextKeyExpr::And(parsed_parts?));
+        }
+
+        // Handle negation: !expr
+        if let Some(rest) = trimmed.strip_prefix('!') {
+            let inner = Self::parse(rest)?;
+            return Ok(ContextKeyExpr::Not(Box::new(inner)));
         }
 
         // Single primary expression
@@ -63,19 +69,13 @@ impl ContextKeyExpr {
     }
 
     fn parse_primary(expr: &str) -> Result<Self, ContextKeyError> {
-        let trimmed = expr.trim();
+        let trimmed = unwrap_parens(expr.trim());
 
         if trimmed == "true" {
             return Ok(ContextKeyExpr::True);
         }
         if trimmed == "false" {
             return Ok(ContextKeyExpr::False);
-        }
-
-        // Negation: !expr
-        if let Some(rest) = trimmed.strip_prefix('!') {
-            let inner = Self::parse_primary(rest)?;
-            return Ok(ContextKeyExpr::Not(Box::new(inner)));
         }
 
         // Equality: key == val
@@ -153,6 +153,34 @@ impl ContextKeyExpr {
             ContextKeyExpr::Or(items) => items.iter().any(|e| e.evaluate(context)),
         }
     }
+}
+
+fn unwrap_parens(mut s: &str) -> &str {
+    loop {
+        s = s.trim();
+        if s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
+            let bytes = s.as_bytes();
+            let mut depth = 0;
+            let mut all_enclosed = true;
+            for (i, &b) in bytes.iter().enumerate() {
+                if b == b'(' {
+                    depth += 1;
+                } else if b == b')' {
+                    depth -= 1;
+                    if depth == 0 && i < bytes.len() - 1 {
+                        all_enclosed = false;
+                        break;
+                    }
+                }
+            }
+            if all_enclosed && depth == 0 {
+                s = &s[1..s.len() - 1];
+                continue;
+            }
+        }
+        break;
+    }
+    s.trim()
 }
 
 fn split_top_level<'a>(s: &'a str, delim: &str) -> Vec<&'a str> {
@@ -300,5 +328,24 @@ mod tests {
 
         assert!(ctx.evaluate_expr("currentExt in supportedExts"));
         assert!(!ctx.evaluate_expr("unknownExt in supportedExts"));
+    }
+
+    #[test]
+    fn test_context_key_parentheses_and_precedence() {
+        let ctx = ContextKeyService::new();
+        ctx.set_bool("a", true);
+        ctx.set_bool("b", false);
+        ctx.set_bool("c", true);
+
+        // a && (b || c) -> true && (false || true) -> true
+        assert!(ctx.evaluate_expr("a && (b || c)"));
+        // (a && b) || c -> (true && false) || true -> true
+        assert!(ctx.evaluate_expr("(a && b) || c"));
+        // (a && b) -> false
+        assert!(!ctx.evaluate_expr("(a && b)"));
+        // !(a && b) -> true
+        assert!(ctx.evaluate_expr("!(a && b)"));
+        // ! ( b ) -> true
+        assert!(ctx.evaluate_expr("!(b)"));
     }
 }

@@ -33,21 +33,46 @@ pub struct KeyCombo {
 
 impl KeyCombo {
     pub fn parse(s: &str) -> Option<Self> {
-        let parts: Vec<&str> = s.split('+').map(|p| p.trim()).collect();
-        let mut modifiers = Modifiers::none();
-        let mut key = String::new();
+        let s = s.trim();
+        if s.is_empty() {
+            return None;
+        }
 
-        for part in parts {
-            let lower = part.to_ascii_lowercase();
-            match lower.as_str() {
-                "ctrl" | "control" => modifiers.ctrl = true,
-                "shift" => modifiers.shift = true,
-                "alt" | "opt" | "option" => modifiers.alt = true,
-                "cmd" | "command" | "meta" | "win" => modifiers.meta = true,
-                other => key = other.to_string(),
+        // Special case for "+" or keys ending with "++" (e.g. "ctrl++")
+        if s == "+" {
+            return Some(Self {
+                modifiers: Modifiers::none(),
+                key: "+".to_string(),
+            });
+        }
+
+        let (mod_part, key_part) = if s.ends_with("++") {
+            let prefix = &s[..s.len() - 2];
+            (prefix, "+")
+        } else {
+            let parts: Vec<&str> = s.rsplitn(2, '+').collect();
+            if parts.len() == 2 {
+                (parts[1], parts[0])
+            } else {
+                ("", parts[0])
+            }
+        };
+
+        let mut modifiers = Modifiers::none();
+        if !mod_part.is_empty() {
+            for part in mod_part.split('+').map(|p| p.trim()).filter(|p| !p.is_empty()) {
+                let lower = part.to_ascii_lowercase();
+                match lower.as_str() {
+                    "ctrl" | "control" => modifiers.ctrl = true,
+                    "shift" => modifiers.shift = true,
+                    "alt" | "opt" | "option" => modifiers.alt = true,
+                    "cmd" | "command" | "meta" | "win" => modifiers.meta = true,
+                    _ => {}
+                }
             }
         }
 
+        let key = key_part.trim().to_ascii_lowercase();
         if key.is_empty() {
             None
         } else {
@@ -120,9 +145,10 @@ impl KeybindingService {
         self.bindings.write().push(binding);
     }
 
-    /// Load keybindings from a JSON string matching VS Code's `keybindings.json` format.
+    /// Load keybindings from a JSON string matching VS Code's `keybindings.json` format (supports JSONC).
     pub fn load_keybindings_json(&self, json_str: &str) -> Result<(), String> {
-        let entries: Vec<KeybindingEntryRaw> = serde_json::from_str(json_str).map_err(|e| e.to_string())?;
+        let stripped = crate::configuration::strip_json_comments(json_str);
+        let entries: Vec<KeybindingEntryRaw> = serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
         let mut list = self.bindings.write();
 
         for raw in entries {
@@ -235,5 +261,29 @@ mod tests {
         context.set_bool("editorTextFocus", true);
         let chord_cmd = service.handle_key(&c_combo, &context);
         assert_eq!(chord_cmd, Some("editor.action.addCommentLine".to_string()));
+    }
+
+    #[test]
+    fn test_keybinding_plus_and_jsonc() {
+        let zoom_in = KeyCombo::parse("ctrl++").unwrap();
+        assert!(zoom_in.modifiers.ctrl);
+        assert_eq!(zoom_in.key, "+");
+
+        let plus_only = KeyCombo::parse("+").unwrap();
+        assert_eq!(plus_only.key, "+");
+        assert!(!plus_only.modifiers.ctrl);
+
+        // JSONC with comments & trailing comma
+        let service = KeybindingService::new();
+        let jsonc = r#"[
+            // Zoom in
+            {
+                "key": "ctrl++",
+                "command": "workbench.action.zoomIn",
+            },
+        ]"#;
+        service.load_keybindings_json(jsonc).unwrap();
+        let ctx = ContextKeyService::new();
+        assert_eq!(service.handle_key(&zoom_in, &ctx), Some("workbench.action.zoomIn".to_string()));
     }
 }

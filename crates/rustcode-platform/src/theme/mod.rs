@@ -82,9 +82,10 @@ impl ThemeService {
         self.current_theme = theme;
     }
 
-    /// Parse a VS Code theme JSON string.
+    /// Parse a VS Code theme JSON string (supports JSONC).
     pub fn parse_theme_json(json_str: &str) -> Result<ColorTheme, String> {
-        let raw: RawThemeJson = serde_json::from_str(json_str).map_err(|e| e.to_string())?;
+        let stripped = crate::configuration::strip_json_comments(json_str);
+        let raw: RawThemeJson = serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
 
         let name = raw.name.unwrap_or_else(|| "Custom Theme".to_string());
         let kind = match raw.theme_type.as_deref() {

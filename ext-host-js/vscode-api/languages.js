@@ -14,10 +14,15 @@ class DiagnosticCollection {
   set(uri, diagnostics) {
     const key = uri.toString();
     this._entries.set(key, diagnostics);
+    const mappedDiagnostics = (diagnostics || []).map(d => ({
+      ...d,
+      // Convert VS Code API 0-indexed severity (0=Error) to LSP 1-indexed (1=Error)
+      severity: typeof d.severity === 'number' ? d.severity + 1 : 1,
+    }));
     rpc.call('languages.setDiagnostics', {
       name: this.name,
       uri: key,
-      diagnostics,
+      diagnostics: mappedDiagnostics,
     });
   }
 
@@ -44,22 +49,35 @@ const languages = {
 
   registerCompletionItemProvider(selector, provider, ...triggerCharacters) {
     const id = `completion_${nextProviderId++}`;
-    return rpc.registerObjectProxy('Completion', id, provider, ['provideCompletionItems', 'resolveCompletionItem']);
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('Completion', id, provider, ['provideCompletionItems', 'resolveCompletionItem'], {
+      selector: sel,
+      triggerCharacters,
+    });
   },
 
   registerHoverProvider(selector, provider) {
     const id = `hover_${nextProviderId++}`;
-    return rpc.registerObjectProxy('Hover', id, provider, ['provideHover']);
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('Hover', id, provider, ['provideHover'], {
+      selector: sel,
+    });
   },
 
   registerDefinitionProvider(selector, provider) {
     const id = `definition_${nextProviderId++}`;
-    return rpc.registerObjectProxy('Definition', id, provider, ['provideDefinition']);
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('Definition', id, provider, ['provideDefinition'], {
+      selector: sel,
+    });
   },
 
   registerDocumentFormattingEditProvider(selector, provider) {
     const id = `formatting_${nextProviderId++}`;
-    return rpc.registerObjectProxy('DocumentFormatting', id, provider, ['provideDocumentFormattingEdits']);
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('DocumentFormatting', id, provider, ['provideDocumentFormattingEdits'], {
+      selector: sel,
+    });
   },
 };
 

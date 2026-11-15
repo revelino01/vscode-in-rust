@@ -72,4 +72,12 @@ fn test_end_to_end_editor_and_platform_integration() {
     let theme = ThemeService::parse_theme_json(theme_json).unwrap();
     assert_eq!(theme.name, "Dark+ (default dark)");
     assert_eq!(theme.colors.get("editor.background"), Some(&"#1e1e1e".to_string()));
+
+    // 6. Verify trailing line retrieval and complex when expressions
+    assert_eq!(buffer.get_line_content(4), Some("".to_string()));
+
+    let complex_ctx = ContextKeyService::new();
+    complex_ctx.set_bool("editorTextFocus", true);
+    complex_ctx.set_bool("editorReadonly", false);
+    assert!(complex_ctx.evaluate_expr("(editorTextFocus && !editorReadonly) || isVibe"));
 }

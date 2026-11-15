@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::disposable::{Disposable, ActionDisposable};
 
-type Listener<T> = Box<dyn Fn(&T) + Send + Sync + 'static>;
+type Listener<T> = Arc<dyn Fn(&T) + Send + Sync + 'static>;
 
 struct SharedEmitterState<T> {
     listeners: HashMap<u64, Listener<T>>,
@@ -43,10 +43,13 @@ impl<T: Clone + Send + 'static> Emitter<T> {
         }
     }
 
-    /// Fire the event to all registered listeners.
+    /// Fire the event to all registered listeners without holding the lock during invocation.
     pub fn fire(&self, value: T) {
-        let guard = self.state.lock();
-        for listener in guard.listeners.values() {
+        let listeners: Vec<Listener<T>> = {
+            let guard = self.state.lock();
+            guard.listeners.values().cloned().collect()
+        };
+        for listener in listeners {
             listener(&value);
         }
     }
@@ -73,7 +76,7 @@ impl<T: Clone + Send + 'static> Event<T> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         {
             let mut guard = self.state.lock();
-            guard.listeners.insert(id, Box::new(listener));
+            guard.listeners.insert(id, Arc::new(listener));
         }
 
         let state = Arc::clone(&self.state);
@@ -110,5 +113,34 @@ mod tests {
         emitter.fire("third".to_string());
 
         assert_eq!(*received.lock(), vec!["first", "second"]);
+    }
+
+    #[test]
+    fn test_emitter_reentrant_dispose_during_fire() {
+        let emitter = Emitter::<i32>::new();
+        let event = emitter.event();
+
+        let sub_holder: Arc<Mutex<Option<Box<dyn Disposable>>>> = Arc::new(Mutex::new(None));
+        let sub_clone = Arc::clone(&sub_holder);
+        let count = Arc::new(Mutex::new(0));
+        let count_clone = Arc::clone(&count);
+
+        let sub = event.attach(move |val| {
+            *count_clone.lock() += val;
+            // Dispose self inside the callback — must not deadlock!
+            if let Some(mut s) = sub_clone.lock().take() {
+                s.dispose();
+            }
+        });
+
+        *sub_holder.lock() = Some(sub);
+
+        // Firing should succeed cleanly and unregister the listener
+        emitter.fire(10);
+        assert_eq!(*count.lock(), 10);
+
+        // Subsequent fires should not reach the listener
+        emitter.fire(20);
+        assert_eq!(*count.lock(), 10);
     }
 }

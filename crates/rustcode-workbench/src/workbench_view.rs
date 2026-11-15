@@ -98,7 +98,9 @@ impl WorkbenchView {
         let activity_bar = Rect::from_xywh(bounds.min_x(), bounds.min_y(), act_bar_w, main_h);
 
         let sidebar_w = if self.layout.sidebar_visible {
-            self.layout.sidebar_width.min(bounds.width() - act_bar_w - 100.0)
+            self.layout
+                .sidebar_width
+                .min((bounds.width() - act_bar_w - 100.0).max(0.0))
         } else {
             0.0
         };
@@ -111,7 +113,7 @@ impl WorkbenchView {
 
         let rem_w = (bounds.width() - act_bar_w - sidebar_w).max(0.0);
         let panel_h = if self.layout.panel_visible {
-            self.layout.panel_height.min(main_h - 100.0)
+            self.layout.panel_height.min((main_h - 100.0).max(0.0))
         } else {
             0.0
         };
@@ -267,7 +269,8 @@ impl View for WorkbenchView {
                             ExplorerAction::OpenFile(path) => {
                                 let path_str = path.to_string_lossy().to_string();
                                 let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
-                                self.editor_area.open_file(&path_str, title, "", true);
+                                let content = std::fs::read_to_string(path).unwrap_or_default();
+                                self.editor_area.open_file(&path_str, title, &content, true);
                                 self.last_action = Some(WorkbenchAction::OpenFile(path.clone()));
                             }
                             ExplorerAction::ToggleDir(_) => {}

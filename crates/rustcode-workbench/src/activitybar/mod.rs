@@ -142,7 +142,7 @@ impl View for ActivityBarView {
                 theme.activity_bar_inactive_fg
             };
 
-            let text_w = icon_str.len() as f32 * font.char_width;
+            let text_w = font.text_width(icon_str);
             let text_x = bounds.min_x() + (bounds.width() - text_w) / 2.0;
             let text_y = slot_y + (slot_h - font.line_height) / 2.0;
 
@@ -157,7 +157,7 @@ impl View for ActivityBarView {
             // Badge indicator if present
             if let Some(badge) = item.badge {
                 let badge_str = badge.to_string();
-                let b_w = (badge_str.len() as f32 * font.char_width + 8.0).max(16.0);
+                let b_w = (font.text_width(&badge_str) + 8.0).max(16.0);
                 let b_h = 14.0;
                 let b_x = bounds.max_x() - b_w - 4.0;
                 let b_y = slot_y + 4.0;
@@ -181,6 +181,9 @@ impl View for ActivityBarView {
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         if let InputEvent::MouseDown(mouse) = event {
+            if !bounds.contains(mouse.position) {
+                return EventResult::Ignored;
+            }
             let slot_h = 48.0;
             let idx = ((mouse.position.y - bounds.min_y()) / slot_h).floor() as usize;
             if idx < self.model.items.len() {

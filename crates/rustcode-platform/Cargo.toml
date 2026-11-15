@@ -3,6 +3,10 @@ name = "rustcode-platform"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+gpui = []
+
 [dependencies]
 rustcode-base = { path = "../rustcode-base" }
 parking_lot = "0.12"

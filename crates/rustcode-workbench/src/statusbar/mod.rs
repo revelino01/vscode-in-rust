@@ -97,7 +97,7 @@ impl StatusBarView {
         // Left items
         let mut cur_x = bounds.min_x() + 8.0;
         for item in self.model.left_items() {
-            let w = item.text.len() as f32 * font.char_width;
+            let w = font.text_width(&item.text);
             let rect = Rect::from_xywh(cur_x, bounds.min_y(), w, bounds.height());
             result.push((item.clone(), rect));
             cur_x += w + 14.0;
@@ -106,7 +106,7 @@ impl StatusBarView {
         // Right items
         let mut right_x = bounds.max_x() - 8.0;
         for item in self.model.right_items() {
-            let w = item.text.len() as f32 * font.char_width;
+            let w = font.text_width(&item.text);
             right_x -= w;
             let rect = Rect::from_xywh(right_x, bounds.min_y(), w, bounds.height());
             result.push((item.clone(), rect));
@@ -143,6 +143,9 @@ impl View for StatusBarView {
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         if let InputEvent::MouseDown(mouse) = event {
+            if !bounds.contains(mouse.position) {
+                return EventResult::Ignored;
+            }
             let font = FontMetrics::default_monospace();
             let rects = self.item_rects(bounds, &font);
 

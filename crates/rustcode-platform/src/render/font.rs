@@ -44,6 +44,11 @@ impl FontMetrics {
         self.descent = self.line_height - self.ascent;
         self
     }
+
+    /// Measure text width in monospace pixels based on character count.
+    pub fn text_width(&self, text: &str) -> f32 {
+        text.chars().count() as f32 * self.char_width
+    }
 }
 
 #[cfg(test)]

@@ -246,4 +246,26 @@ fn test_end_to_end_gpui_presentation_layer() {
     ));
     let res = window.dispatch_event(&scroll_ev, bounds);
     assert_eq!(res, EventResult::Consumed);
+
+    // 7. Multi-byte UTF-8 editing, cursor placement, and undo/redo round-trip
+    let editor = window.view.editor_area.active_editor_mut().unwrap();
+    editor.set_primary_position(rustcode_editor::cursor::Position::new(0, 0));
+    editor.insert_text("🚀");
+    assert!(editor.text().starts_with("🚀fn main()"));
+    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 4));
+
+    // Delete backwards removes emoji completely
+    editor.delete_backwards();
+    assert!(editor.text().starts_with("fn main()"));
+    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 0));
+
+    // Undo restores emoji and cursor position
+    assert!(editor.undo());
+    assert!(editor.text().starts_with("🚀fn main()"));
+    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 4));
+
+    // Redo reverts to deleted state
+    assert!(editor.redo());
+    assert!(editor.text().starts_with("fn main()"));
+    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 0));
 }

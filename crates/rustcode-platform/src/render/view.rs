@@ -44,3 +44,11 @@ impl<'a> ViewContext<'a> {
 pub trait GpuiElement {
     fn render(&mut self, cx: &mut ViewContext) -> Scene;
 }
+
+impl<T: View> GpuiElement for T {
+    fn render(&mut self, cx: &mut ViewContext) -> Scene {
+        let mut scene = Scene::new();
+        View::render(self, cx.bounds, cx.theme, cx.font, &mut scene);
+        scene
+    }
+}

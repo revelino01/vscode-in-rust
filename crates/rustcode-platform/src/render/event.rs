@@ -80,9 +80,15 @@ impl KeyEvent {
     pub fn new(key: KeyCode, modifiers: Modifiers) -> Self {
         let text = match key {
             KeyCode::Char(c) if !modifiers.ctrl && !modifiers.alt && !modifiers.meta => {
-                Some(c.to_string())
+                if modifiers.shift {
+                    Some(c.to_uppercase().to_string())
+                } else {
+                    Some(c.to_string())
+                }
             }
-            KeyCode::Space => Some(" ".to_string()),
+            KeyCode::Space if !modifiers.ctrl && !modifiers.alt && !modifiers.meta => {
+                Some(" ".to_string())
+            }
             _ => None,
         };
         Self {

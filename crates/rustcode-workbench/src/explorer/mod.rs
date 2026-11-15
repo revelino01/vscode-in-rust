@@ -202,7 +202,7 @@ impl View for FileExplorerView {
 
             let icon = if row.is_dir { "[D] " } else { "[F] " };
             let full_label = format!("{}{}{}", prefix, icon, row.name);
-            let label_w = full_label.len() as f32 * font.char_width;
+            let label_w = font.text_width(&full_label);
 
             scene.push_text(GlyphRun::new(
                 full_label,
@@ -216,6 +216,9 @@ impl View for FileExplorerView {
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         if let InputEvent::MouseDown(mouse) = event {
+            if !bounds.contains(mouse.position) {
+                return EventResult::Ignored;
+            }
             let header_h = 28.0;
             if mouse.position.y < bounds.min_y() + header_h {
                 return EventResult::Ignored;

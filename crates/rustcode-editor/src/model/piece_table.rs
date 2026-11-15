@@ -218,6 +218,43 @@ impl PieceTable {
         self.len()
     }
 
+    /// Return the previous valid UTF-8 character boundary before `offset`.
+    pub fn prev_char_boundary(&self, offset: usize) -> usize {
+        if offset == 0 {
+            return 0;
+        }
+        let offset = std::cmp::min(offset, self.len());
+        self.floor_char_boundary(offset - 1)
+    }
+
+    /// Return the next valid UTF-8 character boundary after `offset`.
+    pub fn next_char_boundary(&self, offset: usize) -> usize {
+        if offset >= self.len() {
+            return self.len();
+        }
+        let offset = self.floor_char_boundary(offset);
+        let mut pieces = Vec::new();
+        self.collect_pieces(&self.root, &mut pieces);
+        let mut cur = 0;
+        for piece in pieces {
+            let next = cur + piece.length;
+            if offset >= cur && offset < next {
+                let rel = offset - cur;
+                let slice = match piece.source {
+                    PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
+                    PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
+                };
+                let mut i = rel + 1;
+                while i < slice.len() && !slice.is_char_boundary(i) {
+                    i += 1;
+                }
+                return cur + i;
+            }
+            cur = next;
+        }
+        self.len()
+    }
+
     /// Insert text at a specific character offset.
     pub fn insert(&mut self, offset: usize, text: &str) {
         if text.is_empty() {
@@ -640,6 +677,21 @@ mod tests {
 
         // Delete without panic even on unaligned boundary
         let _ = utf8_table.delete(6, 3);
-        assert!(utf8_table.len() > 0);
+        assert!(!utf8_table.is_empty());
+    }
+
+    #[test]
+    fn test_piece_table_prev_next_char_boundaries() {
+        let table = PieceTable::from_str("a🦀b");
+        assert_eq!(table.len(), 6);
+        assert_eq!(table.prev_char_boundary(0), 0);
+        assert_eq!(table.prev_char_boundary(1), 0);
+        assert_eq!(table.prev_char_boundary(5), 1);
+        assert_eq!(table.prev_char_boundary(6), 5);
+
+        assert_eq!(table.next_char_boundary(0), 1);
+        assert_eq!(table.next_char_boundary(1), 5);
+        assert_eq!(table.next_char_boundary(5), 6);
+        assert_eq!(table.next_char_boundary(6), 6);
     }
 }

@@ -3,6 +3,10 @@ name = "rustcode-workbench"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+gpui = ["rustcode-platform/gpui"]
+
 [dependencies]
 rustcode-base = { path = "../rustcode-base" }
 rustcode-platform = { path = "../rustcode-platform" }

@@ -82,7 +82,7 @@ impl CommandPalette {
             return;
         }
 
-        // Fuzzy match against label and category
+        // Fuzzy match against category and label
         for (idx, item) in self.items.iter().enumerate() {
             let full_text = match &item.category {
                 Some(cat) => format!("{}: {}", cat, item.label).to_ascii_lowercase(),
@@ -178,7 +178,7 @@ impl View for CommandPaletteView {
 
         // Query text
         let query_x = prompt_x + 2.0 * font.char_width;
-        let query_w = self.model.query.len() as f32 * font.char_width;
+        let query_w = font.text_width(&self.model.query);
         if !self.model.query.is_empty() {
             scene.push_text(GlyphRun::new(
                 self.model.query.clone(),
@@ -223,7 +223,7 @@ impl View for CommandPaletteView {
             };
             let label_x = bounds.min_x() + 14.0;
             let item_y = row_y + (row_h - font.line_height) / 2.0;
-            let label_w = display_str.len() as f32 * font.char_width;
+            let label_w = font.text_width(&display_str);
 
             scene.push_text(GlyphRun::new(
                 display_str,
@@ -235,7 +235,7 @@ impl View for CommandPaletteView {
 
             // Keybinding badge if present
             if let Some(kb) = &item.keybinding {
-                let kb_w = kb.len() as f32 * font.char_width;
+                let kb_w = font.text_width(kb);
                 let kb_x = bounds.max_x() - 14.0 - kb_w;
                 scene.push_text(GlyphRun::new(
                     kb.clone(),
@@ -280,14 +280,23 @@ impl View for CommandPaletteView {
                         EventResult::Ignored
                     }
                 }
+                KeyCode::Space if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                    self.model.query.push(' ');
+                    self.model.refilter();
+                    EventResult::Consumed
+                }
                 KeyCode::Char(c) if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
-                    self.model.query.push(*c);
+                    let ch = if key.modifiers.shift { c.to_ascii_uppercase() } else { *c };
+                    self.model.query.push(ch);
                     self.model.refilter();
                     EventResult::Consumed
                 }
                 _ => EventResult::Ignored,
             },
             InputEvent::MouseDown(mouse) => {
+                if !bounds.contains(mouse.position) {
+                    return EventResult::Ignored;
+                }
                 let input_h = 36.0;
                 let row_h = 28.0;
                 if mouse.position.y > bounds.min_y() + input_h {
@@ -410,5 +419,33 @@ mod tests {
             view.last_action,
             Some(PaletteAction::Execute("workbench.action.openSettings".to_string()))
         );
+
+        // Test space typing in command palette
+        let mut space_palette = CommandPalette::new();
+        space_palette.set_items(vec![
+            PaletteItem {
+                command_id: "workbench.action.toggleSidebar".to_string(),
+                label: "Toggle Sidebar".to_string(),
+                category: Some("View".to_string()),
+                keybinding: None,
+            },
+        ]);
+        let mut space_view = CommandPaletteView::new(space_palette);
+        for key in [KeyCode::Char('v'), KeyCode::Space, KeyCode::Char('t')] {
+            let res = space_view.handle_event(
+                &InputEvent::KeyDown(KeyEvent::new(key, Modifiers::none())),
+                bounds,
+            );
+            assert_eq!(res, EventResult::Consumed);
+        }
+        assert_eq!(space_view.model.query, "v t");
+        assert_eq!(space_view.model.results().len(), 1);
+
+        // Click outside bounds should be ignored
+        let outside_ev = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            Point::new(50.0, 20.0), // outside bounds
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        assert_eq!(space_view.handle_event(&outside_ev, bounds), EventResult::Ignored);
     }
 }

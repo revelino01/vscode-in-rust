@@ -87,63 +87,61 @@ impl UndoRedoStack {
         !self.future.is_empty()
     }
 
-    pub fn undo(&mut self, table: &mut PieceTable) -> bool {
-        let element = match self.past.pop() {
-            Some(e) => e,
-            None => return false,
-        };
-
-        match &element {
-            UndoElement::Single(edit) => {
-                Self::revert_edit(table, edit);
-            }
+    pub fn undo(&mut self, table: &mut PieceTable) -> Option<usize> {
+        let element = self.past.pop()?;
+        let target_offset = match &element {
+            UndoElement::Single(edit) => Self::revert_edit(table, edit),
             UndoElement::Group(edits) => {
+                let mut last_off = None;
                 for edit in edits.iter().rev() {
-                    Self::revert_edit(table, edit);
+                    last_off = Some(Self::revert_edit(table, edit));
                 }
+                last_off.unwrap_or(0)
             }
-        }
+        };
 
         self.future.push(element);
-        true
+        Some(target_offset)
     }
 
-    pub fn redo(&mut self, table: &mut PieceTable) -> bool {
-        let element = match self.future.pop() {
-            Some(e) => e,
-            None => return false,
+    pub fn redo(&mut self, table: &mut PieceTable) -> Option<usize> {
+        let element = self.future.pop()?;
+        let target_offset = match &element {
+            UndoElement::Single(edit) => Self::apply_edit(table, edit),
+            UndoElement::Group(edits) => {
+                let mut last_off = None;
+                for edit in edits {
+                    last_off = Some(Self::apply_edit(table, edit));
+                }
+                last_off.unwrap_or(0)
+            }
         };
 
-        match &element {
-            UndoElement::Single(edit) => {
-                Self::apply_edit(table, edit);
-            }
-            UndoElement::Group(edits) => {
-                for edit in edits {
-                    Self::apply_edit(table, edit);
-                }
-            }
-        }
-
         self.past.push(element);
-        true
+        Some(target_offset)
     }
 
-    fn revert_edit(table: &mut PieceTable, edit: &TextEdit) {
+    fn revert_edit(table: &mut PieceTable, edit: &TextEdit) -> usize {
         if !edit.inserted_text.is_empty() {
             table.delete(edit.offset, edit.inserted_text.len());
         }
         if !edit.deleted_text.is_empty() {
             table.insert(edit.offset, &edit.deleted_text);
+            edit.offset + edit.deleted_text.len()
+        } else {
+            edit.offset
         }
     }
 
-    fn apply_edit(table: &mut PieceTable, edit: &TextEdit) {
+    fn apply_edit(table: &mut PieceTable, edit: &TextEdit) -> usize {
         if !edit.deleted_text.is_empty() {
             table.delete(edit.offset, edit.deleted_text.len());
         }
         if !edit.inserted_text.is_empty() {
             table.insert(edit.offset, &edit.inserted_text);
+            edit.offset + edit.inserted_text.len()
+        } else {
+            edit.offset
         }
     }
 }

@@ -56,9 +56,11 @@ impl EditorGroup {
 
         // If current active tab is preview and not dirty, replace it
         if let Some(idx) = self.active_tab_index {
-            if self.tabs[idx].is_preview && !self.tabs[idx].is_dirty {
-                self.tabs[idx] = EditorTab::new(uri, title, is_preview);
-                return idx;
+            if let Some(tab) = self.tabs.get_mut(idx) {
+                if tab.is_preview && !tab.is_dirty {
+                    *tab = EditorTab::new(uri, title, is_preview);
+                    return idx;
+                }
             }
         }
 
@@ -199,7 +201,7 @@ impl View for EditorAreaView {
         // Render each tab
         for (idx, tab) in group.tabs.iter().enumerate() {
             let is_active = group.active_tab_index == Some(idx);
-            let tab_w = (tab.title.len() as f32 * font.char_width + 40.0).clamp(80.0, 220.0);
+            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
             let tab_rect = Rect::from_xywh(cur_x, bounds.min_y(), tab_w, tab_bar_h);
 
             let bg_color = if is_active {
@@ -283,6 +285,9 @@ impl View for EditorAreaView {
 
         match event {
             InputEvent::MouseDown(mouse) => {
+                if !bounds.contains(mouse.position) {
+                    return EventResult::Ignored;
+                }
                 if mouse.position.y < bounds.min_y() + tab_bar_h {
                     // Click within tab bar
                     let font = FontMetrics::default_monospace();
@@ -290,13 +295,15 @@ impl View for EditorAreaView {
                     let mut cur_x = bounds.min_x();
 
                     for (idx, tab) in group.tabs.iter().enumerate() {
-                        let tab_w = (tab.title.len() as f32 * font.char_width + 40.0).clamp(80.0, 220.0);
+                        let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
                         let tab_rect = Rect::from_xywh(cur_x, bounds.min_y(), tab_w, tab_bar_h);
 
                         if tab_rect.contains(mouse.position) {
                             // Check if close button clicked
                             if mouse.position.x >= cur_x + tab_w - 22.0 {
                                 self.model.current_group().close_tab(idx);
+                                let open_uris: std::collections::HashSet<_> = self.model.groups.iter().flat_map(|g| g.tabs.iter().map(|t| &t.uri)).collect();
+                                self.editors.retain(|u, _| open_uris.contains(u));
                                 self.last_action = Some(EditorAreaAction::TabClosed(idx));
                             } else {
                                 self.model.current_group().active_tab_index = Some(idx);

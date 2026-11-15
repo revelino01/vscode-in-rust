@@ -56,13 +56,66 @@ impl EditorView {
 
     // --- Editing & Movement Operations ---
 
+    pub fn delete_selection(&mut self) -> bool {
+        let sel = self.cursor_state.primary().clone();
+        if sel.is_empty() {
+            return false;
+        }
+
+        let (start_pos, end_pos) = if sel.anchor <= sel.active {
+            (sel.anchor, sel.active)
+        } else {
+            (sel.active, sel.anchor)
+        };
+
+        let mut buf = self.buffer.write();
+        let start_offset = buf.position_to_offset(start_pos.line, start_pos.column);
+        let end_offset = buf.position_to_offset(end_pos.line, end_pos.column);
+        let del_len = end_offset.saturating_sub(start_offset);
+        if del_len > 0 {
+            let deleted = buf.delete(start_offset, del_len);
+            self.undo_stack
+                .push_edit(TextEdit::delete(start_offset, &deleted));
+            let (new_line, new_col) = buf.offset_to_position(start_offset);
+            self.cursor_state.set_primary(Position::new(new_line, new_col));
+            true
+        } else {
+            self.cursor_state.set_primary(start_pos);
+            false
+        }
+    }
+
     pub fn insert_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
 
-        let pos = self.primary_position();
+        let sel = self.cursor_state.primary().clone();
         let mut buf = self.buffer.write();
+
+        if !sel.is_empty() {
+            let (start_pos, end_pos) = if sel.anchor <= sel.active {
+                (sel.anchor, sel.active)
+            } else {
+                (sel.active, sel.anchor)
+            };
+            let start_offset = buf.position_to_offset(start_pos.line, start_pos.column);
+            let end_offset = buf.position_to_offset(end_pos.line, end_pos.column);
+            let del_len = end_offset.saturating_sub(start_offset);
+            let deleted = if del_len > 0 {
+                buf.delete(start_offset, del_len)
+            } else {
+                String::new()
+            };
+            buf.insert(start_offset, text);
+            self.undo_stack
+                .push_edit(TextEdit::replace(start_offset, &deleted, text));
+            let (new_line, new_col) = buf.offset_to_position(start_offset + text.len());
+            self.cursor_state.set_primary(Position::new(new_line, new_col));
+            return;
+        }
+
+        let pos = self.primary_position();
         let offset = buf.position_to_offset(pos.line, pos.column);
 
         buf.insert(offset, text);
@@ -73,6 +126,10 @@ impl EditorView {
     }
 
     pub fn delete_backwards(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+
         let pos = self.primary_position();
         let mut buf = self.buffer.write();
         let offset = buf.position_to_offset(pos.line, pos.column);
@@ -81,17 +138,21 @@ impl EditorView {
             return;
         }
 
-        let del_len = 1;
-        let del_offset = offset - del_len;
-        let deleted = buf.delete(del_offset, del_len);
+        let prev_offset = buf.prev_char_boundary(offset);
+        let del_len = offset - prev_offset;
+        let deleted = buf.delete(prev_offset, del_len);
         self.undo_stack
-            .push_edit(TextEdit::delete(del_offset, &deleted));
+            .push_edit(TextEdit::delete(prev_offset, &deleted));
 
-        let (new_line, new_col) = buf.offset_to_position(del_offset);
+        let (new_line, new_col) = buf.offset_to_position(prev_offset);
         self.cursor_state.set_primary(Position::new(new_line, new_col));
     }
 
     pub fn delete_forwards(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
+
         let pos = self.primary_position();
         let mut buf = self.buffer.write();
         let offset = buf.position_to_offset(pos.line, pos.column);
@@ -100,98 +161,134 @@ impl EditorView {
             return;
         }
 
-        let deleted = buf.delete(offset, 1);
+        let next_offset = buf.next_char_boundary(offset);
+        let del_len = next_offset - offset;
+        let deleted = buf.delete(offset, del_len);
         self.undo_stack.push_edit(TextEdit::delete(offset, &deleted));
     }
 
-    pub fn move_cursor_left(&mut self) {
+    pub fn move_cursor_left(&mut self, select: bool) {
         let pos = self.primary_position();
         let buf = self.buffer.read();
         let offset = buf.position_to_offset(pos.line, pos.column);
 
         if offset > 0 {
-            let (new_line, new_col) = buf.offset_to_position(offset - 1);
-            self.cursor_state.set_primary(Position::new(new_line, new_col));
+            let prev_offset = buf.prev_char_boundary(offset);
+            let (new_line, new_col) = buf.offset_to_position(prev_offset);
+            let target = Position::new(new_line, new_col);
+            if select {
+                self.cursor_state.primary_mut().active = target;
+            } else {
+                self.cursor_state.set_primary(target);
+            }
+        } else if !select {
+            self.cursor_state.set_primary(pos);
         }
     }
 
-    pub fn move_cursor_right(&mut self) {
+    pub fn move_cursor_right(&mut self, select: bool) {
         let pos = self.primary_position();
         let buf = self.buffer.read();
         let offset = buf.position_to_offset(pos.line, pos.column);
 
         if offset < buf.len() {
-            let (new_line, new_col) = buf.offset_to_position(offset + 1);
-            self.cursor_state.set_primary(Position::new(new_line, new_col));
+            let next_offset = buf.next_char_boundary(offset);
+            let (new_line, new_col) = buf.offset_to_position(next_offset);
+            let target = Position::new(new_line, new_col);
+            if select {
+                self.cursor_state.primary_mut().active = target;
+            } else {
+                self.cursor_state.set_primary(target);
+            }
+        } else if !select {
+            self.cursor_state.set_primary(pos);
         }
     }
 
-    pub fn move_cursor_up(&mut self) {
+    pub fn move_cursor_up(&mut self, select: bool) {
         let pos = self.primary_position();
         if pos.line > 0 {
             let target_line = pos.line - 1;
-            let line_len = self
-                .buffer
-                .read()
-                .get_line_content(target_line)
-                .map_or(0, |l| l.len());
-            let target_col = pos.column.min(line_len);
-            self.cursor_state
-                .set_primary(Position::new(target_line, target_col));
+            let buf = self.buffer.read();
+            let content = buf.get_line_content(target_line).unwrap_or_default();
+            let mut target_col = pos.column.min(content.len());
+            while target_col > 0 && !content.is_char_boundary(target_col) {
+                target_col -= 1;
+            }
+            let target = Position::new(target_line, target_col);
+            if select {
+                self.cursor_state.primary_mut().active = target;
+            } else {
+                self.cursor_state.set_primary(target);
+            }
         }
     }
 
-    pub fn move_cursor_down(&mut self) {
+    pub fn move_cursor_down(&mut self, select: bool) {
         let pos = self.primary_position();
-        let line_count = self.buffer.read().line_count();
+        let buf = self.buffer.read();
+        let line_count = buf.line_count();
         if pos.line + 1 < line_count {
             let target_line = pos.line + 1;
-            let line_len = self
-                .buffer
-                .read()
-                .get_line_content(target_line)
-                .map_or(0, |l| l.len());
-            let target_col = pos.column.min(line_len);
-            self.cursor_state
-                .set_primary(Position::new(target_line, target_col));
+            let content = buf.get_line_content(target_line).unwrap_or_default();
+            let mut target_col = pos.column.min(content.len());
+            while target_col > 0 && !content.is_char_boundary(target_col) {
+                target_col -= 1;
+            }
+            let target = Position::new(target_line, target_col);
+            if select {
+                self.cursor_state.primary_mut().active = target;
+            } else {
+                self.cursor_state.set_primary(target);
+            }
         }
     }
 
-    pub fn move_cursor_home(&mut self) {
+    pub fn move_cursor_home(&mut self, select: bool) {
         let pos = self.primary_position();
-        self.cursor_state
-            .set_primary(Position::new(pos.line, 0));
+        let target = Position::new(pos.line, 0);
+        if select {
+            self.cursor_state.primary_mut().active = target;
+        } else {
+            self.cursor_state.set_primary(target);
+        }
     }
 
-    pub fn move_cursor_end(&mut self) {
+    pub fn move_cursor_end(&mut self, select: bool) {
         let pos = self.primary_position();
         let line_len = self
             .buffer
             .read()
             .get_line_content(pos.line)
             .map_or(0, |l| l.len());
-        self.cursor_state
-            .set_primary(Position::new(pos.line, line_len));
+        let target = Position::new(pos.line, line_len);
+        if select {
+            self.cursor_state.primary_mut().active = target;
+        } else {
+            self.cursor_state.set_primary(target);
+        }
     }
 
     pub fn undo(&mut self) -> bool {
         let mut buf = self.buffer.write();
-        let ok = self.undo_stack.undo(&mut buf);
-        if ok {
-            let (line, col) = buf.offset_to_position(buf.len());
+        if let Some(target_offset) = self.undo_stack.undo(&mut buf) {
+            let (line, col) = buf.offset_to_position(target_offset);
             self.cursor_state.set_primary(Position::new(line, col));
+            true
+        } else {
+            false
         }
-        ok
     }
 
     pub fn redo(&mut self) -> bool {
         let mut buf = self.buffer.write();
-        let ok = self.undo_stack.redo(&mut buf);
-        if ok {
-            let (line, col) = buf.offset_to_position(buf.len());
+        if let Some(target_offset) = self.undo_stack.redo(&mut buf) {
+            let (line, col) = buf.offset_to_position(target_offset);
             self.cursor_state.set_primary(Position::new(line, col));
+            true
+        } else {
+            false
         }
-        ok
     }
 }
 
@@ -248,7 +345,7 @@ impl View for EditorView {
 
             // 5a. Gutter line number
             let line_num_str = (line_idx + 1).to_string();
-            let num_w = line_num_str.len() as f32 * font.char_width;
+            let num_w = font.text_width(&line_num_str);
             let num_x = bounds.min_x() + gutter_w - num_w - 6.0;
             let num_color = if line_idx == primary_pos.line {
                 theme.editor_line_number_active
@@ -264,6 +361,8 @@ impl View for EditorView {
                 font.font_size,
             ));
 
+            let line_content = buf.get_line_content(line_idx).unwrap_or_default();
+
             // 5b. Selections on this line
             for sel in &self.cursor_state.selections {
                 if !sel.is_empty() {
@@ -274,13 +373,14 @@ impl View for EditorView {
                     };
 
                     if line_idx >= min_pos.line && line_idx <= max_pos.line {
-                        let line_len = buf.get_line_content(line_idx).map_or(0, |l| l.len());
                         let start_col = if line_idx == min_pos.line { min_pos.column } else { 0 };
-                        let end_col = if line_idx == max_pos.line { max_pos.column } else { line_len };
+                        let end_col = if line_idx == max_pos.line { max_pos.column } else { line_content.len() };
 
                         if end_col > start_col {
-                            let sel_x = text_area_x + (start_col as f32 - self.scroll_left) * font.char_width;
-                            let sel_w = ((end_col - start_col) as f32 * font.char_width).max(4.0);
+                            let start_visual = line_content[..start_col.min(line_content.len())].chars().count();
+                            let end_visual = line_content[..end_col.min(line_content.len())].chars().count();
+                            let sel_x = text_area_x + (start_visual as f32 - self.scroll_left) * font.char_width;
+                            let sel_w = ((end_visual - start_visual) as f32 * font.char_width).max(4.0);
                             let sel_rect = Rect::from_xywh(sel_x, line_y, sel_w, font.line_height);
                             scene.push_quad(Quad::new(sel_rect).with_background(theme.editor_selection));
                         }
@@ -289,26 +389,25 @@ impl View for EditorView {
             }
 
             // 5c. Text content
-            if let Some(content) = buf.get_line_content(line_idx) {
-                if !content.is_empty() {
-                    let text_w = content.len() as f32 * font.char_width;
-                    let text_x = text_area_x - self.scroll_left * font.char_width;
-                    scene.push_text(GlyphRun::new(
-                        content,
-                        Point::new(text_x, line_y),
-                        Rect::from_xywh(text_x, line_y, text_w, font.line_height),
-                        theme.editor_foreground,
-                        font.font_size,
-                    ));
-                }
+            if !line_content.is_empty() {
+                let text_w = font.text_width(&line_content);
+                let text_x = text_area_x - self.scroll_left * font.char_width;
+                scene.push_text(GlyphRun::new(
+                    line_content.clone(),
+                    Point::new(text_x, line_y),
+                    Rect::from_xywh(text_x, line_y, text_w, font.line_height),
+                    theme.editor_foreground,
+                    font.font_size,
+                ));
             }
 
             // 5d. Cursors on this line
             if self.is_focused {
                 for sel in &self.cursor_state.selections {
                     if sel.active.line == line_idx {
+                        let visual_col = line_content[..sel.active.column.min(line_content.len())].chars().count();
                         let cursor_x = text_area_x
-                            + (sel.active.column as f32 - self.scroll_left) * font.char_width;
+                            + (visual_col as f32 - self.scroll_left) * font.char_width;
                         let cursor_rect =
                             Rect::from_xywh(cursor_x, line_y, 2.0, font.line_height);
                         scene.push_quad(Quad::new(cursor_rect).with_background(theme.editor_cursor));
@@ -324,6 +423,9 @@ impl View for EditorView {
 
         match event {
             InputEvent::MouseDown(mouse) => {
+                if !bounds.contains(mouse.position) {
+                    return EventResult::Ignored;
+                }
                 self.is_focused = true;
                 if mouse.position.x >= bounds.min_x() + gutter_w {
                     let buf = self.buffer.read();
@@ -336,14 +438,20 @@ impl View for EditorView {
                     let line_idx = clicked_line.min(line_count.saturating_sub(1));
 
                     let text_area_x = bounds.min_x() + gutter_w + 8.0;
-                    let clicked_col = ((mouse.position.x - text_area_x
+                    let clicked_char_col = ((mouse.position.x - text_area_x
                         + self.scroll_left * font.char_width)
                         / font.char_width)
                         .round()
                         .max(0.0) as usize;
 
-                    let line_len = buf.get_line_content(line_idx).map_or(0, |l| l.len());
-                    let col = clicked_col.min(line_len);
+                    let line_content = buf.get_line_content(line_idx).unwrap_or_default();
+                    let total_chars = line_content.chars().count();
+                    let char_idx = clicked_char_col.min(total_chars);
+                    let col = if char_idx >= total_chars {
+                        line_content.len()
+                    } else {
+                        line_content.char_indices().nth(char_idx).map_or(line_content.len(), |(b, _)| b)
+                    };
 
                     let target = Position::new(line_idx, col);
                     if mouse.modifiers.shift {
@@ -353,7 +461,18 @@ impl View for EditorView {
                     }
                     EventResult::Consumed
                 } else {
-                    EventResult::Ignored
+                    // Click in gutter: select entire line
+                    let buf = self.buffer.read();
+                    let line_count = buf.line_count();
+                    let clicked_line = ((mouse.position.y - bounds.min_y()) / font.line_height
+                        + self.scroll_top)
+                        .floor()
+                        .max(0.0) as usize;
+                    let line_idx = clicked_line.min(line_count.saturating_sub(1));
+                    let line_len = buf.get_line_content(line_idx).map_or(0, |l| l.len());
+                    self.cursor_state.primary_mut().anchor = Position::new(line_idx, 0);
+                    self.cursor_state.primary_mut().active = Position::new(line_idx, line_len);
+                    EventResult::Consumed
                 }
             }
             InputEvent::ScrollWheel(scroll) => {
@@ -377,32 +496,41 @@ impl View for EditorView {
                     {
                         self.redo();
                         return EventResult::Consumed;
+                    } else if key.key == KeyCode::Char('a') && !key.modifiers.shift {
+                        // Select all
+                        let buf = self.buffer.read();
+                        let line_count = buf.line_count();
+                        let last_line = line_count.saturating_sub(1);
+                        let last_col = buf.get_line_content(last_line).map_or(0, |l| l.len());
+                        self.cursor_state.primary_mut().anchor = Position::new(0, 0);
+                        self.cursor_state.primary_mut().active = Position::new(last_line, last_col);
+                        return EventResult::Consumed;
                     }
                 }
 
                 match &key.key {
                     KeyCode::ArrowLeft => {
-                        self.move_cursor_left();
+                        self.move_cursor_left(key.modifiers.shift);
                         EventResult::Consumed
                     }
                     KeyCode::ArrowRight => {
-                        self.move_cursor_right();
+                        self.move_cursor_right(key.modifiers.shift);
                         EventResult::Consumed
                     }
                     KeyCode::ArrowUp => {
-                        self.move_cursor_up();
+                        self.move_cursor_up(key.modifiers.shift);
                         EventResult::Consumed
                     }
                     KeyCode::ArrowDown => {
-                        self.move_cursor_down();
+                        self.move_cursor_down(key.modifiers.shift);
                         EventResult::Consumed
                     }
                     KeyCode::Home => {
-                        self.move_cursor_home();
+                        self.move_cursor_home(key.modifiers.shift);
                         EventResult::Consumed
                     }
                     KeyCode::End => {
-                        self.move_cursor_end();
+                        self.move_cursor_end(key.modifiers.shift);
                         EventResult::Consumed
                     }
                     KeyCode::Backspace => {
@@ -421,8 +549,13 @@ impl View for EditorView {
                         self.insert_text("    ");
                         EventResult::Consumed
                     }
+                    KeyCode::Space if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                        self.insert_text(" ");
+                        EventResult::Consumed
+                    }
                     KeyCode::Char(c) if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
-                        let s = c.to_string();
+                        let ch = if key.modifiers.shift { c.to_ascii_uppercase() } else { *c };
+                        let s = ch.to_string();
                         self.insert_text(&s);
                         EventResult::Consumed
                     }
@@ -490,5 +623,124 @@ mod tests {
         );
         view.handle_event(&click_ev, bounds);
         assert_eq!(view.primary_position().line, 1);
+    }
+
+    #[test]
+    fn test_editor_view_multibyte_utf8_editing_and_undo() {
+        let content = "🦀hello";
+        let mut view = EditorView::from_str(content);
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Move cursor right past '🦀' (4 bytes)
+        view.move_cursor_right(false);
+        assert_eq!(view.primary_position(), Position::new(0, 4));
+
+        // Backspace deletes '🦀' cleanly
+        let bs_ev = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Backspace,
+            Modifiers::none(),
+        ));
+        view.handle_event(&bs_ev, bounds);
+        assert_eq!(view.text(), "hello");
+        assert_eq!(view.primary_position(), Position::new(0, 0));
+
+        // Undo restores '🦀hello' with cursor at (0, 4)
+        assert!(view.undo());
+        assert_eq!(view.text(), "🦀hello");
+        assert_eq!(view.primary_position(), Position::new(0, 4));
+
+        // Move to start, then delete forwards
+        view.move_cursor_home(false);
+        assert_eq!(view.primary_position(), Position::new(0, 0));
+        let del_ev = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Delete,
+            Modifiers::none(),
+        ));
+        view.handle_event(&del_ev, bounds);
+        assert_eq!(view.text(), "hello");
+
+        // Undo delete forwards restores '🦀hello'
+        assert!(view.undo());
+        assert_eq!(view.text(), "🦀hello");
+    }
+
+    #[test]
+    fn test_editor_view_selection_replacement_and_shift_navigation() {
+        let content = "hello world";
+        let mut view = EditorView::from_str(content);
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Shift+Right 5 times to select "hello"
+        for _ in 0..5 {
+            view.handle_event(
+                &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                    KeyCode::ArrowRight,
+                    Modifiers { ctrl: false, shift: true, alt: false, meta: false },
+                )),
+                bounds,
+            );
+        }
+
+        assert_eq!(view.cursor_state.primary().anchor, Position::new(0, 0));
+        assert_eq!(view.cursor_state.primary().active, Position::new(0, 5));
+        assert!(!view.cursor_state.primary().is_empty());
+
+        // Type 'H' replaces "hello" with "H"
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('h'),
+                Modifiers { ctrl: false, shift: true, alt: false, meta: false },
+            )),
+            bounds,
+        );
+        assert_eq!(view.text(), "H world");
+        assert_eq!(view.primary_position(), Position::new(0, 1));
+
+        // Ctrl+A selects all
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('a'),
+                Modifiers { ctrl: true, shift: false, alt: false, meta: false },
+            )),
+            bounds,
+        );
+        assert_eq!(view.cursor_state.primary().anchor, Position::new(0, 0));
+        assert_eq!(view.cursor_state.primary().active, Position::new(0, 7));
+
+        // Backspace deletes entire selection
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Backspace,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(view.text(), "");
+        assert_eq!(view.primary_position(), Position::new(0, 0));
+
+        // Undo restores text
+        assert!(view.undo());
+        assert_eq!(view.text(), "H world");
+    }
+
+    #[test]
+    fn test_editor_view_gutter_click_line_selection() {
+        let content = "first line\nsecond line\nthird line\n";
+        let mut view = EditorView::from_str(content);
+        let font = FontMetrics::default_monospace();
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Click in gutter at line 1 (second line)
+        let click_y = bounds.min_y() + font.line_height + 5.0;
+        let click_ev = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(bounds.min_x() + 10.0, click_y),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        let res = view.handle_event(&click_ev, bounds);
+        assert_eq!(res, EventResult::Consumed);
+
+        // Entire line 1 selected
+        assert_eq!(view.cursor_state.primary().anchor, Position::new(1, 0));
+        assert_eq!(view.cursor_state.primary().active, Position::new(1, 11)); // "second line".len() == 11
     }
 }

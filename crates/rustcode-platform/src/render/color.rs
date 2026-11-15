@@ -110,7 +110,7 @@ pub struct Hsla {
 impl Hsla {
     pub fn new(h: f32, s: f32, l: f32, a: f32) -> Self {
         Self {
-            h: h % 360.0,
+            h: h.rem_euclid(360.0),
             s: s.clamp(0.0, 1.0),
             l: l.clamp(0.0, 1.0),
             a: a.clamp(0.0, 1.0),
@@ -192,5 +192,11 @@ mod tests {
         assert!((color.r - back.r).abs() < 0.01);
         assert!((color.g - back.g).abs() < 0.01);
         assert!((color.b - back.b).abs() < 0.01);
+
+        // Negative hue wraps to positive [0, 360)
+        let hsla_neg = Hsla::new(-60.0, 1.0, 0.5, 1.0);
+        assert_eq!(hsla_neg.h, 300.0);
+        let hsla_pos = Hsla::new(300.0, 1.0, 0.5, 1.0);
+        assert_eq!(hsla_neg.to_rgba(), hsla_pos.to_rgba());
     }
 }

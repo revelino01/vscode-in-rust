@@ -81,7 +81,23 @@ impl WorkbenchWindow {
         // 2. Route event to workbench view hierarchy
         let res = self.view.handle_event(event, bounds);
 
-        // 3. Process any actions emitted by views
+        // 3. Update context keys from focused region
+        match self.view.focused_region {
+            crate::workbench_view::FocusedRegion::Editor => {
+                self.context_keys.set_bool("editorTextFocus", true);
+                self.context_keys.set_bool("sideBarFocus", false);
+            }
+            crate::workbench_view::FocusedRegion::Sidebar => {
+                self.context_keys.set_bool("editorTextFocus", false);
+                self.context_keys.set_bool("sideBarFocus", true);
+            }
+            crate::workbench_view::FocusedRegion::CommandPalette => {
+                self.context_keys.set_bool("inCommandPalette", true);
+            }
+            _ => {}
+        }
+
+        // 4. Process any actions emitted by views
         if let Some(action) = self.view.last_action.take() {
             match action {
                 WorkbenchAction::ExecuteCommand(cmd) => {
@@ -102,11 +118,26 @@ impl WorkbenchWindow {
             "workbench.action.toggleSidebar" => {
                 self.view.toggle_sidebar();
             }
-            "workbench.action.togglePanel" => {
+            "workbench.action.togglePanel" | "workbench.action.terminal.toggleTerminal" => {
                 self.view.toggle_panel();
             }
-            "workbench.action.showCommands" => {
+            "workbench.action.showCommands" | "workbench.action.quickOpen" => {
                 self.open_command_palette();
+            }
+            "workbench.action.closeActiveEditor" => {
+                if let Some(active_tab) = self.view.editor_area.model.current_group_ref().active_tab_index {
+                    self.view.editor_area.model.current_group().close_tab(active_tab);
+                }
+            }
+            "undo" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.undo();
+                }
+            }
+            "redo" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.redo();
+                }
             }
             _ => {}
         }
@@ -115,11 +146,12 @@ impl WorkbenchWindow {
     pub fn open_command_palette(&mut self) {
         let mut items = Vec::new();
         for cmd_id in self.commands.list_commands() {
+            let keybinding = self.keybindings.lookup_keybinding(&cmd_id);
             items.push(PaletteItem {
                 command_id: cmd_id.clone(),
                 label: cmd_id.replace("workbench.action.", "").replace("editor.action.", ""),
                 category: Some("Command".to_string()),
-                keybinding: None,
+                keybinding,
             });
         }
 
@@ -206,5 +238,46 @@ mod tests {
 
         // Command Palette should now be open!
         assert!(window.view.is_command_palette_open);
+
+        // Verify keybinding badge was resolved for showCommands
+        let palette = window.view.command_palette.as_ref().unwrap();
+        let show_cmd_item = palette
+            .model
+            .items
+            .iter()
+            .find(|i| i.command_id == "workbench.action.showCommands");
+        assert!(show_cmd_item.is_some());
+        assert_eq!(
+            show_cmd_item.unwrap().keybinding,
+            Some("Ctrl+Shift+P".to_string())
+        );
+
+        // Close command palette with Escape
+        let esc_ev = InputEvent::KeyDown(KeyEvent::new(KeyCode::Escape, Modifiers::none()));
+        window.dispatch_event(&esc_ev, bounds);
+        assert!(!window.view.is_command_palette_open);
+
+        // Open a file tab and verify Ctrl+W closes it
+        window.open_file("file:///test.rs", "test.rs", "fn test() {}", false);
+        assert_eq!(window.view.editor_area.model.current_group_ref().tabs.len(), 1);
+
+        // Register workbench.action.closeActiveEditor
+        let keymap2 = r#"[
+            { "key": "ctrl+w", "command": "workbench.action.closeActiveEditor" }
+        ]"#;
+        window.keybindings.load_keybindings_json(keymap2).unwrap();
+
+        let ctrl_w = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('w'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        let res3 = window.dispatch_event(&ctrl_w, bounds);
+        assert_eq!(res3, EventResult::Consumed);
+        assert_eq!(window.view.editor_area.model.current_group_ref().tabs.len(), 0);
     }
 }

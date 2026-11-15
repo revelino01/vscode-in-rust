@@ -46,8 +46,7 @@ impl KeyCombo {
             });
         }
 
-        let (mod_part, key_part) = if s.ends_with("++") {
-            let prefix = &s[..s.len() - 2];
+        let (mod_part, key_part) = if let Some(prefix) = s.strip_suffix("++") {
             (prefix, "+")
         } else {
             let parts: Vec<&str> = s.rsplitn(2, '+').collect();
@@ -79,6 +78,35 @@ impl KeyCombo {
             Some(Self { modifiers, key })
         }
     }
+
+    pub fn to_display_string(&self) -> String {
+        let mut parts = Vec::new();
+        if self.modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if self.modifiers.shift {
+            parts.push("Shift");
+        }
+        if self.modifiers.alt {
+            parts.push("Alt");
+        }
+        if self.modifiers.meta {
+            parts.push("Cmd");
+        }
+        let key_display = match self.key.as_str() {
+            " " => "Space".to_string(),
+            k if k.len() == 1 => k.to_ascii_uppercase(),
+            k => {
+                let mut c = k.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }
+            }
+        };
+        parts.push(&key_display);
+        parts.join("+")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -102,6 +130,13 @@ impl KeyChord {
         };
 
         Some(Self { first, second })
+    }
+
+    pub fn to_display_string(&self) -> String {
+        match &self.second {
+            Some(sec) => format!("{} {}", self.first.to_display_string(), sec.to_display_string()),
+            None => self.first.to_display_string(),
+        }
     }
 }
 
@@ -144,6 +179,17 @@ impl KeybindingService {
     /// Register a single keybinding.
     pub fn register(&self, binding: ResolvedKeybinding) {
         self.bindings.write().push(binding);
+    }
+
+    /// Lookup formatted keybinding display string for a command ID.
+    pub fn lookup_keybinding(&self, command: &str) -> Option<String> {
+        let bindings = self.bindings.read();
+        for b in bindings.iter() {
+            if b.command == command {
+                return Some(b.chord.to_display_string());
+            }
+        }
+        None
     }
 
     /// Load keybindings from a JSON string matching VS Code's `keybindings.json` format (supports JSONC).
@@ -286,5 +332,25 @@ mod tests {
         service.load_keybindings_json(jsonc).unwrap();
         let ctx = ContextKeyService::new();
         assert_eq!(service.handle_key(&zoom_in, &ctx), Some("workbench.action.zoomIn".to_string()));
+    }
+
+    #[test]
+    fn test_keybinding_display_string_and_lookup() {
+        let service = KeybindingService::new();
+        let json = r#"[
+            { "key": "ctrl+shift+p", "command": "workbench.action.showCommands" },
+            { "key": "ctrl+k ctrl+c", "command": "editor.action.commentLine" }
+        ]"#;
+        service.load_keybindings_json(json).unwrap();
+
+        assert_eq!(
+            service.lookup_keybinding("workbench.action.showCommands"),
+            Some("Ctrl+Shift+P".to_string())
+        );
+        assert_eq!(
+            service.lookup_keybinding("editor.action.commentLine"),
+            Some("Ctrl+K Ctrl+C".to_string())
+        );
+        assert_eq!(service.lookup_keybinding("unknown.command"), None);
     }
 }

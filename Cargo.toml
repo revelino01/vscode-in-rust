@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/rustcode-base",
     "crates/rustcode-editor",
+    "crates/rustcode-platform",
 ]
 
 [profile.release]

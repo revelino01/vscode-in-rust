@@ -1,0 +1,17 @@
+//! `rustcode-platform` — Layer 1: Platform Services.
+//!
+//! Provides configuration management (`ConfigurationService`),
+//! keybinding resolution (`KeybindingService`), command registration (`CommandRegistry`),
+//! and theme styling (`ThemeService`).
+
+pub mod commands;
+pub mod configuration;
+pub mod fs;
+pub mod keybindings;
+pub mod theme;
+
+pub use commands::{CommandCallback, CommandRegistry};
+pub use configuration::{ConfigurationChangeEvent, ConfigurationService, ConfigurationTarget};
+pub use fs::{FileChangeEvent, FileChangeType, FileSystemService};
+pub use keybindings::{KeyChord, KeyCombo, KeybindingService, Modifiers, ResolvedKeybinding};
+pub use theme::{ColorTheme, ThemeKind, ThemeService, TokenColorRule};

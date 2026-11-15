@@ -1,0 +1,37 @@
+{
+  "name": "Light+ (default light)",
+  "type": "light",
+  "colors": {
+    "editor.background": "#ffffff",
+    "editor.foreground": "#000000",
+    "activityBar.background": "#2c2c2c",
+    "activityBar.foreground": "#ffffff",
+    "sideBar.background": "#f3f3f3",
+    "sideBar.foreground": "#333333",
+    "statusBar.background": "#007acc",
+    "statusBar.foreground": "#ffffff"
+  },
+  "tokenColors": [
+    {
+      "name": "Comments",
+      "scope": ["comment"],
+      "settings": {
+        "foreground": "#008000"
+      }
+    },
+    {
+      "name": "Keywords",
+      "scope": ["keyword", "storage"],
+      "settings": {
+        "foreground": "#0000ff"
+      }
+    },
+    {
+      "name": "Strings",
+      "scope": ["string"],
+      "settings": {
+        "foreground": "#a31515"
+      }
+    }
+  ]
+}

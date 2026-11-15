@@ -1,0 +1,133 @@
+// vscode.window API implementation
+
+const rpc = require('../rpc-bridge');
+const { StatusBarAlignment, Disposable } = require('./types');
+
+class StatusBarItemProxy {
+  constructor(id, alignment, priority) {
+    this.id = id;
+    this.alignment = alignment;
+    this.priority = priority;
+    this._text = '';
+    this._tooltip = '';
+    this._command = null;
+    this._color = null;
+    this._visible = false;
+  }
+
+  get text() { return this._text; }
+  set text(val) {
+    this._text = val;
+    this._sync();
+  }
+
+  get tooltip() { return this._tooltip; }
+  set tooltip(val) {
+    this._tooltip = val;
+    this._sync();
+  }
+
+  get command() { return this._command; }
+  set command(val) {
+    this._command = val;
+    this._sync();
+  }
+
+  show() {
+    this._visible = true;
+    this._sync();
+  }
+
+  hide() {
+    this._visible = false;
+    rpc.call('window.hideStatusBarItem', { id: this.id });
+  }
+
+  dispose() {
+    this.hide();
+  }
+
+  _sync() {
+    if (this._visible) {
+      rpc.call('window.setStatusBarItem', {
+        id: this.id,
+        text: this._text,
+        tooltip: this._tooltip,
+        command: this._command,
+        alignment: this.alignment,
+        priority: this.priority,
+      });
+    }
+  }
+}
+
+let nextStatusBarId = 1;
+
+const window = {
+  // Messages
+  async showInformationMessage(message, ...items) {
+    return await rpc.call('window.showInformationMessage', { message, items });
+  },
+
+  async showWarningMessage(message, ...items) {
+    return await rpc.call('window.showWarningMessage', { message, items });
+  },
+
+  async showErrorMessage(message, ...items) {
+    return await rpc.call('window.showErrorMessage', { message, items });
+  },
+
+  // Quick Pick & Input
+  async showQuickPick(items, options = {}, token) {
+    const rawItems = Array.isArray(items) ? items : await Promise.resolve(items);
+    const normalized = rawItems.map(i => (typeof i === 'string' ? { label: i } : i));
+    return await rpc.call('window.showQuickPick', { items: normalized, options });
+  },
+
+  async showInputBox(options = {}, token) {
+    return await rpc.call('window.showInputBox', { options });
+  },
+
+  // Status Bar
+  createStatusBarItem(alignment = StatusBarAlignment.Left, priority = 0) {
+    const id = `sb_item_${nextStatusBarId++}`;
+    return new StatusBarItemProxy(id, alignment, priority);
+  },
+
+  // Tree Data Provider
+  registerTreeDataProvider(viewId, provider) {
+    return rpc.registerObjectProxy('TreeDataProvider', viewId, provider, [
+      'getTreeItem',
+      'getChildren',
+      'getParent',
+      'resolveTreeItem',
+    ]);
+  },
+
+  // Terminal
+  createTerminal(nameOrOptions) {
+    const options = typeof nameOrOptions === 'string' ? { name: nameOrOptions } : (nameOrOptions || {});
+    const id = `term_${Date.now()}`;
+    rpc.call('window.createTerminal', { id, ...options });
+
+    return {
+      name: options.name || 'Terminal',
+      show() {
+        rpc.call('window.showTerminal', { id });
+      },
+      sendText(text, addNewLine = true) {
+        rpc.call('window.sendTerminalText', { id, text, addNewLine });
+      },
+      dispose() {
+        rpc.call('window.disposeTerminal', { id });
+      }
+    };
+  },
+
+  // Events
+  onDidChangeActiveTextEditor: rpc.createEvent('window.onDidChangeActiveTextEditor'),
+  onDidChangeVisibleTextEditors: rpc.createEvent('window.onDidChangeVisibleTextEditors'),
+  onDidChangeTextEditorSelection: rpc.createEvent('window.onDidChangeTextEditorSelection'),
+};
+
+module.exports = window;

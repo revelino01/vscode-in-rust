@@ -1,0 +1,23 @@
+{
+  "name": "sample-hello-world",
+  "displayName": "Sample Hello World",
+  "description": "Demonstration extension running on RustCode",
+  "version": "0.0.1",
+  "publisher": "rustcode",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onCommand:sample.helloWorld"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "sample.helloWorld",
+        "title": "Hello World",
+        "category": "Sample"
+      }
+    ]
+  }
+}

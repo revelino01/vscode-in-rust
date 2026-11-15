@@ -1,5 +1,58 @@
 # RustCode — Implementation Plan
 
+## 📌 Implementation Progress Tracker
+
+> Live status of the RustCode implementation in `https://github.com/revelino01/vscode-in-rust.git`.
+
+### Phase 0: Scaffold & Core Foundation
+- [x] Cargo workspace setup with 8 modular crates (`rustcode-base`, `rustcode-platform`, `rustcode-editor`, `rustcode-terminal`, `rustcode-protocols`, `rustcode-ext-host`, `rustcode-workbench`, `rustcode-app`)
+- [x] `rustcode-base`: `Disposable`, `DisposableStore`, typed `Emitter<T>` / `Event<T>`, `CancellationTokenSource`, `CancellationToken`
+- [x] `rustcode-base`: VS Code `when` clause context-key expression parser & evaluator (`ContextKeyExpr`, `ContextKeyService`)
+- [x] `rustcode-editor`: Piece Table text buffer with balanced tree, O(log n) inserts & deletes, line indexing, offset-to-position mapping
+- [x] `rustcode-editor`: Transactional `UndoRedoStack` with edit grouping and multi-cursor support
+- [x] `rustcode-editor`: `CursorState`, `Position`, `Range`, `Selection`, and `DecorationModel`
+- [x] `rustcode-platform`: `ConfigurationService` with defaults -> user -> workspace hierarchy, JSONC comment stripping, dot-separated queries
+- [x] `rustcode-platform`: `KeybindingService` with multi-chord support (`Ctrl+K Ctrl+C`), modifiers parsing, `when` clause evaluation
+- [x] `rustcode-platform`: `CommandRegistry` with disposable registration and dispatch
+- [x] `rustcode-platform`: `ThemeService` loading VS Code JSON themes and TextMate token color scopes
+- [x] `rustcode-ext-host`: Extension manifest parser (`package.json`), activation events, and contribution points
+- [x] `rustcode-ext-host`: MessagePack & JSON binary RPC bridge (`RpcBridge`, `RpcMessage`)
+- [x] `rustcode-ext-host`: Provider callback registry (`Completion`, `Hover`, `Definition`, `Formatting`, `TreeData`)
+- [x] `rustcode-workbench`: `WorkbenchLayout` shell state (sidebar, panel, status bar, activity bar toggles)
+- [x] `rustcode-workbench`: `EditorArea` and `EditorGroup` with tabs, dirty tracking, and preview mode
+- [x] `rustcode-workbench`: `CommandPalette` with fuzzy subsequence query search
+- [x] `rustcode-workbench`: `StatusBar` with left/right alignment and priority sorting
+- [x] `rustcode-terminal`: `TerminalManager` & `TerminalInstance` sessions
+- [x] `rustcode-protocols`: LSP, DAP, and Git SCM protocol definitions
+- [x] `rustcode-app`: `RustCodeContext` service container bootstrap and builtin command handlers
+- [x] `ext-host-js`: JavaScript `vscode.*` API shim (`types.js`, `commands.js`, `window.js`, `workspace.js`, `languages.js`, `env.js`, `rpc-bridge.js`)
+- [x] `ext-host-js`: Node.js compatibility layer (`events.js`, `path.js`, `fs.js`)
+- [x] Resources: VS Code Dark+ & Light+ default themes, Linux keymaps, sample Hello World extension
+- [x] Test Suite: 29 unit and integration tests passing (`cargo test --workspace`)
+
+### Phase 1: Minimal Editor & File Workflows
+- [x] Configuration loading (`settings.json`)
+- [x] Keybinding resolution (`keybindings.json`)
+- [x] Theme engine (VS Code JSON theme loader)
+- [x] Extension manifest discovery (`package.json`)
+- [ ] Tree-sitter syntax highlighting integration
+- [ ] File I/O async disk save / auto-save service
+- [ ] File tree filesystem watcher (`notify`)
+
+### Phase 2: Language Intelligence & Marketplace
+- [ ] `languages.*` LSP client lifecycle
+- [ ] Autocomplete UI widget
+- [ ] Diagnostics squiggly underlines & Problems panel
+- [ ] Open VSX marketplace client (.vsix package downloader)
+
+### Phase 3: Full Parity
+- [ ] DAP debug adapter integration
+- [ ] Git / SCM sidebar diff viewer
+- [ ] Webview host integration (`wry`)
+- [ ] GPU window rendering (GPUI / wgpu surface)
+
+---
+
 ## Goal
 
 Build **RustCode**, a ground-up Rust rewrite of VS Code that:

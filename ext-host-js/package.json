@@ -1,0 +1,11 @@
+{
+  "name": "rustcode-ext-host-js",
+  "version": "0.1.0",
+  "description": "JavaScript vscode.* API shim and Node.js compatibility layer for RustCode",
+  "main": "vscode-api/index.js",
+  "scripts": {
+    "test": "node test.js"
+  },
+  "author": "RustCode Contributors",
+  "license": "MIT"
+}

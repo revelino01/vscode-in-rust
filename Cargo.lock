@@ -234,6 +234,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustcode-app"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "rustcode-base",
+ "rustcode-editor",
+ "rustcode-ext-host",
+ "rustcode-platform",
+ "rustcode-protocols",
+ "rustcode-terminal",
+ "rustcode-workbench",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustcode-base"
 version = "0.1.0"
 dependencies = [
@@ -279,6 +295,26 @@ name = "rustcode-platform"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "rustcode-base",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "rustcode-protocols"
+version = "0.1.0"
+dependencies = [
+ "rustcode-base",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "rustcode-terminal"
+version = "0.1.0"
+dependencies = [
  "rustcode-base",
  "serde",
  "serde_json",

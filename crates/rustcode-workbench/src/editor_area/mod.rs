@@ -1,12 +1,18 @@
 //! Editor group and tab model mirroring VS Code's editor grid, and GPUI EditorAreaView component.
 
-use rustcode_editor::EditorView;
+use parking_lot::RwLock;
+use rustcode_editor::{EditorView, GrammarRegistry, TextDocument};
+use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, Point, Quad, Rect, Scene, View,
     WorkbenchThemeStyles,
 };
+use rustcode_platform::theme::ThemeService;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditorTab {
@@ -137,6 +143,7 @@ pub enum EditorAreaAction {
 pub struct EditorAreaView {
     pub model: EditorArea,
     pub editors: HashMap<String, EditorView>,
+    pub grammar_registry: Arc<GrammarRegistry>,
     pub last_action: Option<EditorAreaAction>,
 }
 
@@ -151,6 +158,7 @@ impl EditorAreaView {
         Self {
             model,
             editors: HashMap::new(),
+            grammar_registry: Arc::new(GrammarRegistry::new()),
             last_action: None,
         }
     }
@@ -160,8 +168,53 @@ impl EditorAreaView {
         group.open_tab(uri, title, is_preview);
 
         if !self.editors.contains_key(uri) {
-            self.editors
-                .insert(uri.to_string(), EditorView::from_str(content));
+            let path_buf = uri
+                .strip_prefix("file://")
+                .map(PathBuf::from)
+                .or_else(|| Some(PathBuf::from(uri)));
+
+
+            let grammar = if let Some(p) = &path_buf {
+                self.grammar_registry.get_for_path(p)
+            } else {
+                self.grammar_registry.get_by_id("plaintext").unwrap()
+            };
+
+            let doc = Arc::new(RwLock::new(TextDocument::new(
+                content,
+                path_buf,
+                Some(grammar.language_id()),
+            )));
+
+            let mut editor = EditorView::from_str(content).with_document(doc);
+            let theme = ThemeService::default_dark_theme();
+            editor.set_language(grammar.language_id(), theme, &self.grammar_registry);
+
+            self.editors.insert(uri.to_string(), editor);
+        }
+    }
+
+    pub fn save_active_file(
+        &mut self,
+        fs: &FileSystemService,
+    ) -> Result<FileMetadata, FileSystemError> {
+        let uri = self
+            .model
+            .current_group()
+            .active_tab()
+            .map(|t| t.uri.clone())
+            .ok_or_else(|| {
+                FileSystemError::NotFound(PathBuf::from("no_active_tab"))
+            })?;
+
+        if let Some(editor) = self.editors.get_mut(&uri) {
+            let meta = editor.save_sync(fs)?;
+            if let Some(idx) = self.model.current_group().active_tab_index {
+                self.model.current_group().set_dirty(idx, false);
+            }
+            Ok(meta)
+        } else {
+            Err(FileSystemError::NotFound(PathBuf::from(&uri)))
         }
     }
 
@@ -175,6 +228,7 @@ impl EditorAreaView {
         self.editors.get(&uri)
     }
 }
+
 
 impl View for EditorAreaView {
     fn render(
@@ -231,11 +285,15 @@ impl View for EditorAreaView {
                 theme.tab_inactive_fg
             };
 
-            let title_text = if tab.is_dirty {
+            let is_dirty = tab.is_dirty
+                || self.editors.get(&tab.uri).is_some_and(|e| e.is_dirty());
+
+            let title_text = if is_dirty {
                 format!("{} \u{25cf}", tab.title)
             } else {
                 tab.title.clone()
             };
+
 
             let title_y = bounds.min_y() + (tab_bar_h - font.line_height) / 2.0;
             let title_x = cur_x + 10.0;
@@ -406,7 +464,9 @@ mod tests {
         assert!(scene.contains_text("lib.rs"));
         assert!(scene.contains_text("pub fn hello()"));
 
+
         // Click first tab to switch back to main.rs
+
         let click_ev = InputEvent::MouseDown(MouseEvent::new(
             Point::new(30.0, 15.0),
             rustcode_platform::render::MouseButton::Left,
@@ -418,4 +478,30 @@ mod tests {
             "main.rs"
         );
     }
+
+    #[test]
+    fn test_editor_area_save_active_file() {
+        let tmp_dir = std::env::temp_dir().join(format!("rustcode_area_save_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let path = tmp_dir.join("saved_app.rs");
+        let uri = format!("file://{}", path.display());
+
+        let fs = FileSystemService::new();
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(&uri, "saved_app.rs", "fn initial() {}", false);
+
+        // Edit active editor
+        area_view.active_editor_mut().unwrap().insert_text(" ");
+        assert!(area_view.active_editor().unwrap().is_dirty());
+
+        // Save active file
+        let meta = area_view.save_active_file(&fs).unwrap();
+        assert_eq!(meta.path, path);
+        assert!(!area_view.active_editor().unwrap().is_dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), " fn initial() {}");
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    }
 }
+

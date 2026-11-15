@@ -28,7 +28,7 @@
 - [x] `ext-host-js`: JavaScript `vscode.*` API shim (`types.js`, `commands.js`, `window.js`, `workspace.js`, `languages.js`, `env.js`, `rpc-bridge.js`)
 - [x] `ext-host-js`: Node.js compatibility layer (`events.js`, `path.js`, `fs.js`)
 - [x] Resources: VS Code Dark+ & Light+ default themes, Linux keymaps, sample Hello World extension
-- [x] Test Suite: 58 unit and integration tests passing (`cargo test --workspace`)
+- [x] Test Suite: 74 unit and integration tests passing (`cargo test --workspace`)
 - [x] GPUI UI Presentation Layer: View abstractions, element rendering pipeline (scene graph display lists, quad/glyph layout, theme color mappings from `ThemeService` into GPUI styles), concrete component models (`EditorView`, `WorkbenchLayout`, `WorkbenchView`, `ActivityBarView`, `FileExplorerView`, `StatusBarView`, `CommandPaletteView`, `EditorAreaView`), and input event routing (GPUI keyboard chords, mouse clicks/scrolls to editor cursor/edits and platform keybindings/commands)
 - [x] Robustness & Edge Cases: Fixed PieceTable multi-byte UTF-8 prev/next char boundary navigation & deletion, undo/redo cursor position restoration, selection replacement/deletion, Shift+Arrow selection expansion, Ctrl+A select all, CommandPalette space matching, Hsla negative hue wrapping, out-of-bounds mouse events, and keybinding display string badge resolution
 
@@ -37,9 +37,10 @@
 - [x] Keybinding resolution (`keybindings.json`)
 - [x] Theme engine (VS Code JSON theme loader)
 - [x] Extension manifest discovery (`package.json`)
-- [ ] Tree-sitter syntax highlighting integration
-- [ ] File I/O async disk save / auto-save service
-- [ ] File tree filesystem watcher (`notify`)
+- [x] Tree-sitter syntax highlighting integration (dual Tree-sitter/tokenizer pipeline, grammar registry for Rust, JS, TS, Python, JSON, Markdown, packed TokenMetadata, TextMate scope color resolution from ThemeService, incremental line caching, and EditorView syntax colored rendering)
+- [x] File I/O async disk save / auto-save service (async tokio::fs and sync atomic writes with temp-file rename, conflict detection with mtime and content hash checks, and AutoSaveService with afterDelay, onFocusChange, and onWindowChange)
+- [x] File tree filesystem watcher (`notify` recommended watcher, granular create/change/delete event emitters, recursive and non-recursive watching with Disposable lifecycle)
+
 
 ### Phase 2: Language Intelligence & Marketplace
 - [ ] `languages.*` LSP client lifecycle

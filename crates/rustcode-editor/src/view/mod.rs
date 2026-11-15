@@ -1,13 +1,17 @@
 //! GPUI EditorView component rendering text lines, line numbers, cursor, selections, and routing input.
 
 use crate::cursor::{CursorState, Position};
+use crate::document::TextDocument;
 use crate::model::piece_table::PieceTable;
 use crate::model::undo_redo::{TextEdit, UndoRedoStack};
-use parking_lot::RwLock;
+use crate::syntax::{GrammarRegistry, SyntaxHighlighter};
+use parking_lot::{Mutex, RwLock};
+use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Scene, View,
     WorkbenchThemeStyles,
 };
+use rustcode_platform::theme::ColorTheme;
 use std::sync::Arc;
 
 pub struct EditorView {
@@ -17,6 +21,8 @@ pub struct EditorView {
     pub scroll_top: f32,
     pub scroll_left: f32,
     pub is_focused: bool,
+    pub syntax_highlighter: Mutex<Option<SyntaxHighlighter>>,
+    pub document: Option<Arc<RwLock<TextDocument>>>,
 }
 
 impl EditorView {
@@ -28,8 +34,70 @@ impl EditorView {
             scroll_top: 0.0,
             scroll_left: 0.0,
             is_focused: true,
+            syntax_highlighter: Mutex::new(None),
+            document: None,
         }
     }
+
+    pub fn with_syntax(self, highlighter: SyntaxHighlighter) -> Self {
+        *self.syntax_highlighter.lock() = Some(highlighter);
+        self
+    }
+
+    pub fn with_document(mut self, doc: Arc<RwLock<TextDocument>>) -> Self {
+        self.set_document(doc);
+        self
+    }
+
+    pub fn set_document(&mut self, doc: Arc<RwLock<TextDocument>>) {
+        self.buffer = doc.read().buffer.clone();
+        self.document = Some(doc);
+    }
+
+    pub fn set_language(&mut self, lang_id: &str, theme: ColorTheme, registry: &GrammarRegistry) {
+        let sh = SyntaxHighlighter::for_language(lang_id, theme, registry);
+        *self.syntax_highlighter.lock() = Some(sh);
+    }
+
+    pub fn set_theme(&mut self, theme: ColorTheme) {
+        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+            sh.set_theme(theme);
+        }
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.document
+            .as_ref()
+            .is_some_and(|d| d.read().is_dirty)
+    }
+
+    pub fn save_sync(&mut self, fs: &FileSystemService) -> Result<FileMetadata, FileSystemError> {
+        if let Some(doc) = &self.document {
+            doc.write().save_sync(fs)
+        } else {
+            Err(FileSystemError::NotFound(std::path::PathBuf::from("unnamed")))
+        }
+    }
+
+    pub async fn save_async(&mut self, fs: &FileSystemService) -> Result<FileMetadata, FileSystemError> {
+        let (path, content) = if let Some(doc) = &self.document {
+            let d = doc.read();
+            let p = d.path.clone().ok_or_else(|| {
+                FileSystemError::NotFound(std::path::PathBuf::from("unnamed"))
+            })?;
+            (p, d.text())
+        } else {
+            return Err(FileSystemError::NotFound(std::path::PathBuf::from("unnamed")));
+        };
+
+        let meta = fs.write_atomic(&path, &content).await?;
+        if let Some(doc) = &self.document {
+            doc.write().mark_saved(meta.clone());
+        }
+        Ok(meta)
+    }
+
+
 
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(content: &str) -> Self {
@@ -78,6 +146,14 @@ impl EditorView {
                 .push_edit(TextEdit::delete(start_offset, &deleted));
             let (new_line, new_col) = buf.offset_to_position(start_offset);
             self.cursor_state.set_primary(Position::new(new_line, new_col));
+            drop(buf);
+
+            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+                sh.invalidate_from(start_pos.line);
+            }
+            if let Some(doc) = &self.document {
+                doc.write().mark_edited();
+            }
             true
         } else {
             self.cursor_state.set_primary(start_pos);
@@ -112,6 +188,14 @@ impl EditorView {
                 .push_edit(TextEdit::replace(start_offset, &deleted, text));
             let (new_line, new_col) = buf.offset_to_position(start_offset + text.len());
             self.cursor_state.set_primary(Position::new(new_line, new_col));
+            drop(buf);
+
+            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+                sh.invalidate_from(start_pos.line);
+            }
+            if let Some(doc) = &self.document {
+                doc.write().mark_edited();
+            }
             return;
         }
 
@@ -123,6 +207,14 @@ impl EditorView {
 
         let (new_line, new_col) = buf.offset_to_position(offset + text.len());
         self.cursor_state.set_primary(Position::new(new_line, new_col));
+        drop(buf);
+
+        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+            sh.invalidate_from(pos.line);
+        }
+        if let Some(doc) = &self.document {
+            doc.write().mark_edited();
+        }
     }
 
     pub fn delete_backwards(&mut self) {
@@ -146,6 +238,14 @@ impl EditorView {
 
         let (new_line, new_col) = buf.offset_to_position(prev_offset);
         self.cursor_state.set_primary(Position::new(new_line, new_col));
+        drop(buf);
+
+        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+            sh.invalidate_from(new_line);
+        }
+        if let Some(doc) = &self.document {
+            doc.write().mark_edited();
+        }
     }
 
     pub fn delete_forwards(&mut self) {
@@ -165,7 +265,16 @@ impl EditorView {
         let del_len = next_offset - offset;
         let deleted = buf.delete(offset, del_len);
         self.undo_stack.push_edit(TextEdit::delete(offset, &deleted));
+        drop(buf);
+
+        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+            sh.invalidate_from(pos.line);
+        }
+        if let Some(doc) = &self.document {
+            doc.write().mark_edited();
+        }
     }
+
 
     pub fn move_cursor_left(&mut self, select: bool) {
         let pos = self.primary_position();
@@ -274,6 +383,14 @@ impl EditorView {
         if let Some(target_offset) = self.undo_stack.undo(&mut buf) {
             let (line, col) = buf.offset_to_position(target_offset);
             self.cursor_state.set_primary(Position::new(line, col));
+            drop(buf);
+
+            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+                sh.invalidate_all();
+            }
+            if let Some(doc) = &self.document {
+                doc.write().mark_edited();
+            }
             true
         } else {
             false
@@ -285,11 +402,20 @@ impl EditorView {
         if let Some(target_offset) = self.undo_stack.redo(&mut buf) {
             let (line, col) = buf.offset_to_position(target_offset);
             self.cursor_state.set_primary(Position::new(line, col));
+            drop(buf);
+
+            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+                sh.invalidate_all();
+            }
+            if let Some(doc) = &self.document {
+                doc.write().mark_edited();
+            }
             true
         } else {
             false
         }
     }
+
 }
 
 impl View for EditorView {
@@ -390,16 +516,82 @@ impl View for EditorView {
 
             // 5c. Text content
             if !line_content.is_empty() {
-                let text_w = font.text_width(&line_content);
-                let text_x = text_area_x - self.scroll_left * font.char_width;
-                scene.push_text(GlyphRun::new(
-                    line_content.clone(),
-                    Point::new(text_x, line_y),
-                    Rect::from_xywh(text_x, line_y, text_w, font.line_height),
-                    theme.editor_foreground,
-                    font.font_size,
-                ));
+                let mut rendered_tokens = false;
+                let mut highlighter_guard = self.syntax_highlighter.lock();
+                if let Some(highlighter) = highlighter_guard.as_mut() {
+                    let tokens = highlighter.get_line_tokens(line_idx, &line_content);
+                    if !tokens.is_empty() {
+                        rendered_tokens = true;
+                        let mut last_byte = 0;
+                        for span in tokens {
+                            if span.start > last_byte && span.start <= line_content.len() {
+                                let gap_text = &line_content[last_byte..span.start];
+                                let gap_start_vis = line_content[..last_byte].chars().count();
+                                let gap_vis_w = gap_text.chars().count() as f32 * font.char_width;
+                                let gap_x = text_area_x + (gap_start_vis as f32 - self.scroll_left) * font.char_width;
+                                scene.push_text(GlyphRun::new(
+                                    gap_text.to_string(),
+                                    Point::new(gap_x, line_y),
+                                    Rect::from_xywh(gap_x, line_y, gap_vis_w, font.line_height),
+                                    theme.editor_foreground,
+                                    font.font_size,
+                                ));
+                            }
+
+                            if span.end <= line_content.len() && span.start < span.end {
+                                let span_text = &line_content[span.start..span.end];
+                                let span_start_vis = line_content[..span.start].chars().count();
+                                let span_vis_w = span_text.chars().count() as f32 * font.char_width;
+                                let span_x = text_area_x + (span_start_vis as f32 - self.scroll_left) * font.char_width;
+                                let span_color = span.color.unwrap_or(theme.editor_foreground);
+                                scene.push_text(
+                                    GlyphRun::new(
+                                        span_text.to_string(),
+                                        Point::new(span_x, line_y),
+                                        Rect::from_xywh(span_x, line_y, span_vis_w, font.line_height),
+                                        span_color,
+                                        font.font_size,
+                                    )
+                                    .with_style(
+                                        span.metadata.is_bold(),
+                                        span.metadata.is_italic(),
+                                        span.metadata.is_underline(),
+                                    ),
+                                );
+                                last_byte = span.end;
+                            }
+                        }
+
+                        if last_byte < line_content.len() {
+                            let tail_text = &line_content[last_byte..];
+                            let tail_start_vis = line_content[..last_byte].chars().count();
+                            let tail_vis_w = tail_text.chars().count() as f32 * font.char_width;
+                            let tail_x = text_area_x + (tail_start_vis as f32 - self.scroll_left) * font.char_width;
+                            scene.push_text(GlyphRun::new(
+                                tail_text.to_string(),
+                                Point::new(tail_x, line_y),
+                                Rect::from_xywh(tail_x, line_y, tail_vis_w, font.line_height),
+                                theme.editor_foreground,
+                                font.font_size,
+                            ));
+                        }
+                    }
+                }
+                drop(highlighter_guard);
+
+                if !rendered_tokens {
+                    let text_w = font.text_width(&line_content);
+                    let text_x = text_area_x - self.scroll_left * font.char_width;
+                    scene.push_text(GlyphRun::new(
+                        line_content.clone(),
+                        Point::new(text_x, line_y),
+                        Rect::from_xywh(text_x, line_y, text_w, font.line_height),
+                        theme.editor_foreground,
+                        font.font_size,
+                    ));
+                }
             }
+
 
             // 5d. Cursors on this line
             if self.is_focused {
@@ -743,4 +935,62 @@ mod tests {
         assert_eq!(view.cursor_state.primary().anchor, Position::new(1, 0));
         assert_eq!(view.cursor_state.primary().active, Position::new(1, 11)); // "second line".len() == 11
     }
+
+    #[test]
+    fn test_editor_view_syntax_highlighted_rendering() {
+        use rustcode_platform::render::Rgba;
+        use rustcode_platform::theme::ThemeService;
+
+        let content = "pub fn main() {\n    let msg = \"RustCode\";\n}\n";
+        let mut view = EditorView::from_str(content);
+        let registry = GrammarRegistry::new();
+        let theme = ThemeService::default_dark_theme();
+
+        view.set_language("rust", theme.clone(), &registry);
+
+        let font = FontMetrics::default_monospace();
+        let theme_styles = WorkbenchThemeStyles::from_theme(&theme);
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut scene = Scene::new();
+        view.render(bounds, &theme_styles, &font, &mut scene);
+
+        // Verify keyword color (#C586C0) and string color (#CE9178) exist in the scene glyph runs
+        let keyword_color = Rgba::from_hex("#C586C0").unwrap();
+        let string_color = Rgba::from_hex("#CE9178").unwrap();
+
+        let has_keyword = scene.glyph_runs().iter().any(|r| r.color == keyword_color);
+        let has_string = scene.glyph_runs().iter().any(|r| r.color == string_color);
+
+        assert!(has_keyword, "Scene should contain keyword color #C586C0");
+        assert!(has_string, "Scene should contain string color #CE9178");
+    }
+
+    #[test]
+    fn test_editor_view_document_dirty_and_save() {
+        let tmp_dir = std::env::temp_dir().join(format!("rustcode_view_doc_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let file_path = tmp_dir.join("main.rs");
+
+        let fs = FileSystemService::new();
+        let doc = Arc::new(RwLock::new(TextDocument::new(
+            "fn hello() {}",
+            Some(file_path.clone()),
+            Some("rust"),
+        )));
+
+        let mut view = EditorView::new(doc.read().buffer.clone()).with_document(doc.clone());
+        assert!(!view.is_dirty());
+
+        // Type text
+        view.insert_text(" ");
+        assert!(view.is_dirty());
+
+        // Save
+        let meta = view.save_sync(&fs).unwrap();
+        assert!(!view.is_dirty());
+        assert_eq!(meta.path, file_path);
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 }
+

@@ -19,6 +19,16 @@ pub struct Emitter<T: Clone + Send + 'static> {
     next_id: Arc<AtomicU64>,
 }
 
+impl<T: Clone + Send + 'static> Clone for Emitter<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+            next_id: Arc::clone(&self.next_id),
+        }
+    }
+}
+
+
 impl<T: Clone + Send + 'static> Default for Emitter<T> {
     fn default() -> Self {
         Self::new()

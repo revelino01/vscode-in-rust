@@ -193,8 +193,32 @@ impl Scene {
     }
 
     pub fn contains_text(&self, needle: &str) -> bool {
-        self.glyph_runs().iter().any(|g| g.text.contains(needle))
+        if self.glyph_runs().iter().any(|g| g.text.contains(needle)) {
+            return true;
+        }
+
+        // Check if concatenated glyph runs on the same visual line contain the needle
+        let mut current_y: Option<f32> = None;
+        let mut line_buf = String::new();
+
+        for run in self.glyph_runs() {
+            if let Some(y) = current_y {
+                if (run.origin.y - y).abs() > 1.0 {
+                    if line_buf.contains(needle) {
+                        return true;
+                    }
+                    line_buf.clear();
+                    current_y = Some(run.origin.y);
+                }
+            } else {
+                current_y = Some(run.origin.y);
+            }
+            line_buf.push_str(&run.text);
+        }
+
+        line_buf.contains(needle)
     }
+
 
     pub fn hit_test(&self, point: Point) -> Vec<&SceneNode> {
         self.nodes

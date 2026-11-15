@@ -269,3 +269,70 @@ fn test_end_to_end_gpui_presentation_layer() {
     assert!(editor.text().starts_with("fn main()"));
     assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 0));
 }
+
+#[tokio::test]
+async fn test_end_to_end_syntax_highlighting_and_file_io() {
+    use rustcode_editor::{AutoSaveConfig, AutoSaveMode, AutoSaveService, TextDocument};
+    use rustcode_platform::fs::{FileConflict, FileSystemService};
+    use rustcode_platform::render::Rgba;
+    use std::sync::Arc;
+    use parking_lot::RwLock;
+
+
+    let tmp_dir = std::env::temp_dir().join(format!("rustcode_e2e_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let file_path = tmp_dir.join("main.rs");
+    let uri = format!("file://{}", file_path.display());
+
+    let fs = FileSystemService::new();
+    let initial_code = "pub fn add(a: i32, b: i32) -> i32 {\n    let sum = a + b;\n    sum\n}\n";
+
+    // 1. Write file atomically
+    let meta = fs.write_atomic(&file_path, initial_code).await.unwrap();
+    assert_eq!(meta.size, initial_code.len() as u64);
+
+    // 2. Open file in document model
+    let doc = Arc::new(RwLock::new(TextDocument::open_async(&file_path).await.unwrap()));
+    assert!(!doc.read().is_dirty);
+    assert_eq!(doc.read().language_id, "rust");
+
+    // 3. Set up auto-save service
+    let mut auto_save = AutoSaveService::new(AutoSaveConfig {
+        mode: AutoSaveMode::OnFocusChange,
+        delay: std::time::Duration::from_millis(50),
+    });
+    auto_save.register(doc.clone());
+
+    // 4. Create workbench window and open file with syntax highlighting
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    window.open_file(&uri, "main.rs", initial_code, false);
+
+
+    // 5. Render window to mock surface
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let scene = window.render(&mut surface);
+
+    // Verify syntax colors present: keyword purple (#C586C0)
+    let keyword_color = Rgba::from_hex("#C586C0").unwrap();
+    assert!(scene.glyph_runs().iter().any(|r| r.color == keyword_color));
+    assert!(scene.contains_text("pub fn add"));
+
+    // 6. Edit file in editor
+    let editor = window.view.editor_area.active_editor_mut().unwrap();
+    editor.insert_text("// comment\n");
+    assert!(editor.is_dirty());
+
+    // 7. Save active file
+    let saved_meta = window.view.editor_area.save_active_file(&fs).unwrap();
+    assert_eq!(saved_meta.path, file_path);
+    assert!(!window.view.editor_area.active_editor().unwrap().is_dirty());
+
+    // Verify external conflict check
+    std::fs::write(&file_path, "externally modified!").unwrap();
+    let conflict = fs.check_conflict(&file_path, &saved_meta).unwrap();
+    assert!(matches!(conflict, Some(FileConflict::ModifiedOnDisk { .. })));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+

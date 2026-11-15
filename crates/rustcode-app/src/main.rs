@@ -1,81 +1,7 @@
-//! RustCode application entry point and service bootstrap.
+//! RustCode application binary entry point.
 
-use parking_lot::Mutex;
-use rustcode_base::context_key::ContextKeyService;
-use rustcode_base::disposable::DisposableStore;
-use rustcode_ext_host::ExtensionLoader;
-use rustcode_platform::{CommandRegistry, ConfigurationService, KeybindingService, ThemeService};
-use rustcode_workbench::{EditorArea, FileExplorer, WorkbenchLayout};
-use serde_json::json;
-use std::sync::Arc;
-
-pub struct RustCodeContext {
-    pub config: ConfigurationService,
-    pub commands: CommandRegistry,
-    pub keybindings: KeybindingService,
-    pub context_keys: ContextKeyService,
-    pub theme: ThemeService,
-    pub layout: WorkbenchLayout,
-    pub editor_area: EditorArea,
-    pub explorer: FileExplorer,
-    pub ext_loader: ExtensionLoader,
-    pub disposables: Arc<Mutex<DisposableStore>>,
-}
-
-impl Default for RustCodeContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RustCodeContext {
-    pub fn new() -> Self {
-        let config = ConfigurationService::new();
-        let commands = CommandRegistry::new();
-        let keybindings = KeybindingService::new();
-        let context_keys = ContextKeyService::new();
-        let theme = ThemeService::new();
-        let layout = WorkbenchLayout::new();
-        let editor_area = EditorArea::new();
-        let explorer = FileExplorer::new();
-        let ext_loader = ExtensionLoader::new();
-        let disposables = Arc::new(Mutex::new(DisposableStore::new()));
-
-        let ctx = Self {
-            config,
-            commands,
-            keybindings,
-            context_keys,
-            theme,
-            layout,
-            editor_area,
-            explorer,
-            ext_loader,
-            disposables,
-        };
-        ctx.register_builtin_commands();
-        ctx
-    }
-
-    fn register_builtin_commands(&self) {
-        let mut store = self.disposables.lock();
-
-        store.add_boxed(self.commands.register("workbench.action.toggleSidebar", |_| {
-            println!("[RustCode] Toggling sidebar visibility");
-            Ok(json!({ "toggled": true }))
-        }));
-
-        store.add_boxed(self.commands.register("workbench.action.openSettings", |_| {
-            println!("[RustCode] Opening settings");
-            Ok(json!({ "opened": "settings.json" }))
-        }));
-
-        store.add_boxed(self.commands.register("workbench.action.showCommands", |_| {
-            println!("[RustCode] Opening Command Palette");
-            Ok(json!({ "palette": "opened" }))
-        }));
-    }
-}
+use rustcode_app::RustCodeContext;
+use rustcode_platform::render::MockRenderSurface;
 
 fn main() {
     println!("=======================================================");
@@ -94,17 +20,15 @@ fn main() {
     let res = app.commands.execute("workbench.action.toggleSidebar", None).unwrap();
     println!("Executed builtin command: {}", res);
 
+    // Bootstrap GPUI WorkbenchWindow host
+    let window = app.create_window();
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let scene = window.render(&mut surface);
+    println!(
+        "Rendered GPUI Scene: {} quads, {} text runs",
+        scene.quads().len(),
+        scene.glyph_runs().len()
+    );
+
     println!("Bootstrap completed successfully.");
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_rustcode_bootstrap() {
-        let app = RustCodeContext::new();
-        assert!(app.commands.has_command("workbench.action.toggleSidebar"));
-        assert_eq!(app.config.get::<u32>("editor.fontSize"), Some(14));
-    }
 }

@@ -121,6 +121,7 @@ struct KeybindingEntryRaw {
     when: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct KeybindingService {
     bindings: Arc<RwLock<Vec<ResolvedKeybinding>>>,
     pending_chord: Arc<RwLock<Option<KeyCombo>>>,

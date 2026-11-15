@@ -5,8 +5,10 @@
 
 pub mod cursor;
 pub mod model;
+pub mod view;
 pub mod viewmodel;
 
 pub use cursor::{CursorState, Position, Range, Selection};
 pub use model::{Piece, PieceSource, PieceTable, TextEdit, UndoElement, UndoRedoStack};
+pub use view::EditorView;
 pub use viewmodel::{DecorationKind, DecorationModel, LineDecoration};

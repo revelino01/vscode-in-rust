@@ -57,6 +57,7 @@ struct RawTokenSettings {
     font_style: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ThemeService {
     current_theme: ColorTheme,
 }

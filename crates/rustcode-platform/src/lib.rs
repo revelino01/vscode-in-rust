@@ -8,10 +8,17 @@ pub mod commands;
 pub mod configuration;
 pub mod fs;
 pub mod keybindings;
+pub mod render;
 pub mod theme;
 
 pub use commands::{CommandCallback, CommandRegistry};
 pub use configuration::{ConfigurationChangeEvent, ConfigurationService, ConfigurationTarget};
 pub use fs::{FileChangeEvent, FileChangeType, FileSystemService};
 pub use keybindings::{KeyChord, KeyCombo, KeybindingService, Modifiers, ResolvedKeybinding};
+pub use render::{
+    Corners, Edges, EventResult, FontMetrics, GlyphRun, GpuiElement, Hsla, InputEvent, KeyCode,
+    KeyEvent, MockRenderSurface, MouseButton, MouseEvent, MouseMoveEvent, Point, Quad, Rect,
+    RenderSurface, Rgba, Scene, SceneNode, ScrollEvent, Shadow, Size, View, ViewContext,
+    WorkbenchThemeStyles,
+};
 pub use theme::{ColorTheme, ThemeKind, ThemeService, TokenColorRule};

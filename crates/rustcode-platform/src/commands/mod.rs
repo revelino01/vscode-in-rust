@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 pub type CommandCallback = Arc<dyn Fn(Option<Value>) -> Result<Value, String> + Send + Sync + 'static>;
 
+#[derive(Clone)]
 pub struct CommandRegistry {
     commands: Arc<RwLock<HashMap<String, CommandCallback>>>,
 }

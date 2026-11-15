@@ -148,6 +148,7 @@ impl PieceTable {
     }
 
     /// Create a piece table initialized with content.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(content: &str) -> Self {
         let len = content.len();
         let lf = count_line_feeds(content);
@@ -383,6 +384,7 @@ impl PieceTable {
     }
 
     /// Extract entire content as a String.
+    #[allow(clippy::inherent_to_string_shadow_display)]
     pub fn to_string(&self) -> String {
         self.get_range(0, self.len())
     }

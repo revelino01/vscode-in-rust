@@ -183,7 +183,6 @@ fn map_ext_to_lang_id(ext: &str) -> String {
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
 

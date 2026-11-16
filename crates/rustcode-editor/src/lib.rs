@@ -3,6 +3,7 @@
 //! Provides the core text buffer backed by a high-performance Piece Table,
 //! transactional undo/redo history, and cursor/selection management.
 
+pub mod completion;
 pub mod cursor;
 pub mod document;
 pub mod model;
@@ -10,6 +11,10 @@ pub mod syntax;
 pub mod view;
 pub mod viewmodel;
 
+pub use completion::{
+    expand_snippet, fuzzy_match, AutocompleteWidget, CompletionItem, CompletionItemKind,
+    CompletionList,
+};
 pub use cursor::{CursorState, Position, Range, Selection};
 pub use document::{AutoSaveConfig, AutoSaveMode, AutoSaveService, TextDocument};
 pub use model::{Piece, PieceSource, PieceTable, TextEdit, UndoElement, UndoRedoStack};

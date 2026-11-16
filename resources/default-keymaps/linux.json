@@ -35,5 +35,10 @@
   {
     "key": "ctrl+`",
     "command": "workbench.action.terminal.toggleTerminal"
+  },
+  {
+    "key": "ctrl+space",
+    "command": "editor.action.triggerSuggest",
+    "when": "editorTextFocus && !editorReadonly"
   }
 ]

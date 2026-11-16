@@ -3,96 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub mod lsp {
-    use super::*;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-    pub enum DiagnosticSeverity {
-        Error = 1,
-        Warning = 2,
-        Information = 3,
-        Hint = 4,
-    }
-
-    impl<'de> serde::Deserialize<'de> for DiagnosticSeverity {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            struct SeverityVisitor;
-            impl<'de> serde::de::Visitor<'de> for SeverityVisitor {
-                type Value = DiagnosticSeverity;
-
-                fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                    formatter.write_str("an integer severity (0-4) or severity name")
-                }
-
-                fn visit_u64<E>(self, value: u64) -> Result<DiagnosticSeverity, E>
-                where
-                    E: serde::de::Error,
-                {
-                    match value {
-                        0 | 1 => Ok(DiagnosticSeverity::Error),
-                        2 => Ok(DiagnosticSeverity::Warning),
-                        3 => Ok(DiagnosticSeverity::Information),
-                        4 => Ok(DiagnosticSeverity::Hint),
-                        _ => Err(E::custom(format!("invalid diagnostic severity: {}", value))),
-                    }
-                }
-
-                fn visit_i64<E>(self, value: i64) -> Result<DiagnosticSeverity, E>
-                where
-                    E: serde::de::Error,
-                {
-                    self.visit_u64(value as u64)
-                }
-
-                fn visit_str<E>(self, value: &str) -> Result<DiagnosticSeverity, E>
-                where
-                    E: serde::de::Error,
-                {
-                    match value.to_ascii_lowercase().as_str() {
-                        "error" => Ok(DiagnosticSeverity::Error),
-                        "warning" => Ok(DiagnosticSeverity::Warning),
-                        "information" | "info" => Ok(DiagnosticSeverity::Information),
-                        "hint" => Ok(DiagnosticSeverity::Hint),
-                        _ => Err(E::custom(format!("invalid diagnostic severity string: {}", value))),
-                    }
-                }
-            }
-
-            deserializer.deserialize_any(SeverityVisitor)
-        }
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct LspPosition {
-        pub line: u32,
-        pub character: u32,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct LspRange {
-        pub start: LspPosition,
-        pub end: LspPosition,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct LspDiagnostic {
-        pub range: LspRange,
-        pub severity: Option<DiagnosticSeverity>,
-        pub message: String,
-        pub source: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct LspCompletionItem {
-        pub label: String,
-        pub detail: Option<String>,
-        pub documentation: Option<String>,
-        pub insert_text: Option<String>,
-    }
-}
+pub mod lsp;
 
 pub mod git {
     use super::*;
@@ -144,8 +55,8 @@ pub mod dap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lsp::*;
     use git::*;
+    use lsp::*;
 
     #[test]
     fn test_lsp_and_git_protocols() {

@@ -43,8 +43,8 @@
 
 
 ### Phase 2: Language Intelligence & Marketplace
-- [ ] `languages.*` LSP client lifecycle
-- [ ] Autocomplete UI widget
+- [x] `languages.*` LSP client lifecycle (stdio JSON-RPC transport with framed message headers `Content-Length: ...\r\n\r\n`, full document lifecycle syncing `textDocument/didOpen`, `textDocument/didChange` with incremental & full edits, `textDocument/didClose`, request routing for completion, hover, and definition, LanguageFeatureBridge aggregating LSP and extension host providers)
+- [x] Autocomplete UI widget (GPUI popover overlay anchored at active cursor position in `EditorView`, triggered automatically on trigger characters `.` / `:` / `/` or manually with `Ctrl+Space`, live fuzzy matching and prefix filtering, arrow key selection `Up`/`Down`, `Tab` / `Enter` commit with snippet tabstop expansion into PieceTable buffer, `Escape` dismiss, and detail / documentation preview panel)
 - [ ] Diagnostics squiggly underlines & Problems panel
 - [ ] Open VSX marketplace client (.vsix package downloader)
 

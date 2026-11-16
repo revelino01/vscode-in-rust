@@ -11,5 +11,5 @@ pub use manifest::{
     ContributedCommand, Contributions, ExtensionLoader, ExtensionManifest, KeybindingContribution,
     LanguageContribution, LoadedExtension, ThemeContribution,
 };
-pub use provider::{ProviderRegistration, ProviderRegistry, ProviderType};
+pub use provider::{LanguageFeatureBridge, ProviderRegistration, ProviderRegistry, ProviderType};
 pub use rpc::{RpcBridge, RpcMessage};

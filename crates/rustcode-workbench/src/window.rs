@@ -139,6 +139,11 @@ impl WorkbenchWindow {
                     editor.redo();
                 }
             }
+            "editor.action.triggerSuggest" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.trigger_suggest(None);
+                }
+            }
             _ => {}
         }
     }

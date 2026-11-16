@@ -1,5 +1,8 @@
 //! Provider callback registry for language intelligence and tree views.
 
+pub mod bridge;
+
+pub use bridge::LanguageFeatureBridge;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

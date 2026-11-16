@@ -339,3 +339,160 @@ async fn test_end_to_end_syntax_highlighting_and_file_io() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+#[tokio::test]
+async fn test_end_to_end_lsp_and_autocomplete_integration() {
+    use rustcode_editor::{CompletionItem, CompletionItemKind};
+    use rustcode_ext_host::{LanguageFeatureBridge, ProviderRegistry};
+    use rustcode_protocols::lsp::{
+        read_framed_message, write_framed_message, InitializeParams, LspClient, LspClientManager,
+        LspPosition,
+    };
+    use std::sync::Arc;
+    use tokio::io::duplex;
+
+    // 1. Set up LSP Client with Mock Language Server over duplex
+    let (client_read, mut server_write) = duplex(4096);
+    let (mut server_read, client_write) = duplex(4096);
+    let lsp_client = Arc::new(LspClient::from_io(client_read, client_write));
+
+    tokio::spawn(async move {
+        let mut buf = Vec::new();
+
+        // Expect initialize
+        let msg = read_framed_message(&mut server_read, &mut buf).await.unwrap().unwrap();
+        let req: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(req["method"], "initialize");
+        let id = req["id"].as_u64().unwrap();
+        let resp = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "capabilities": {
+                    "textDocumentSync": 1,
+                    "completionProvider": { "triggerCharacters": [".", ":"] }
+                }
+            }
+        });
+        write_framed_message(&mut server_write, &serde_json::to_vec(&resp).unwrap()).await.unwrap();
+
+        // Expect initialized
+        let msg = read_framed_message(&mut server_read, &mut buf).await.unwrap().unwrap();
+        let notif: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(notif["method"], "initialized");
+
+        // Expect didOpen
+        let msg = read_framed_message(&mut server_read, &mut buf).await.unwrap().unwrap();
+        let open: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(open["method"], "textDocument/didOpen");
+
+        // Expect completion request
+        let msg = read_framed_message(&mut server_read, &mut buf).await.unwrap().unwrap();
+        let comp: serde_json::Value = serde_json::from_slice(&msg).unwrap();
+        assert_eq!(comp["method"], "textDocument/completion");
+        let comp_id = comp["id"].as_u64().unwrap();
+        let comp_resp = json!({
+            "jsonrpc": "2.0",
+            "id": comp_id,
+            "result": [
+                {
+                    "label": "to_uppercase",
+                    "kind": 2,
+                    "detail": "fn(&self) -> String",
+                    "documentation": "Returns a new uppercase copy of the string.",
+                    "insertText": "to_uppercase()"
+                }
+            ]
+        });
+        write_framed_message(&mut server_write, &serde_json::to_vec(&comp_resp).unwrap()).await.unwrap();
+    });
+
+    let lsp_mgr = Arc::new(LspClientManager::new());
+    lsp_client.initialize(InitializeParams::default()).await.unwrap();
+    lsp_client.initialized().await.unwrap();
+    lsp_mgr.attach_client("rust", lsp_client.clone());
+
+    // 2. Set up LanguageFeatureBridge
+    let reg = Arc::new(ProviderRegistry::new());
+    let rpc = Arc::new(rustcode_ext_host::RpcBridge::new());
+    let bridge = Arc::new(LanguageFeatureBridge::new(reg, rpc, lsp_mgr.clone()));
+
+    // 3. Set up RustCode window and open document
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    let initial_text = "fn main() {\n    let text = \"rust\";\n}\n";
+    window.open_file("file:///workspace/main.rs", "main.rs", initial_text, false);
+
+    // Sync didOpen to LSP
+    lsp_mgr
+        .did_open_document("file:///workspace/main.rs", "rust", 1, initial_text)
+        .await
+        .unwrap();
+
+    // Query completions from LSP via bridge
+    let lsp_items = bridge
+        .request_completions(
+            "file:///workspace/main.rs",
+            "rust",
+            LspPosition::new(1, 20),
+            Some('.'),
+        )
+        .await;
+    assert_eq!(lsp_items.len(), 1);
+    assert_eq!(lsp_items[0].label, "to_uppercase");
+
+    // 4. Attach completion provider to active editor view
+    let editor = window.view.editor_area.active_editor_mut().unwrap();
+    editor.completion_provider = Some(Arc::new(move |_lang, _pos, _trigger| {
+        vec![CompletionItem::new("to_uppercase")
+            .with_kind(CompletionItemKind::Method)
+            .with_detail("fn(&self) -> String")
+            .with_doc("Returns a new uppercase copy of the string.")
+            .with_insert_text("to_uppercase()")]
+    }));
+
+    // Move cursor right after "text" in `let text = "rust";` (line 1, column 12)
+    editor.set_primary_position(rustcode_editor::cursor::Position::new(1, 12));
+
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+
+    // 5. Type '.' -> Triggers autocomplete
+    let dot_ev = InputEvent::KeyDown(KeyEvent::new(KeyCode::Char('.'), Modifiers::none()));
+    let res = window.dispatch_event(&dot_ev, bounds);
+    assert_eq!(res, EventResult::Consumed);
+
+    assert!(window
+        .view
+        .editor_area
+        .active_editor()
+        .unwrap()
+        .autocomplete
+        .is_visible);
+
+    // Type "to_u" to live-filter completion candidates specifically to "to_uppercase"
+    for ch in "to_u".chars() {
+        window.dispatch_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+            bounds,
+        );
+    }
+
+    // 6. Render surface: verify autocomplete popover & documentation preview present in scene graph
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("to_uppercase"));
+    assert!(scene.contains_text("fn(&self) -> String"));
+
+    // 7. Commit completion item with Tab key
+    let tab_ev = InputEvent::KeyDown(KeyEvent::new(KeyCode::Tab, Modifiers::none()));
+    let res = window.dispatch_event(&tab_ev, bounds);
+    assert_eq!(res, EventResult::Consumed);
+
+    let editor_mut = window.view.editor_area.active_editor_mut().unwrap();
+    assert!(!editor_mut.autocomplete.is_visible);
+    assert!(editor_mut.text().contains("let text.to_uppercase() = \"rust\";"));
+
+    // 8. Undo reverts completion
+    assert!(editor_mut.undo());
+    assert!(editor_mut.text().contains("let text.to_u = \"rust\";"));
+}
+

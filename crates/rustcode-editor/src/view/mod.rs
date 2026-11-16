@@ -1,5 +1,6 @@
 //! GPUI EditorView component rendering text lines, line numbers, cursor, selections, and routing input.
 
+use crate::completion::{AutocompleteWidget, CompletionItem, CompletionItemKind};
 use crate::cursor::{CursorState, Position};
 use crate::document::TextDocument;
 use crate::model::piece_table::PieceTable;
@@ -14,6 +15,9 @@ use rustcode_platform::render::{
 use rustcode_platform::theme::ColorTheme;
 use std::sync::Arc;
 
+pub type CompletionProviderFn =
+    Arc<dyn Fn(&str, Position, Option<char>) -> Vec<CompletionItem> + Send + Sync>;
+
 pub struct EditorView {
     pub buffer: Arc<RwLock<PieceTable>>,
     pub cursor_state: CursorState,
@@ -23,6 +27,8 @@ pub struct EditorView {
     pub is_focused: bool,
     pub syntax_highlighter: Mutex<Option<SyntaxHighlighter>>,
     pub document: Option<Arc<RwLock<TextDocument>>>,
+    pub autocomplete: AutocompleteWidget,
+    pub completion_provider: Option<CompletionProviderFn>,
 }
 
 impl EditorView {
@@ -36,6 +42,8 @@ impl EditorView {
             is_focused: true,
             syntax_highlighter: Mutex::new(None),
             document: None,
+            autocomplete: AutocompleteWidget::new(),
+            completion_provider: None,
         }
     }
 
@@ -46,6 +54,11 @@ impl EditorView {
 
     pub fn with_document(mut self, doc: Arc<RwLock<TextDocument>>) -> Self {
         self.set_document(doc);
+        self
+    }
+
+    pub fn with_completion_provider(mut self, provider: CompletionProviderFn) -> Self {
+        self.completion_provider = Some(provider);
         self
     }
 
@@ -120,6 +133,63 @@ impl EditorView {
         let line_count = self.buffer.read().line_count();
         let digits = line_count.to_string().len();
         ((digits + 2) as f32 * font.char_width).max(40.0)
+    }
+
+    pub fn trigger_suggest(&mut self, trigger_char: Option<char>) {
+        let pos = self.primary_position();
+        let lang = self
+            .document
+            .as_ref()
+            .map(|d| d.read().language_id.clone())
+            .unwrap_or_else(|| "rust".to_string());
+
+        let mut items = Vec::new();
+
+        // 1. Query external completion provider if attached
+        if let Some(provider) = &self.completion_provider {
+            let prov_items = (provider)(&lang, pos, trigger_char);
+            items.extend(prov_items);
+        }
+
+        // 2. Built-in keywords, snippets, and document identifiers
+        let text = self.buffer.read().to_string();
+        let builtin = get_builtin_completions(&lang, trigger_char, &text);
+        for b in builtin {
+            if !items.iter().any(|i| i.label == b.label) {
+                items.push(b);
+            }
+        }
+
+        if !items.is_empty() {
+            self.autocomplete.show(items, pos, trigger_char);
+        }
+    }
+
+    pub fn commit_autocomplete(&mut self) -> bool {
+        if !self.autocomplete.is_visible {
+            return false;
+        }
+
+        let primary_before = self.primary_position();
+        let mut buf = self.buffer.write();
+        let committed = self.autocomplete.commit(
+            &mut buf,
+            &mut self.cursor_state,
+            &mut self.undo_stack,
+        );
+        drop(buf);
+
+        if committed.is_some() {
+            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+                sh.invalidate_from(primary_before.line);
+            }
+            if let Some(doc) = &self.document {
+                doc.write().mark_edited();
+            }
+            true
+        } else {
+            false
+        }
     }
 
     // --- Editing & Movement Operations ---
@@ -640,6 +710,24 @@ impl View for EditorView {
                 }
             }
         }
+
+        // 6. Autocomplete Popover Overlay
+        if self.autocomplete.is_visible {
+            let buf = self.buffer.read();
+            let line_content = buf.get_line_content(primary_pos.line).unwrap_or_default();
+            let visual_col = line_content[..primary_pos.column.min(line_content.len())].chars().count();
+            let cursor_x = text_area_x + (visual_col as f32 - self.scroll_left) * font.char_width;
+            let cursor_y = bounds.min_y() + (primary_pos.line as f32 - self.scroll_top) * font.line_height;
+            drop(buf);
+
+            self.autocomplete.render(
+                Point::new(cursor_x, cursor_y),
+                bounds,
+                theme,
+                font,
+                scene,
+            );
+        }
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
@@ -652,6 +740,30 @@ impl View for EditorView {
                     return EventResult::Ignored;
                 }
                 self.is_focused = true;
+
+                // Check click in autocomplete popover or documentation panel
+                if self.autocomplete.is_visible {
+                    let maybe_pop = *self.autocomplete.last_bounds.lock();
+                    if let Some(pop_bounds) = maybe_pop {
+                        if pop_bounds.contains(mouse.position) {
+                            let item_idx = self.autocomplete.scroll_offset
+                                + ((mouse.position.y - pop_bounds.min_y() - 2.0) / 24.0).floor().max(0.0) as usize;
+                            if item_idx < self.autocomplete.filtered_items.len() {
+                                self.autocomplete.selected_index = item_idx;
+                                self.commit_autocomplete();
+                                return EventResult::Consumed;
+                            }
+                        }
+                    }
+                    let maybe_doc = *self.autocomplete.last_doc_bounds.lock();
+                    if let Some(doc_bounds) = maybe_doc {
+                        if doc_bounds.contains(mouse.position) {
+                            return EventResult::Consumed;
+                        }
+                    }
+                    self.autocomplete.hide();
+                }
+
                 if mouse.position.x >= bounds.min_x() + gutter_w {
                     let buf = self.buffer.read();
                     let line_count = buf.line_count();
@@ -711,6 +823,12 @@ impl View for EditorView {
                     return EventResult::Ignored;
                 }
 
+                // Check manual trigger suggest keybinding: Ctrl+Space
+                if key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta && key.key == KeyCode::Space {
+                    self.trigger_suggest(None);
+                    return EventResult::Consumed;
+                }
+
                 // Check undo / redo key combinations
                 if key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta {
                     if key.key == KeyCode::Char('z') && !key.modifiers.shift {
@@ -730,6 +848,87 @@ impl View for EditorView {
                         self.cursor_state.primary_mut().anchor = Position::new(0, 0);
                         self.cursor_state.primary_mut().active = Position::new(last_line, last_col);
                         return EventResult::Consumed;
+                    }
+                }
+
+                // Intercept autocomplete controls when suggestion popup is active
+                if self.autocomplete.is_visible {
+                    match &key.key {
+                        KeyCode::ArrowUp => {
+                            self.autocomplete.select_prev();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::ArrowDown => {
+                            self.autocomplete.select_next();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Tab | KeyCode::Enter => {
+                            if self.commit_autocomplete() {
+                                return EventResult::Consumed;
+                            }
+                        }
+                        KeyCode::Escape => {
+                            self.autocomplete.hide();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Backspace => {
+                            self.delete_backwards();
+                            let new_pos = self.primary_position();
+                            let trigger_pos = self.autocomplete.trigger_position;
+                            if new_pos.line != trigger_pos.line || new_pos.column < trigger_pos.column {
+                                self.autocomplete.hide();
+                            } else {
+                                let buf = self.buffer.read();
+                                if let Some(content) = buf.get_line_content(new_pos.line) {
+                                    let start = trigger_pos.column.min(content.len());
+                                    let end = new_pos.column.min(content.len());
+                                    let prefix = if end >= start
+                                        && content.is_char_boundary(start)
+                                        && content.is_char_boundary(end)
+                                    {
+                                        &content[start..end]
+                                    } else {
+                                        ""
+                                    };
+                                    self.autocomplete.update_filter(prefix);
+                                }
+                            }
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Char(c)
+                            if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta =>
+                        {
+                            let ch = if key.modifiers.shift {
+                                c.to_ascii_uppercase()
+                            } else {
+                                *c
+                            };
+                            let s = ch.to_string();
+                            self.insert_text(&s);
+
+                            if ch == '.' || ch == ':' || ch == '/' {
+                                self.trigger_suggest(Some(ch));
+                            } else {
+                                let new_pos = self.primary_position();
+                                let trigger_pos = self.autocomplete.trigger_position;
+                                let buf = self.buffer.read();
+                                if let Some(content) = buf.get_line_content(new_pos.line) {
+                                    let start = trigger_pos.column.min(content.len());
+                                    let end = new_pos.column.min(content.len());
+                                    let prefix = if end >= start
+                                        && content.is_char_boundary(start)
+                                        && content.is_char_boundary(end)
+                                    {
+                                        &content[start..end]
+                                    } else {
+                                        ""
+                                    };
+                                    self.autocomplete.update_filter(prefix);
+                                }
+                            }
+                            return EventResult::Consumed;
+                        }
+                        _ => {}
                     }
                 }
 
@@ -782,7 +981,18 @@ impl View for EditorView {
                         let ch = if key.modifiers.shift { c.to_ascii_uppercase() } else { *c };
                         let s = ch.to_string();
                         self.insert_text(&s);
+                        if ch == '.' || ch == ':' || ch == '/' {
+                            self.trigger_suggest(Some(ch));
+                        }
                         EventResult::Consumed
+                    }
+                    KeyCode::Escape => {
+                        if self.autocomplete.is_visible {
+                            self.autocomplete.hide();
+                            EventResult::Consumed
+                        } else {
+                            EventResult::Ignored
+                        }
                     }
                     _ => {
                         if let Some(txt) = &key.text {
@@ -797,6 +1007,317 @@ impl View for EditorView {
             _ => EventResult::Ignored,
         }
     }
+}
+
+pub fn get_builtin_completions(
+    lang: &str,
+    trigger_char: Option<char>,
+    text: &str,
+) -> Vec<CompletionItem> {
+    let mut items = Vec::new();
+
+    if trigger_char == Some('.') {
+        match lang {
+            "rust" => {
+                items.push(
+                    CompletionItem::new("clone")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(&self) -> Self")
+                        .with_doc("Returns a copy of the value.")
+                        .with_insert_text("clone()"),
+                );
+                items.push(
+                    CompletionItem::new("to_string")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(&self) -> String")
+                        .with_doc("Converts the given value to a String.")
+                        .with_insert_text("to_string()"),
+                );
+                items.push(
+                    CompletionItem::new("len")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(&self) -> usize")
+                        .with_doc("Returns the number of elements in the container.")
+                        .with_insert_text("len()"),
+                );
+                items.push(
+                    CompletionItem::new("is_empty")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(&self) -> bool")
+                        .with_doc("Returns true if the container has a length of 0.")
+                        .with_insert_text("is_empty()"),
+                );
+                items.push(
+                    CompletionItem::new("iter")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(&self) -> Iter<'_, T>")
+                        .with_doc("Returns an iterator over the slice.")
+                        .with_insert_text("iter()"),
+                );
+                items.push(
+                    CompletionItem::new("map")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn<B, F>(self, f: F) -> Map<Self, F>")
+                        .with_doc("Takes a closure and creates an iterator which calls that closure on each element.")
+                        .with_insert_text("map(|$1| $0)"),
+                );
+                items.push(
+                    CompletionItem::new("unwrap")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(self) -> T")
+                        .with_doc("Returns the contained Some or Ok value, or panics.")
+                        .with_insert_text("unwrap()"),
+                );
+                items.push(
+                    CompletionItem::new("push")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(&mut self, value: T)")
+                        .with_doc("Appends an element to the back of a collection.")
+                        .with_insert_text("push($0)"),
+                );
+                items.push(
+                    CompletionItem::new("contains")
+                        .with_kind(CompletionItemKind::Method)
+                        .with_detail("fn(&self, x: &T) -> bool")
+                        .with_insert_text("contains(&$0)"),
+                );
+            }
+            "javascript" | "typescript" => {
+                for (name, detail, doc) in [
+                    ("length", "number", "The length of the array or string."),
+                    (
+                        "map",
+                        "(callback: (value: T) => U) => U[]",
+                        "Calls a defined callback function on each element of an array.",
+                    ),
+                    (
+                        "filter",
+                        "(predicate: (value: T) => boolean) => T[]",
+                        "Returns the elements of an array that meet the condition.",
+                    ),
+                    (
+                        "forEach",
+                        "(callback: (value: T) => void) => void",
+                        "Performs the specified action for each element in an array.",
+                    ),
+                    (
+                        "push",
+                        "(...items: T[]) => number",
+                        "Appends new elements to the end of an array.",
+                    ),
+                    (
+                        "pop",
+                        "() => T | undefined",
+                        "Removes the last element from an array and returns it.",
+                    ),
+                    (
+                        "indexOf",
+                        "(searchElement: T) => number",
+                        "Returns the index of the first occurrence of a value in an array.",
+                    ),
+                    (
+                        "includes",
+                        "(searchElement: T) => boolean",
+                        "Determines whether an array includes a certain element.",
+                    ),
+                    (
+                        "toString",
+                        "() => string",
+                        "Returns a string representation of an object.",
+                    ),
+                ] {
+                    items.push(
+                        CompletionItem::new(name)
+                            .with_kind(CompletionItemKind::Method)
+                            .with_detail(detail)
+                            .with_doc(doc)
+                            .with_insert_text(if name == "length" {
+                                "length".to_string()
+                            } else {
+                                format!("{}()", name)
+                            }),
+                    );
+                }
+            }
+            "python" => {
+                for (name, detail, doc) in [
+                    (
+                        "append",
+                        "def append(self, object: _T) -> None",
+                        "Append object to the end of the list.",
+                    ),
+                    (
+                        "extend",
+                        "def extend(self, iterable: Iterable[_T]) -> None",
+                        "Extend list by appending elements from the iterable.",
+                    ),
+                    (
+                        "get",
+                        "def get(self, key: _KT, default: _VT = ...) -> _VT",
+                        "Return the value for key if key is in the dictionary.",
+                    ),
+                    (
+                        "keys",
+                        "def keys(self) -> dict_keys",
+                        "Return a new view of the dictionary's keys.",
+                    ),
+                    (
+                        "values",
+                        "def values(self) -> dict_values",
+                        "Return a new view of the dictionary's values.",
+                    ),
+                    (
+                        "items",
+                        "def items(self) -> dict_items",
+                        "Return a new view of the dictionary's items.",
+                    ),
+                    (
+                        "split",
+                        "def split(self, sep: str | None = None) -> list[str]",
+                        "Return a list of the words in the string.",
+                    ),
+                    (
+                        "strip",
+                        "def strip(self, chars: str | None = None) -> str",
+                        "Return a copy of the string with whitespace removed.",
+                    ),
+                ] {
+                    items.push(
+                        CompletionItem::new(name)
+                            .with_kind(CompletionItemKind::Method)
+                            .with_detail(detail)
+                            .with_doc(doc)
+                            .with_insert_text(format!("{}()", name)),
+                    );
+                }
+            }
+            _ => {}
+        }
+    } else if trigger_char == Some(':') {
+        if lang == "rust" {
+            items.push(
+                CompletionItem::new("new")
+                    .with_kind(CompletionItemKind::Function)
+                    .with_detail("fn() -> Self")
+                    .with_doc("Constructs a new instance.")
+                    .with_insert_text("new()"),
+            );
+            items.push(
+                CompletionItem::new("default")
+                    .with_kind(CompletionItemKind::Function)
+                    .with_detail("fn() -> Self")
+                    .with_doc("Returns the default value for the type.")
+                    .with_insert_text("default()"),
+            );
+            items.push(
+                CompletionItem::new("from")
+                    .with_kind(CompletionItemKind::Function)
+                    .with_detail("fn(t: T) -> Self")
+                    .with_doc("Converts to this type from the input type.")
+                    .with_insert_text("from($0)"),
+            );
+        }
+    } else {
+        match lang {
+            "rust" => {
+                let keywords = [
+                    "fn", "let", "mut", "pub", "struct", "enum", "impl", "trait", "match", "if",
+                    "else", "return", "use", "mod", "crate", "self", "Self", "true", "false",
+                    "async", "await", "where", "for", "while", "loop", "break", "continue", "type",
+                ];
+                for kw in keywords {
+                    items.push(CompletionItem::new(kw).with_kind(CompletionItemKind::Keyword));
+                }
+
+                let types = [
+                    "String", "Vec", "Option", "Result", "Some", "None", "Ok", "Err", "HashMap",
+                    "Arc", "Mutex", "RwLock", "Box", "u8", "u32", "u64", "i32", "i64", "f32",
+                    "f64", "bool", "usize",
+                ];
+                for t in types {
+                    items.push(CompletionItem::new(t).with_kind(CompletionItemKind::Struct));
+                }
+
+                items.push(
+                    CompletionItem::new("println!")
+                        .with_kind(CompletionItemKind::Snippet)
+                        .with_detail("macro")
+                        .with_doc("Prints to the standard output, with a newline.")
+                        .with_insert_text("println!(\"{}\", $0);"),
+                );
+                items.push(
+                    CompletionItem::new("eprintln!")
+                        .with_kind(CompletionItemKind::Snippet)
+                        .with_detail("macro")
+                        .with_doc("Prints to the standard error, with a newline.")
+                        .with_insert_text("eprintln!(\"{}\", $0);"),
+                );
+                items.push(
+                    CompletionItem::new("fn")
+                        .with_kind(CompletionItemKind::Snippet)
+                        .with_detail("Function template")
+                        .with_doc("Define a new function.")
+                        .with_insert_text("fn ${1:name}() {\n    $0\n}"),
+                );
+                items.push(
+                    CompletionItem::new("struct")
+                        .with_kind(CompletionItemKind::Snippet)
+                        .with_detail("Struct template")
+                        .with_doc("Define a new struct.")
+                        .with_insert_text("struct ${1:Name} {\n    $0\n}"),
+                );
+            }
+            "javascript" | "typescript" => {
+                let keywords = [
+                    "function", "const", "let", "var", "if", "else", "return", "import", "export",
+                    "from", "class", "async", "await", "try", "catch", "throw", "new", "this",
+                    "typeof", "instanceof", "null", "undefined", "true", "false",
+                ];
+                for kw in keywords {
+                    items.push(CompletionItem::new(kw).with_kind(CompletionItemKind::Keyword));
+                }
+                items.push(
+                    CompletionItem::new("console.log")
+                        .with_kind(CompletionItemKind::Snippet)
+                        .with_detail("console.log(data)")
+                        .with_doc("Prints output to the console.")
+                        .with_insert_text("console.log($0);"),
+                );
+            }
+            "python" => {
+                let keywords = [
+                    "def", "class", "import", "from", "as", "if", "elif", "else", "for", "while",
+                    "return", "yield", "try", "except", "finally", "with", "raise", "pass", "True",
+                    "False", "None", "lambda", "async", "await",
+                ];
+                for kw in keywords {
+                    items.push(CompletionItem::new(kw).with_kind(CompletionItemKind::Keyword));
+                }
+                items.push(
+                    CompletionItem::new("print")
+                        .with_kind(CompletionItemKind::Snippet)
+                        .with_detail("print(*values)")
+                        .with_doc("Prints values to a stream, or to sys.stdout by default.")
+                        .with_insert_text("print($0)"),
+                );
+            }
+            _ => {}
+        }
+
+        // Scan identifiers from document text
+        let mut seen = std::collections::HashSet::new();
+        for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if word.len() >= 3
+                && !word.chars().next().unwrap().is_ascii_digit()
+                && seen.insert(word)
+                && !items.iter().any(|i| i.label == word)
+            {
+                items.push(CompletionItem::new(word).with_kind(CompletionItemKind::Variable));
+            }
+        }
+    }
+
+    items
 }
 
 #[cfg(test)]
@@ -1056,6 +1577,163 @@ mod tests {
         let mut scene2 = Scene::new();
         view.render(bounds, &theme_styles, &font, &mut scene2);
         assert!(scene2.glyph_runs().iter().any(|r| r.color == comment_color));
+    }
+
+    #[test]
+    fn test_editor_view_autocomplete_trigger_characters_and_commit() {
+        let content = "let x = foo;";
+        let mut view = EditorView::from_str(content);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Move cursor right after "foo" (column 11)
+        view.set_primary_position(Position::new(0, 11));
+
+        // Type trigger character '.'
+        let dot_key = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Char('.'),
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        let res = view.handle_event(&dot_key, bounds);
+        assert_eq!(res, EventResult::Consumed);
+
+        // Autocomplete popover should now be visible with method suggestions
+        assert!(view.autocomplete.is_visible);
+        assert!(view.autocomplete.filtered_items.iter().any(|(i, _)| i.label == "clone"));
+
+        // Render scene with autocomplete popup active
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("clone"));
+        assert!(scene.contains_text("fn(&self) -> Self"));
+
+        // Type 'c' to filter candidates
+        let c_key = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Char('c'),
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        view.handle_event(&c_key, bounds);
+        assert_eq!(view.autocomplete.selected_item().unwrap().label, "clone");
+
+        // Commit with Tab
+        let tab_key = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Tab,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        let res = view.handle_event(&tab_key, bounds);
+        assert_eq!(res, EventResult::Consumed);
+
+        // Popover should be dismissed and buffer text updated
+        assert!(!view.autocomplete.is_visible);
+        assert_eq!(view.text(), "let x = foo.clone();");
+        assert_eq!(view.primary_position(), Position::new(0, 19));
+    }
+
+    #[test]
+    fn test_editor_view_autocomplete_ctrl_space_and_snippet() {
+        let mut view = EditorView::from_str("");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Press Ctrl+Space to trigger suggest
+        let ctrl_space = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Space,
+            rustcode_platform::keybindings::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        let res = view.handle_event(&ctrl_space, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert!(view.autocomplete.is_visible);
+
+        // Arrow navigation
+        let arrow_down = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::ArrowDown,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        view.handle_event(&arrow_down, bounds);
+
+        let arrow_up = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::ArrowUp,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        view.handle_event(&arrow_up, bounds);
+
+        // Type "pri" to filter to println! snippet
+        for ch in "pri".chars() {
+            view.handle_event(
+                &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                    KeyCode::Char(ch),
+                    rustcode_platform::keybindings::Modifiers::none(),
+                )),
+                bounds,
+            );
+        }
+
+        assert_eq!(view.autocomplete.selected_item().unwrap().label, "println!");
+
+        // Commit with Enter
+        let enter_key = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Enter,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        view.handle_event(&enter_key, bounds);
+
+        assert!(!view.autocomplete.is_visible);
+        assert_eq!(view.text(), "println!(\"{}\", );");
+        // Cursor placed at tabstop $0 inside quotes
+        assert_eq!(view.primary_position(), Position::new(0, 15));
+    }
+
+    #[test]
+    fn test_editor_view_autocomplete_custom_provider_and_dismiss() {
+        let mut view = EditorView::from_str("");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Attach custom completion provider
+        view = view.with_completion_provider(Arc::new(|_lang, _pos, _trigger| {
+            vec![
+                CompletionItem::new("custom_feature")
+                    .with_kind(CompletionItemKind::Function)
+                    .with_detail("fn custom_feature() -> bool")
+                    .with_doc("A custom extension-provided item.")
+                    .with_insert_text("custom_feature()"),
+            ]
+        }));
+
+        // Trigger with Ctrl+Space
+        view.trigger_suggest(None);
+        assert!(view.autocomplete.is_visible);
+        assert!(view
+            .autocomplete
+            .filtered_items
+            .iter()
+            .any(|(i, _)| i.label == "custom_feature"));
+
+        // Type "custom" to filter
+        for ch in "custom".chars() {
+            view.handle_event(
+                &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                    KeyCode::Char(ch),
+                    rustcode_platform::keybindings::Modifiers::none(),
+                )),
+                bounds,
+            );
+        }
+        assert_eq!(view.autocomplete.selected_item().unwrap().label, "custom_feature");
+
+        // Escape dismisses
+        let esc_key = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Escape,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        let res = view.handle_event(&esc_key, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert!(!view.autocomplete.is_visible);
+        assert_eq!(view.text(), "custom");
     }
 }
 

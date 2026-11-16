@@ -148,6 +148,10 @@ impl LspClient {
                 }
             }
             is_running_reader.store(false, Ordering::SeqCst);
+            let mut map = pending_clone.lock();
+            for (_id, tx) in map.drain() {
+                let _ = tx.send(Err(LspError::NotRunning));
+            }
         });
 
         Self {
@@ -190,10 +194,10 @@ impl LspClient {
         self.pending.lock().insert(id, tx);
 
         let bytes = serde_json::to_vec(&req)?;
-        self.tx_outbound
-            .send(bytes)
-            .await
-            .map_err(|_| LspError::ChannelClosed)?;
+        if self.tx_outbound.send(bytes).await.is_err() {
+            self.pending.lock().remove(&id);
+            return Err(LspError::ChannelClosed);
+        }
 
         rx.await.map_err(|_| LspError::ChannelClosed)?
     }
@@ -552,5 +556,23 @@ mod tests {
 
         let hover_res = client.hover("file:///a.rs", LspPosition::new(1, 4)).await;
         assert!(matches!(hover_res, Err(LspError::ServerError { code: -32603, .. })));
+    }
+
+    #[tokio::test]
+    async fn test_lsp_client_disconnect_fails_pending_requests() {
+        let (client_read, server_write) = duplex(4096);
+        let (server_read, client_write) = duplex(4096);
+
+        let client = LspClient::from_io(client_read, client_write);
+
+        // Abruptly drop server read and write streams to simulate server crash / EOF
+        drop(server_write);
+        drop(server_read);
+
+        // Give reader task a moment to detect EOF
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let res = client.send_request("test/ping", Value::Null).await;
+        assert!(res.is_err());
     }
 }

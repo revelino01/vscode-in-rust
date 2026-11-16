@@ -1,8 +1,7 @@
 //! Language feature bridge coordinating LSP clients and JavaScript extension providers.
 
 use super::{ProviderRegistry, ProviderType};
-use crate::rpc::{RpcBridge, RpcMessage};
-use parking_lot::Mutex;
+use crate::rpc::RpcBridge;
 use rustcode_protocols::lsp::{
     CompletionContext, CompletionTriggerKind, Hover, LspClientManager, LspCompletionItem,
     LspLocation, LspPosition, MarkupContent,
@@ -15,7 +14,6 @@ pub struct LanguageFeatureBridge {
     pub provider_registry: Arc<ProviderRegistry>,
     pub rpc_bridge: Arc<RpcBridge>,
     pub lsp_manager: Arc<LspClientManager>,
-    pending_js_responses: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl LanguageFeatureBridge {
@@ -28,7 +26,6 @@ impl LanguageFeatureBridge {
             provider_registry,
             rpc_bridge,
             lsp_manager,
-            pending_js_responses: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -68,7 +65,7 @@ impl LanguageFeatureBridge {
             .get_providers_for_language(ProviderType::Completion, language_id);
 
         for provider in js_providers {
-            let (req, rx) = self.rpc_bridge.create_request(
+            let (_req, rx) = self.rpc_bridge.create_request(
                 "languages.provideCompletionItems",
                 json!({
                     "providerId": provider.id,
@@ -77,13 +74,6 @@ impl LanguageFeatureBridge {
                     "triggerCharacter": trigger_char.map(|c| c.to_string()),
                 }),
             );
-
-            // In real runtime, `req` is sent across IPC to the extension host process
-            let id = match req {
-                RpcMessage::Request { id, .. } => id,
-                _ => continue,
-            };
-            self.pending_js_responses.lock().insert(id);
 
             // If a response arrives within 250ms, incorporate items
             if let Ok(Ok(Ok(val))) = tokio::time::timeout(std::time::Duration::from_millis(250), rx).await {
@@ -118,7 +108,7 @@ impl LanguageFeatureBridge {
             .get_providers_for_language(ProviderType::Hover, language_id);
 
         for provider in js_providers {
-            let (req, rx) = self.rpc_bridge.create_request(
+            let (_req, rx) = self.rpc_bridge.create_request(
                 "languages.provideHover",
                 json!({
                     "providerId": provider.id,
@@ -126,12 +116,6 @@ impl LanguageFeatureBridge {
                     "position": position,
                 }),
             );
-
-            let id = match req {
-                RpcMessage::Request { id, .. } => id,
-                _ => continue,
-            };
-            self.pending_js_responses.lock().insert(id);
 
             if let Ok(Ok(Ok(val))) = tokio::time::timeout(std::time::Duration::from_millis(250), rx).await {
                 if let Ok(hover) = serde_json::from_value::<Hover>(val.clone()) {
@@ -168,7 +152,7 @@ impl LanguageFeatureBridge {
             .get_providers_for_language(ProviderType::Definition, language_id);
 
         for provider in js_providers {
-            let (req, rx) = self.rpc_bridge.create_request(
+            let (_req, rx) = self.rpc_bridge.create_request(
                 "languages.provideDefinition",
                 json!({
                     "providerId": provider.id,
@@ -176,12 +160,6 @@ impl LanguageFeatureBridge {
                     "position": position,
                 }),
             );
-
-            let id = match req {
-                RpcMessage::Request { id, .. } => id,
-                _ => continue,
-            };
-            self.pending_js_responses.lock().insert(id);
 
             if let Ok(Ok(Ok(val))) = tokio::time::timeout(std::time::Duration::from_millis(250), rx).await {
                 if let Ok(locs) = serde_json::from_value::<Vec<LspLocation>>(val.clone()) {

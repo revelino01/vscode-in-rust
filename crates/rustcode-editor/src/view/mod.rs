@@ -143,6 +143,40 @@ impl EditorView {
             .map(|d| d.read().language_id.clone())
             .unwrap_or_else(|| "rust".to_string());
 
+        // Calculate trigger anchor position and prefix
+        let (trigger_pos, prefix) = {
+            let buf = self.buffer.read();
+            if let Some(line) = buf.get_line_content(pos.line) {
+                let col = pos.column.min(line.len());
+                if trigger_char.is_none() {
+                    let mut word_start = col;
+                    while word_start > 0 {
+                        let prev_idx = line[..word_start]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        let ch = line[prev_idx..word_start].chars().next().unwrap();
+                        if ch.is_alphanumeric() || ch == '_' {
+                            word_start = prev_idx;
+                        } else {
+                            break;
+                        }
+                    }
+                    let prefix = if col > word_start {
+                        line[word_start..col].to_string()
+                    } else {
+                        String::new()
+                    };
+                    (Position::new(pos.line, word_start), prefix)
+                } else {
+                    (pos, String::new())
+                }
+            } else {
+                (pos, String::new())
+            }
+        };
+
         let mut items = Vec::new();
 
         // 1. Query external completion provider if attached
@@ -153,7 +187,8 @@ impl EditorView {
 
         // 2. Built-in keywords, snippets, and document identifiers
         let text = self.buffer.read().to_string();
-        let builtin = get_builtin_completions(&lang, trigger_char, &text);
+        let current_pref = if prefix.is_empty() { None } else { Some(prefix.as_str()) };
+        let builtin = get_builtin_completions(&lang, trigger_char, &text, current_pref);
         for b in builtin {
             if !items.iter().any(|i| i.label == b.label) {
                 items.push(b);
@@ -161,7 +196,10 @@ impl EditorView {
         }
 
         if !items.is_empty() {
-            self.autocomplete.show(items, pos, trigger_char);
+            self.autocomplete.show(items, trigger_pos, trigger_char);
+            if !prefix.is_empty() {
+                self.autocomplete.update_filter(&prefix);
+            }
         }
     }
 
@@ -751,8 +789,8 @@ impl View for EditorView {
                             if item_idx < self.autocomplete.filtered_items.len() {
                                 self.autocomplete.selected_index = item_idx;
                                 self.commit_autocomplete();
-                                return EventResult::Consumed;
                             }
+                            return EventResult::Consumed;
                         }
                     }
                     let maybe_doc = *self.autocomplete.last_doc_bounds.lock();
@@ -1013,6 +1051,7 @@ pub fn get_builtin_completions(
     lang: &str,
     trigger_char: Option<char>,
     text: &str,
+    current_prefix: Option<&str>,
 ) -> Vec<CompletionItem> {
     let mut items = Vec::new();
 
@@ -1309,6 +1348,7 @@ pub fn get_builtin_completions(
         for word in text.split(|c: char| !c.is_alphanumeric() && c != '_') {
             if word.len() >= 3
                 && !word.chars().next().unwrap().is_ascii_digit()
+                && Some(word) != current_prefix
                 && seen.insert(word)
                 && !items.iter().any(|i| i.label == word)
             {
@@ -1734,6 +1774,78 @@ mod tests {
         assert_eq!(res, EventResult::Consumed);
         assert!(!view.autocomplete.is_visible);
         assert_eq!(view.text(), "custom");
+    }
+
+    #[test]
+    fn test_editor_view_autocomplete_ctrl_space_with_existing_prefix_no_duplication() {
+        let mut view = EditorView::from_str("let x = pri");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Move cursor to end of "pri" (column 11)
+        view.set_primary_position(Position::new(0, 11));
+
+        // Press Ctrl+Space
+        let ctrl_space = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Space,
+            rustcode_platform::keybindings::Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        let res = view.handle_event(&ctrl_space, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert!(view.autocomplete.is_visible);
+
+        // Verify println! is the top match
+        assert_eq!(view.autocomplete.selected_item().unwrap().label, "println!");
+
+        // Press Tab to commit
+        let tab_key = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Tab,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        let res = view.handle_event(&tab_key, bounds);
+        assert_eq!(res, EventResult::Consumed);
+
+        assert!(!view.autocomplete.is_visible);
+        // Prefix "pri" must have been replaced, NOT duplicated as "priprintln!"
+        assert_eq!(view.text(), "let x = println!(\"{}\", );");
+        assert_eq!(view.primary_position(), Position::new(0, 23));
+    }
+
+    #[test]
+    fn test_editor_view_autocomplete_no_match_dismisses_and_restores_navigation() {
+        let mut view = EditorView::from_str("line 1\nline 2\n");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        view.set_primary_position(Position::new(0, 0));
+
+        // Trigger autocomplete
+        view.trigger_suggest(None);
+        assert!(view.autocomplete.is_visible);
+
+        // Type characters that match nothing
+        for ch in "xyz123".chars() {
+            view.handle_event(
+                &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                    KeyCode::Char(ch),
+                    rustcode_platform::keybindings::Modifiers::none(),
+                )),
+                bounds,
+            );
+        }
+
+        // Popup should now be dismissed
+        assert!(!view.autocomplete.is_visible);
+
+        // Arrow Down should now move cursor normally instead of being swallowed
+        let arrow_down = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::ArrowDown,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        view.handle_event(&arrow_down, bounds);
+        assert_eq!(view.primary_position().line, 1);
     }
 }
 

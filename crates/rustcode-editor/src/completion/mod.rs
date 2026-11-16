@@ -138,10 +138,10 @@ pub fn expand_snippet(template: &str) -> (String, usize) {
                     chars.next();
                     expanded.push('$');
                     continue;
-                } else if next == '0' || next == '1' {
-                    chars.next();
+                } else if next.is_ascii_digit() {
+                    let digit = chars.next().unwrap();
                     // Place cursor at tabstop
-                    if cursor_offset.is_none() || next == '0' {
+                    if cursor_offset.is_none() || digit == '0' {
                         cursor_offset = Some(expanded.len());
                     }
                     continue;
@@ -154,13 +154,18 @@ pub fn expand_snippet(template: &str) -> (String, usize) {
                         }
                         placeholder.push(inner);
                     }
-                    // Handle `${1:default_text}`
+                    // Handle `${1:default_text}`, `${1|choice1,choice2|}`, or `${1}`
                     let text = if let Some((_, def)) = placeholder.split_once(':') {
                         def
+                    } else if let Some((_, choices)) = placeholder.split_once('|') {
+                        let choices_trimmed = choices.strip_suffix('|').unwrap_or(choices);
+                        choices_trimmed.split(',').next().unwrap_or("")
+                    } else if placeholder.chars().all(|ch| ch.is_ascii_digit()) {
+                        ""
                     } else {
                         &placeholder
                     };
-                    if cursor_offset.is_none() {
+                    if cursor_offset.is_none() || placeholder.starts_with('0') {
                         cursor_offset = Some(expanded.len());
                     }
                     expanded.push_str(text);
@@ -184,25 +189,32 @@ pub fn fuzzy_match(candidate: &str, query: &str) -> Option<i32> {
 
     // 1. Exact prefix match
     if candidate.starts_with(query) {
-        return Some(1000 + (100 - (candidate.len() - query.len()) as i32).max(0));
+        return Some(1000 + (100 - (candidate.len() as i32 - query.len() as i32)).max(0));
     }
 
-    // 2. Case-insensitive prefix match
-    if candidate.len() >= query.len()
-        && candidate[..query.len()].eq_ignore_ascii_case(query)
-    {
-        return Some(800 + (100 - (candidate.len() - query.len()) as i32).max(0));
+    // 2. Case-insensitive prefix match (UTF-8 safe)
+    let query_chars_count = query.chars().count();
+    let cand_prefix: String = candidate.chars().take(query_chars_count).collect();
+    if cand_prefix.eq_ignore_ascii_case(query) {
+        return Some(800 + (100 - (candidate.len() as i32 - query.len() as i32)).max(0));
     }
 
-    // 3. Subsequence fuzzy match
+    // 3. Subsequence fuzzy match (UTF-8 safe)
     let mut score = 500;
     let mut cand_chars = candidate.chars().enumerate();
-    let mut prev_idx = None;
+    let mut prev_char: Option<char> = None;
+    let mut prev_idx: Option<usize> = None;
 
     for q in query.chars() {
         let q_lower = q.to_ascii_lowercase();
         let mut matched = false;
         for (idx, c) in cand_chars.by_ref() {
+            let is_boundary = idx == 0
+                || prev_char == Some('_')
+                || prev_char == Some(' ')
+                || (prev_char.is_some_and(|p| p.is_lowercase()) && c.is_uppercase());
+            prev_char = Some(c);
+
             if c.to_ascii_lowercase() == q_lower {
                 // Bonus for exact case match
                 if c == q {
@@ -214,11 +226,8 @@ pub fn fuzzy_match(candidate: &str, query: &str) -> Option<i32> {
                         score += 30;
                     }
                 }
-                // Bonus for word boundary (after underscore or camelCase)
-                if idx == 0
-                    || (idx > 0 && candidate.as_bytes().get(idx - 1) == Some(&b'_'))
-                    || c.is_uppercase()
-                {
+                // Bonus for word boundary
+                if is_boundary {
                     score += 25;
                 }
                 prev_idx = Some(idx);
@@ -324,6 +333,7 @@ impl AutocompleteWidget {
         });
 
         self.filtered_items = matches;
+        self.is_visible = !self.filtered_items.is_empty();
         if self.filtered_items.is_empty() {
             self.selected_index = 0;
             self.scroll_offset = 0;
@@ -406,7 +416,7 @@ impl AutocompleteWidget {
         }
 
         // Set cursor to the snippet tabstop or end of inserted text
-        let final_offset = start_offset + cursor_rel_offset;
+        let final_offset = (start_offset + cursor_rel_offset).min(buffer.len());
         let (new_line, new_col) = buffer.offset_to_position(final_offset);
         cursor_state.set_primary(Position::new(new_line, new_col));
 
@@ -540,10 +550,20 @@ impl AutocompleteWidget {
                     // Position to right of list by default, or left if no space
                     let mut doc_x = list_x + list_w + 4.0;
                     if doc_x + doc_w > editor_bounds.max_x() - 10.0 {
-                        doc_x = (list_x - doc_w - 4.0).max(editor_bounds.min_x() + 10.0);
+                        if list_x - doc_w - 4.0 >= editor_bounds.min_x() {
+                            doc_x = list_x - doc_w - 4.0;
+                        } else {
+                            doc_x = (editor_bounds.max_x() - doc_w - 10.0).max(editor_bounds.min_x());
+                        }
                     }
 
-                    let doc_rect = Rect::from_xywh(doc_x, list_y, doc_w, doc_h);
+                    // Clamp vertically so documentation does not overflow bottom
+                    let mut doc_y = list_y;
+                    if doc_y + doc_h > editor_bounds.max_y() - 10.0 {
+                        doc_y = (editor_bounds.max_y() - doc_h - 10.0).max(editor_bounds.min_y());
+                    }
+
+                    let doc_rect = Rect::from_xywh(doc_x, doc_y, doc_w, doc_h);
                     *self.last_doc_bounds.lock() = Some(doc_rect);
 
                     // Background & border
@@ -553,7 +573,7 @@ impl AutocompleteWidget {
                             .with_border_edges(border_color, Edges::all(1.0)),
                     );
 
-                    let mut cur_y = list_y + 8.0;
+                    let mut cur_y = doc_y + 8.0;
 
                     // Header: Detail (type signature)
                     if let Some(detail) = &selected.detail {
@@ -581,7 +601,7 @@ impl AutocompleteWidget {
                     if let Some(doc) = &selected.documentation {
                         let doc_fg = Rgba::new(0.80, 0.80, 0.80, 1.0);
                         for line in doc.lines() {
-                            if cur_y + font.line_height > list_y + doc_h - 4.0 {
+                            if cur_y + font.line_height > doc_y + doc_h - 4.0 {
                                 break;
                             }
                             scene.push_text(GlyphRun::new(
@@ -621,6 +641,17 @@ mod tests {
         let (text3, offset3) = expand_snippet("simple_ident");
         assert_eq!(text3, "simple_ident");
         assert_eq!(offset3, 12);
+
+        let (text4, offset4) = expand_snippet("assert_eq!($1, $2);");
+        assert_eq!(text4, "assert_eq!(, );");
+        assert_eq!(offset4, 11);
+
+        let (text5, offset5) = expand_snippet("let x = ${1};");
+        assert_eq!(text5, "let x = ;");
+        assert_eq!(offset5, 8);
+
+        let (text6, _) = expand_snippet("choose(${1|alpha,beta|});");
+        assert_eq!(text6, "choose(alpha);");
     }
 
     #[test]
@@ -633,6 +664,11 @@ mod tests {
         let score_prefix = fuzzy_match("clone", "cl").unwrap();
         let score_subseq = fuzzy_match("collect", "cl").unwrap();
         assert!(score_prefix >= score_subseq);
+
+        // UTF-8 multi-byte characters must not panic
+        assert!(fuzzy_match("日本語_test", "a").is_none());
+        assert!(fuzzy_match("✓_check", "✓").is_some());
+        assert!(fuzzy_match("✓_check", "c").is_some());
     }
 
     #[test]
@@ -680,5 +716,17 @@ mod tests {
         assert_eq!(committed.unwrap().label, "clone");
         assert_eq!(buffer.to_string(), "let x = foo.clone();");
         assert!(!widget.is_visible);
+    }
+
+    #[test]
+    fn test_autocomplete_widget_filter_empty_dismisses() {
+        let mut widget = AutocompleteWidget::new();
+        let items = vec![CompletionItem::new("clone")];
+        widget.show(items, Position::new(0, 0), None);
+        assert!(widget.is_visible);
+
+        widget.update_filter("zzz");
+        assert!(!widget.is_visible);
+        assert!(widget.filtered_items.is_empty());
     }
 }

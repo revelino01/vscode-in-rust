@@ -31,13 +31,21 @@ pub fn encode_framed_message(payload: &[u8]) -> Vec<u8> {
 /// Returns `Ok(Some(payload))` if a complete message is ready,
 /// `Ok(None)` if more data is needed, or `Err(...)` if headers are invalid.
 pub fn decode_framed_message(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>, LspCodecError> {
-    // 1. Locate delimiter between headers and body: "\r\n\r\n" or "\n\n"
-    let (header_len, body_start) = if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-        (pos, pos + 4)
-    } else if let Some(pos) = buffer.windows(2).position(|w| w == b"\n\n") {
-        (pos, pos + 2)
-    } else {
-        return Ok(None);
+    // 1. Locate delimiter between headers and body: whichever occurs first between "\r\n\r\n" and "\n\n"
+    let pos_crlf = buffer.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, p + 4));
+    let pos_lf = buffer.windows(2).position(|w| w == b"\n\n").map(|p| (p, p + 2));
+
+    let (header_len, body_start) = match (pos_crlf, pos_lf) {
+        (Some((h1, b1)), Some((h2, b2))) => {
+            if h1 <= h2 {
+                (h1, b1)
+            } else {
+                (h2, b2)
+            }
+        }
+        (Some((h, b)), None) => (h, b),
+        (None, Some((h, b))) => (h, b),
+        (None, None) => return Ok(None),
     };
 
     // 2. Parse headers
@@ -171,5 +179,20 @@ mod tests {
         let decoded = decode_framed_message(&mut buf).unwrap().expect("message");
         assert_eq!(decoded, b"Hello, World");
         assert_eq!(buf, b"!");
+    }
+
+    #[test]
+    fn test_lf_only_delimiter_and_chunked_boundary() {
+        let raw = b"Content-Length: 5\n\nhello";
+        let mut buf = Vec::new();
+
+        // Feed up to the middle of "\n\n"
+        buf.extend_from_slice(&raw[..18]); // "Content-Length: 5\n"
+        assert!(decode_framed_message(&mut buf).unwrap().is_none());
+
+        buf.extend_from_slice(&raw[18..]);
+        let decoded = decode_framed_message(&mut buf).unwrap().expect("message");
+        assert_eq!(decoded, b"hello");
+        assert!(buf.is_empty());
     }
 }

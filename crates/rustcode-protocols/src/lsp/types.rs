@@ -85,7 +85,9 @@ impl LspRange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LspLocation {
+    #[serde(alias = "targetUri")]
     pub uri: String,
+    #[serde(alias = "targetSelectionRange", alias = "targetRange")]
     pub range: LspRange,
 }
 
@@ -186,7 +188,11 @@ pub struct LspCompletionItem {
     pub kind: Option<CompletionItemKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_documentation",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub documentation: Option<String>,
     #[serde(rename = "insertText", alias = "insert_text", skip_serializing_if = "Option::is_none")]
     pub insert_text: Option<String>,
@@ -194,6 +200,25 @@ pub struct LspCompletionItem {
     pub filter_text: Option<String>,
     #[serde(rename = "sortText", alias = "sort_text", skip_serializing_if = "Option::is_none")]
     pub sort_text: Option<String>,
+}
+
+pub fn deserialize_documentation<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let opt = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s)),
+        Some(serde_json::Value::Object(map)) => {
+            if let Some(serde_json::Value::String(val)) = map.get("value") {
+                Ok(Some(val.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
 }
 
 impl LspCompletionItem {
@@ -309,9 +334,62 @@ impl MarkupContent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hover {
+    #[serde(deserialize_with = "deserialize_markup_content")]
     pub contents: MarkupContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<LspRange>,
+}
+
+pub fn deserialize_markup_content<'de, D>(deserializer: D) -> Result<MarkupContent, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    match val {
+        serde_json::Value::String(s) => Ok(MarkupContent::markdown(s)),
+        serde_json::Value::Object(map) => {
+            let kind_str = map.get("kind").and_then(|k| k.as_str()).unwrap_or("markdown");
+            let kind = if kind_str.eq_ignore_ascii_case("plaintext") {
+                MarkupKind::PlainText
+            } else {
+                MarkupKind::Markdown
+            };
+            let value = map
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(MarkupContent { kind, value })
+        }
+        serde_json::Value::Array(arr) => {
+            let mut combined = String::new();
+            for item in arr {
+                match item {
+                    serde_json::Value::String(s) => {
+                        if !combined.is_empty() {
+                            combined.push_str("\n\n");
+                        }
+                        combined.push_str(&s);
+                    }
+                    serde_json::Value::Object(map) => {
+                        if let Some(val) = map.get("value").and_then(|v| v.as_str()) {
+                            if !combined.is_empty() {
+                                combined.push_str("\n\n");
+                            }
+                            if let Some(lang) = map.get("language").and_then(|l| l.as_str()) {
+                                combined.push_str(&format!("```{}\n{}\n```", lang, val));
+                            } else {
+                                combined.push_str(val);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(MarkupContent::markdown(combined))
+        }
+        _ => Ok(MarkupContent::markdown("")),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,4 +491,59 @@ pub struct ServerCapabilities {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitializeResult {
     pub capabilities: ServerCapabilities,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_completion_item_markup_documentation_deserialization() {
+        let json_str = r#"{
+            "label": "clone",
+            "kind": 2,
+            "documentation": {
+                "kind": "markdown",
+                "value": "Returns a copy of the value."
+            }
+        }"#;
+
+        let item: LspCompletionItem = serde_json::from_str(json_str).expect("deserialize item");
+        assert_eq!(item.label, "clone");
+        assert_eq!(item.kind, Some(CompletionItemKind::Method));
+        assert_eq!(
+            item.documentation.as_deref(),
+            Some("Returns a copy of the value.")
+        );
+    }
+
+    #[test]
+    fn test_hover_flexible_deserialization() {
+        // 1. Plain string contents
+        let json_str = r#"{"contents": "Simple hover"}"#;
+        let hover: Hover = serde_json::from_str(json_str).expect("deserialize hover string");
+        assert_eq!(hover.contents.value, "Simple hover");
+
+        // 2. Marked string array
+        let json_arr = r#"{"contents": [{"language": "rust", "value": "fn foo()"}, "doc text"]}"#;
+        let hover_arr: Hover = serde_json::from_str(json_arr).expect("deserialize hover arr");
+        assert!(hover_arr.contents.value.contains("```rust\nfn foo()\n```"));
+        assert!(hover_arr.contents.value.contains("doc text"));
+    }
+
+    #[test]
+    fn test_location_link_deserialization() {
+        let json_str = r#"{
+            "targetUri": "file:///path/to/file.rs",
+            "targetSelectionRange": {
+                "start": { "line": 10, "character": 4 },
+                "end": { "line": 10, "character": 8 }
+            }
+        }"#;
+
+        let loc: LspLocation = serde_json::from_str(json_str).expect("deserialize location link");
+        assert_eq!(loc.uri, "file:///path/to/file.rs");
+        assert_eq!(loc.range.start.line, 10);
+        assert_eq!(loc.range.start.character, 4);
+    }
 }

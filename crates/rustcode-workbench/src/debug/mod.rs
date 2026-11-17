@@ -39,6 +39,9 @@ pub enum DebugViewAction {
     EvaluateExpression {
         expression: String,
     },
+    ToggleVariables,
+    ToggleCallStack,
+    ToggleBreakpoints,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -291,10 +294,10 @@ impl View for DebugToolbarView {
                 // Keybinding shortcuts for debug actions
                 let action = match key.key {
                     KeyCode::F5 => {
-                        if key.modifiers.shift {
-                            Some(DebugToolbarAction::Stop)
-                        } else if key.modifiers.ctrl {
+                        if key.modifiers.ctrl {
                             Some(DebugToolbarAction::Restart)
+                        } else if key.modifiers.shift {
+                            Some(DebugToolbarAction::Stop)
                         } else {
                             Some(if self.is_paused {
                                 DebugToolbarAction::Continue
@@ -394,6 +397,7 @@ impl View for DebugSidebarView {
 
         // 3. Section: VARIABLES
         let var_hdr_rect = Rect::from_xywh(bounds.min_x(), cur_y, bounds.width(), section_h);
+        targets.push((var_hdr_rect, DebugViewAction::ToggleVariables));
         scene.push_quad(Quad::new(var_hdr_rect).with_background(theme.panel_bg));
         let arrow = if self.variables_collapsed { "▶" } else { "▼" };
         scene.push_text(GlyphRun::new(
@@ -440,6 +444,7 @@ impl View for DebugSidebarView {
 
         // 4. Section: CALL STACK
         let cs_hdr_rect = Rect::from_xywh(bounds.min_x(), cur_y, bounds.width(), section_h);
+        targets.push((cs_hdr_rect, DebugViewAction::ToggleCallStack));
         scene.push_quad(Quad::new(cs_hdr_rect).with_background(theme.panel_bg));
         let arrow = if self.callstack_collapsed { "▶" } else { "▼" };
         scene.push_text(GlyphRun::new(
@@ -486,6 +491,7 @@ impl View for DebugSidebarView {
 
         // 5. Section: BREAKPOINTS
         let bp_hdr_rect = Rect::from_xywh(bounds.min_x(), cur_y, bounds.width(), section_h);
+        targets.push((bp_hdr_rect, DebugViewAction::ToggleBreakpoints));
         scene.push_quad(Quad::new(bp_hdr_rect).with_background(theme.panel_bg));
         let arrow = if self.breakpoints_collapsed { "▶" } else { "▼" };
         scene.push_text(GlyphRun::new(
@@ -541,6 +547,18 @@ impl View for DebugSidebarView {
             let targets = self.click_targets.read().clone();
             for (rect, action) in targets {
                 if rect.contains(mouse.position) {
+                    match &action {
+                        DebugViewAction::ToggleVariables => {
+                            self.variables_collapsed = !self.variables_collapsed;
+                        }
+                        DebugViewAction::ToggleCallStack => {
+                            self.callstack_collapsed = !self.callstack_collapsed;
+                        }
+                        DebugViewAction::ToggleBreakpoints => {
+                            self.breakpoints_collapsed = !self.breakpoints_collapsed;
+                        }
+                        _ => {}
+                    }
                     self.last_action = Some(action);
                     return EventResult::Consumed;
                 }
@@ -750,6 +768,31 @@ mod tests {
         let res_s_f11 = toolbar.handle_event(&key_shift_f11, bounds);
         assert_eq!(res_s_f11, EventResult::Consumed);
         assert_eq!(toolbar.last_action, Some(DebugToolbarAction::StepOut));
+
+        // Press Ctrl+Shift+F5 (Restart)
+        let key_ctrl_shift_f5 = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::F5,
+            rustcode_platform::keybindings::Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Default::default()
+            },
+        ));
+        let res_restart = toolbar.handle_event(&key_ctrl_shift_f5, bounds);
+        assert_eq!(res_restart, EventResult::Consumed);
+        assert_eq!(toolbar.last_action, Some(DebugToolbarAction::Restart));
+
+        // Press Shift+F5 (Stop)
+        let key_shift_f5 = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::F5,
+            rustcode_platform::keybindings::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+        ));
+        let res_stop = toolbar.handle_event(&key_shift_f5, bounds);
+        assert_eq!(res_stop, EventResult::Consumed);
+        assert_eq!(toolbar.last_action, Some(DebugToolbarAction::Stop));
     }
 
     #[test]
@@ -762,6 +805,20 @@ mod tests {
         let mut scene = Scene::new();
         sidebar.render(bounds, &theme, &font, &mut scene);
         assert!(!scene.quads().is_empty());
+
+        // Click variables header to collapse
+        let targets = sidebar.click_targets.read().clone();
+        let var_hdr = targets
+            .iter()
+            .find(|(_, a)| matches!(a, DebugViewAction::ToggleVariables))
+            .unwrap();
+        let click_var = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            Point::new(var_hdr.0.min_x() + 5.0, var_hdr.0.min_y() + 5.0),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        assert!(!sidebar.variables_collapsed);
+        sidebar.handle_event(&click_var, bounds);
+        assert!(sidebar.variables_collapsed);
 
         // Click call stack frame
         let targets = sidebar.click_targets.read().clone();

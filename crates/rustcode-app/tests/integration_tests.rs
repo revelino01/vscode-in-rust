@@ -985,6 +985,22 @@ async fn test_end_to_end_dap_debug_integration() {
         Some(WorkbenchAction::DebugToolbar(DebugToolbarAction::StepOver))
     );
 
+    // Test Ctrl+Shift+F5 (Restart) keyboard shortcut
+    let restart_key = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::F5,
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        },
+    ));
+    let res_restart = wb.handle_event(&restart_key, bounds);
+    assert_eq!(res_restart, EventResult::Consumed);
+    assert_eq!(
+        wb.last_action,
+        Some(WorkbenchAction::DebugToolbar(DebugToolbarAction::Restart))
+    );
+
     // Test Call Stack navigation in Debug Sidebar
     wb.layout.set_sidebar_view("debug");
     let _ = wb.debug_sidebar.handle_event(
@@ -1083,6 +1099,31 @@ fn test_end_to_end_webview_host_integration() {
     // Verify outbound message arrived at Webview
     assert_eq!(webview_view.outbound_messages.len(), 1);
     assert_eq!(webview_view.outbound_messages[0]["text"], "Ping Extension Host");
+
+    // 5. Test full real-world document HTML with doctype, head, and nested body
+    let full_doc = r#"
+        <!DOCTYPE html>
+        <html>
+        <head><title>Full Doc</title><style>body { margin: 0; }</style></head>
+        <body>
+            <h1>Real Webview</h1>
+            <div>
+                <p>Nested paragraph with &amp; entity.</p>
+                <button id="real_btn">Click</button>
+            </div>
+        </body>
+        </html>
+    "#;
+    webview_view.set_html(full_doc);
+    assert_eq!(webview_view.nodes.len(), 3);
+    assert_eq!(
+        webview_view.nodes[0].kind,
+        WebviewElementKind::Heading1("Real Webview".to_string())
+    );
+    assert_eq!(
+        webview_view.nodes[1].kind,
+        WebviewElementKind::Paragraph("Nested paragraph with & entity.".to_string())
+    );
 }
 
 

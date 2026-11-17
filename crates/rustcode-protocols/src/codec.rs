@@ -31,6 +31,15 @@ pub fn encode_framed_message(payload: &[u8]) -> Vec<u8> {
 /// Returns `Ok(Some(payload))` if a complete message is ready,
 /// `Ok(None)` if more data is needed, or `Err(...)` if headers are invalid.
 pub fn decode_framed_message(buffer: &mut Vec<u8>) -> Result<Option<Vec<u8>>, CodecError> {
+    // 0. Trim any leading newline or carriage-return bytes left by previous messages
+    let trim_count = buffer
+        .iter()
+        .take_while(|&&b| b == b'\r' || b == b'\n')
+        .count();
+    if trim_count > 0 {
+        buffer.drain(0..trim_count);
+    }
+
     // 1. Locate delimiter between headers and body: whichever occurs first between "\r\n\r\n" and "\n\n"
     let pos_crlf = buffer.windows(4).position(|w| w == b"\r\n\r\n").map(|p| (p, p + 4));
     let pos_lf = buffer.windows(2).position(|w| w == b"\n\n").map(|p| (p, p + 2));
@@ -117,4 +126,56 @@ pub async fn write_framed_message<W: AsyncWrite + Unpin>(
     writer.write_all(&framed).await?;
     writer.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_trailing_newlines_between_messages() {
+        // Message 1 followed by trailing CRLF before Message 2
+        let mut buffer = Vec::new();
+        let payload1 = b"{\"msg\":1}";
+        let payload2 = b"{\"msg\":2}";
+
+        buffer.extend_from_slice(&encode_framed_message(payload1));
+        buffer.extend_from_slice(b"\r\n\r\n"); // trailing blank lines
+        buffer.extend_from_slice(&encode_framed_message(payload2));
+
+        let res1 = decode_framed_message(&mut buffer).unwrap();
+        assert_eq!(res1, Some(payload1.to_vec()));
+
+        let res2 = decode_framed_message(&mut buffer).unwrap();
+        assert_eq!(res2, Some(payload2.to_vec()));
+
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn test_unicode_multibyte_payload() {
+        let mut buffer = Vec::new();
+        let payload = "{\"text\": \"こんにちは 🌍 (RustCode DAP)\"}".as_bytes();
+
+        let framed = encode_framed_message(payload);
+        buffer.extend_from_slice(&framed);
+
+        let decoded = decode_framed_message(&mut buffer).unwrap();
+        assert_eq!(decoded, Some(payload.to_vec()));
+    }
+
+    #[test]
+    fn test_malformed_and_missing_content_length() {
+        let mut buf_bad_val = b"Content-Length: not_a_number\r\n\r\n{}".to_vec();
+        assert!(matches!(
+            decode_framed_message(&mut buf_bad_val),
+            Err(CodecError::InvalidContentLength(_))
+        ));
+
+        let mut buf_missing = b"Content-Type: application/json\r\n\r\n{}".to_vec();
+        assert!(matches!(
+            decode_framed_message(&mut buf_missing),
+            Err(CodecError::MissingContentLength)
+        ));
+    }
 }

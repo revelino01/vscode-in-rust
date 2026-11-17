@@ -215,18 +215,21 @@ pub struct SetBreakpointsArguments {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetBreakpointsResponseBody {
+    #[serde(default)]
     pub breakpoints: Vec<Breakpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadsResponseBody {
+    #[serde(default)]
     pub threads: Vec<Thread>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StackTraceResponseBody {
+    #[serde(default)]
     pub stack_frames: Vec<StackFrame>,
     #[serde(default)]
     pub total_frames: Option<u32>,
@@ -235,12 +238,14 @@ pub struct StackTraceResponseBody {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScopesResponseBody {
+    #[serde(default)]
     pub scopes: Vec<Scope>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VariablesResponseBody {
+    #[serde(default)]
     pub variables: Vec<Variable>,
 }
 

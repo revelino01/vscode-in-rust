@@ -42,6 +42,7 @@ pub enum WorkbenchAction {
         column: usize,
     },
     DebugToolbar(DebugToolbarAction),
+    DebugAction(DebugViewAction),
     ScmAction(ScmAction),
     SidebarToggled(bool),
     PanelToggled(bool),
@@ -453,33 +454,44 @@ impl View for WorkbenchView {
                     } else if view_id == "debug" || view_id == "workbench.view.debug" {
                         let res = self.debug_sidebar.handle_event(event, regions.sidebar);
                         if let Some(act) = self.debug_sidebar.last_action.take() {
-                            match act {
+                            match &act {
                                 DebugViewAction::SelectFrame {
                                     path: Some(p),
                                     line,
                                     ..
                                 } => {
-                                    let path_buf = PathBuf::from(&p);
+                                    let path_buf = PathBuf::from(p);
                                     let title = path_buf.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
                                     let content = std::fs::read_to_string(&path_buf).unwrap_or_default();
-                                    self.editor_area.open_file(&p, title, &content, true);
+                                    self.editor_area.open_file(p, title, &content, true);
                                     if let Some(active_editor) = self.editor_area.active_editor_mut() {
-                                        active_editor.set_primary_position(rustcode_editor::Position::new((line as usize).saturating_sub(1), 0));
-                                        active_editor.set_execution_line(Some(line as usize));
+                                        active_editor.set_primary_position(rustcode_editor::Position::new((*line as usize).saturating_sub(1), 0));
+                                        active_editor.set_execution_line(Some(*line as usize));
+                                        if let Some(bps) = self.debug_sidebar.session.breakpoints.get(p) {
+                                            for bp in bps {
+                                                active_editor.add_breakpoint(bp.line as usize);
+                                            }
+                                        }
                                     }
                                 }
                                 DebugViewAction::SelectFrame { path: None, .. } => {}
                                 DebugViewAction::JumpToBreakpoint { path, line } => {
-                                    let path_buf = PathBuf::from(&path);
+                                    let path_buf = PathBuf::from(path);
                                     let title = path_buf.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
                                     let content = std::fs::read_to_string(&path_buf).unwrap_or_default();
-                                    self.editor_area.open_file(&path, title, &content, true);
+                                    self.editor_area.open_file(path, title, &content, true);
                                     if let Some(active_editor) = self.editor_area.active_editor_mut() {
-                                        active_editor.set_primary_position(rustcode_editor::Position::new((line as usize).saturating_sub(1), 0));
+                                        active_editor.set_primary_position(rustcode_editor::Position::new((*line as usize).saturating_sub(1), 0));
+                                        if let Some(bps) = self.debug_sidebar.session.breakpoints.get(path) {
+                                            for bp in bps {
+                                                active_editor.add_breakpoint(bp.line as usize);
+                                            }
+                                        }
                                     }
                                 }
                                 _ => {}
                             }
+                            self.last_action = Some(WorkbenchAction::DebugAction(act));
                         }
                         res
                     } else {
@@ -567,13 +579,35 @@ impl View for WorkbenchView {
                             regions.panel.width(),
                             (regions.panel.height() - tab_h).max(0.0),
                         );
-                        self.debug_console.handle_event(event, content_rect)
+                        let res = self.debug_console.handle_event(event, content_rect);
+                        if let Some(act) = self.debug_console.last_action.take() {
+                            self.last_action = Some(WorkbenchAction::DebugAction(act));
+                        }
+                        res
                     } else {
                         EventResult::Consumed
                     }
                 } else if regions.editor_area.contains(mouse.position) {
                     self.focused_region = FocusedRegion::Editor;
-                    self.editor_area.handle_event(event, regions.editor_area)
+                    let res = self.editor_area.handle_event(event, regions.editor_area);
+                    // Sync editor gutter breakpoint clicks to debug session
+                    if let Some(tab) = self.editor_area.model.current_group_ref().active_tab() {
+                        let uri = tab.uri.clone();
+                        if let Some(editor) = self.editor_area.editors.get_mut(&uri) {
+                            if let Some(rustcode_editor::EditorGutterAction::BreakpointToggled { line, added }) = editor.last_gutter_action.take() {
+                                if added {
+                                    self.debug_sidebar.session.toggle_breakpoint(&uri, line as u32);
+                                } else if let Some(bps) = self.debug_sidebar.session.breakpoints.get_mut(&uri) {
+                                    bps.retain(|b| b.line != line as u32);
+                                }
+                                self.last_action = Some(WorkbenchAction::DebugAction(DebugViewAction::ToggleBreakpoint {
+                                    path: uri,
+                                    line: line as u32,
+                                }));
+                            }
+                        }
+                    }
+                    res
                 } else {
                     EventResult::Ignored
                 }
@@ -612,7 +646,11 @@ impl View for WorkbenchView {
                     }
                     FocusedRegion::Panel => {
                         if self.layout.active_panel_tab == "debug_console" {
-                            self.debug_console.handle_event(event, regions.panel)
+                            let res = self.debug_console.handle_event(event, regions.panel);
+                            if let Some(act) = self.debug_console.last_action.take() {
+                                self.last_action = Some(WorkbenchAction::DebugAction(act));
+                            }
+                            res
                         } else {
                             EventResult::Ignored
                         }
@@ -764,5 +802,68 @@ mod tests {
             })
         );
         assert_eq!(wb.focused_region, FocusedRegion::Editor);
+    }
+
+    #[test]
+    fn test_workbench_gutter_breakpoint_sync_and_debug_console() {
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+
+        // 1. Open file in editor area
+        let file_path = "src/lib.rs";
+        wb.editor_area.open_file(file_path, "lib.rs", "fn foo() {\n    let a = 1;\n    let b = 2;\n}\n", false);
+
+        let regions = wb.compute_regions(bounds);
+        let gutter_click_x = regions.editor_area.min_x() + 10.0;
+        let gutter_click_y = regions.editor_area.min_y() + 35.0 + font.line_height * 2.5; // Line 3
+        let click_gutter = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            Point::new(gutter_click_x, gutter_click_y),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+
+        let res = wb.handle_event(&click_gutter, bounds);
+        assert_eq!(res, EventResult::Consumed);
+
+        // Verify breakpoint was synced to Debug session state
+        assert!(wb.debug_sidebar.session.breakpoints.contains_key(file_path));
+        let bps = &wb.debug_sidebar.session.breakpoints[file_path];
+        assert_eq!(bps.len(), 1);
+        assert_eq!(bps[0].line, 3);
+        assert!(matches!(
+            wb.last_action,
+            Some(WorkbenchAction::DebugAction(DebugViewAction::ToggleBreakpoint { line: 3, .. }))
+        ));
+
+        // 2. Switch panel to debug console and evaluate expression
+        wb.layout.panel_visible = true;
+        wb.layout.set_panel_tab("debug_console");
+        wb.focused_region = FocusedRegion::Panel;
+        wb.debug_console.input_focused = true;
+        wb.debug_console.input_text = "10 * 20".to_string();
+
+        let enter_key = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Enter,
+            rustcode_platform::keybindings::Modifiers::default(),
+        ));
+        let res_eval = wb.handle_event(&enter_key, bounds);
+        assert_eq!(res_eval, EventResult::Consumed);
+        assert_eq!(
+            wb.last_action,
+            Some(WorkbenchAction::DebugAction(DebugViewAction::EvaluateExpression {
+                expression: "10 * 20".to_string()
+            }))
+        );
+
+        // 3. SCM Status Message rendering on failed commit
+        wb.layout.set_sidebar_view("scm");
+        wb.scm_view.commit_message.clear();
+        let _ = wb.scm_view.execute_commit();
+        assert!(wb.scm_view.status_message.is_some());
+
+        let mut scm_scene = Scene::new();
+        wb.scm_view.render(regions.sidebar, &theme, &font, &mut scm_scene);
+        assert!(scm_scene.contains_text("Cannot commit empty message"));
     }
 }

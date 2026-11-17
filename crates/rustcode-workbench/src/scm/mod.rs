@@ -236,7 +236,27 @@ impl View for ScmView {
             font.font_size * 0.9,
         ));
 
-        cur_y += commit_btn_h + 12.0;
+        cur_y += commit_btn_h + 8.0;
+
+        // Status message (commit error or success hash)
+        if let Some(status) = &self.status_message {
+            let status_color = if status.starts_with("Committed:") {
+                theme.editor_info_foreground
+            } else {
+                theme.editor_error_foreground
+            };
+            let status_w = font.text_width(status).min(bounds.width() - 20.0);
+            scene.push_text(GlyphRun::new(
+                status.clone(),
+                Point::new(bounds.min_x() + input_padding, cur_y + 2.0),
+                Rect::from_xywh(bounds.min_x() + input_padding, cur_y + 2.0, status_w, font.line_height),
+                status_color,
+                font.font_size * 0.8,
+            ));
+            cur_y += font.line_height + 4.0;
+        }
+
+        cur_y += 4.0;
 
         // 5. Tree Section: STAGED CHANGES
         let section_h = 24.0;

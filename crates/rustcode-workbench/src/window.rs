@@ -110,6 +110,7 @@ impl WorkbenchWindow {
                 WorkbenchAction::PanelToggled(_) => {}
                 WorkbenchAction::OpenDiff { .. } => {}
                 WorkbenchAction::DebugToolbar(_) => {}
+                WorkbenchAction::DebugAction(_) => {}
                 WorkbenchAction::ScmAction(_) => {}
             }
         }

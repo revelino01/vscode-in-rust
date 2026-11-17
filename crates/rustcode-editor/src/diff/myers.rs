@@ -280,16 +280,16 @@ impl DiffModel {
                     });
                     i += 1;
                 }
-                DiffOpKind::Delete => {
-                    // Check if followed by insertions to form paired modifications
+                DiffOpKind::Delete | DiffOpKind::Insert => {
+                    // Group contiguous deletions and insertions into paired modifications
                     let mut del_chunk = Vec::new();
-                    while i < changes.len() && changes[i].kind == DiffOpKind::Delete {
-                        del_chunk.push(&changes[i]);
-                        i += 1;
-                    }
                     let mut ins_chunk = Vec::new();
-                    while i < changes.len() && changes[i].kind == DiffOpKind::Insert {
-                        ins_chunk.push(&changes[i]);
+                    while i < changes.len() && (changes[i].kind == DiffOpKind::Delete || changes[i].kind == DiffOpKind::Insert) {
+                        if changes[i].kind == DiffOpKind::Delete {
+                            del_chunk.push(&changes[i]);
+                        } else {
+                            ins_chunk.push(&changes[i]);
+                        }
                         i += 1;
                     }
 
@@ -330,18 +330,6 @@ impl DiffModel {
                             kind: row_kind,
                         });
                     }
-                }
-                DiffOpKind::Insert => {
-                    side_by_side_rows.push(SideBySideDiffRow {
-                        left: None,
-                        right: Some(DiffCell {
-                            line_num: changes[i].new_line,
-                            text: changes[i].text.clone(),
-                            kind: DiffOpKind::Insert,
-                        }),
-                        kind: DiffOpKind::Insert,
-                    });
-                    i += 1;
                 }
                 _ => {
                     i += 1;
@@ -425,5 +413,45 @@ mod tests {
         let has_del = diff.inline_rows.iter().any(|r| r.prefix == '-');
         assert!(has_add);
         assert!(has_del);
+    }
+
+    #[test]
+    fn test_myers_diff_crlf_and_trailing_newline_handling() {
+        let old_text = "line1\r\nline2\r\nline3";
+        let new_text = "line1\nline2_modified\nline3\n";
+
+        let diff = DiffModel::compute(old_text, new_text);
+        assert_eq!(diff.additions, 1);
+        assert_eq!(diff.deletions, 1);
+        assert_eq!(diff.modifications, 1);
+    }
+
+    #[test]
+    fn test_myers_diff_roundtrip_transformation_property() {
+        let a = ["Apple", "Banana", "Cherry", "Date", "Elderberry"];
+        let b = ["Banana", "Cherry Pie", "Date", "Elderberry", "Fig", "Grape"];
+
+        let edits = myers_diff(&a, &b);
+        let mut reconstructed = Vec::new();
+        let mut a_idx = 0;
+
+        for op in edits {
+            match op {
+                EditOp::Keep(t) => {
+                    assert_eq!(a[a_idx], t);
+                    reconstructed.push(t);
+                    a_idx += 1;
+                }
+                EditOp::Delete(t) => {
+                    assert_eq!(a[a_idx], t);
+                    a_idx += 1;
+                }
+                EditOp::Insert(t) => {
+                    reconstructed.push(t);
+                }
+            }
+        }
+        assert_eq!(a_idx, a.len());
+        assert_eq!(reconstructed, b.to_vec());
     }
 }

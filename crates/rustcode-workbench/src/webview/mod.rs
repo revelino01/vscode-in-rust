@@ -85,99 +85,334 @@ impl WebviewEditorView {
         }
     }
 
-    /// Simple pure-Rust HTML tag scanner converting tags into renderable nodes.
+    /// Robust pure-Rust HTML tag scanner converting tags into renderable nodes.
     pub fn parse_html(html: &str) -> Vec<ParsedWebviewNode> {
+        let mut cleaned = html.to_string();
+        strip_comments(&mut cleaned);
+        strip_doctype(&mut cleaned);
+        strip_tag_block(&mut cleaned, "head");
+        strip_tag_block(&mut cleaned, "style");
+        strip_tag_block(&mut cleaned, "script");
+
         let mut nodes = Vec::new();
-        let mut rest = html.trim();
+        parse_nodes_recursive(&cleaned, &mut nodes);
+        nodes
+    }
+}
 
-        while !rest.is_empty() {
-            if let Some(start_idx) = rest.find('<') {
-                if let Some(end_idx) = rest[start_idx..].find('>') {
-                    let full_tag_end = start_idx + end_idx;
-                    let tag_content = &rest[start_idx + 1..full_tag_end].trim();
-                    let tag_name = tag_content.split_whitespace().next().unwrap_or("").to_lowercase();
-                    let after_tag = &rest[full_tag_end + 1..];
+fn strip_tag_block(html: &mut String, tag_name: &str) {
+    let open_pat = format!("<{}", tag_name);
+    let close_pat = format!("</{}>", tag_name);
+    while let Some(start) = html.to_lowercase().find(&open_pat) {
+        if let Some(end) = html.to_lowercase()[start..].find(&close_pat) {
+            let full_end = start + end + close_pat.len();
+            html.replace_range(start..full_end, "");
+        } else {
+            html.truncate(start);
+            break;
+        }
+    }
+}
 
-                    if tag_name.starts_with('/') {
-                        rest = after_tag;
-                        continue;
-                    }
+fn strip_comments(html: &mut String) {
+    while let Some(start) = html.find("<!--") {
+        if let Some(end) = html[start..].find("-->") {
+            let full_end = start + end + 3;
+            html.replace_range(start..full_end, "");
+        } else {
+            html.truncate(start);
+            break;
+        }
+    }
+}
 
-                    let is_void = matches!(tag_name.as_str(), "hr" | "br" | "img" | "input") || tag_content.ends_with('/');
-                    let (clean_inner, next_rest) = if is_void {
-                        ("", after_tag)
-                    } else {
-                        let close_tag = format!("</{}>", tag_name);
-                        if let Some(close_idx) = after_tag.find(&close_tag) {
-                            (after_tag[..close_idx].trim(), &after_tag[close_idx + close_tag.len()..])
-                        } else {
-                            (after_tag.trim(), "")
-                        }
-                    };
+fn strip_doctype(html: &mut String) {
+    while let Some(start) = html.to_lowercase().find("<!doctype") {
+        if let Some(end) = html[start..].find('>') {
+            let full_end = start + end + 1;
+            html.replace_range(start..full_end, "");
+        } else {
+            html.truncate(start);
+            break;
+        }
+    }
+}
 
-                    match tag_name.as_str() {
-                        "h1" => nodes.push(ParsedWebviewNode {
-                            kind: WebviewElementKind::Heading1(clean_inner.to_string()),
-                        }),
-                        "h2" => nodes.push(ParsedWebviewNode {
-                            kind: WebviewElementKind::Heading2(clean_inner.to_string()),
-                        }),
-                        "h3" => nodes.push(ParsedWebviewNode {
-                            kind: WebviewElementKind::Heading3(clean_inner.to_string()),
-                        }),
-                        "p" | "div" | "span" => {
-                            if !clean_inner.is_empty() {
-                                nodes.push(ParsedWebviewNode {
-                                    kind: WebviewElementKind::Paragraph(clean_inner.to_string()),
-                                });
-                            }
-                        }
-                        "pre" | "code" => nodes.push(ParsedWebviewNode {
-                            kind: WebviewElementKind::CodeBlock(clean_inner.to_string()),
-                        }),
-                        "button" => {
-                            // Extract data-payload or onclick if present, else send text
-                            let payload = serde_json::json!({
-                                "command": "click",
-                                "text": clean_inner,
-                            });
-                            nodes.push(ParsedWebviewNode {
-                                kind: WebviewElementKind::Button {
-                                    label: clean_inner.to_string(),
-                                    message_payload: payload,
-                                },
-                            });
-                        }
-                        "hr" => nodes.push(ParsedWebviewNode {
-                            kind: WebviewElementKind::HorizontalRule,
-                        }),
-                        "li" => nodes.push(ParsedWebviewNode {
-                            kind: WebviewElementKind::ListItem(clean_inner.to_string()),
-                        }),
-                        _ => {
-                            if !clean_inner.is_empty() && !clean_inner.starts_with('<') {
-                                nodes.push(ParsedWebviewNode {
-                                    kind: WebviewElementKind::Paragraph(clean_inner.to_string()),
-                                });
-                            }
-                        }
-                    }
+fn decode_html_entities(s: &str) -> String {
+    let mut res = s
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&nbsp;", " ");
 
-                    rest = next_rest;
-                } else {
-                    break;
-                }
+    while let Some(start) = res.find("&#") {
+        if let Some(end) = res[start..].find(';') {
+            let entity = &res[start + 2..start + end];
+            let parsed_char = if entity.starts_with('x') || entity.starts_with('X') {
+                u32::from_str_radix(&entity[1..], 16).ok().and_then(char::from_u32)
             } else {
-                if !rest.trim().is_empty() {
-                    nodes.push(ParsedWebviewNode {
-                        kind: WebviewElementKind::Paragraph(rest.trim().to_string()),
-                    });
-                }
+                entity.parse::<u32>().ok().and_then(char::from_u32)
+            };
+            if let Some(ch) = parsed_char {
+                res.replace_range(start..=start + end, &ch.to_string());
+            } else {
                 break;
             }
+        } else {
+            break;
         }
+    }
+    res
+}
 
-        nodes
+fn strip_inner_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        if c == '<' {
+            in_tag = true;
+        } else if c == '>' {
+            in_tag = false;
+        } else if !in_tag {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn strip_and_decode(html: &str) -> String {
+    let stripped = strip_inner_tags(html);
+    decode_html_entities(&stripped).trim().to_string()
+}
+
+fn extract_attribute(tag_content: &str, attr: &str) -> Option<String> {
+    let pattern_double = format!("{}=\"", attr);
+    if let Some(pos) = tag_content.to_lowercase().find(&pattern_double) {
+        let after = &tag_content[pos + pattern_double.len()..];
+        if let Some(end) = after.find('"') {
+            return Some(after[..end].to_string());
+        }
+    }
+    let pattern_single = format!("{}='", attr);
+    if let Some(pos) = tag_content.to_lowercase().find(&pattern_single) {
+        let after = &tag_content[pos + pattern_single.len()..];
+        if let Some(end) = after.find('\'') {
+            return Some(after[..end].to_string());
+        }
+    }
+    None
+}
+
+fn has_child_tags(s: &str) -> bool {
+    s.contains('<') && s.contains('>')
+}
+
+fn has_block_child_tags(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    lower.contains("<h1")
+        || lower.contains("<h2")
+        || lower.contains("<h3")
+        || lower.contains("<h4")
+        || lower.contains("<h5")
+        || lower.contains("<h6")
+        || lower.contains("<p")
+        || lower.contains("<button")
+        || lower.contains("<pre")
+        || lower.contains("<code")
+        || lower.contains("<div")
+        || lower.contains("<hr")
+        || lower.contains("<ul")
+        || lower.contains("<ol")
+        || lower.contains("<li")
+}
+
+fn find_matching_close_tag<'a>(tag_name: &str, html: &'a str) -> (&'a str, &'a str) {
+    let open_prefix = format!("<{}", tag_name);
+    let close_tag = format!("</{}>", tag_name);
+    let mut depth = 1usize;
+    let mut idx = 0;
+
+    while idx < html.len() {
+        let remainder = &html[idx..];
+        if remainder.to_lowercase().starts_with(&close_tag) {
+            depth -= 1;
+            if depth == 0 {
+                let inner = &html[..idx];
+                let next_rest = &html[idx + close_tag.len()..];
+                return (inner.trim(), next_rest);
+            }
+            idx += close_tag.len();
+        } else if remainder.to_lowercase().starts_with(&open_prefix) {
+            let after_open = &remainder[open_prefix.len()..];
+            if after_open.starts_with(' ') || after_open.starts_with('>') || after_open.starts_with('/') {
+                depth += 1;
+            }
+            idx += open_prefix.len();
+        } else {
+            idx += 1;
+        }
+    }
+
+    (html.trim(), "")
+}
+
+fn parse_nodes_recursive(html: &str, nodes: &mut Vec<ParsedWebviewNode>) {
+    let mut rest = html.trim();
+    while !rest.is_empty() {
+        if let Some(start_idx) = rest.find('<') {
+            let leading_text = rest[..start_idx].trim();
+            if !leading_text.is_empty() {
+                let decoded = decode_html_entities(leading_text);
+                if !decoded.trim().is_empty() {
+                    nodes.push(ParsedWebviewNode {
+                        kind: WebviewElementKind::Paragraph(decoded),
+                    });
+                }
+            }
+
+            if let Some(end_idx) = rest[start_idx..].find('>') {
+                let full_tag_end = start_idx + end_idx;
+                let tag_content = rest[start_idx + 1..full_tag_end].trim();
+                let after_tag = &rest[full_tag_end + 1..];
+
+                if tag_content.starts_with('/') {
+                    rest = after_tag;
+                    continue;
+                }
+
+                let tag_name = tag_content
+                    .trim_end_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_lowercase();
+                let is_void = matches!(tag_name.as_str(), "hr" | "br" | "img" | "input" | "meta" | "link") || tag_content.ends_with('/');
+
+                if is_void {
+                    if tag_name == "hr" {
+                        nodes.push(ParsedWebviewNode {
+                            kind: WebviewElementKind::HorizontalRule,
+                        });
+                    }
+                    rest = after_tag;
+                    continue;
+                }
+
+                let (inner, next_rest) = find_matching_close_tag(&tag_name, after_tag);
+
+                match tag_name.as_str() {
+                    "h1" => {
+                        let text = strip_and_decode(inner);
+                        if !text.is_empty() {
+                            nodes.push(ParsedWebviewNode {
+                                kind: WebviewElementKind::Heading1(text),
+                            });
+                        }
+                    }
+                    "h2" => {
+                        let text = strip_and_decode(inner);
+                        if !text.is_empty() {
+                            nodes.push(ParsedWebviewNode {
+                                kind: WebviewElementKind::Heading2(text),
+                            });
+                        }
+                    }
+                    "h3" | "h4" | "h5" | "h6" => {
+                        let text = strip_and_decode(inner);
+                        if !text.is_empty() {
+                            nodes.push(ParsedWebviewNode {
+                                kind: WebviewElementKind::Heading3(text),
+                            });
+                        }
+                    }
+                    "pre" | "code" => {
+                        let text = decode_html_entities(inner).trim().to_string();
+                        if !text.is_empty() {
+                            nodes.push(ParsedWebviewNode {
+                                kind: WebviewElementKind::CodeBlock(text),
+                            });
+                        }
+                    }
+                    "button" => {
+                        let label = strip_and_decode(inner);
+                        let mut payload = serde_json::json!({
+                            "command": "click",
+                            "text": label,
+                        });
+                        if let Some(id) = extract_attribute(tag_content, "id") {
+                            payload["id"] = serde_json::json!(id);
+                        }
+                        nodes.push(ParsedWebviewNode {
+                            kind: WebviewElementKind::Button {
+                                label,
+                                message_payload: payload,
+                            },
+                        });
+                    }
+                    "li" => {
+                        let text = strip_and_decode(inner);
+                        if !text.is_empty() {
+                            nodes.push(ParsedWebviewNode {
+                                kind: WebviewElementKind::ListItem(text),
+                            });
+                        }
+                    }
+                    "p" => {
+                        if has_block_child_tags(inner) {
+                            parse_nodes_recursive(inner, nodes);
+                        } else {
+                            let text = strip_and_decode(inner);
+                            if !text.is_empty() {
+                                nodes.push(ParsedWebviewNode {
+                                    kind: WebviewElementKind::Paragraph(text),
+                                });
+                            }
+                        }
+                    }
+                    "div" | "span" | "section" | "article" | "main" | "header" | "footer"
+                    | "aside" | "nav" | "ul" | "ol" | "html" | "body" | "form" | "table"
+                    | "tbody" | "thead" | "tr" | "td" | "th" => {
+                        if has_child_tags(inner) {
+                            parse_nodes_recursive(inner, nodes);
+                        } else {
+                            let text = strip_and_decode(inner);
+                            if !text.is_empty() {
+                                nodes.push(ParsedWebviewNode {
+                                    kind: WebviewElementKind::Paragraph(text),
+                                });
+                            }
+                        }
+                    }
+                    _ => {
+                        if has_child_tags(inner) {
+                            parse_nodes_recursive(inner, nodes);
+                        } else {
+                            let text = strip_and_decode(inner);
+                            if !text.is_empty() {
+                                nodes.push(ParsedWebviewNode {
+                                    kind: WebviewElementKind::Paragraph(text),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                rest = next_rest;
+            } else {
+                break;
+            }
+        } else {
+            let decoded = decode_html_entities(rest.trim());
+            if !decoded.is_empty() {
+                nodes.push(ParsedWebviewNode {
+                    kind: WebviewElementKind::Paragraph(decoded),
+                });
+            }
+            break;
+        }
     }
 }
 
@@ -396,5 +631,61 @@ mod tests {
         assert_eq!(res, EventResult::Consumed);
         assert_eq!(webview.outbound_messages.len(), 1);
         assert_eq!(webview.outbound_messages[0]["text"], "Click Me");
+    }
+
+    #[test]
+    fn test_webview_full_document_html_parsing() {
+        let full_html = r#"
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <title>Ignored Head</title>
+                <style>body { color: red; }</style>
+                <script>console.log("ignore script content");</script>
+            </head>
+            <body>
+                <!-- Test comment -->
+                <div class="main-wrapper">
+                    <h1>Title &amp; Header</h1>
+                    <p>Paragraph with <strong>bold text</strong> and &lt;escaped&gt; entities.</p>
+                    <div class="actions">
+                        <button id="submit_btn">Submit Action</button>
+                    </div>
+                    <hr/>
+                    <ul>
+                        <li>Item &quot;One&quot;</li>
+                        <li>Item &#39;Two&#39;</li>
+                    </ul>
+                </div>
+            </body>
+            </html>
+        "#;
+
+        let nodes = WebviewEditorView::parse_html(full_html);
+        assert_eq!(nodes.len(), 6);
+
+        assert_eq!(
+            nodes[0].kind,
+            WebviewElementKind::Heading1("Title & Header".to_string())
+        );
+        assert_eq!(
+            nodes[1].kind,
+            WebviewElementKind::Paragraph("Paragraph with bold text and <escaped> entities.".to_string())
+        );
+        assert!(matches!(
+            &nodes[2].kind,
+            WebviewElementKind::Button { label, message_payload }
+                if label == "Submit Action" && message_payload["id"] == "submit_btn"
+        ));
+        assert_eq!(nodes[3].kind, WebviewElementKind::HorizontalRule);
+        assert_eq!(
+            nodes[4].kind,
+            WebviewElementKind::ListItem("Item \"One\"".to_string())
+        );
+        assert_eq!(
+            nodes[5].kind,
+            WebviewElementKind::ListItem("Item 'Two'".to_string())
+        );
     }
 }

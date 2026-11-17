@@ -16,6 +16,10 @@ pub struct WorkbenchThemeStyles {
     pub editor_current_line: Rgba,
     pub editor_gutter_background: Rgba,
     pub editor_gutter_border: Rgba,
+    pub editor_error_foreground: Rgba,
+    pub editor_warning_foreground: Rgba,
+    pub editor_info_foreground: Rgba,
+    pub editor_hint_foreground: Rgba,
 
     // Activity bar styles
     pub activity_bar_bg: Rgba,
@@ -75,6 +79,10 @@ impl WorkbenchThemeStyles {
             editor_current_line: Rgba::from_hex("#282828").unwrap(),
             editor_gutter_background: Rgba::from_hex("#1e1e1e").unwrap(),
             editor_gutter_border: Rgba::from_hex("#2d2d2d").unwrap(),
+            editor_error_foreground: Rgba::from_hex("#f14c4c").unwrap(),
+            editor_warning_foreground: Rgba::from_hex("#cca700").unwrap(),
+            editor_info_foreground: Rgba::from_hex("#3794ff").unwrap(),
+            editor_hint_foreground: Rgba::from_hex("#6c6c6c").unwrap(),
 
             activity_bar_bg: Rgba::from_hex("#333333").unwrap(),
             activity_bar_fg: Rgba::from_hex("#ffffff").unwrap(),
@@ -142,6 +150,10 @@ impl WorkbenchThemeStyles {
                 Self::resolve(theme, "editor.background", d.editor_background),
             ),
             editor_gutter_border: Self::resolve(theme, "editorGroup.border", d.editor_gutter_border),
+            editor_error_foreground: Self::resolve(theme, "editorError.foreground", d.editor_error_foreground),
+            editor_warning_foreground: Self::resolve(theme, "editorWarning.foreground", d.editor_warning_foreground),
+            editor_info_foreground: Self::resolve(theme, "editorInfo.foreground", d.editor_info_foreground),
+            editor_hint_foreground: Self::resolve(theme, "editorHint.foreground", d.editor_hint_foreground),
 
             activity_bar_bg: Self::resolve(theme, "activityBar.background", d.activity_bar_bg),
             activity_bar_fg: Self::resolve(theme, "activityBar.foreground", d.activity_bar_fg),

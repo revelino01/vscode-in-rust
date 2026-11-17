@@ -12,6 +12,7 @@ pub mod activitybar;
 pub mod editor_area;
 pub mod explorer;
 pub mod layout;
+pub mod problems;
 pub mod quickinput;
 pub mod statusbar;
 pub mod window;
@@ -21,6 +22,7 @@ pub use activitybar::{ActivityBar, ActivityBarAction, ActivityBarItem, ActivityB
 pub use editor_area::{EditorArea, EditorAreaAction, EditorAreaView, EditorGroup, EditorTab};
 pub use explorer::{ExplorerAction, ExplorerRow, FileExplorer, FileExplorerView, FileTreeNode};
 pub use layout::WorkbenchLayout;
+pub use problems::{ProblemEntry, ProblemsAction, ProblemsPanel};
 pub use quickinput::{CommandPalette, CommandPaletteView, PaletteAction, PaletteItem};
 pub use statusbar::{
     StatusBar, StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView,

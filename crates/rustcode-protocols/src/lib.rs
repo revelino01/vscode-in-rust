@@ -68,6 +68,7 @@ mod tests {
             severity: Some(DiagnosticSeverity::Error),
             message: "mismatched types".to_string(),
             source: Some("rust-analyzer".to_string()),
+            code: None,
         };
 
         let json = serde_json::to_string(&diag).unwrap();

@@ -2,7 +2,7 @@
 
 pub mod bridge;
 
-pub use bridge::LanguageFeatureBridge;
+pub use bridge::{DiagnosticCollectionManager, LanguageFeatureBridge};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

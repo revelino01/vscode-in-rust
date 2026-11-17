@@ -105,6 +105,7 @@ impl WorkbenchWindow {
                     self.handle_builtin_command_effects(&cmd);
                 }
                 WorkbenchAction::OpenFile(_path) => {}
+                WorkbenchAction::JumpToDiagnostic { .. } => {}
                 WorkbenchAction::SidebarToggled(_) => {}
                 WorkbenchAction::PanelToggled(_) => {}
             }

@@ -255,6 +255,28 @@ impl LspClientManager {
             let _ = client.exit().await;
         }
     }
+
+    pub fn get_diagnostics(&self, uri: &str) -> Vec<LspDiagnostic> {
+        let clients = self.clients.read();
+        for client in clients.values() {
+            let diags = client.get_diagnostics(uri);
+            if !diags.is_empty() {
+                return diags;
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn get_all_diagnostics(&self) -> HashMap<String, Vec<LspDiagnostic>> {
+        let mut map = HashMap::new();
+        let clients = self.clients.read();
+        for client in clients.values() {
+            for (uri, diags) in client.get_all_diagnostics() {
+                map.entry(uri).or_insert_with(Vec::new).extend(diags);
+            }
+        }
+        map
+    }
 }
 
 #[cfg(test)]

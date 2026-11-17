@@ -2,18 +2,116 @@
 
 use super::{ProviderRegistry, ProviderType};
 use crate::rpc::RpcBridge;
+use parking_lot::RwLock;
 use rustcode_protocols::lsp::{
     CompletionContext, CompletionTriggerKind, Hover, LspClientManager, LspCompletionItem,
-    LspLocation, LspPosition, MarkupContent,
+    LspDiagnostic, LspLocation, LspPosition, MarkupContent,
 };
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+#[derive(Default)]
+pub struct DiagnosticCollectionManager {
+    collections: RwLock<HashMap<String, HashMap<String, Vec<LspDiagnostic>>>>,
+}
+
+impl DiagnosticCollectionManager {
+    pub fn new() -> Self {
+        Self {
+            collections: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn set_diagnostics(&self, collection: &str, uri: &str, diagnostics: Vec<LspDiagnostic>) {
+        let mut guard = self.collections.write();
+        let map = guard.entry(collection.to_string()).or_default();
+        if diagnostics.is_empty() {
+            map.remove(uri);
+        } else {
+            map.insert(uri.to_string(), diagnostics);
+        }
+    }
+
+    pub fn clear_diagnostics(&self, collection: &str, uri: &str) {
+        let mut guard = self.collections.write();
+        if let Some(map) = guard.get_mut(collection) {
+            map.remove(uri);
+        }
+    }
+
+    pub fn clear_all_in_collection(&self, collection: &str) {
+        let mut guard = self.collections.write();
+        guard.remove(collection);
+    }
+
+    pub fn get_diagnostics_for_uri(&self, uri: &str) -> Vec<LspDiagnostic> {
+        let mut result = Vec::new();
+        let guard = self.collections.read();
+        for map in guard.values() {
+            if let Some(diags) = map.get(uri) {
+                result.extend(diags.clone());
+            }
+        }
+        result
+    }
+
+    pub fn get_all_diagnostics(&self) -> HashMap<String, Vec<LspDiagnostic>> {
+        let mut result = HashMap::new();
+        let guard = self.collections.read();
+        for map in guard.values() {
+            for (uri, diags) in map {
+                result
+                    .entry(uri.clone())
+                    .or_insert_with(Vec::new)
+                    .extend(diags.clone());
+            }
+        }
+        result
+    }
+
+    pub fn handle_rpc_message(&self, method: &str, params: &serde_json::Value) -> bool {
+        match method {
+            "languages.setDiagnostics" => {
+                if let (Some(name), Some(uri), Some(diags_val)) = (
+                    params.get("name").and_then(|n| n.as_str()),
+                    params.get("uri").and_then(|u| u.as_str()),
+                    params.get("diagnostics"),
+                ) {
+                    if let Ok(diags) = serde_json::from_value::<Vec<LspDiagnostic>>(diags_val.clone()) {
+                        self.set_diagnostics(name, uri, diags);
+                        return true;
+                    }
+                }
+                false
+            }
+            "languages.clearDiagnostics" => {
+                if let (Some(name), Some(uri)) = (
+                    params.get("name").and_then(|n| n.as_str()),
+                    params.get("uri").and_then(|u| u.as_str()),
+                ) {
+                    self.clear_diagnostics(name, uri);
+                    return true;
+                }
+                false
+            }
+            "languages.clearAllDiagnostics" => {
+                if let Some(name) = params.get("name").and_then(|n| n.as_str()) {
+                    self.clear_all_in_collection(name);
+                    return true;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+}
 
 pub struct LanguageFeatureBridge {
     pub provider_registry: Arc<ProviderRegistry>,
     pub rpc_bridge: Arc<RpcBridge>,
     pub lsp_manager: Arc<LspClientManager>,
+    pub diagnostic_manager: Arc<DiagnosticCollectionManager>,
 }
 
 impl LanguageFeatureBridge {
@@ -26,7 +124,27 @@ impl LanguageFeatureBridge {
             provider_registry,
             rpc_bridge,
             lsp_manager,
+            diagnostic_manager: Arc::new(DiagnosticCollectionManager::new()),
         }
+    }
+
+    pub fn with_diagnostic_manager(mut self, dm: Arc<DiagnosticCollectionManager>) -> Self {
+        self.diagnostic_manager = dm;
+        self
+    }
+
+    pub fn get_diagnostics(&self, uri: &str) -> Vec<LspDiagnostic> {
+        let mut list = self.lsp_manager.get_diagnostics(uri);
+        list.extend(self.diagnostic_manager.get_diagnostics_for_uri(uri));
+        list
+    }
+
+    pub fn get_all_diagnostics(&self) -> HashMap<String, Vec<LspDiagnostic>> {
+        let mut all = self.lsp_manager.get_all_diagnostics();
+        for (uri, ext_diags) in self.diagnostic_manager.get_all_diagnostics() {
+            all.entry(uri).or_default().extend(ext_diags);
+        }
+        all
     }
 
     /// Request completions from LSP servers and registered JS extension providers,
@@ -264,5 +382,45 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert!(items.iter().any(|i| i.label == "to_string"));
         assert!(items.iter().any(|i| i.label == "custom_macro"));
+    }
+
+    #[test]
+    fn test_diagnostic_collection_manager_and_rpc() {
+        let manager = DiagnosticCollectionManager::new();
+
+        // 1. Ingest via RPC notification: languages.setDiagnostics
+        let params = json!({
+            "name": "eslint",
+            "uri": "file:///src/index.js",
+            "diagnostics": [
+                {
+                    "range": {
+                        "start": { "line": 5, "character": 2 },
+                        "end": { "line": 5, "character": 10 }
+                    },
+                    "severity": 1,
+                    "message": "Missing semicolon",
+                    "source": "eslint",
+                    "code": "semi"
+                }
+            ]
+        });
+
+        let handled = manager.handle_rpc_message("languages.setDiagnostics", &params);
+        assert!(handled);
+
+        let diags = manager.get_diagnostics_for_uri("file:///src/index.js");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].message, "Missing semicolon");
+        assert_eq!(diags[0].source.as_deref(), Some("eslint"));
+
+        // 2. Clear diagnostics for file
+        let clear_params = json!({
+            "name": "eslint",
+            "uri": "file:///src/index.js"
+        });
+        let handled_clear = manager.handle_rpc_message("languages.clearDiagnostics", &clear_params);
+        assert!(handled_clear);
+        assert!(manager.get_diagnostics_for_uri("file:///src/index.js").is_empty());
     }
 }

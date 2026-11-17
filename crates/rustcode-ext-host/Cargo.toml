@@ -13,4 +13,6 @@ rmp-serde = "1"
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 parking_lot = "0.12"
 thiserror = "2"
+flate2 = { version = "1.1.11", default-features = false, features = ["rust_backend"] }
+zip = { version = "9.6.1", default-features = false, features = ["deflate"] }
 

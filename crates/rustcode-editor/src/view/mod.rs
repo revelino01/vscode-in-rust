@@ -6,11 +6,12 @@ use crate::document::TextDocument;
 use crate::model::piece_table::PieceTable;
 use crate::model::undo_redo::{TextEdit, UndoRedoStack};
 use crate::syntax::{GrammarRegistry, SyntaxHighlighter};
+use crate::viewmodel::{DiagnosticSeverity, EditorDiagnostic};
 use parking_lot::{Mutex, RwLock};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
-    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Scene, View,
-    WorkbenchThemeStyles,
+    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba,
+    Scene, Shadow, View, WorkbenchThemeStyles,
 };
 use rustcode_platform::theme::ColorTheme;
 use std::sync::Arc;
@@ -29,6 +30,9 @@ pub struct EditorView {
     pub document: Option<Arc<RwLock<TextDocument>>>,
     pub autocomplete: AutocompleteWidget,
     pub completion_provider: Option<CompletionProviderFn>,
+    pub diagnostics: Vec<EditorDiagnostic>,
+    pub hovered_diagnostic: Option<EditorDiagnostic>,
+    pub hover_position: Option<Point>,
 }
 
 impl EditorView {
@@ -44,7 +48,46 @@ impl EditorView {
             document: None,
             autocomplete: AutocompleteWidget::new(),
             completion_provider: None,
+            diagnostics: Vec::new(),
+            hovered_diagnostic: None,
+            hover_position: None,
         }
+    }
+
+    pub fn set_diagnostics(&mut self, diagnostics: Vec<EditorDiagnostic>) {
+        self.diagnostics = diagnostics;
+        self.hovered_diagnostic = None;
+        self.hover_position = None;
+    }
+
+    pub fn clear_diagnostics(&mut self) {
+        self.diagnostics.clear();
+        self.hovered_diagnostic = None;
+        self.hover_position = None;
+    }
+
+    pub fn diagnostics_for_line(&self, line: usize) -> Vec<&EditorDiagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.range.start.line <= line && d.range.end.line >= line)
+            .collect()
+    }
+
+    pub fn diagnostic_at_position(&self, pos: Position) -> Option<&EditorDiagnostic> {
+        self.diagnostics.iter().find(|d| {
+            if pos.line < d.range.start.line || pos.line > d.range.end.line {
+                return false;
+            }
+            if d.range.start.line == d.range.end.line {
+                pos.column >= d.range.start.column && pos.column <= d.range.end.column
+            } else if pos.line == d.range.start.line {
+                pos.column >= d.range.start.column
+            } else if pos.line == d.range.end.line {
+                pos.column <= d.range.end.column
+            } else {
+                true
+            }
+        })
     }
 
     pub fn with_syntax(self, highlighter: SyntaxHighlighter) -> Self {
@@ -734,7 +777,38 @@ impl View for EditorView {
             }
 
 
-            // 5d. Cursors on this line
+            // 5d. Diagnostics squiggly underlines on this line
+            for diag in self.diagnostics_for_line(line_idx) {
+                let start_col = if line_idx == diag.range.start.line {
+                    diag.range.start.column
+                } else {
+                    0
+                };
+                let end_col = if line_idx == diag.range.end.line {
+                    diag.range.end.column
+                } else {
+                    line_content.len()
+                };
+                let end_col = end_col.max(start_col + 1);
+
+                let start_vis = line_content[..start_col.min(line_content.len())].chars().count();
+                let end_vis = line_content[..end_col.min(line_content.len())].chars().count().max(start_vis + 1);
+
+                let sq_x = text_area_x + (start_vis as f32 - self.scroll_left) * font.char_width;
+                let sq_w = ((end_vis - start_vis) as f32 * font.char_width).max(4.0);
+                let sq_y = line_y + font.line_height - 2.5;
+
+                let color = match diag.severity {
+                    DiagnosticSeverity::Error => theme.editor_error_foreground,
+                    DiagnosticSeverity::Warning => theme.editor_warning_foreground,
+                    DiagnosticSeverity::Information => theme.editor_info_foreground,
+                    DiagnosticSeverity::Hint => theme.editor_hint_foreground,
+                };
+
+                render_squiggly_wave(scene, sq_x, sq_x + sq_w, sq_y, color);
+            }
+
+            // 5e. Cursors on this line
             if self.is_focused {
                 for sel in &self.cursor_state.selections {
                     if sel.active.line == line_idx {
@@ -766,6 +840,77 @@ impl View for EditorView {
                 scene,
             );
         }
+
+        // 7. Error hover tooltip overlay
+        if let (Some(diag), Some(mouse_pt)) = (&self.hovered_diagnostic, self.hover_position) {
+            let header_text = diag.formatted_header();
+            let message_text = &diag.message;
+
+            let header_w = font.text_width(&header_text);
+            let message_w = font.text_width(message_text);
+            let card_w = (header_w.max(message_w) + 28.0).max(180.0).min(bounds.width() - 40.0);
+            let card_h = font.line_height * 2.0 + 16.0;
+
+            let mut card_x = mouse_pt.x + 8.0;
+            if card_x + card_w > bounds.max_x() - 10.0 {
+                card_x = (bounds.max_x() - card_w - 10.0).max(bounds.min_x() + 10.0);
+            }
+            let mut card_y = mouse_pt.y + 16.0;
+            if card_y + card_h > bounds.max_y() - 10.0 {
+                card_y = (mouse_pt.y - card_h - 6.0).max(bounds.min_y() + 10.0);
+            }
+
+            let card_rect = Rect::from_xywh(card_x, card_y, card_w, card_h);
+            scene.push_shadow(Shadow {
+                bounds: card_rect,
+                offset: Point::new(0.0, 4.0),
+                blur: 10.0,
+                spread: 0.0,
+                color: Rgba::new(0.0, 0.0, 0.0, 0.35),
+            });
+
+            let sev_color = match diag.severity {
+                DiagnosticSeverity::Error => theme.editor_error_foreground,
+                DiagnosticSeverity::Warning => theme.editor_warning_foreground,
+                DiagnosticSeverity::Information => theme.editor_info_foreground,
+                DiagnosticSeverity::Hint => theme.editor_hint_foreground,
+            };
+
+            scene.push_quad(
+                Quad::new(card_rect)
+                    .with_background(theme.command_palette_bg)
+                    .with_border_edges(theme.panel_border, Edges::all(1.0))
+                    .with_corner_radius(4.0),
+            );
+
+            let bar_rect = Rect::from_xywh(card_x, card_y, 4.0, card_h);
+            scene.push_quad(
+                Quad::new(bar_rect)
+                    .with_background(sev_color)
+                    .with_corner_radius(2.0),
+            );
+
+            let header_pt = Point::new(card_x + 10.0, card_y + 6.0);
+            scene.push_text(
+                GlyphRun::new(
+                    header_text,
+                    header_pt,
+                    Rect::from_xywh(header_pt.x, header_pt.y, header_w, font.line_height),
+                    sev_color,
+                    font.font_size * 0.9,
+                )
+                .with_style(true, false, false),
+            );
+
+            let msg_pt = Point::new(card_x + 10.0, card_y + 6.0 + font.line_height);
+            scene.push_text(GlyphRun::new(
+                message_text.clone(),
+                msg_pt,
+                Rect::from_xywh(msg_pt.x, msg_pt.y, message_w, font.line_height),
+                theme.editor_foreground,
+                font.font_size,
+            ));
+        }
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
@@ -774,6 +919,8 @@ impl View for EditorView {
 
         match event {
             InputEvent::MouseDown(mouse) => {
+                self.hovered_diagnostic = None;
+                self.hover_position = None;
                 if !bounds.contains(mouse.position) {
                     return EventResult::Ignored;
                 }
@@ -857,6 +1004,8 @@ impl View for EditorView {
                 EventResult::Consumed
             }
             InputEvent::KeyDown(key) => {
+                self.hovered_diagnostic = None;
+                self.hover_position = None;
                 if !self.is_focused {
                     return EventResult::Ignored;
                 }
@@ -1042,8 +1191,71 @@ impl View for EditorView {
                     }
                 }
             }
+            InputEvent::MouseMove(mouse) => {
+                if !bounds.contains(mouse.position) {
+                    if self.hovered_diagnostic.is_some() {
+                        self.hovered_diagnostic = None;
+                        self.hover_position = None;
+                        return EventResult::Consumed;
+                    }
+                    return EventResult::Ignored;
+                }
+
+                if mouse.position.x >= bounds.min_x() + gutter_w {
+                    let buf = self.buffer.read();
+                    let line_count = buf.line_count();
+                    let line = ((mouse.position.y - bounds.min_y()) / font.line_height + self.scroll_top)
+                        .floor()
+                        .max(0.0) as usize;
+                    if line < line_count {
+                        let text_area_x = bounds.min_x() + gutter_w + 8.0;
+                        let char_col = ((mouse.position.x - text_area_x + self.scroll_left * font.char_width)
+                            / font.char_width)
+                            .floor()
+                            .max(0.0) as usize;
+                        let line_content = buf.get_line_content(line).unwrap_or_default();
+                        let total_chars = line_content.chars().count();
+                        let char_idx = char_col.min(total_chars);
+                        let col = if char_idx >= total_chars {
+                            line_content.len()
+                        } else {
+                            line_content.char_indices().nth(char_idx).map_or(line_content.len(), |(b, _)| b)
+                        };
+                        drop(buf);
+
+                        let pos = Position::new(line, col);
+                        if let Some(diag) = self.diagnostic_at_position(pos) {
+                            let diag_cloned = diag.clone();
+                            self.hovered_diagnostic = Some(diag_cloned);
+                            self.hover_position = Some(mouse.position);
+                            return EventResult::Consumed;
+                        }
+                    }
+                }
+
+                if self.hovered_diagnostic.is_some() {
+                    self.hovered_diagnostic = None;
+                    self.hover_position = None;
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
             _ => EventResult::Ignored,
         }
+    }
+}
+
+fn render_squiggly_wave(scene: &mut Scene, start_x: f32, end_x: f32, y: f32, color: Rgba) {
+    let wave_step: f32 = 3.0;
+    let mut cur_x = start_x;
+    let mut up = false;
+    while cur_x < end_x {
+        let seg_w = wave_step.min(end_x - cur_x);
+        let seg_y = if up { y - 1.2 } else { y + 0.8 };
+        scene.push_quad(Quad::new(Rect::from_xywh(cur_x, seg_y, seg_w, 1.2)).with_background(color));
+        cur_x += seg_w;
+        up = !up;
     }
 }
 
@@ -1363,6 +1575,7 @@ pub fn get_builtin_completions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursor::Range;
     use rustcode_platform::keybindings::Modifiers;
     use rustcode_platform::render::MouseEvent;
 
@@ -1846,6 +2059,106 @@ mod tests {
         ));
         view.handle_event(&arrow_down, bounds);
         assert_eq!(view.primary_position().line, 1);
+    }
+
+    #[test]
+    fn test_editor_view_diagnostics_squiggly_underlines_rendering() {
+        let mut view = EditorView::from_str("let x: i32 = \"bad\";\nlet warning_val = 123;\nlet info_note = 456;");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        // Add 3 diagnostics: Error, Warning, Info
+        view.set_diagnostics(vec![
+            EditorDiagnostic::error(
+                Range::new(Position::new(0, 13), Position::new(0, 18)),
+                "mismatched types: expected `i32`, found `&str`",
+            )
+            .with_source("rust-analyzer")
+            .with_code("E0308"),
+            EditorDiagnostic::warning(
+                Range::new(Position::new(1, 4), Position::new(1, 15)),
+                "unused variable: `warning_val`",
+            )
+            .with_source("rustc")
+            .with_code("unused_variables"),
+            EditorDiagnostic::info(
+                Range::new(Position::new(2, 4), Position::new(2, 13)),
+                "consider making this constant",
+            ),
+        ]);
+
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+
+        // Verify quads exist with the diagnostic colors
+        let quads = scene.quads();
+        let has_error_wave = quads.iter().any(|q| q.background == Some(theme.editor_error_foreground));
+        let has_warning_wave = quads.iter().any(|q| q.background == Some(theme.editor_warning_foreground));
+        let has_info_wave = quads.iter().any(|q| q.background == Some(theme.editor_info_foreground));
+
+        assert!(has_error_wave, "Should have rendered red squiggly wave for error");
+        assert!(has_warning_wave, "Should have rendered yellow squiggly wave for warning");
+        assert!(has_info_wave, "Should have rendered blue squiggly wave for info");
+    }
+
+    #[test]
+    fn test_editor_view_diagnostics_hover_tooltip_and_dismiss() {
+        let mut view = EditorView::from_str("fn main() {\n    let result = unknown_fn();\n}");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        view.set_diagnostics(vec![
+            EditorDiagnostic::error(
+                Range::new(Position::new(1, 17), Position::new(1, 27)),
+                "cannot find function `unknown_fn` in this scope",
+            )
+            .with_source("rust-analyzer")
+            .with_code("E0425"),
+        ]);
+
+        // Calculate coordinate of `unknown_fn` on line 1, col 20
+        let gutter_w = view.gutter_width(&font);
+        let text_area_x = bounds.min_x() + gutter_w + 8.0;
+        let target_x = text_area_x + 20.0 * font.char_width;
+        let target_y = bounds.min_y() + 1.5 * font.line_height;
+
+        // Hover over the diagnostic span
+        let move_over = InputEvent::MouseMove(rustcode_platform::render::MouseMoveEvent {
+            position: Point::new(target_x, target_y),
+        });
+        let res = view.handle_event(&move_over, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert!(view.hovered_diagnostic.is_some());
+        let diag = view.hovered_diagnostic.as_ref().unwrap();
+        assert_eq!(diag.message, "cannot find function `unknown_fn` in this scope");
+        assert_eq!(diag.source.as_deref(), Some("rust-analyzer"));
+        assert_eq!(diag.code.as_deref(), Some("E0425"));
+
+        // Render scene with hover active
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("rust-analyzer (E0425)"));
+        assert!(scene.contains_text("cannot find function `unknown_fn` in this scope"));
+
+        // Move mouse away to empty area
+        let move_away = InputEvent::MouseMove(rustcode_platform::render::MouseMoveEvent {
+            position: Point::new(bounds.min_x() + 10.0, bounds.min_y() + 500.0),
+        });
+        view.handle_event(&move_away, bounds);
+        assert!(view.hovered_diagnostic.is_none());
+
+        // Hover again and then dismiss via MouseDown
+        view.handle_event(&move_over, bounds);
+        assert!(view.hovered_diagnostic.is_some());
+
+        let mouse_down = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            Point::new(target_x, target_y),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        view.handle_event(&mouse_down, bounds);
+        assert!(view.hovered_diagnostic.is_none());
     }
 }
 

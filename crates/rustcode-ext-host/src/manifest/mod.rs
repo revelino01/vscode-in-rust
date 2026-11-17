@@ -24,9 +24,18 @@ pub struct ExtensionManifest {
 pub struct Contributions {
     pub commands: Option<Vec<ContributedCommand>>,
     pub languages: Option<Vec<LanguageContribution>>,
+    pub grammars: Option<Vec<GrammarContribution>>,
     pub themes: Option<Vec<ThemeContribution>>,
     pub keybindings: Option<Vec<KeybindingContribution>>,
     pub configuration: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrammarContribution {
+    pub language: String,
+    #[serde(rename = "scopeName")]
+    pub scope_name: Option<String>,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -24,5 +24,7 @@ pub use syntax::{
     TokenSpan, TypeScriptGrammar,
 };
 pub use view::EditorView;
-pub use viewmodel::{DecorationKind, DecorationModel, LineDecoration};
+pub use viewmodel::{
+    DecorationKind, DecorationModel, DiagnosticSeverity, EditorDiagnostic, LineDecoration,
+};
 

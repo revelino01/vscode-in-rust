@@ -32,6 +32,8 @@ pub enum LspError {
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, LspError>>>>>;
 
+pub type DiagnosticsListener = Arc<dyn Fn(&str, &[LspDiagnostic]) + Send + Sync>;
+
 pub struct LspClient {
     next_id: AtomicU64,
     pending: PendingMap,
@@ -39,6 +41,7 @@ pub struct LspClient {
     capabilities: Arc<Mutex<Option<ServerCapabilities>>>,
     is_running: Arc<AtomicBool>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<LspDiagnostic>>>>,
+    diagnostics_listeners: Arc<Mutex<Vec<DiagnosticsListener>>>,
 }
 
 impl LspClient {
@@ -84,6 +87,7 @@ impl LspClient {
         let capabilities = Arc::new(Mutex::new(None));
         let is_running = Arc::new(AtomicBool::new(true));
         let diagnostics = Arc::new(Mutex::new(HashMap::new()));
+        let diagnostics_listeners: Arc<Mutex<Vec<DiagnosticsListener>>> = Arc::new(Mutex::new(Vec::new()));
 
         // Outbound writer loop
         let is_running_clone = is_running.clone();
@@ -100,6 +104,7 @@ impl LspClient {
         let pending_clone = pending.clone();
         let is_running_reader = is_running.clone();
         let diags_clone = diagnostics.clone();
+        let listeners_clone = diagnostics_listeners.clone();
         tokio::spawn(async move {
             let mut reader = reader;
             let mut buf = Vec::new();
@@ -133,7 +138,11 @@ impl LspClient {
                                             params.get("diagnostics"),
                                         ) {
                                             if let Ok(parsed) = serde_json::from_value::<Vec<LspDiagnostic>>(diags.clone()) {
-                                                diags_clone.lock().insert(uri.to_string(), parsed);
+                                                diags_clone.lock().insert(uri.to_string(), parsed.clone());
+                                                let listeners = listeners_clone.lock().clone();
+                                                for listener in listeners {
+                                                    listener(uri, &parsed);
+                                                }
                                             }
                                         }
                                     }
@@ -161,6 +170,7 @@ impl LspClient {
             capabilities,
             is_running,
             diagnostics,
+            diagnostics_listeners,
         }
     }
 
@@ -174,6 +184,44 @@ impl LspClient {
 
     pub fn get_diagnostics(&self, uri: &str) -> Vec<LspDiagnostic> {
         self.diagnostics.lock().get(uri).cloned().unwrap_or_default()
+    }
+
+    pub fn get_all_diagnostics(&self) -> HashMap<String, Vec<LspDiagnostic>> {
+        self.diagnostics.lock().clone()
+    }
+
+    pub fn on_diagnostics<F>(&self, listener: F)
+    where
+        F: Fn(&str, &[LspDiagnostic]) + Send + Sync + 'static,
+    {
+        self.diagnostics_listeners.lock().push(Arc::new(listener));
+    }
+
+    pub fn set_diagnostics(&self, uri: &str, diags: Vec<LspDiagnostic>) {
+        self.diagnostics.lock().insert(uri.to_string(), diags.clone());
+        let listeners = self.diagnostics_listeners.lock().clone();
+        for listener in listeners {
+            listener(uri, &diags);
+        }
+    }
+
+    pub fn clear_diagnostics(&self, uri: &str) {
+        self.diagnostics.lock().remove(uri);
+        let listeners = self.diagnostics_listeners.lock().clone();
+        for listener in listeners {
+            listener(uri, &[]);
+        }
+    }
+
+    pub fn clear_all_diagnostics(&self) {
+        let keys: Vec<String> = self.diagnostics.lock().keys().cloned().collect();
+        self.diagnostics.lock().clear();
+        let listeners = self.diagnostics_listeners.lock().clone();
+        for key in keys {
+            for listener in &listeners {
+                listener(&key, &[]);
+            }
+        }
     }
 
     /// Send a low-level JSON-RPC request and wait for the response.

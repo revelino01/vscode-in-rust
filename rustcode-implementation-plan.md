@@ -45,8 +45,8 @@
 ### Phase 2: Language Intelligence & Marketplace
 - [x] `languages.*` LSP client lifecycle (stdio JSON-RPC transport with framed message headers `Content-Length: ...\r\n\r\n`, full document lifecycle syncing `textDocument/didOpen`, `textDocument/didChange` with incremental & full edits, `textDocument/didClose`, request routing for completion, hover, and definition, LanguageFeatureBridge aggregating LSP and extension host providers)
 - [x] Autocomplete UI widget (GPUI popover overlay anchored at active cursor position in `EditorView`, triggered automatically on trigger characters `.` / `:` / `/` or manually with `Ctrl+Space`, live fuzzy matching and prefix filtering, arrow key selection `Up`/`Down`, `Tab` / `Enter` commit with snippet tabstop expansion into PieceTable buffer, `Escape` dismiss, and detail / documentation preview panel)
-- [ ] Diagnostics squiggly underlines & Problems panel
-- [ ] Open VSX marketplace client (.vsix package downloader)
+- [x] Diagnostics squiggly underlines & Problems panel (ingest from LSP `textDocument/publishDiagnostics` and extension `vscode.languages.createDiagnosticCollection`, render squiggly wave underlines with red/yellow/blue/gray severity styling under editor spans, error hover tooltips showing source, code, and message on mouse move, dockable `Problems` tab in bottom panel grouping by file with collapse/expand and filter, status bar & tab badge counts, and jump-to-location on problem click)
+- [x] Open VSX marketplace client & extension downloader (REST client querying `https://open-vsx.org/api/`, search extensions by keyword, fetch version metadata, download and unpack `.vsix` archives into `~/.rustcode/extensions/` with path traversal protections and standard `extension/` prefix stripping, and parse unpacked `package.json` to register contributed commands into `CommandRegistry`, themes into `ThemeService`, and grammars into the runtime)
 
 ### Phase 3: Full Parity
 - [ ] DAP debug adapter integration

@@ -496,3 +496,232 @@ async fn test_end_to_end_lsp_and_autocomplete_integration() {
     assert!(editor_mut.text().contains("let text.to_u = \"rust\";"));
 }
 
+#[tokio::test]
+async fn test_end_to_end_diagnostics_and_problems_panel() {
+    use rustcode_editor::cursor::{Position, Range};
+    use rustcode_editor::viewmodel::EditorDiagnostic;
+
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+
+    // 1. Open a document in the editor
+    let code = "fn compute() {\n    let answer: i32 = \"forty-two\";\n}\n";
+    window.view.editor_area.open_file("src/calc.rs", "calc.rs", code, true);
+
+    // 2. Ingest diagnostics (from LSP publishDiagnostics or Extension host collection)
+    let diags = vec![
+        EditorDiagnostic::error(
+            Range::new(Position::new(1, 22), Position::new(1, 33)),
+            "mismatched types: expected `i32`, found `&str`",
+        )
+        .with_source("rust-analyzer")
+        .with_code("E0308"),
+        EditorDiagnostic::warning(
+            Range::new(Position::new(1, 8), Position::new(1, 14)),
+            "unused variable: `answer`",
+        )
+        .with_source("rustc")
+        .with_code("unused_variables"),
+    ];
+
+    // Set diagnostics on active editor and update workbench problems
+    window
+        .view
+        .editor_area
+        .active_editor_mut()
+        .unwrap()
+        .set_diagnostics(diags.clone());
+
+    window.view.update_problems("src/calc.rs", diags);
+
+    // 3. Render: verify status bar item reflects error & warning count badges
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("$(error) 1  $(warning) 1"));
+
+    // Verify squiggly waves rendered in editor
+    let editor_theme = window.theme.current();
+    let theme_styles = rustcode_platform::render::WorkbenchThemeStyles::from_theme(editor_theme);
+    let has_error_wave = scene.quads().iter().any(|q| q.background == Some(theme_styles.editor_error_foreground));
+    let has_warning_wave = scene.quads().iter().any(|q| q.background == Some(theme_styles.editor_warning_foreground));
+    assert!(has_error_wave, "Red squiggly underline must be rendered in editor");
+    assert!(has_warning_wave, "Yellow squiggly underline must be rendered in editor");
+
+    // 4. Hover over the error diagnostic span: verify hover tooltip in scene
+    let font = FontMetrics::default_monospace();
+    let gutter_w = window.view.editor_area.active_editor().unwrap().gutter_width(&font);
+    let editor_regions = window.view.compute_regions(bounds);
+    let target_x = editor_regions.editor_area.min_x() + gutter_w + 8.0 + 25.0 * font.char_width;
+    let target_y = editor_regions.editor_area.min_y() + 35.0 + 1.5 * font.line_height;
+
+    let hover_ev = InputEvent::MouseMove(rustcode_platform::render::MouseMoveEvent {
+        position: Point::new(target_x, target_y),
+    });
+    window.dispatch_event(&hover_ev, bounds);
+
+    let hover_scene = window.render(&mut surface);
+    assert!(hover_scene.contains_text("rust-analyzer (E0308)"));
+    assert!(hover_scene.contains_text("mismatched types"));
+
+    // 5. Open Bottom Panel and activate Problems tab
+    window.view.layout.panel_visible = true;
+    window.view.layout.set_panel_tab("problems");
+
+    let panel_scene = window.render(&mut surface);
+    assert!(panel_scene.contains_text("PROBLEMS 2"));
+    assert!(panel_scene.contains_text("src/calc.rs"));
+    assert!(panel_scene.contains_text("[Error]"));
+    assert!(panel_scene.contains_text("[Warning]"));
+
+    // 6. Click on problem row in Problems panel: jumps to location in editor
+    let panel_regions = window.view.compute_regions(bounds);
+    let click_y = panel_regions.panel.min_y() + 26.0 + 24.0 + 22.0 + 5.0;
+    let click_x = panel_regions.panel.min_x() + 40.0;
+    let click_ev = InputEvent::MouseDown(MouseEvent::new(Point::new(click_x, click_y), MouseButton::Left));
+    window.dispatch_event(&click_ev, bounds);
+
+    assert_eq!(window.view.focused_region, rustcode_workbench::FocusedRegion::Editor);
+    let active_pos = window.view.editor_area.active_editor().unwrap().primary_position();
+    assert_eq!(active_pos, Position::new(1, 22));
+}
+
+#[tokio::test]
+async fn test_end_to_end_open_vsx_marketplace_and_downloader() {
+    use rustcode_ext_host::marketplace::{
+        ExtensionInstaller, MarketplaceClient, MockHttpTransport,
+    };
+    use rustcode_platform::commands::CommandRegistry;
+    use rustcode_platform::theme::ThemeService;
+    use std::io::Write;
+    use std::sync::Arc;
+    use zip::write::SimpleFileOptions;
+
+    // 1. Create a mock .vsix archive containing package.json and themes
+    let manifest_json = r##"{
+        "name": "synthwave-84",
+        "publisher": "robbowen",
+        "version": "0.1.15",
+        "displayName": "SynthWave '84",
+        "contributes": {
+            "commands": [
+                {
+                    "command": "synthwave84.enableNeon",
+                    "title": "Enable Neon Dreams",
+                    "category": "SynthWave '84"
+                }
+            ],
+            "themes": [
+                {
+                    "label": "SynthWave '84",
+                    "uiTheme": "vs-dark",
+                    "path": "./themes/synthwave.json"
+                }
+            ]
+        }
+    }"##;
+
+    let theme_json = r##"{
+        "name": "SynthWave '84",
+        "type": "dark",
+        "colors": {
+            "editor.background": "#262335",
+            "editor.foreground": "#ffffff"
+        }
+    }"##;
+
+    let mut vsix_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut vsix_buf);
+        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("extension/package.json", options).unwrap();
+        zip.write_all(manifest_json.as_bytes()).unwrap();
+        zip.start_file("extension/themes/synthwave.json", options).unwrap();
+        zip.write_all(theme_json.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    let vsix_bytes = vsix_buf.into_inner();
+
+    // 2. Set up Mock Open VSX HTTP transport
+    let transport = Arc::new(MockHttpTransport::new());
+    let download_url = "https://open-vsx.org/api/robbowen/synthwave-84/0.1.15/file/synthwave-84.vsix";
+
+    // Mock search endpoint
+    transport.set_response(
+        "https://open-vsx.org/api/-/search?query=synthwave&size=10&offset=0",
+        serde_json::to_vec(&serde_json::json!({
+            "totalSize": 1,
+            "extensions": [
+                {
+                    "namespace": "robbowen",
+                    "name": "synthwave-84",
+                    "version": "0.1.15",
+                    "displayName": "SynthWave '84",
+                    "downloadUrl": download_url
+                }
+            ]
+        })).unwrap(),
+    );
+
+    // Mock metadata endpoint
+    transport.set_response(
+        "https://open-vsx.org/api/robbowen/synthwave-84",
+        serde_json::to_vec(&serde_json::json!({
+            "namespace": "robbowen",
+            "name": "synthwave-84",
+            "version": "0.1.15",
+            "downloadUrl": download_url
+        })).unwrap(),
+    );
+
+    // Mock download binary endpoint
+    transport.set_response(download_url, vsix_bytes);
+
+    let client = Arc::new(MarketplaceClient::new("https://open-vsx.org/api", transport));
+
+    // 3. Search extensions via client
+    let search_res = client.search("synthwave", Some(10), Some(0)).await.unwrap();
+    assert_eq!(search_res.total_size, 1);
+    assert_eq!(search_res.extensions[0].name, "synthwave-84");
+
+    // 4. Download and unpack via installer
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("rustcode_e2e_ext_{}", now));
+    let installer = ExtensionInstaller::new(client, &temp_dir);
+
+    let loaded = installer
+        .install_from_marketplace("robbowen", "synthwave-84", None)
+        .await
+        .unwrap();
+
+    assert_eq!(loaded.manifest.name, "synthwave-84");
+    assert_eq!(loaded.manifest.publisher, "robbowen");
+    assert!(loaded.root_dir.join("package.json").exists());
+    assert!(loaded.root_dir.join("themes/synthwave.json").exists());
+
+    // 5. Register runtime contributions
+    let commands = CommandRegistry::new();
+    let mut theme_service = ThemeService::new();
+
+    let (registered_count, _subs) = installer
+        .register_contributions(&loaded, &commands, Some(&mut theme_service), |_lang, _path| Ok(()))
+        .unwrap();
+
+    assert_eq!(registered_count, 2);
+
+    // Verify command works
+    assert!(commands.has_command("synthwave84.enableNeon"));
+    let cmd_res = commands.execute("synthwave84.enableNeon", None).unwrap();
+    assert_eq!(cmd_res.get("command").and_then(|c| c.as_str()), Some("synthwave84.enableNeon"));
+
+    // Verify theme applied
+    assert_eq!(theme_service.current().name, "SynthWave '84");
+    assert_eq!(
+        theme_service.current().colors.get("editor.background").map(|s| s.as_str()),
+        Some("#262335")
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+

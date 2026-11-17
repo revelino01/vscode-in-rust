@@ -91,12 +91,38 @@ pub struct LspLocation {
     pub range: LspRange,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DiagnosticCode {
+    String(String),
+    Integer(i64),
+}
+
+impl std::fmt::Display for DiagnosticCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiagnosticCode::String(s) => write!(f, "{}", s),
+            DiagnosticCode::Integer(i) => write!(f, "{}", i),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LspDiagnostic {
     pub range: LspRange,
     pub severity: Option<DiagnosticSeverity>,
     pub message: String,
     pub source: Option<String>,
+    #[serde(default)]
+    pub code: Option<DiagnosticCode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublishDiagnosticsParams {
+    pub uri: String,
+    #[serde(default)]
+    pub version: Option<i32>,
+    pub diagnostics: Vec<LspDiagnostic>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

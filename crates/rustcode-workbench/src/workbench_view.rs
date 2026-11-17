@@ -4,8 +4,10 @@ use crate::activitybar::{ActivityBarAction, ActivityBarView};
 use crate::editor_area::EditorAreaView;
 use crate::explorer::{ExplorerAction, FileExplorerView};
 use crate::layout::WorkbenchLayout;
+use crate::problems::{ProblemsAction, ProblemsPanel};
 use crate::quickinput::{CommandPaletteView, PaletteAction};
-use crate::statusbar::{StatusBarAction, StatusBarView};
+use crate::statusbar::{StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
+use parking_lot::RwLock;
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, Point, Quad, Rect, Rgba, Scene, View,
     WorkbenchThemeStyles,
@@ -24,6 +26,11 @@ pub enum FocusedRegion {
 pub enum WorkbenchAction {
     ExecuteCommand(String),
     OpenFile(PathBuf),
+    JumpToDiagnostic {
+        uri: String,
+        line: usize,
+        column: usize,
+    },
     SidebarToggled(bool),
     PanelToggled(bool),
 }
@@ -34,6 +41,8 @@ pub struct WorkbenchView {
     pub explorer: FileExplorerView,
     pub editor_area: EditorAreaView,
     pub status_bar: StatusBarView,
+    pub problems_panel: ProblemsPanel,
+    pub panel_tab_bounds: RwLock<Vec<(String, Rect)>>,
     pub command_palette: Option<CommandPaletteView>,
     pub is_command_palette_open: bool,
     pub focused_region: FocusedRegion,
@@ -48,17 +57,47 @@ impl Default for WorkbenchView {
 
 impl WorkbenchView {
     pub fn new() -> Self {
+        let mut status_bar = StatusBarView::default();
+        status_bar.model.set_item(StatusBarItem {
+            id: "workbench.status.problems".to_string(),
+            text: "$(error) 0  $(warning) 0".to_string(),
+            tooltip: Some("No problems".to_string()),
+            command: Some("workbench.action.problems.focus".to_string()),
+            alignment: StatusBarAlignment::Left,
+            priority: 100,
+        });
+
         Self {
             layout: WorkbenchLayout::new(),
             activity_bar: ActivityBarView::default(),
             explorer: FileExplorerView::default(),
             editor_area: EditorAreaView::default(),
-            status_bar: StatusBarView::default(),
+            status_bar,
+            problems_panel: ProblemsPanel::new(),
+            panel_tab_bounds: RwLock::new(Vec::new()),
             command_palette: None,
             is_command_palette_open: false,
             focused_region: FocusedRegion::Editor,
             last_action: None,
         }
+    }
+
+    pub fn update_problems(&mut self, uri: &str, diags: Vec<rustcode_editor::viewmodel::EditorDiagnostic>) {
+        self.problems_panel.set_file_diagnostics(uri, diags);
+        let badge_text = self.problems_panel.status_badge_text();
+        let tooltip = format!(
+            "{} errors, {} warnings",
+            self.problems_panel.total_errors(),
+            self.problems_panel.total_warnings()
+        );
+        self.status_bar.model.set_item(StatusBarItem {
+            id: "workbench.status.problems".to_string(),
+            text: badge_text,
+            tooltip: Some(tooltip),
+            command: Some("workbench.action.problems.focus".to_string()),
+            alignment: StatusBarAlignment::Left,
+            priority: 100,
+        });
     }
 
     pub fn open_command_palette(&mut self, palette_view: CommandPaletteView) {
@@ -186,20 +225,94 @@ impl View for WorkbenchView {
         // 4. Editor area
         self.editor_area.render(regions.editor_area, theme, font, scene);
 
-        // 5. Panel (terminal / problems)
+        // 5. Panel (terminal / problems / output)
         if self.layout.panel_visible {
+            let tab_h = 26.0f32;
+            let tab_bar_rect = Rect::from_xywh(regions.panel.min_x(), regions.panel.min_y(), regions.panel.width(), tab_h);
             scene.push_quad(
-                Quad::new(regions.panel)
+                Quad::new(tab_bar_rect)
                     .with_background(theme.panel_bg)
-                    .with_border_edges(theme.panel_border, Edges::new(1.0, 0.0, 0.0, 0.0)),
+                    .with_border_edges(theme.panel_border, Edges::new(1.0, 0.0, 1.0, 0.0)),
             );
+
+            let mut tab_bounds = Vec::new();
+            let mut cur_x = regions.panel.min_x() + 8.0;
+
+            let tabs = [
+                ("problems", format!("PROBLEMS {}", self.problems_panel.total_count())),
+                ("output", "OUTPUT".to_string()),
+                ("terminal", "TERMINAL".to_string()),
+            ];
+
+            for (tab_id, label) in tabs {
+                let is_active = self.layout.active_panel_tab == tab_id;
+                let text_w = font.text_width(&label);
+                let tab_w = text_w + 16.0;
+                let tab_rect = Rect::from_xywh(cur_x, regions.panel.min_y(), tab_w, tab_h);
+                tab_bounds.push((tab_id.to_string(), tab_rect));
+
+                if is_active {
+                    scene.push_quad(
+                        Quad::new(tab_rect)
+                            .with_background(theme.tab_active_bg)
+                            .with_border_edges(theme.activity_bar_active_border, Edges::new(0.0, 0.0, 2.0, 0.0)),
+                    );
+                }
+
+                let text_color = if is_active {
+                    theme.tab_active_fg
+                } else {
+                    theme.tab_inactive_fg
+                };
+
+                scene.push_text(GlyphRun::new(
+                    label,
+                    Point::new(cur_x + 8.0, regions.panel.min_y() + 5.0),
+                    Rect::from_xywh(cur_x + 8.0, regions.panel.min_y() + 5.0, text_w, font.line_height),
+                    text_color,
+                    font.font_size * 0.85,
+                ));
+
+                cur_x += tab_w + 4.0;
+            }
+
+            // Close button on right edge
+            let close_rect = Rect::from_xywh(regions.panel.max_x() - 28.0, regions.panel.min_y(), 24.0, tab_h);
+            tab_bounds.push(("close".to_string(), close_rect));
             scene.push_text(GlyphRun::new(
-                "TERMINAL".to_string(),
-                Point::new(regions.panel.min_x() + 10.0, regions.panel.min_y() + 6.0),
-                Rect::from_xywh(regions.panel.min_x() + 10.0, regions.panel.min_y() + 6.0, 100.0, font.line_height),
+                "✕".to_string(),
+                Point::new(close_rect.min_x() + 6.0, regions.panel.min_y() + 5.0),
+                Rect::from_xywh(close_rect.min_x() + 6.0, regions.panel.min_y() + 5.0, 16.0, font.line_height),
                 theme.sidebar_header_fg,
                 font.font_size * 0.85,
             ));
+
+            *self.panel_tab_bounds.write() = tab_bounds;
+
+            // Content below tab bar
+            let content_rect = Rect::from_xywh(
+                regions.panel.min_x(),
+                regions.panel.min_y() + tab_h,
+                regions.panel.width(),
+                (regions.panel.height() - tab_h).max(0.0),
+            );
+
+            if self.layout.active_panel_tab == "problems" {
+                self.problems_panel.render(content_rect, theme, font, scene);
+            } else {
+                scene.push_quad(Quad::new(content_rect).with_background(theme.panel_bg));
+                scene.push_text(GlyphRun::new(
+                    if self.layout.active_panel_tab == "terminal" {
+                        "Terminal session active."
+                    } else {
+                        "Output console empty."
+                    }.to_string(),
+                    Point::new(content_rect.min_x() + 16.0, content_rect.min_y() + 12.0),
+                    Rect::from_xywh(content_rect.min_x() + 16.0, content_rect.min_y() + 12.0, 300.0, font.line_height),
+                    theme.sidebar_header_fg,
+                    font.font_size * 0.9,
+                ));
+            }
         }
 
         // 6. Status bar
@@ -282,11 +395,61 @@ impl View for WorkbenchView {
                     if let Some(action) = &self.status_bar.last_action {
                         match action {
                             StatusBarAction::ExecuteCommand(cmd) => {
+                                if cmd == "workbench.action.problems.focus" {
+                                    self.layout.set_panel_tab("problems");
+                                    self.focused_region = FocusedRegion::Panel;
+                                }
                                 self.last_action = Some(WorkbenchAction::ExecuteCommand(cmd.clone()));
                             }
                         }
                     }
                     res
+                } else if self.layout.panel_visible && regions.panel.contains(mouse.position) {
+                    self.focused_region = FocusedRegion::Panel;
+                    let tab_h = 26.0f32;
+                    let tab_bar_rect = Rect::from_xywh(regions.panel.min_x(), regions.panel.min_y(), regions.panel.width(), tab_h);
+
+                    if tab_bar_rect.contains(mouse.position) {
+                        let tabs = self.panel_tab_bounds.read().clone();
+                        for (tab_id, rect) in tabs {
+                            if rect.contains(mouse.position) {
+                                if tab_id == "close" {
+                                    self.layout.panel_visible = false;
+                                    self.last_action = Some(WorkbenchAction::PanelToggled(false));
+                                } else {
+                                    self.layout.set_panel_tab(&tab_id);
+                                }
+                                return EventResult::Consumed;
+                            }
+                        }
+                        EventResult::Consumed
+                    } else if self.layout.active_panel_tab == "problems" {
+                        let content_rect = Rect::from_xywh(
+                            regions.panel.min_x(),
+                            regions.panel.min_y() + tab_h,
+                            regions.panel.width(),
+                            (regions.panel.height() - tab_h).max(0.0),
+                        );
+                        let res = self.problems_panel.handle_event(event, content_rect);
+                        if let Some(ProblemsAction::JumpToLocation { uri, position }) = &self.problems_panel.last_action {
+                            let path = PathBuf::from(uri);
+                            let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                            let content = std::fs::read_to_string(&path).unwrap_or_default();
+                            self.editor_area.open_file(uri, title, &content, true);
+                            if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                active_editor.set_primary_position(*position);
+                            }
+                            self.focused_region = FocusedRegion::Editor;
+                            self.last_action = Some(WorkbenchAction::JumpToDiagnostic {
+                                uri: uri.clone(),
+                                line: position.line,
+                                column: position.column,
+                            });
+                        }
+                        res
+                    } else {
+                        EventResult::Consumed
+                    }
                 } else if regions.editor_area.contains(mouse.position) {
                     self.focused_region = FocusedRegion::Editor;
                     self.editor_area.handle_event(event, regions.editor_area)
@@ -305,6 +468,13 @@ impl View for WorkbenchView {
                 if self.layout.sidebar_visible && regions.sidebar.contains(scroll.position) {
                     self.explorer.handle_event(event, regions.sidebar)
                 } else if regions.editor_area.contains(scroll.position) {
+                    self.editor_area.handle_event(event, regions.editor_area)
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            InputEvent::MouseMove(mouse) => {
+                if regions.editor_area.contains(mouse.position) {
                     self.editor_area.handle_event(event, regions.editor_area)
                 } else {
                     EventResult::Ignored
@@ -374,5 +544,61 @@ mod tests {
             wb.last_action,
             Some(WorkbenchAction::ExecuteCommand("workbench.action.toggleSidebar".to_string()))
         );
+    }
+
+    #[test]
+    fn test_workbench_problems_panel_tabs_and_jump_to_location() {
+        use rustcode_editor::cursor::{Position, Range};
+        use rustcode_editor::viewmodel::EditorDiagnostic;
+
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+
+        wb.update_problems(
+            "src/main.rs",
+            vec![EditorDiagnostic::error(
+                Range::new(Position::new(12, 4), Position::new(12, 10)),
+                "cannot find value `x` in this scope",
+            )
+            .with_source("rust-analyzer")
+            .with_code("E0425")],
+        );
+
+        // Status bar item was updated with count badge
+        let left_items = wb.status_bar.model.left_items();
+        let prob_item = left_items.iter().find(|i| i.id == "workbench.status.problems").unwrap();
+        assert_eq!(prob_item.text, "$(error) 1  $(warning) 0");
+
+        // Toggle panel on and switch to problems
+        wb.layout.panel_visible = true;
+        wb.layout.set_panel_tab("problems");
+
+        let mut scene = Scene::new();
+        wb.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("PROBLEMS 1"));
+        assert!(scene.contains_text("src/main.rs"));
+        assert!(scene.contains_text("cannot find value `x` in this scope"));
+
+        // Click diagnostic row in panel to jump to location
+        let regions = wb.compute_regions(bounds);
+        let diag_click_pt = Point::new(regions.panel.min_x() + 40.0, regions.panel.min_y() + 26.0 + 24.0 + 22.0 + 5.0);
+        let click_ev = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            diag_click_pt,
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        let res = wb.handle_event(&click_ev, bounds);
+        assert_eq!(res, EventResult::Consumed);
+
+        assert_eq!(
+            wb.last_action,
+            Some(WorkbenchAction::JumpToDiagnostic {
+                uri: "src/main.rs".to_string(),
+                line: 12,
+                column: 4,
+            })
+        );
+        assert_eq!(wb.focused_region, FocusedRegion::Editor);
     }
 }

@@ -108,6 +108,9 @@ impl WorkbenchWindow {
                 WorkbenchAction::JumpToDiagnostic { .. } => {}
                 WorkbenchAction::SidebarToggled(_) => {}
                 WorkbenchAction::PanelToggled(_) => {}
+                WorkbenchAction::OpenDiff { .. } => {}
+                WorkbenchAction::DebugToolbar(_) => {}
+                WorkbenchAction::ScmAction(_) => {}
             }
         }
 

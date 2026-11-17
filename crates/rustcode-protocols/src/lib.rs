@@ -1,56 +1,19 @@
 //! `rustcode-protocols` — Layer 5: LSP, DAP, and Git SCM Protocol Definitions.
 
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
+pub mod codec;
+pub mod dap;
+pub mod git;
 pub mod lsp;
 
-pub mod git {
-    use super::*;
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-    pub enum GitStatusKind {
-        Untracked,
-        Modified,
-        Added,
-        Deleted,
-        Renamed,
-        Conflicted,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct GitStatusEntry {
-        pub path: PathBuf,
-        pub status: GitStatusKind,
-        pub is_staged: bool,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct BranchInfo {
-        pub name: String,
-        pub is_current: bool,
-        pub upstream: Option<String>,
-    }
-}
-
-pub mod dap {
-    use super::*;
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct SourceBreakpoint {
-        pub line: u32,
-        pub column: Option<u32>,
-        pub condition: Option<String>,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct StackFrame {
-        pub id: u32,
-        pub name: String,
-        pub line: u32,
-        pub column: u32,
-    }
-}
+pub use codec::{decode_framed_message, encode_framed_message, CodecError};
+pub use dap::{
+    Breakpoint, Capabilities, ContinuedEventBody, DapClient, DapError, DapEventListener,
+    DapMessage, InitializeRequestArguments, OutputEventBody, Scope, Source, SourceBreakpoint,
+    StackFrame, StoppedEventBody, Thread, Variable,
+};
+pub use git::{
+    BranchInfo, CommitInfo, GitStatusEntry, GitStatusKind, ScmRepository,
+};
 
 #[cfg(test)]
 mod tests {
@@ -76,7 +39,7 @@ mod tests {
         assert_eq!(decoded.message, "mismatched types");
 
         let entry = GitStatusEntry {
-            path: PathBuf::from("src/main.rs"),
+            path: std::path::PathBuf::from("src/main.rs"),
             status: GitStatusKind::Modified,
             is_staged: true,
         };

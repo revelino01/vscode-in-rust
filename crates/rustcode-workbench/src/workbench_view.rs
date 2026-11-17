@@ -1,15 +1,19 @@
 //! GPUI WorkbenchView coordinator composing all UI shell regions into a cohesive presentation tree.
 
 use crate::activitybar::{ActivityBarAction, ActivityBarView};
+use crate::debug::{
+    DebugConsoleView, DebugSidebarView, DebugToolbarAction, DebugToolbarView, DebugViewAction,
+};
 use crate::editor_area::EditorAreaView;
 use crate::explorer::{ExplorerAction, FileExplorerView};
 use crate::layout::WorkbenchLayout;
 use crate::problems::{ProblemsAction, ProblemsPanel};
 use crate::quickinput::{CommandPaletteView, PaletteAction};
+use crate::scm::{ScmAction, ScmView};
 use crate::statusbar::{StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
 use parking_lot::RwLock;
 use rustcode_platform::render::{
-    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, Point, Quad, Rect, Rgba, Scene, View,
+    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba, Scene, View,
     WorkbenchThemeStyles,
 };
 use std::path::PathBuf;
@@ -26,11 +30,19 @@ pub enum FocusedRegion {
 pub enum WorkbenchAction {
     ExecuteCommand(String),
     OpenFile(PathBuf),
+    OpenDiff {
+        path: PathBuf,
+        title: String,
+        original: String,
+        modified: String,
+    },
     JumpToDiagnostic {
         uri: String,
         line: usize,
         column: usize,
     },
+    DebugToolbar(DebugToolbarAction),
+    ScmAction(ScmAction),
     SidebarToggled(bool),
     PanelToggled(bool),
 }
@@ -39,6 +51,10 @@ pub struct WorkbenchView {
     pub layout: WorkbenchLayout,
     pub activity_bar: ActivityBarView,
     pub explorer: FileExplorerView,
+    pub scm_view: ScmView,
+    pub debug_sidebar: DebugSidebarView,
+    pub debug_toolbar: DebugToolbarView,
+    pub debug_console: DebugConsoleView,
     pub editor_area: EditorAreaView,
     pub status_bar: StatusBarView,
     pub problems_panel: ProblemsPanel,
@@ -71,6 +87,10 @@ impl WorkbenchView {
             layout: WorkbenchLayout::new(),
             activity_bar: ActivityBarView::default(),
             explorer: FileExplorerView::default(),
+            scm_view: ScmView::default(),
+            debug_sidebar: DebugSidebarView::default(),
+            debug_toolbar: DebugToolbarView::default(),
+            debug_console: DebugConsoleView::default(),
             editor_area: EditorAreaView::default(),
             status_bar,
             problems_panel: ProblemsPanel::new(),
@@ -226,15 +246,27 @@ impl View for WorkbenchView {
             self.activity_bar.render(regions.activity_bar, theme, font, scene);
         }
 
-        // 3. Primary sidebar (Explorer)
+        // 3. Primary sidebar (Explorer / SCM / Debug)
         if self.layout.sidebar_visible {
-            self.explorer.render(regions.sidebar, theme, font, scene);
+            let view_id = self.layout.active_sidebar_view.as_str();
+            if view_id == "scm" || view_id == "workbench.view.scm" {
+                self.scm_view.render(regions.sidebar, theme, font, scene);
+            } else if view_id == "debug" || view_id == "workbench.view.debug" {
+                self.debug_sidebar.render(regions.sidebar, theme, font, scene);
+            } else {
+                self.explorer.render(regions.sidebar, theme, font, scene);
+            }
         }
 
-        // 4. Editor area
+        // 4. Editor area & Floating Debug Toolbar
         self.editor_area.render(regions.editor_area, theme, font, scene);
 
-        // 5. Panel (terminal / problems / output)
+        if self.debug_toolbar.is_visible {
+            let tb_bounds = self.debug_toolbar.toolbar_bounds(regions.editor_area);
+            self.debug_toolbar.render(tb_bounds, theme, font, scene);
+        }
+
+        // 5. Panel (terminal / problems / debug_console / output)
         if self.layout.panel_visible {
             let tab_h = 26.0f32;
             let tab_bar_rect = Rect::from_xywh(regions.panel.min_x(), regions.panel.min_y(), regions.panel.width(), tab_h);
@@ -250,6 +282,7 @@ impl View for WorkbenchView {
             let tabs = [
                 ("problems", format!("PROBLEMS {}", self.problems_panel.total_count())),
                 ("output", "OUTPUT".to_string()),
+                ("debug_console", "DEBUG CONSOLE".to_string()),
                 ("terminal", "TERMINAL".to_string()),
             ];
 
@@ -308,6 +341,8 @@ impl View for WorkbenchView {
 
             if self.layout.active_panel_tab == "problems" {
                 self.problems_panel.render(content_rect, theme, font, scene);
+            } else if self.layout.active_panel_tab == "debug_console" {
+                self.debug_console.render(content_rect, theme, font, scene);
             } else {
                 scene.push_quad(Quad::new(content_rect).with_background(theme.panel_bg));
                 scene.push_text(GlyphRun::new(
@@ -374,6 +409,18 @@ impl View for WorkbenchView {
 
         match event {
             InputEvent::MouseDown(mouse) => {
+                // Priority 1: Floating Debug Toolbar overlay
+                if self.debug_toolbar.is_visible {
+                    let tb_bounds = self.debug_toolbar.toolbar_bounds(regions.editor_area);
+                    if tb_bounds.contains(mouse.position) {
+                        let res = self.debug_toolbar.handle_event(event, tb_bounds);
+                        if let Some(act) = self.debug_toolbar.last_action.take() {
+                            self.last_action = Some(WorkbenchAction::DebugToolbar(act));
+                        }
+                        return res;
+                    }
+                }
+
                 if self.layout.activity_bar_visible && regions.activity_bar.contains(mouse.position) {
                     let res = self.activity_bar.handle_event(event, regions.activity_bar);
                     if let Some(action) = &self.activity_bar.last_action {
@@ -385,20 +432,72 @@ impl View for WorkbenchView {
                     res
                 } else if self.layout.sidebar_visible && regions.sidebar.contains(mouse.position) {
                     self.focused_region = FocusedRegion::Sidebar;
-                    let res = self.explorer.handle_event(event, regions.sidebar);
-                    if let Some(action) = &self.explorer.last_action {
-                        match action {
-                            ExplorerAction::OpenFile(path) => {
+                    let view_id = self.layout.active_sidebar_view.as_str();
+                    if view_id == "scm" || view_id == "workbench.view.scm" {
+                        let res = self.scm_view.handle_event(event, regions.sidebar);
+                        if let Some(scm_act) = self.scm_view.last_action.take() {
+                            if let ScmAction::OpenDiff { path, title, original, modified } = &scm_act {
                                 let path_str = path.to_string_lossy().to_string();
-                                let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
-                                let content = std::fs::read_to_string(path).unwrap_or_default();
-                                self.editor_area.open_file(&path_str, title, &content, true);
-                                self.last_action = Some(WorkbenchAction::OpenFile(path.clone()));
+                                self.editor_area.open_diff(&path_str, title, original, modified);
+                                self.last_action = Some(WorkbenchAction::OpenDiff {
+                                    path: path.clone(),
+                                    title: title.clone(),
+                                    original: original.clone(),
+                                    modified: modified.clone(),
+                                });
+                            } else {
+                                self.last_action = Some(WorkbenchAction::ScmAction(scm_act));
                             }
-                            ExplorerAction::ToggleDir(_) => {}
                         }
+                        res
+                    } else if view_id == "debug" || view_id == "workbench.view.debug" {
+                        let res = self.debug_sidebar.handle_event(event, regions.sidebar);
+                        if let Some(act) = self.debug_sidebar.last_action.take() {
+                            match act {
+                                DebugViewAction::SelectFrame {
+                                    path: Some(p),
+                                    line,
+                                    ..
+                                } => {
+                                    let path_buf = PathBuf::from(&p);
+                                    let title = path_buf.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                                    let content = std::fs::read_to_string(&path_buf).unwrap_or_default();
+                                    self.editor_area.open_file(&p, title, &content, true);
+                                    if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                        active_editor.set_primary_position(rustcode_editor::Position::new((line as usize).saturating_sub(1), 0));
+                                        active_editor.set_execution_line(Some(line as usize));
+                                    }
+                                }
+                                DebugViewAction::SelectFrame { path: None, .. } => {}
+                                DebugViewAction::JumpToBreakpoint { path, line } => {
+                                    let path_buf = PathBuf::from(&path);
+                                    let title = path_buf.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                                    let content = std::fs::read_to_string(&path_buf).unwrap_or_default();
+                                    self.editor_area.open_file(&path, title, &content, true);
+                                    if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                        active_editor.set_primary_position(rustcode_editor::Position::new((line as usize).saturating_sub(1), 0));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        res
+                    } else {
+                        let res = self.explorer.handle_event(event, regions.sidebar);
+                        if let Some(action) = &self.explorer.last_action {
+                            match action {
+                                ExplorerAction::OpenFile(path) => {
+                                    let path_str = path.to_string_lossy().to_string();
+                                    let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                                    let content = std::fs::read_to_string(path).unwrap_or_default();
+                                    self.editor_area.open_file(&path_str, title, &content, true);
+                                    self.last_action = Some(WorkbenchAction::OpenFile(path.clone()));
+                                }
+                                ExplorerAction::ToggleDir(_) => {}
+                            }
+                        }
+                        res
                     }
-                    res
                 } else if self.layout.status_bar_visible && regions.status_bar.contains(mouse.position) {
                     let res = self.status_bar.handle_event(event, regions.status_bar);
                     if let Some(action) = &self.status_bar.last_action {
@@ -461,6 +560,14 @@ impl View for WorkbenchView {
                             });
                         }
                         res
+                    } else if self.layout.active_panel_tab == "debug_console" {
+                        let content_rect = Rect::from_xywh(
+                            regions.panel.min_x(),
+                            regions.panel.min_y() + tab_h,
+                            regions.panel.width(),
+                            (regions.panel.height() - tab_h).max(0.0),
+                        );
+                        self.debug_console.handle_event(event, content_rect)
                     } else {
                         EventResult::Consumed
                     }
@@ -471,16 +578,59 @@ impl View for WorkbenchView {
                     EventResult::Ignored
                 }
             }
-            InputEvent::KeyDown(_) | InputEvent::KeyUp(_) => {
+            InputEvent::KeyDown(key) => {
+                // Global Debug shortcuts: F5, F10, F11, Shift+F11, Shift+F5, Ctrl+Shift+F5
+                match key.key {
+                    KeyCode::F5 | KeyCode::F10 | KeyCode::F11 => {
+                        let res = self.debug_toolbar.handle_event(event, regions.editor_area);
+                        if let Some(act) = self.debug_toolbar.last_action.take() {
+                            self.last_action = Some(WorkbenchAction::DebugToolbar(act));
+                            return EventResult::Consumed;
+                        }
+                        if res == EventResult::Consumed {
+                            return res;
+                        }
+                    }
+                    _ => {}
+                }
+
                 match self.focused_region {
                     FocusedRegion::Editor => self.editor_area.handle_event(event, regions.editor_area),
-                    FocusedRegion::Sidebar => self.explorer.handle_event(event, regions.sidebar),
+                    FocusedRegion::Sidebar => {
+                        let view_id = self.layout.active_sidebar_view.as_str();
+                        if view_id == "scm" || view_id == "workbench.view.scm" {
+                            let res = self.scm_view.handle_event(event, regions.sidebar);
+                            if let Some(act) = self.scm_view.last_action.take() {
+                                self.last_action = Some(WorkbenchAction::ScmAction(act));
+                            }
+                            res
+                        } else if view_id == "debug" || view_id == "workbench.view.debug" {
+                            self.debug_sidebar.handle_event(event, regions.sidebar)
+                        } else {
+                            self.explorer.handle_event(event, regions.sidebar)
+                        }
+                    }
+                    FocusedRegion::Panel => {
+                        if self.layout.active_panel_tab == "debug_console" {
+                            self.debug_console.handle_event(event, regions.panel)
+                        } else {
+                            EventResult::Ignored
+                        }
+                    }
                     _ => EventResult::Ignored,
                 }
             }
+            InputEvent::KeyUp(_) => EventResult::Ignored,
             InputEvent::ScrollWheel(scroll) => {
                 if self.layout.sidebar_visible && regions.sidebar.contains(scroll.position) {
-                    self.explorer.handle_event(event, regions.sidebar)
+                    let view_id = self.layout.active_sidebar_view.as_str();
+                    if view_id == "scm" || view_id == "workbench.view.scm" {
+                        self.scm_view.handle_event(event, regions.sidebar)
+                    } else if view_id == "debug" || view_id == "workbench.view.debug" {
+                        self.debug_sidebar.handle_event(event, regions.sidebar)
+                    } else {
+                        self.explorer.handle_event(event, regions.sidebar)
+                    }
                 } else if regions.editor_area.contains(scroll.position) {
                     self.editor_area.handle_event(event, regions.editor_area)
                 } else {

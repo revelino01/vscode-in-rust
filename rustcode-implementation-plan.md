@@ -49,9 +49,9 @@
 - [x] Open VSX marketplace client & extension downloader (REST client querying `https://open-vsx.org/api/`, search extensions by keyword, fetch version metadata, download and unpack `.vsix` archives into `~/.rustcode/extensions/` with path traversal protections and standard `extension/` prefix stripping, and parse unpacked `package.json` to register contributed commands into `CommandRegistry`, themes into `ThemeService`, and grammars into the runtime)
 
 ### Phase 3: Full Parity
-- [ ] DAP debug adapter integration
-- [ ] Git / SCM sidebar diff viewer
-- [ ] Webview host integration (`wry`)
+- [x] DAP debug adapter integration (DAP client over stdio framing, breakpoint management, stack frames, scopes, variables, floating debug toolbar with Continue/Step/Restart/Stop, and Call Stack / Variables / Breakpoints sidebar with Debug Console)
+- [x] Git / SCM sidebar diff viewer (pure-Rust Eugene Myers O(ND) diff algorithm with inline & side-by-side DiffEditorView, SCM primary sidebar with Staged Changes, Changes, and Untracked trees, staging/unstaging actions, commit message input and execution)
+- [x] Webview host integration (pure-Rust modular webview host with HTML parser & GPUI renderer, bidirectional MessagePort RPC bridge `postMessage` / `onDidReceiveMessage`, and `vscode.window.createWebviewPanel` extension host support)
 - [x] GPU window rendering (GPUI presentation layer, mockable render surface, and scene graph pipeline)
 
 ---

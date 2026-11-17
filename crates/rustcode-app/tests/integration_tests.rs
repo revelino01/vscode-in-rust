@@ -742,4 +742,348 @@ async fn test_end_to_end_open_vsx_marketplace_and_downloader() {
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
 
+#[tokio::test]
+async fn test_end_to_end_git_scm_and_diff_viewer() {
+    use rustcode_editor::{DiffModel, DiffViewMode};
+    use rustcode_platform::View;
+    use rustcode_protocols::git::ScmRepository;
+    use rustcode_workbench::{ScmView, WorkbenchView};
+
+    // 1. Initialize SCM repository with staged, modified, and untracked files
+    let repo = ScmRepository::sample_repository();
+    assert_eq!(repo.staged.len(), 1);
+    assert_eq!(repo.changes.len(), 1);
+    assert_eq!(repo.untracked.len(), 1);
+
+    // 2. Myers diff verification on sample file
+    let (orig, modif) = {
+        let (o, m) = repo.get_file_diff("src/main.rs").unwrap();
+        (o.to_string(), m.to_string())
+    };
+    let diff_model = DiffModel::compute(&orig, &modif);
+    assert!(diff_model.additions > 0);
+    assert!(diff_model.inline_rows.iter().any(|r| r.prefix == '+'));
+    assert!(diff_model.side_by_side_rows.iter().any(|r| r.left.is_some() && r.right.is_some()));
+
+    // 3. Initialize WorkbenchView with SCM
+    let mut wb = WorkbenchView::new();
+    wb.scm_view = ScmView::new(repo);
+
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let font = FontMetrics::default_monospace();
+    let theme_styles = rustcode_platform::render::WorkbenchThemeStyles::dark_default();
+
+    // 4. Switch Activity Bar to SCM view
+    wb.layout.set_sidebar_view("scm");
+    assert_eq!(wb.layout.active_sidebar_view, "scm");
+
+    // Render SCM sidebar in workbench
+    let mut scene = rustcode_platform::render::Scene::new();
+    wb.render(bounds, &theme_styles, &font, &mut scene);
+    assert!(!scene.quads().is_empty());
+
+    // 5. Open diff in editor area
+    let diff_uri = "src/main.rs (Working Tree)";
+    wb.editor_area.open_diff(diff_uri, "main.rs (Diff)", &orig, &modif);
+    assert!(wb.editor_area.diff_editors.contains_key(diff_uri));
+
+    let diff_view = wb.editor_area.diff_editors.get_mut(diff_uri).unwrap();
+    assert_eq!(diff_view.mode, DiffViewMode::SideBySide);
+    diff_view.toggle_mode();
+    assert_eq!(diff_view.mode, DiffViewMode::Inline);
+
+    // 6. Stage untracked file via SCM view
+    assert!(wb.scm_view.repo.stage_file("README.md"));
+    assert_eq!(wb.scm_view.repo.staged.len(), 2);
+    assert_eq!(wb.scm_view.repo.untracked.len(), 0);
+
+    // 7. Commit changes via commit message input and execute
+    wb.scm_view.set_commit_message("feat: update Cargo.toml and README");
+    let commit_hash = wb.scm_view.execute_commit().unwrap();
+    assert!(!commit_hash.is_empty());
+    assert!(wb.scm_view.repo.staged.is_empty());
+    assert_eq!(wb.scm_view.repo.commits.len(), 1);
+    assert_eq!(wb.scm_view.commit_message, "");
+}
+
+#[tokio::test]
+async fn test_end_to_end_dap_debug_integration() {
+    use rustcode_editor::{EditorGutterAction, EditorView};
+    use rustcode_platform::View;
+    use rustcode_protocols::codec::{read_framed_message, write_framed_message};
+    use rustcode_protocols::dap::{
+        DapClient, DapMessage, InitializeRequestArguments, SourceBreakpoint,
+    };
+    use rustcode_workbench::{
+        DebugSessionState, DebugToolbarAction, WorkbenchAction, WorkbenchView,
+    };
+    use tokio::io::duplex;
+
+    // 1. Breakpoints in EditorView gutter
+    let mut editor = EditorView::from_str("fn main() {\n    let mut sum = 0;\n    sum += 42;\n}\n");
+    let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+    let font = FontMetrics::default_monospace();
+    let theme_styles = rustcode_platform::render::WorkbenchThemeStyles::dark_default();
+
+    // Toggle breakpoint on line 3
+    assert!(!editor.has_breakpoint(3));
+    let gutter_click_y = bounds.min_y() + font.line_height * 2.5;
+    let click_ev = InputEvent::MouseDown(MouseEvent::new(
+        Point::new(bounds.min_x() + 8.0, gutter_click_y),
+        MouseButton::Left,
+    ));
+    let res = editor.handle_event(&click_ev, bounds);
+    assert_eq!(res, EventResult::Consumed);
+    assert!(editor.has_breakpoint(3));
+    assert_eq!(
+        editor.last_gutter_action,
+        Some(EditorGutterAction::BreakpointToggled { line: 3, added: true })
+    );
+
+    // Render scene and verify breakpoint red dot
+    let mut scene = rustcode_platform::render::Scene::new();
+    editor.render(bounds, &theme_styles, &font, &mut scene);
+    let has_red_dot = scene.quads().iter().any(|q| {
+        q.background
+            .is_some_and(|bg| (bg.r - 0.9).abs() < 0.05 && (bg.g - 0.15).abs() < 0.05)
+    });
+    assert!(has_red_dot);
+
+    // 2. DAP Client communication over stdio duplex stream
+    let (client_io, server_io) = duplex(4096);
+    let (c_reader, c_writer) = tokio::io::split(client_io);
+    let dap_client = DapClient::from_io(c_reader, c_writer);
+
+    tokio::spawn(async move {
+        let (mut s_reader, mut s_writer) = tokio::io::split(server_io);
+        let mut buf = Vec::new();
+
+        while let Ok(Some(bytes)) = read_framed_message(&mut s_reader, &mut buf).await {
+            let msg: DapMessage = serde_json::from_slice(&bytes).unwrap();
+            if let DapMessage::Request { seq, command, .. } = msg {
+                match command.as_str() {
+                    "initialize" => {
+                        let resp = DapMessage::Response {
+                            seq: 1,
+                            request_seq: seq,
+                            success: true,
+                            command,
+                            message: None,
+                            body: Some(json!({ "supportsConfigurationDoneRequest": true })),
+                        };
+                        let _ = write_framed_message(&mut s_writer, &serde_json::to_vec(&resp).unwrap()).await;
+                    }
+                    "setBreakpoints" => {
+                        let resp = DapMessage::Response {
+                            seq: 2,
+                            request_seq: seq,
+                            success: true,
+                            command,
+                            message: None,
+                            body: Some(json!({
+                                "breakpoints": [
+                                    { "verified": true, "line": 3 }
+                                ]
+                            })),
+                        };
+                        let _ = write_framed_message(&mut s_writer, &serde_json::to_vec(&resp).unwrap()).await;
+                    }
+                    "threads" => {
+                        let resp = DapMessage::Response {
+                            seq: 3,
+                            request_seq: seq,
+                            success: true,
+                            command,
+                            message: None,
+                            body: Some(json!({
+                                "threads": [{ "id": 1, "name": "Worker Thread" }]
+                            })),
+                        };
+                        let _ = write_framed_message(&mut s_writer, &serde_json::to_vec(&resp).unwrap()).await;
+                    }
+                    "stackTrace" => {
+                        let resp = DapMessage::Response {
+                            seq: 4,
+                            request_seq: seq,
+                            success: true,
+                            command,
+                            message: None,
+                            body: Some(json!({
+                                "stackFrames": [
+                                    { "id": 100, "name": "main()", "line": 3, "column": 5 }
+                                ]
+                            })),
+                        };
+                        let _ = write_framed_message(&mut s_writer, &serde_json::to_vec(&resp).unwrap()).await;
+                    }
+                    "next" => {
+                        let resp = DapMessage::Response {
+                            seq: 5,
+                            request_seq: seq,
+                            success: true,
+                            command,
+                            message: None,
+                            body: None,
+                        };
+                        let _ = write_framed_message(&mut s_writer, &serde_json::to_vec(&resp).unwrap()).await;
+                    }
+                    "disconnect" => {
+                        let resp = DapMessage::Response {
+                            seq: 6,
+                            request_seq: seq,
+                            success: true,
+                            command,
+                            message: None,
+                            body: None,
+                        };
+                        let _ = write_framed_message(&mut s_writer, &serde_json::to_vec(&resp).unwrap()).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    });
+
+    let caps = dap_client
+        .initialize(InitializeRequestArguments {
+            adapter_id: "lldb".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(caps.supports_configuration_done_request, Some(true));
+
+    let bps = dap_client
+        .set_breakpoints("src/main.rs", &[SourceBreakpoint::new(3)])
+        .await
+        .unwrap();
+    assert_eq!(bps.len(), 1);
+    assert!(bps[0].verified);
+
+    let threads = dap_client.threads().await.unwrap();
+    assert_eq!(threads[0].name, "Worker Thread");
+
+    let frames = dap_client.stack_trace(1).await.unwrap();
+    assert_eq!(frames[0].id, 100);
+    assert_eq!(frames[0].line, 3);
+
+    assert!(dap_client.next(1).await.is_ok());
+    assert!(dap_client.disconnect(false).await.is_ok());
+
+    // 3. Floating Debug Toolbar & Sidebar Panels
+    let mut wb = WorkbenchView::new();
+    wb.debug_sidebar.session = DebugSessionState::sample_session();
+    wb.debug_toolbar.is_visible = true;
+
+    // Test F10 (Step Over) keyboard shortcut
+    let f10_key = InputEvent::KeyDown(KeyEvent::new(KeyCode::F10, Modifiers::default()));
+    let res = wb.handle_event(&f10_key, bounds);
+    assert_eq!(res, EventResult::Consumed);
+    assert_eq!(
+        wb.last_action,
+        Some(WorkbenchAction::DebugToolbar(DebugToolbarAction::StepOver))
+    );
+
+    // Test Call Stack navigation in Debug Sidebar
+    wb.layout.set_sidebar_view("debug");
+    let _ = wb.debug_sidebar.handle_event(
+        &InputEvent::MouseDown(MouseEvent::new(Point::new(50.0, 150.0), MouseButton::Left)),
+        Rect::from_xywh(48.0, 0.0, 280.0, 768.0),
+    );
+
+    // Test Debug Console in bottom panel
+    wb.layout.set_panel_tab("debug_console");
+    wb.debug_console
+        .append_output("stdout", "Process initialized at 0x7fff0000\n");
+    assert_eq!(wb.debug_console.output_lines.len(), 1);
+}
+
+#[test]
+fn test_end_to_end_webview_host_integration() {
+    use rustcode_ext_host::webview::{ExtHostWebviewManager, WebviewOptions};
+    use rustcode_platform::View;
+    use rustcode_workbench::webview::WebviewElementKind;
+    use rustcode_workbench::WorkbenchView;
+
+    let ext_host_mgr = ExtHostWebviewManager::new();
+
+    // 1. Extension Host creates webview panel
+    let panel_state = ext_host_mgr.create_panel(
+        "cat_coding_panel",
+        "catCoding",
+        "Cat Coding Preview",
+        WebviewOptions {
+            enable_scripts: true,
+            local_resource_roots: vec![],
+        },
+    );
+    assert_eq!(panel_state.id, "cat_coding_panel");
+
+    let sample_html = r#"
+        <h1>Cat Coding</h1>
+        <p>Realtime collaborative preview powered by RustCode.</p>
+        <hr>
+        <code>console.log("Hello from inside webview");</code>
+        <button>Ping Extension Host</button>
+    "#;
+    ext_host_mgr.set_html("cat_coding_panel", sample_html);
+
+    // 2. Open Webview in Workbench Editor Area
+    let mut wb = WorkbenchView::new();
+    wb.editor_area.open_webview(
+        "cat_coding_panel",
+        "Cat Coding Preview",
+        "catCoding",
+        sample_html,
+        WebviewOptions {
+            enable_scripts: true,
+            local_resource_roots: vec![],
+        },
+        Some(ext_host_mgr.clone()),
+    );
+
+    assert!(wb.editor_area.webviews.contains_key("cat_coding_panel"));
+    let webview_view = wb.editor_area.webviews.get_mut("cat_coding_panel").unwrap();
+    assert_eq!(webview_view.nodes.len(), 5);
+    assert!(matches!(webview_view.nodes[0].kind, WebviewElementKind::Heading1(_)));
+    assert!(matches!(webview_view.nodes[4].kind, WebviewElementKind::Button { .. }));
+
+    // 3. Render Webview into scene graph
+    let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+    let font = FontMetrics::default_monospace();
+    let theme_styles = rustcode_platform::render::WorkbenchThemeStyles::dark_default();
+
+    let mut scene = rustcode_platform::render::Scene::new();
+    webview_view.render(bounds, &theme_styles, &font, &mut scene);
+    assert!(!scene.quads().is_empty());
+
+    // 4. Test Bidirectional MessagePort / RPC bridge
+    // Ext-host -> Webview
+    webview_view.receive_message_from_host(json!({
+        "type": "update",
+        "cat": "fluffy",
+        "energy": 100
+    }));
+    assert_eq!(webview_view.inbound_messages.len(), 1);
+    assert_eq!(webview_view.inbound_messages[0]["cat"], "fluffy");
+
+    // Webview -> Ext-host (clicking the button)
+    let targets = webview_view.button_targets.read().clone();
+    assert_eq!(targets.len(), 1);
+    let btn_rect = targets[0].0;
+
+    let click = InputEvent::MouseDown(MouseEvent::new(
+        Point::new(btn_rect.min_x() + 4.0, btn_rect.min_y() + 4.0),
+        MouseButton::Left,
+    ));
+    let res = webview_view.handle_event(&click, bounds);
+    assert_eq!(res, EventResult::Consumed);
+
+    // Verify outbound message arrived at Webview
+    assert_eq!(webview_view.outbound_messages.len(), 1);
+    assert_eq!(webview_view.outbound_messages[0]["text"], "Ping Extension Host");
+}
+
+
 

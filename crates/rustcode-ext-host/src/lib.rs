@@ -7,6 +7,7 @@ pub mod manifest;
 pub mod marketplace;
 pub mod provider;
 pub mod rpc;
+pub mod webview;
 
 pub use manifest::{
     ContributedCommand, Contributions, ExtensionLoader, ExtensionManifest, GrammarContribution,
@@ -21,3 +22,6 @@ pub use provider::{
     ProviderType,
 };
 pub use rpc::{RpcBridge, RpcMessage};
+pub use webview::{
+    ExtHostWebviewManager, WebviewMessageListener, WebviewOptions, WebviewPanelState,
+};

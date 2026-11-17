@@ -14,10 +14,16 @@ use rustcode_platform::render::{
     Scene, Shadow, View, WorkbenchThemeStyles,
 };
 use rustcode_platform::theme::ColorTheme;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub type CompletionProviderFn =
     Arc<dyn Fn(&str, Position, Option<char>) -> Vec<CompletionItem> + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorGutterAction {
+    BreakpointToggled { line: usize, added: bool },
+}
 
 pub struct EditorView {
     pub buffer: Arc<RwLock<PieceTable>>,
@@ -33,6 +39,9 @@ pub struct EditorView {
     pub diagnostics: Vec<EditorDiagnostic>,
     pub hovered_diagnostic: Option<EditorDiagnostic>,
     pub hover_position: Option<Point>,
+    pub breakpoints: BTreeSet<usize>,
+    pub execution_line: Option<usize>,
+    pub last_gutter_action: Option<EditorGutterAction>,
 }
 
 impl EditorView {
@@ -51,7 +60,36 @@ impl EditorView {
             diagnostics: Vec::new(),
             hovered_diagnostic: None,
             hover_position: None,
+            breakpoints: BTreeSet::new(),
+            execution_line: None,
+            last_gutter_action: None,
         }
+    }
+
+    pub fn toggle_breakpoint(&mut self, line: usize) -> bool {
+        if self.breakpoints.contains(&line) {
+            self.breakpoints.remove(&line);
+            false
+        } else {
+            self.breakpoints.insert(line);
+            true
+        }
+    }
+
+    pub fn add_breakpoint(&mut self, line: usize) {
+        self.breakpoints.insert(line);
+    }
+
+    pub fn remove_breakpoint(&mut self, line: usize) {
+        self.breakpoints.remove(&line);
+    }
+
+    pub fn has_breakpoint(&self, line: usize) -> bool {
+        self.breakpoints.contains(&line)
+    }
+
+    pub fn set_execution_line(&mut self, line: Option<usize>) {
+        self.execution_line = line;
     }
 
     pub fn set_diagnostics(&mut self, diagnostics: Vec<EditorDiagnostic>) {
@@ -204,7 +242,7 @@ impl EditorView {
     pub fn gutter_width(&self, font: &FontMetrics) -> f32 {
         let line_count = self.buffer.read().line_count();
         let digits = line_count.to_string().len();
-        ((digits + 2) as f32 * font.char_width).max(40.0)
+        ((digits + 4) as f32 * font.char_width).max(48.0)
     }
 
     pub fn trigger_suggest(&mut self, trigger_char: Option<char>) {
@@ -663,9 +701,44 @@ impl View for EditorView {
 
         for line_idx in start_line..end_line {
             let line_y = bounds.min_y() + (line_idx as f32 - self.scroll_top) * font.line_height;
+            let line_1based = line_idx + 1;
+
+            // Breakpoint dot in gutter margin
+            if self.breakpoints.contains(&line_1based) {
+                let dot_size = 10.0;
+                let dot_x = bounds.min_x() + 4.0;
+                let dot_y = line_y + (font.line_height - dot_size) / 2.0;
+                scene.push_quad(
+                    Quad::new(Rect::from_xywh(dot_x, dot_y, dot_size, dot_size))
+                        .with_background(Rgba::new(0.9, 0.15, 0.15, 1.0))
+                        .with_corner_radius(dot_size / 2.0),
+                );
+            }
+
+            // Current execution paused line marker
+            if self.execution_line == Some(line_1based) {
+                let hl_rect = Rect::from_xywh(
+                    bounds.min_x() + gutter_w,
+                    line_y,
+                    bounds.width() - gutter_w,
+                    font.line_height,
+                );
+                scene.push_quad(
+                    Quad::new(hl_rect).with_background(Rgba::new(0.4, 0.4, 0.1, 0.3)),
+                );
+
+                let arrow_x = bounds.min_x() + 4.0;
+                scene.push_text(GlyphRun::new(
+                    "▶".to_string(),
+                    Point::new(arrow_x, line_y),
+                    Rect::from_xywh(arrow_x, line_y, 12.0, font.line_height),
+                    Rgba::new(1.0, 0.85, 0.2, 1.0),
+                    font.font_size * 0.85,
+                ));
+            }
 
             // 5a. Gutter line number
-            let line_num_str = (line_idx + 1).to_string();
+            let line_num_str = line_1based.to_string();
             let num_w = font.text_width(&line_num_str);
             let num_x = bounds.min_x() + gutter_w - num_w - 6.0;
             let num_color = if line_idx == primary_pos.line {
@@ -1013,15 +1086,29 @@ impl View for EditorView {
                     }
                     EventResult::Consumed
                 } else {
-                    // Click in gutter: select entire line
-                    let buf = self.buffer.read();
-                    let line_count = buf.line_count();
+                    // Click in gutter: toggle breakpoint on clicked line and select line
+                    let (line_count, line_len) = {
+                        let buf = self.buffer.read();
+                        let count = buf.line_count();
+                        let idx = (((mouse.position.y - bounds.min_y()) / font.line_height
+                            + self.scroll_top)
+                            .floor()
+                            .max(0.0) as usize)
+                            .min(count.saturating_sub(1));
+                        let len = buf.get_line_content(idx).map_or(0, |l| l.len());
+                        (count, len)
+                    };
                     let clicked_line = ((mouse.position.y - bounds.min_y()) / font.line_height
                         + self.scroll_top)
                         .floor()
                         .max(0.0) as usize;
                     let line_idx = clicked_line.min(line_count.saturating_sub(1));
-                    let line_len = buf.get_line_content(line_idx).map_or(0, |l| l.len());
+                    let line_1based = line_idx + 1;
+                    let added = self.toggle_breakpoint(line_1based);
+                    self.last_gutter_action = Some(EditorGutterAction::BreakpointToggled {
+                        line: line_1based,
+                        added,
+                    });
                     self.cursor_state.primary_mut().anchor = Position::new(line_idx, 0);
                     self.cursor_state.primary_mut().active = Position::new(line_idx, line_len);
                     EventResult::Consumed
@@ -2310,6 +2397,95 @@ mod tests {
         let res = view.handle_event(&move_inside, bounds);
         assert_eq!(res, EventResult::Consumed);
         assert!(view.hovered_diagnostic.is_some(), "Hover card must remain open when mouse moves inside it");
+    }
+
+    #[test]
+    fn test_editor_view_gutter_breakpoint_toggle_and_render() {
+        let mut view = EditorView::from_str("line 1\nline 2\nline 3");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+
+        assert!(!view.has_breakpoint(2));
+
+        // Click in gutter on line 2 (y around line_height * 1.5)
+        let gutter_click_x = bounds.min_x() + 10.0;
+        let gutter_click_y = bounds.min_y() + font.line_height * 1.5;
+        let click = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            Point::new(gutter_click_x, gutter_click_y),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+
+        let res = view.handle_event(&click, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert!(view.has_breakpoint(2));
+        assert_eq!(
+            view.last_gutter_action,
+            Some(EditorGutterAction::BreakpointToggled {
+                line: 2,
+                added: true
+            })
+        );
+
+        // Render and verify red dot quad is pushed
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+        let red_quad = scene.quads().iter().any(|q| {
+            if let Some(bg) = q.background {
+                (bg.r - 0.9).abs() < 0.01 && (bg.g - 0.15).abs() < 0.01
+            } else {
+                false
+            }
+        });
+        assert!(red_quad, "Breakpoint red dot must be rendered in the scene");
+
+        // Second click in gutter on line 2 toggles it off
+        let res2 = view.handle_event(&click, bounds);
+        assert_eq!(res2, EventResult::Consumed);
+        assert!(!view.has_breakpoint(2));
+        assert_eq!(
+            view.last_gutter_action,
+            Some(EditorGutterAction::BreakpointToggled {
+                line: 2,
+                added: false
+            })
+        );
+    }
+
+    #[test]
+    fn test_diff_editor_view_render_and_mode_toggle() {
+        use crate::diff::view::DiffEditorView;
+        use crate::diff::myers::DiffViewMode;
+
+        let original = "fn test() {\n    let a = 1;\n}";
+        let modified = "fn test() {\n    let a = 2;\n    let b = 3;\n}";
+
+        let mut diff_view = DiffEditorView::new("test.rs", original, modified);
+        assert_eq!(diff_view.mode, DiffViewMode::SideBySide);
+        assert!(diff_view.model.additions > 0);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+
+        let mut scene = Scene::new();
+        diff_view.render(bounds, &theme, &font, &mut scene);
+        assert!(!scene.quads().is_empty());
+
+        // Click toggle mode button
+        let btn_bounds = diff_view.header_button_bounds.read().unwrap();
+        let click = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            Point::new(btn_bounds.min_x() + 5.0, btn_bounds.min_y() + 5.0),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        let res = diff_view.handle_event(&click, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert_eq!(diff_view.mode, DiffViewMode::Inline);
+
+        // Render inline
+        let mut inline_scene = Scene::new();
+        diff_view.render(bounds, &theme, &font, &mut inline_scene);
+        assert!(!inline_scene.quads().is_empty());
     }
 }
 

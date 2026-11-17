@@ -5,6 +5,7 @@
 
 pub mod completion;
 pub mod cursor;
+pub mod diff;
 pub mod document;
 pub mod model;
 pub mod syntax;
@@ -16,6 +17,10 @@ pub use completion::{
     CompletionList,
 };
 pub use cursor::{CursorState, Position, Range, Selection};
+pub use diff::{
+    myers_diff, DiffCell, DiffChange, DiffEditorView, DiffModel, DiffOpKind, DiffViewMode, EditOp,
+    InlineDiffRow, SideBySideDiffRow,
+};
 pub use document::{AutoSaveConfig, AutoSaveMode, AutoSaveService, TextDocument};
 pub use model::{Piece, PieceSource, PieceTable, TextEdit, UndoElement, UndoRedoStack};
 pub use syntax::{
@@ -23,7 +28,7 @@ pub use syntax::{
     PlainTextGrammar, PythonGrammar, RustGrammar, SyntaxHighlighter, SyntaxScope, TokenMetadata,
     TokenSpan, TypeScriptGrammar,
 };
-pub use view::EditorView;
+pub use view::{EditorGutterAction, EditorView};
 pub use viewmodel::{
     DecorationKind, DecorationModel, DiagnosticSeverity, EditorDiagnostic, LineDecoration,
 };

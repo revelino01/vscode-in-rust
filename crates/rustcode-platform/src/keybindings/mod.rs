@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub struct Modifiers {
     pub ctrl: bool,
     pub shift: bool,
@@ -16,12 +16,7 @@ pub struct Modifiers {
 
 impl Modifiers {
     pub fn none() -> Self {
-        Self {
-            ctrl: false,
-            shift: false,
-            alt: false,
-            meta: false,
-        }
+        Self::default()
     }
 }
 

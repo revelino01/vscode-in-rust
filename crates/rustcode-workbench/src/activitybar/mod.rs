@@ -53,6 +53,13 @@ impl ActivityBar {
                     badge: None,
                 },
                 ActivityBarItem {
+                    id: "workbench.view.debug".to_string(),
+                    title: "Run and Debug".to_string(),
+                    icon: "debug".to_string(),
+                    view_container_id: "debug".to_string(),
+                    badge: None,
+                },
+                ActivityBarItem {
                     id: "workbench.view.extensions".to_string(),
                     title: "Extensions".to_string(),
                     icon: "extensions".to_string(),
@@ -132,6 +139,7 @@ impl View for ActivityBarView {
                 "explorer" => "EXP",
                 "search" => "SRC",
                 "scm" => "SCM",
+                "debug" => "DBG",
                 "extensions" => "EXT",
                 _ => &item.title[..item.title.len().min(3)],
             };

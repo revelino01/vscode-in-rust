@@ -550,6 +550,7 @@ dependencies = [
  "parking_lot",
  "rustcode-base",
  "rustcode-editor",
+ "rustcode-ext-host",
  "rustcode-platform",
  "rustcode-protocols",
  "serde",

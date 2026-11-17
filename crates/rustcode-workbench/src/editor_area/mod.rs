@@ -1,7 +1,8 @@
 //! Editor group and tab model mirroring VS Code's editor grid, and GPUI EditorAreaView component.
 
 use parking_lot::RwLock;
-use rustcode_editor::{EditorView, GrammarRegistry, TextDocument};
+use rustcode_editor::{DiffEditorView, EditorView, GrammarRegistry, TextDocument};
+use rustcode_ext_host::webview::{ExtHostWebviewManager, WebviewOptions};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, Point, Quad, Rect, Scene, View,
@@ -12,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use crate::webview::WebviewEditorView;
 
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +145,8 @@ pub enum EditorAreaAction {
 pub struct EditorAreaView {
     pub model: EditorArea,
     pub editors: HashMap<String, EditorView>,
+    pub diff_editors: HashMap<String, DiffEditorView>,
+    pub webviews: HashMap<String, WebviewEditorView>,
     pub grammar_registry: Arc<GrammarRegistry>,
     pub last_action: Option<EditorAreaAction>,
 }
@@ -158,9 +162,35 @@ impl EditorAreaView {
         Self {
             model,
             editors: HashMap::new(),
+            diff_editors: HashMap::new(),
+            webviews: HashMap::new(),
             grammar_registry: Arc::new(GrammarRegistry::new()),
             last_action: None,
         }
+    }
+
+    pub fn open_diff(&mut self, uri: &str, title: &str, original: &str, modified: &str) {
+        let group = self.model.current_group();
+        group.open_tab(uri, title, false);
+        self.diff_editors
+            .insert(uri.to_string(), DiffEditorView::new(title, original, modified));
+    }
+
+    pub fn open_webview(
+        &mut self,
+        id: &str,
+        title: &str,
+        view_type: &str,
+        html: &str,
+        options: WebviewOptions,
+        ext_host_manager: Option<ExtHostWebviewManager>,
+    ) {
+        let group = self.model.current_group();
+        group.open_tab(id, title, false);
+        self.webviews.insert(
+            id.to_string(),
+            WebviewEditorView::new(id, view_type, title, html, options, ext_host_manager),
+        );
     }
 
     pub fn open_file(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
@@ -330,8 +360,16 @@ impl View for EditorAreaView {
             (bounds.height() - tab_bar_h).max(0.0),
         );
 
-        if let Some(active_editor) = self.active_editor() {
-            active_editor.render(content_rect, theme, font, scene);
+        if let Some(tab) = self.model.current_group_ref().active_tab() {
+            if let Some(diff_view) = self.diff_editors.get(&tab.uri) {
+                diff_view.render(content_rect, theme, font, scene);
+            } else if let Some(webview) = self.webviews.get(&tab.uri) {
+                webview.render(content_rect, theme, font, scene);
+            } else if let Some(editor) = self.editors.get(&tab.uri) {
+                editor.render(content_rect, theme, font, scene);
+            } else {
+                scene.push_quad(Quad::new(content_rect).with_background(theme.editor_background));
+            }
         } else {
             // Empty editor background
             scene.push_quad(Quad::new(content_rect).with_background(theme.editor_background));
@@ -362,6 +400,8 @@ impl View for EditorAreaView {
                                 self.model.current_group().close_tab(idx);
                                 let open_uris: std::collections::HashSet<_> = self.model.groups.iter().flat_map(|g| g.tabs.iter().map(|t| &t.uri)).collect();
                                 self.editors.retain(|u, _| open_uris.contains(u));
+                                self.diff_editors.retain(|u, _| open_uris.contains(u));
+                                self.webviews.retain(|u, _| open_uris.contains(u));
                                 self.last_action = Some(EditorAreaAction::TabClosed(idx));
                             } else {
                                 self.model.current_group().active_tab_index = Some(idx);
@@ -373,15 +413,24 @@ impl View for EditorAreaView {
                     }
                     EventResult::Ignored
                 } else {
-                    // Click within active editor
+                    // Click within active editor / diff / webview
                     let content_rect = Rect::from_xywh(
                         bounds.min_x(),
                         bounds.min_y() + tab_bar_h,
                         bounds.width(),
                         (bounds.height() - tab_bar_h).max(0.0),
                     );
-                    if let Some(editor) = self.active_editor_mut() {
-                        editor.handle_event(event, content_rect)
+                    if let Some(tab) = self.model.current_group_ref().active_tab() {
+                        let uri = tab.uri.clone();
+                        if let Some(diff_view) = self.diff_editors.get_mut(&uri) {
+                            diff_view.handle_event(event, content_rect)
+                        } else if let Some(webview) = self.webviews.get_mut(&uri) {
+                            webview.handle_event(event, content_rect)
+                        } else if let Some(editor) = self.editors.get_mut(&uri) {
+                            editor.handle_event(event, content_rect)
+                        } else {
+                            EventResult::Ignored
+                        }
                     } else {
                         EventResult::Ignored
                     }
@@ -394,8 +443,17 @@ impl View for EditorAreaView {
                     bounds.width(),
                     (bounds.height() - tab_bar_h).max(0.0),
                 );
-                if let Some(editor) = self.active_editor_mut() {
-                    editor.handle_event(event, content_rect)
+                if let Some(tab) = self.model.current_group_ref().active_tab() {
+                    let uri = tab.uri.clone();
+                    if let Some(diff_view) = self.diff_editors.get_mut(&uri) {
+                        diff_view.handle_event(event, content_rect)
+                    } else if let Some(webview) = self.webviews.get_mut(&uri) {
+                        webview.handle_event(event, content_rect)
+                    } else if let Some(editor) = self.editors.get_mut(&uri) {
+                        editor.handle_event(event, content_rect)
+                    } else {
+                        EventResult::Ignored
+                    }
                 } else {
                     EventResult::Ignored
                 }

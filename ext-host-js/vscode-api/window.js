@@ -124,6 +124,45 @@ const window = {
     };
   },
 
+  // Webview
+  createWebviewPanel(viewType, title, showOptions = {}, options = {}) {
+    const id = `webview_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+    let _html = '';
+    const messageEvent = rpc.createEvent(`webview.onDidReceiveMessage.${id}`);
+    const disposeEvent = rpc.createEvent(`webview.onDidDispose.${id}`);
+
+    rpc.call('window.createWebviewPanel', { id, viewType, title, showOptions, options });
+
+    const webview = {
+      get html() {
+        return _html;
+      },
+      set html(value) {
+        _html = value;
+        rpc.call('window.setWebviewHtml', { id, html: value });
+      },
+      postMessage(message) {
+        return rpc.call('window.postMessageToWebview', { id, message });
+      },
+      onDidReceiveMessage: messageEvent,
+      options,
+    };
+
+    return {
+      viewType,
+      title,
+      webview,
+      reveal(viewColumn) {
+        rpc.call('window.revealWebviewPanel', { id, viewColumn });
+      },
+      dispose() {
+        rpc.call('window.disposeWebviewPanel', { id });
+        rpc.dispatchNotification(`webview.onDidDispose.${id}`, {});
+      },
+      onDidDispose: disposeEvent,
+    };
+  },
+
   // Events
   onDidChangeActiveTextEditor: rpc.createEvent('window.onDidChangeActiveTextEditor'),
   onDidChangeVisibleTextEditors: rpc.createEvent('window.onDidChangeVisibleTextEditors'),

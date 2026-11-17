@@ -498,8 +498,10 @@ async fn test_end_to_end_lsp_and_autocomplete_integration() {
 
 #[tokio::test]
 async fn test_end_to_end_diagnostics_and_problems_panel() {
-    use rustcode_editor::cursor::{Position, Range};
-    use rustcode_editor::viewmodel::EditorDiagnostic;
+    use rustcode_editor::cursor::Position;
+    use rustcode_protocols::lsp::types::{
+        DiagnosticCode, DiagnosticSeverity as LspSeverity, LspDiagnostic, LspPosition, LspRange,
+    };
 
     let app = RustCodeContext::new();
     let mut window = app.create_window();
@@ -509,31 +511,30 @@ async fn test_end_to_end_diagnostics_and_problems_panel() {
     let code = "fn compute() {\n    let answer: i32 = \"forty-two\";\n}\n";
     window.view.editor_area.open_file("src/calc.rs", "calc.rs", code, true);
 
-    // 2. Ingest diagnostics (from LSP publishDiagnostics or Extension host collection)
-    let diags = vec![
-        EditorDiagnostic::error(
-            Range::new(Position::new(1, 22), Position::new(1, 33)),
-            "mismatched types: expected `i32`, found `&str`",
-        )
-        .with_source("rust-analyzer")
-        .with_code("E0308"),
-        EditorDiagnostic::warning(
-            Range::new(Position::new(1, 8), Position::new(1, 14)),
-            "unused variable: `answer`",
-        )
-        .with_source("rustc")
-        .with_code("unused_variables"),
+    // 2. Ingest diagnostics from LSP publishDiagnostics notifications
+    let lsp_diags = vec![
+        LspDiagnostic {
+            range: LspRange::new(LspPosition::new(1, 22), LspPosition::new(1, 33)),
+            severity: Some(LspSeverity::Error),
+            message: "mismatched types: expected `i32`, found `&str`".to_string(),
+            source: Some("rust-analyzer".to_string()),
+            code: Some(DiagnosticCode::String("E0308".to_string())),
+        },
+        LspDiagnostic {
+            range: LspRange::new(LspPosition::new(1, 8), LspPosition::new(1, 14)),
+            severity: Some(LspSeverity::Warning),
+            message: "unused variable: `answer`".to_string(),
+            source: Some("rustc".to_string()),
+            code: Some(DiagnosticCode::String("unused_variables".to_string())),
+        },
     ];
 
-    // Set diagnostics on active editor and update workbench problems
-    window
-        .view
-        .editor_area
-        .active_editor_mut()
-        .unwrap()
-        .set_diagnostics(diags.clone());
-
-    window.view.update_problems("src/calc.rs", diags);
+    // Single call ingests LSP diagnostics, updating workbench problems AND editor diagnostics
+    window.view.update_lsp_problems("src/calc.rs", &lsp_diags);
+    assert_eq!(
+        window.view.editor_area.active_editor().unwrap().diagnostics.len(),
+        2
+    );
 
     // 3. Render: verify status bar item reflects error & warning count badges
     let mut surface = MockRenderSurface::new(1024.0, 768.0);
@@ -564,9 +565,16 @@ async fn test_end_to_end_diagnostics_and_problems_panel() {
     assert!(hover_scene.contains_text("rust-analyzer (E0308)"));
     assert!(hover_scene.contains_text("mismatched types"));
 
-    // 5. Open Bottom Panel and activate Problems tab
-    window.view.layout.panel_visible = true;
-    window.view.layout.set_panel_tab("problems");
+    // 5. Verify clicking status bar badge opens bottom panel to problems tab
+    assert!(!window.view.layout.panel_visible);
+    let status_regions = window.view.compute_regions(bounds);
+    let badge_click = InputEvent::MouseDown(MouseEvent::new(
+        Point::new(status_regions.status_bar.min_x() + 30.0, status_regions.status_bar.min_y() + 10.0),
+        MouseButton::Left,
+    ));
+    window.dispatch_event(&badge_click, bounds);
+    assert!(window.view.layout.panel_visible, "Status bar badge click must open bottom panel");
+    assert_eq!(window.view.layout.active_panel_tab, "problems");
 
     let panel_scene = window.render(&mut surface);
     assert!(panel_scene.contains_text("PROBLEMS 2"));
@@ -589,7 +597,7 @@ async fn test_end_to_end_diagnostics_and_problems_panel() {
 #[tokio::test]
 async fn test_end_to_end_open_vsx_marketplace_and_downloader() {
     use rustcode_ext_host::marketplace::{
-        ExtensionInstaller, MarketplaceClient, MockHttpTransport,
+        ExtensionDownloader, ExtensionInstaller, MarketplaceClient, MockHttpTransport,
     };
     use rustcode_platform::commands::CommandRegistry;
     use rustcode_platform::theme::ThemeService;
@@ -642,6 +650,11 @@ async fn test_end_to_end_open_vsx_marketplace_and_downloader() {
     }
     let vsix_bytes = vsix_buf.into_inner();
 
+    // Verify in-memory manifest parsing from VSIX buffer without disk unpack
+    let memory_manifest = ExtensionDownloader::read_manifest_from_vsix(&vsix_bytes).unwrap();
+    assert_eq!(memory_manifest.name, "synthwave-84");
+    assert_eq!(memory_manifest.publisher, "robbowen");
+
     // 2. Set up Mock Open VSX HTTP transport
     let transport = Arc::new(MockHttpTransport::new());
     let download_url = "https://open-vsx.org/api/robbowen/synthwave-84/0.1.15/file/synthwave-84.vsix";
@@ -675,7 +688,7 @@ async fn test_end_to_end_open_vsx_marketplace_and_downloader() {
     );
 
     // Mock download binary endpoint
-    transport.set_response(download_url, vsix_bytes);
+    transport.set_response(download_url, vsix_bytes.clone());
 
     let client = Arc::new(MarketplaceClient::new("https://open-vsx.org/api", transport));
 
@@ -698,6 +711,11 @@ async fn test_end_to_end_open_vsx_marketplace_and_downloader() {
     assert_eq!(loaded.manifest.publisher, "robbowen");
     assert!(loaded.root_dir.join("package.json").exists());
     assert!(loaded.root_dir.join("themes/synthwave.json").exists());
+
+    // Verify direct installation from VSIX bytes (single unpack directly into target folder)
+    let direct_loaded = installer.install_from_vsix(&vsix_bytes, None).unwrap();
+    assert_eq!(direct_loaded.manifest.name, "synthwave-84");
+    assert!(direct_loaded.root_dir.join("package.json").exists());
 
     // 5. Register runtime contributions
     let commands = CommandRegistry::new();

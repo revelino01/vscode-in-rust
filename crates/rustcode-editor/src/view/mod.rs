@@ -74,20 +74,49 @@ impl EditorView {
     }
 
     pub fn diagnostic_at_position(&self, pos: Position) -> Option<&EditorDiagnostic> {
-        self.diagnostics.iter().find(|d| {
-            if pos.line < d.range.start.line || pos.line > d.range.end.line {
-                return false;
-            }
-            if d.range.start.line == d.range.end.line {
-                pos.column >= d.range.start.column && pos.column <= d.range.end.column
-            } else if pos.line == d.range.start.line {
-                pos.column >= d.range.start.column
-            } else if pos.line == d.range.end.line {
-                pos.column <= d.range.end.column
-            } else {
-                true
-            }
-        })
+        self.diagnostics
+            .iter()
+            .filter(|d| {
+                if pos.line < d.range.start.line || pos.line > d.range.end.line {
+                    return false;
+                }
+                if d.range.start.line == d.range.end.line {
+                    pos.column >= d.range.start.column && pos.column <= d.range.end.column
+                } else if pos.line == d.range.start.line {
+                    pos.column >= d.range.start.column
+                } else if pos.line == d.range.end.line {
+                    pos.column <= d.range.end.column
+                } else {
+                    true
+                }
+            })
+            .min_by_key(|d| d.severity as u8)
+    }
+
+    pub fn hover_card_bounds(
+        diag: &EditorDiagnostic,
+        mouse_pt: Point,
+        bounds: Rect,
+        font: &FontMetrics,
+    ) -> Rect {
+        let header_text = diag.formatted_header();
+        let message_text = &diag.message;
+
+        let header_w = font.text_width(&header_text);
+        let message_w = font.text_width(message_text);
+        let card_w = (header_w.max(message_w) + 28.0).max(180.0).min(bounds.width() - 40.0);
+        let card_h = font.line_height * 2.0 + 16.0;
+
+        let mut card_x = mouse_pt.x + 8.0;
+        if card_x + card_w > bounds.max_x() - 10.0 {
+            card_x = (bounds.max_x() - card_w - 10.0).max(bounds.min_x() + 10.0);
+        }
+        let mut card_y = mouse_pt.y + 16.0;
+        if card_y + card_h > bounds.max_y() - 10.0 {
+            card_y = (mouse_pt.y - card_h - 6.0).max(bounds.min_y() + 10.0);
+        }
+
+        Rect::from_xywh(card_x, card_y, card_w, card_h)
     }
 
     pub fn with_syntax(self, highlighter: SyntaxHighlighter) -> Self {
@@ -789,10 +818,18 @@ impl View for EditorView {
                 } else {
                     line_content.len()
                 };
-                let end_col = end_col.max(start_col + 1);
+                let safe_start = safe_char_boundary(&line_content, start_col);
+                let safe_end = {
+                    let end_aligned = safe_char_boundary(&line_content, end_col);
+                    if end_aligned <= safe_start {
+                        next_char_boundary(&line_content, safe_start)
+                    } else {
+                        end_aligned
+                    }
+                };
 
-                let start_vis = line_content[..start_col.min(line_content.len())].chars().count();
-                let end_vis = line_content[..end_col.min(line_content.len())].chars().count().max(start_vis + 1);
+                let start_vis = line_content[..safe_start].chars().count();
+                let end_vis = line_content[..safe_end.min(line_content.len())].chars().count().max(start_vis + 1);
 
                 let sq_x = text_area_x + (start_vis as f32 - self.scroll_left) * font.char_width;
                 let sq_w = ((end_vis - start_vis) as f32 * font.char_width).max(4.0);
@@ -812,7 +849,8 @@ impl View for EditorView {
             if self.is_focused {
                 for sel in &self.cursor_state.selections {
                     if sel.active.line == line_idx {
-                        let visual_col = line_content[..sel.active.column.min(line_content.len())].chars().count();
+                        let safe_col = safe_char_boundary(&line_content, sel.active.column);
+                        let visual_col = line_content[..safe_col].chars().count();
                         let cursor_x = text_area_x
                             + (visual_col as f32 - self.scroll_left) * font.char_width;
                         let cursor_rect =
@@ -827,7 +865,8 @@ impl View for EditorView {
         if self.autocomplete.is_visible {
             let buf = self.buffer.read();
             let line_content = buf.get_line_content(primary_pos.line).unwrap_or_default();
-            let visual_col = line_content[..primary_pos.column.min(line_content.len())].chars().count();
+            let safe_col = safe_char_boundary(&line_content, primary_pos.column);
+            let visual_col = line_content[..safe_col].chars().count();
             let cursor_x = text_area_x + (visual_col as f32 - self.scroll_left) * font.char_width;
             let cursor_y = bounds.min_y() + (primary_pos.line as f32 - self.scroll_top) * font.line_height;
             drop(buf);
@@ -848,19 +887,10 @@ impl View for EditorView {
 
             let header_w = font.text_width(&header_text);
             let message_w = font.text_width(message_text);
-            let card_w = (header_w.max(message_w) + 28.0).max(180.0).min(bounds.width() - 40.0);
-            let card_h = font.line_height * 2.0 + 16.0;
-
-            let mut card_x = mouse_pt.x + 8.0;
-            if card_x + card_w > bounds.max_x() - 10.0 {
-                card_x = (bounds.max_x() - card_w - 10.0).max(bounds.min_x() + 10.0);
-            }
-            let mut card_y = mouse_pt.y + 16.0;
-            if card_y + card_h > bounds.max_y() - 10.0 {
-                card_y = (mouse_pt.y - card_h - 6.0).max(bounds.min_y() + 10.0);
-            }
-
-            let card_rect = Rect::from_xywh(card_x, card_y, card_w, card_h);
+            let card_rect = Self::hover_card_bounds(diag, mouse_pt, bounds, font);
+            let card_x = card_rect.min_x();
+            let card_y = card_rect.min_y();
+            let card_h = card_rect.height();
             scene.push_shadow(Shadow {
                 bounds: card_rect,
                 offset: Point::new(0.0, 4.0),
@@ -1201,6 +1231,14 @@ impl View for EditorView {
                     return EventResult::Ignored;
                 }
 
+                // If mouse rests inside the active hover card, keep tooltip visible
+                if let (Some(diag), Some(hover_pt)) = (&self.hovered_diagnostic, self.hover_position) {
+                    let card_rect = Self::hover_card_bounds(diag, hover_pt, bounds, &font);
+                    if card_rect.contains(mouse.position) {
+                        return EventResult::Consumed;
+                    }
+                }
+
                 if mouse.position.x >= bounds.min_x() + gutter_w {
                     let buf = self.buffer.read();
                     let line_count = buf.line_count();
@@ -1246,12 +1284,39 @@ impl View for EditorView {
     }
 }
 
+fn safe_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn next_char_boundary(s: &str, mut idx: usize) -> usize {
+    if idx >= s.len() {
+        return s.len();
+    }
+    idx += 1;
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
 fn render_squiggly_wave(scene: &mut Scene, start_x: f32, end_x: f32, y: f32, color: Rgba) {
+    if !start_x.is_finite() || !end_x.is_finite() || start_x >= end_x {
+        return;
+    }
     let wave_step: f32 = 3.0;
     let mut cur_x = start_x;
     let mut up = false;
     while cur_x < end_x {
         let seg_w = wave_step.min(end_x - cur_x);
+        if seg_w <= 0.0 {
+            break;
+        }
         let seg_y = if up { y - 1.2 } else { y + 0.8 };
         scene.push_quad(Quad::new(Rect::from_xywh(cur_x, seg_y, seg_w, 1.2)).with_background(color));
         cur_x += seg_w;
@@ -2159,6 +2224,92 @@ mod tests {
         ));
         view.handle_event(&mouse_down, bounds);
         assert!(view.hovered_diagnostic.is_none());
+    }
+
+    #[test]
+    fn test_editor_view_diagnostics_utf8_char_boundaries_no_panic() {
+        // Line with 4-byte UTF-8 emoji at byte indices 6..10
+        let mut view = EditorView::from_str("hello 🦀 world;\nlet val = 100;");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        // Intentionally place diagnostic start/end in the middle of the 4-byte 🦀 character (byte 7)
+        view.set_diagnostics(vec![
+            EditorDiagnostic::error(
+                Range::new(Position::new(0, 7), Position::new(0, 9)),
+                "unsupported emoji identifier",
+            ),
+        ]);
+
+        let mut scene = Scene::new();
+        // Rendering must not panic with slice indexing error
+        view.render(bounds, &theme, &font, &mut scene);
+        let quads = scene.quads();
+        let has_error_wave = quads.iter().any(|q| q.background == Some(theme.editor_error_foreground));
+        assert!(has_error_wave);
+    }
+
+    #[test]
+    fn test_editor_view_diagnostic_severity_precedence() {
+        let mut view = EditorView::from_str("fn test() { let x = 1; }");
+        // Warning first, then Error on same span
+        view.set_diagnostics(vec![
+            EditorDiagnostic::warning(
+                Range::new(Position::new(0, 16), Position::new(0, 17)),
+                "unused variable",
+            ),
+            EditorDiagnostic::error(
+                Range::new(Position::new(0, 16), Position::new(0, 17)),
+                "type mismatch",
+            ),
+        ]);
+
+        let diag = view.diagnostic_at_position(Position::new(0, 16)).unwrap();
+        assert_eq!(diag.severity, DiagnosticSeverity::Error);
+        assert_eq!(diag.message, "type mismatch");
+    }
+
+    #[test]
+    fn test_editor_view_hover_card_mouse_navigation() {
+        let mut view = EditorView::from_str("fn test() { let x = 1; }");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let font = FontMetrics::default_monospace();
+
+        view.set_diagnostics(vec![
+            EditorDiagnostic::error(
+                Range::new(Position::new(0, 16), Position::new(0, 20)),
+                "severe error",
+            ),
+        ]);
+
+        let gutter_w = view.gutter_width(&font);
+        let text_area_x = bounds.min_x() + gutter_w + 8.0;
+        let target_x = text_area_x + 18.0 * font.char_width;
+        let target_y = bounds.min_y() + 0.5 * font.line_height;
+
+        let move_over = InputEvent::MouseMove(rustcode_platform::render::MouseMoveEvent {
+            position: Point::new(target_x, target_y),
+        });
+        view.handle_event(&move_over, bounds);
+        assert!(view.hovered_diagnostic.is_some());
+
+        // Calculate card bounds
+        let card = EditorView::hover_card_bounds(
+            view.hovered_diagnostic.as_ref().unwrap(),
+            Point::new(target_x, target_y),
+            bounds,
+            &font,
+        );
+
+        // Move mouse into the card itself (e.g. card center)
+        let inside_card = Point::new(card.min_x() + card.width() * 0.5, card.min_y() + card.height() * 0.5);
+        let move_inside = InputEvent::MouseMove(rustcode_platform::render::MouseMoveEvent {
+            position: inside_card,
+        });
+        let res = view.handle_event(&move_inside, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert!(view.hovered_diagnostic.is_some(), "Hover card must remain open when mouse moves inside it");
     }
 }
 

@@ -551,6 +551,7 @@ dependencies = [
  "rustcode-base",
  "rustcode-editor",
  "rustcode-platform",
+ "rustcode-protocols",
  "serde",
  "serde_json",
  "thiserror",

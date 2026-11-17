@@ -38,29 +38,23 @@ impl ExtensionInstaller {
         vsix_bytes: &[u8],
         custom_folder_name: Option<&str>,
     ) -> Result<LoadedExtension, MarketplaceError> {
-        // Temporarily extract or extract into target directory
-        let temp_manifest = {
-            let temp_dir = self.extensions_dir.join(".temp_unpack");
-            let manifest = ExtensionDownloader::unpack_vsix(vsix_bytes, &temp_dir)?;
-            let _ = std::fs::remove_dir_all(&temp_dir);
-            manifest
-        };
+        let manifest = ExtensionDownloader::read_manifest_from_vsix(vsix_bytes)?;
 
         let folder_name = custom_folder_name
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
                 format!(
                     "{}.{}-{}",
-                    temp_manifest.publisher, temp_manifest.name, temp_manifest.version
+                    manifest.publisher, manifest.name, manifest.version
                 )
             });
 
         let target_dir = self.extensions_dir.join(folder_name);
-        let manifest = ExtensionDownloader::unpack_vsix(vsix_bytes, &target_dir)?;
+        let unpacked_manifest = ExtensionDownloader::unpack_vsix(vsix_bytes, &target_dir)?;
 
         Ok(LoadedExtension {
             root_dir: target_dir,
-            manifest,
+            manifest: unpacked_manifest,
             is_activated: false,
         })
     }
@@ -134,7 +128,8 @@ impl ExtensionInstaller {
             if let Some(themes) = &contributes.themes {
                 if let Some(ts) = theme_service {
                     for theme_contrib in themes {
-                        let theme_path = ext.root_dir.join(&theme_contrib.path);
+                        let rel_path = theme_contrib.path.trim_start_matches('.').trim_start_matches('/');
+                        let theme_path = ext.root_dir.join(rel_path);
                         if theme_path.exists() {
                             if let Ok(theme_content) = std::fs::read_to_string(&theme_path) {
                                 if let Ok(parsed_theme) = ThemeService::parse_theme_json(&theme_content) {
@@ -150,7 +145,8 @@ impl ExtensionInstaller {
             // 3. Register contributed grammars
             if let Some(grammars) = &contributes.grammars {
                 for g in grammars {
-                    let grammar_path = ext.root_dir.join(&g.path);
+                    let rel_path = g.path.trim_start_matches('.').trim_start_matches('/');
+                    let grammar_path = ext.root_dir.join(rel_path);
                     if grammar_path.exists() && grammar_registrar(&g.language, &grammar_path).is_ok() {
                         registered_count += 1;
                     }

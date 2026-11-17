@@ -122,6 +122,11 @@ impl WorkbenchWindow {
             "workbench.action.togglePanel" | "workbench.action.terminal.toggleTerminal" => {
                 self.view.toggle_panel();
             }
+            "workbench.action.problems.focus" => {
+                self.view.layout.panel_visible = true;
+                self.view.layout.set_panel_tab("problems");
+                self.view.focused_region = crate::workbench_view::FocusedRegion::Panel;
+            }
             "workbench.action.showCommands" | "workbench.action.quickOpen" => {
                 self.open_command_palette();
             }

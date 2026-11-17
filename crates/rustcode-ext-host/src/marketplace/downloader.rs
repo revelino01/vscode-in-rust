@@ -16,6 +16,30 @@ impl ExtensionDownloader {
         }
     }
 
+    /// Read and parse extension manifest (`package.json`) directly from in-memory VSIX package bytes.
+    pub fn read_manifest_from_vsix(vsix_bytes: &[u8]) -> Result<ExtensionManifest, MarketplaceError> {
+        let reader = std::io::Cursor::new(vsix_bytes);
+        let mut archive = zip::ZipArchive::new(reader)
+            .map_err(|e| MarketplaceError::Archive(format!("Failed to read zip archive: {}", e)))?;
+
+        for i in 0..archive.len() {
+            let mut file = archive
+                .by_index(i)
+                .map_err(|e| MarketplaceError::Archive(format!("Failed to read entry {}: {}", i, e)))?;
+
+            if let Some(enclosed) = file.enclosed_name() {
+                if enclosed == Path::new("extension/package.json") || enclosed == Path::new("package.json") {
+                    let mut content = String::new();
+                    std::io::Read::read_to_string(&mut file, &mut content)?;
+                    return crate::manifest::ExtensionLoader::parse_manifest(&content)
+                        .map_err(MarketplaceError::InvalidManifest);
+                }
+            }
+        }
+
+        Err(MarketplaceError::NotFound("package.json not found in VSIX archive".to_string()))
+    }
+
     /// Unpack a `.vsix` ZIP archive into `target_dir` and parse the root `package.json`.
     /// Automatically strips the standard `"extension/"` package root prefix.
     pub fn unpack_vsix(vsix_bytes: &[u8], target_dir: &Path) -> Result<ExtensionManifest, MarketplaceError> {
@@ -37,6 +61,9 @@ impl ExtensionDownloader {
 
             // Strip "extension" prefix if present as VSIX packages place contents in `extension/`
             let dest_rel = enclosed.strip_prefix("extension").unwrap_or(&enclosed);
+            if dest_rel.as_os_str().is_empty() {
+                continue;
+            }
 
             let dest = target_dir.join(dest_rel);
 

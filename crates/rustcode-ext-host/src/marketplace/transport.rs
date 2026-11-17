@@ -70,7 +70,7 @@ impl HttpTransport for CurlHttpTransport {
         let url_owned = url.to_string();
         Box::pin(async move {
             let output = tokio::process::Command::new("curl")
-                .args(["-sSL", "--fail", &url_owned])
+                .args(["-sSL", "--fail", "--connect-timeout", "15", "-m", "120", &url_owned])
                 .output()
                 .await
                 .map_err(|e| MarketplaceError::Http(format!("Failed to execute curl: {}", e)))?;

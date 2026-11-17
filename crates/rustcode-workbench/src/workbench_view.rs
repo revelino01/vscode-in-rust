@@ -83,6 +83,9 @@ impl WorkbenchView {
     }
 
     pub fn update_problems(&mut self, uri: &str, diags: Vec<rustcode_editor::viewmodel::EditorDiagnostic>) {
+        if let Some(editor) = self.editor_area.editors.get_mut(uri) {
+            editor.set_diagnostics(diags.clone());
+        }
         self.problems_panel.set_file_diagnostics(uri, diags);
         let badge_text = self.problems_panel.status_badge_text();
         let tooltip = format!(
@@ -98,6 +101,12 @@ impl WorkbenchView {
             alignment: StatusBarAlignment::Left,
             priority: 100,
         });
+    }
+
+    pub fn update_lsp_problems(&mut self, uri: &str, diags: &[rustcode_protocols::lsp::types::LspDiagnostic]) {
+        let editor_diags: Vec<rustcode_editor::viewmodel::EditorDiagnostic> =
+            diags.iter().map(crate::problems::lsp_diagnostic_to_editor).collect();
+        self.update_problems(uri, editor_diags);
     }
 
     pub fn open_command_palette(&mut self, palette_view: CommandPaletteView) {
@@ -396,6 +405,7 @@ impl View for WorkbenchView {
                         match action {
                             StatusBarAction::ExecuteCommand(cmd) => {
                                 if cmd == "workbench.action.problems.focus" {
+                                    self.layout.panel_visible = true;
                                     self.layout.set_panel_tab("problems");
                                     self.focused_region = FocusedRegion::Panel;
                                 }
@@ -431,17 +441,21 @@ impl View for WorkbenchView {
                             (regions.panel.height() - tab_h).max(0.0),
                         );
                         let res = self.problems_panel.handle_event(event, content_rect);
-                        if let Some(ProblemsAction::JumpToLocation { uri, position }) = &self.problems_panel.last_action {
-                            let path = PathBuf::from(uri);
+                        if let Some(ProblemsAction::JumpToLocation { uri, position }) = self.problems_panel.last_action.take() {
+                            let clean_path = uri.strip_prefix("file://").unwrap_or(&uri);
+                            let path = PathBuf::from(clean_path);
                             let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
                             let content = std::fs::read_to_string(&path).unwrap_or_default();
-                            self.editor_area.open_file(uri, title, &content, true);
+                            self.editor_area.open_file(&uri, title, &content, true);
                             if let Some(active_editor) = self.editor_area.active_editor_mut() {
-                                active_editor.set_primary_position(*position);
+                                active_editor.set_primary_position(position);
+                                if let Some(file_diags) = self.problems_panel.files.get(&uri) {
+                                    active_editor.set_diagnostics(file_diags.clone());
+                                }
                             }
                             self.focused_region = FocusedRegion::Editor;
                             self.last_action = Some(WorkbenchAction::JumpToDiagnostic {
-                                uri: uri.clone(),
+                                uri,
                                 line: position.line,
                                 column: position.column,
                             });

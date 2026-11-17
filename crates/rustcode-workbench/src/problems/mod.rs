@@ -75,6 +75,11 @@ impl ProblemsPanel {
         }
     }
 
+    pub fn set_lsp_diagnostics(&mut self, uri: &str, diags: &[rustcode_protocols::lsp::types::LspDiagnostic]) {
+        let editor_diags: Vec<EditorDiagnostic> = diags.iter().map(lsp_diagnostic_to_editor).collect();
+        self.set_file_diagnostics(uri, editor_diags);
+    }
+
     pub fn clear_file_diagnostics(&mut self, uri: &str) {
         self.files.remove(uri);
         self.collapsed_files.remove(uri);
@@ -132,15 +137,16 @@ impl ProblemsPanel {
         self.filter = filter.to_lowercase();
     }
 
-    /// Return diagnostics matching current filter, grouped by file
-    pub fn filtered_files(&self) -> BTreeMap<String, Vec<&EditorDiagnostic>> {
+    /// Return diagnostics matching current filter, grouped by file, retaining original file index
+    pub fn filtered_files(&self) -> BTreeMap<String, Vec<(usize, &EditorDiagnostic)>> {
         let mut map = BTreeMap::new();
         let f = self.filter.trim();
 
         for (uri, list) in &self.files {
-            let matched: Vec<&EditorDiagnostic> = list
+            let matched: Vec<(usize, &EditorDiagnostic)> = list
                 .iter()
-                .filter(|d| {
+                .enumerate()
+                .filter(|(_, d)| {
                     if f.is_empty() {
                         return true;
                     }
@@ -157,6 +163,31 @@ impl ProblemsPanel {
         }
         map
     }
+}
+
+pub fn lsp_diagnostic_to_editor(diag: &rustcode_protocols::lsp::types::LspDiagnostic) -> EditorDiagnostic {
+    let sev = match diag.severity {
+        Some(rustcode_protocols::lsp::types::DiagnosticSeverity::Error) => DiagnosticSeverity::Error,
+        Some(rustcode_protocols::lsp::types::DiagnosticSeverity::Warning) => DiagnosticSeverity::Warning,
+        Some(rustcode_protocols::lsp::types::DiagnosticSeverity::Information) => DiagnosticSeverity::Information,
+        Some(rustcode_protocols::lsp::types::DiagnosticSeverity::Hint) => DiagnosticSeverity::Hint,
+        None => DiagnosticSeverity::Error,
+    };
+    let mut ed = EditorDiagnostic::new(
+        rustcode_editor::cursor::Range::new(
+            rustcode_editor::cursor::Position::new(diag.range.start.line as usize, diag.range.start.character as usize),
+            rustcode_editor::cursor::Position::new(diag.range.end.line as usize, diag.range.end.character as usize),
+        ),
+        sev,
+        &diag.message,
+    );
+    if let Some(src) = &diag.source {
+        ed = ed.with_source(src);
+    }
+    if let Some(code) = &diag.code {
+        ed = ed.with_code(code.to_string());
+    }
+    ed
 }
 
 impl View for ProblemsPanel {
@@ -210,11 +241,23 @@ impl View for ProblemsPanel {
 
         // 2. Diagnostics list
         let mut row_cache = Vec::new();
-        let mut cur_y = bounds.min_y() + toolbar_h + 4.0;
         let row_h = 22.0f32;
         let content_w = bounds.width();
+        let content_top = bounds.min_y() + toolbar_h;
+        let content_bottom = bounds.max_y();
 
         let filtered = self.filtered_files();
+        let total_rows: usize = filtered
+            .iter()
+            .map(|(uri, diags)| {
+                1 + if self.collapsed_files.contains(uri) { 0 } else { diags.len() }
+            })
+            .sum();
+        let visible_h = (bounds.height() - toolbar_h).max(0.0);
+        let max_scroll = ((total_rows as f32 * row_h) - visible_h).max(0.0);
+        let clamped_scroll = self.scroll_top.clamp(0.0, max_scroll);
+        let mut cur_y = content_top + 4.0 - clamped_scroll;
+
         if filtered.is_empty() {
             let empty_text = if self.files.is_empty() {
                 "No problems have been detected in the workspace."
@@ -223,133 +266,131 @@ impl View for ProblemsPanel {
             };
             scene.push_text(GlyphRun::new(
                 empty_text.to_string(),
-                Point::new(bounds.min_x() + 16.0, cur_y + 8.0),
-                Rect::from_xywh(bounds.min_x() + 16.0, cur_y + 8.0, 400.0, font.line_height),
+                Point::new(bounds.min_x() + 16.0, content_top + 8.0),
+                Rect::from_xywh(bounds.min_x() + 16.0, content_top + 8.0, 400.0, font.line_height),
                 theme.editor_line_number,
                 font.font_size * 0.9,
             ));
         } else {
             for (uri, diags) in filtered {
-                if cur_y + row_h > bounds.max_y() {
-                    break;
-                }
-
                 let is_collapsed = self.collapsed_files.contains(&uri);
                 let file_row_rect = Rect::from_xywh(bounds.min_x(), cur_y, content_w, row_h);
-                row_cache.push((uri.clone(), None, file_row_rect));
 
-                // File header row
-                let arrow = if is_collapsed { "▶ " } else { "▼ " };
-                let file_label = format!("{}{}", arrow, uri);
-                let badge = format!(" ({})", diags.len());
+                if cur_y + row_h >= content_top && cur_y < content_bottom {
+                    row_cache.push((uri.clone(), None, file_row_rect));
 
-                let file_w = font.text_width(&file_label);
-                let badge_w = font.text_width(&badge);
+                    // File header row
+                    let arrow = if is_collapsed { "▶ " } else { "▼ " };
+                    let file_label = format!("{}{}", arrow, uri);
+                    let badge = format!(" ({})", diags.len());
 
-                scene.push_text(
-                    GlyphRun::new(
-                        file_label,
-                        Point::new(bounds.min_x() + 8.0, cur_y + 3.0),
-                        Rect::from_xywh(bounds.min_x() + 8.0, cur_y + 3.0, file_w, font.line_height),
-                        theme.editor_foreground,
-                        font.font_size * 0.9,
-                    )
-                    .with_style(true, false, false),
-                );
+                    let file_w = font.text_width(&file_label);
+                    let badge_w = font.text_width(&badge);
 
-                scene.push_text(GlyphRun::new(
-                    badge,
-                    Point::new(bounds.min_x() + 8.0 + file_w, cur_y + 3.0),
-                    Rect::from_xywh(bounds.min_x() + 8.0 + file_w, cur_y + 3.0, badge_w, font.line_height),
-                    theme.editor_line_number,
-                    font.font_size * 0.85,
-                ));
+                    scene.push_text(
+                        GlyphRun::new(
+                            file_label,
+                            Point::new(bounds.min_x() + 8.0, cur_y + 3.0),
+                            Rect::from_xywh(bounds.min_x() + 8.0, cur_y + 3.0, file_w, font.line_height),
+                            theme.editor_foreground,
+                            font.font_size * 0.9,
+                        )
+                        .with_style(true, false, false),
+                    );
+
+                    scene.push_text(GlyphRun::new(
+                        badge,
+                        Point::new(bounds.min_x() + 8.0 + file_w, cur_y + 3.0),
+                        Rect::from_xywh(bounds.min_x() + 8.0 + file_w, cur_y + 3.0, badge_w, font.line_height),
+                        theme.editor_line_number,
+                        font.font_size * 0.85,
+                    ));
+                }
 
                 cur_y += row_h;
 
                 // Problem items under this file
                 if !is_collapsed {
-                    for (idx, diag) in diags.iter().enumerate() {
-                        if cur_y + row_h > bounds.max_y() {
-                            break;
-                        }
-
+                    for (orig_idx, diag) in diags {
                         let diag_rect = Rect::from_xywh(bounds.min_x(), cur_y, content_w, row_h);
-                        row_cache.push((uri.clone(), Some(idx), diag_rect));
 
-                        let is_selected = self.selected.as_ref().is_some_and(|(u, i)| u == &uri && *i == idx);
-                        if is_selected {
-                            scene.push_quad(
-                                Quad::new(diag_rect)
-                                    .with_background(theme.list_active_selection_bg)
-                                    .with_corner_radius(2.0),
+                        if cur_y + row_h >= content_top && cur_y < content_bottom {
+                            row_cache.push((uri.clone(), Some(orig_idx), diag_rect));
+
+                            let is_selected = self.selected.as_ref().is_some_and(|(u, i)| u == &uri && *i == orig_idx);
+                            if is_selected {
+                                scene.push_quad(
+                                    Quad::new(diag_rect)
+                                        .with_background(theme.list_active_selection_bg)
+                                        .with_corner_radius(2.0),
+                                );
+                            }
+
+                            // Severity badge/tag
+                            let (sev_str, sev_color) = match diag.severity {
+                                DiagnosticSeverity::Error => ("[Error] ", theme.editor_error_foreground),
+                                DiagnosticSeverity::Warning => ("[Warning] ", theme.editor_warning_foreground),
+                                DiagnosticSeverity::Information => ("[Info] ", theme.editor_info_foreground),
+                                DiagnosticSeverity::Hint => ("[Hint] ", theme.editor_hint_foreground),
+                            };
+
+                            let pos_str = format!("[{}:{}] ", diag.range.start.line + 1, diag.range.start.column + 1);
+                            let source_str = diag.formatted_header();
+
+                            let sev_w = font.text_width(sev_str);
+                            let pos_w = font.text_width(&pos_str);
+                            let msg_w = font.text_width(&diag.message);
+                            let src_w = font.text_width(&source_str);
+
+                            let mut item_x = bounds.min_x() + 24.0;
+
+                            // 1. Severity
+                            scene.push_text(
+                                GlyphRun::new(
+                                    sev_str.to_string(),
+                                    Point::new(item_x, cur_y + 3.0),
+                                    Rect::from_xywh(item_x, cur_y + 3.0, sev_w, font.line_height),
+                                    sev_color,
+                                    font.font_size * 0.85,
+                                )
+                                .with_style(true, false, false),
                             );
-                        }
+                            item_x += sev_w;
 
-                        // Severity badge/tag
-                        let (sev_str, sev_color) = match diag.severity {
-                            DiagnosticSeverity::Error => ("[Error] ", theme.editor_error_foreground),
-                            DiagnosticSeverity::Warning => ("[Warning] ", theme.editor_warning_foreground),
-                            DiagnosticSeverity::Information => ("[Info] ", theme.editor_info_foreground),
-                            DiagnosticSeverity::Hint => ("[Hint] ", theme.editor_hint_foreground),
-                        };
-
-                        let pos_str = format!("[{}:{}] ", diag.range.start.line + 1, diag.range.start.column + 1);
-                        let source_str = diag.formatted_header();
-
-                        let sev_w = font.text_width(sev_str);
-                        let pos_w = font.text_width(&pos_str);
-                        let msg_w = font.text_width(&diag.message);
-                        let src_w = font.text_width(&source_str);
-
-                        let mut item_x = bounds.min_x() + 24.0;
-
-                        // 1. Severity
-                        scene.push_text(
-                            GlyphRun::new(
-                                sev_str.to_string(),
+                            // 2. Position
+                            scene.push_text(GlyphRun::new(
+                                pos_str,
                                 Point::new(item_x, cur_y + 3.0),
-                                Rect::from_xywh(item_x, cur_y + 3.0, sev_w, font.line_height),
-                                sev_color,
+                                Rect::from_xywh(item_x, cur_y + 3.0, pos_w, font.line_height),
+                                theme.editor_line_number,
                                 font.font_size * 0.85,
-                            )
-                            .with_style(true, false, false),
-                        );
-                        item_x += sev_w;
+                            ));
+                            item_x += pos_w;
 
-                        // 2. Position
-                        scene.push_text(GlyphRun::new(
-                            pos_str,
-                            Point::new(item_x, cur_y + 3.0),
-                            Rect::from_xywh(item_x, cur_y + 3.0, pos_w, font.line_height),
-                            theme.editor_line_number,
-                            font.font_size * 0.85,
-                        ));
-                        item_x += pos_w;
+                            // 3. Message
+                            let msg_color = if is_selected {
+                                Rgba::from_hex("#ffffff").unwrap()
+                            } else {
+                                theme.editor_foreground
+                            };
+                            scene.push_text(GlyphRun::new(
+                                diag.message.clone(),
+                                Point::new(item_x, cur_y + 3.0),
+                                Rect::from_xywh(item_x, cur_y + 3.0, msg_w, font.line_height),
+                                msg_color,
+                                font.font_size * 0.85,
+                            ));
+                            item_x += msg_w + 8.0;
 
-                        // 3. Message
-                        let msg_color = if is_selected {
-                            Rgba::from_hex("#ffffff").unwrap()
-                        } else {
-                            theme.editor_foreground
-                        };
-                        scene.push_text(GlyphRun::new(
-                            diag.message.clone(),
-                            Point::new(item_x, cur_y + 3.0),
-                            Rect::from_xywh(item_x, cur_y + 3.0, msg_w, font.line_height),
-                            msg_color,
-                            font.font_size * 0.85,
-                        ));
-                        item_x += msg_w + 8.0;
-
-                        // 4. Source & Code
-                        scene.push_text(GlyphRun::new(
-                            source_str,
-                            Point::new(item_x, cur_y + 3.0),
-                            Rect::from_xywh(item_x, cur_y + 3.0, src_w, font.line_height),
-                            theme.editor_line_number,
-                            font.font_size * 0.8,
-                        ));
+                            // 4. Source & Code
+                            scene.push_text(GlyphRun::new(
+                                source_str,
+                                Point::new(item_x, cur_y + 3.0),
+                                Rect::from_xywh(item_x, cur_y + 3.0, src_w, font.line_height),
+                                theme.editor_line_number,
+                                font.font_size * 0.8,
+                            ));
+                        }
 
                         cur_y += row_h;
                     }
@@ -362,6 +403,14 @@ impl View for ProblemsPanel {
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         match event {
+            InputEvent::ScrollWheel(scroll) => {
+                if bounds.contains(scroll.position) {
+                    self.scroll_top = (self.scroll_top - scroll.delta_y).max(0.0);
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
             InputEvent::MouseDown(mouse) => {
                 if !bounds.contains(mouse.position) {
                     return EventResult::Ignored;
@@ -510,5 +559,103 @@ mod tests {
                 position: Position::new(15, 2),
             })
         );
+    }
+
+    #[test]
+    fn test_problems_panel_filter_click_jump_accuracy() {
+        let mut panel = ProblemsPanel::new();
+        // 3 problems in one file: index 0 is warning, index 1 is error, index 2 is info
+        panel.set_file_diagnostics(
+            "src/service.rs",
+            vec![
+                EditorDiagnostic::warning(
+                    Range::new(Position::new(5, 0), Position::new(5, 10)),
+                    "unused import `std::io`",
+                ),
+                EditorDiagnostic::error(
+                    Range::new(Position::new(42, 4), Position::new(42, 20)),
+                    "cannot find value `database`",
+                )
+                .with_source("rust-analyzer")
+                .with_code("E0425"),
+                EditorDiagnostic::info(
+                    Range::new(Position::new(100, 0), Position::new(100, 5)),
+                    "todo: implement caching",
+                ),
+            ],
+        );
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 400.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        // Filter for "database" - should match ONLY index 1
+        panel.set_filter("database");
+        let filtered = panel.filtered_files();
+        assert_eq!(filtered["src/service.rs"].len(), 1);
+        assert_eq!(filtered["src/service.rs"][0].0, 1); // original index 1
+
+        let mut scene = Scene::new();
+        panel.render(bounds, &theme, &font, &mut scene);
+
+        // Click the single displayed diagnostic row under the file header (y approx 0 + 24 + 4 + 22 + 5 = 55)
+        let click_event = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
+            Point::new(50.0, 55.0),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        let res = panel.handle_event(&click_event, bounds);
+        assert_eq!(res, EventResult::Consumed);
+
+        // Crucial verification: Must jump to Position(42, 4), NOT Position(5, 0) (index 0)
+        assert_eq!(
+            panel.last_action,
+            Some(ProblemsAction::JumpToLocation {
+                uri: "src/service.rs".to_string(),
+                position: Position::new(42, 4),
+            })
+        );
+        assert_eq!(panel.selected, Some(("src/service.rs".to_string(), 1)));
+    }
+
+    #[test]
+    fn test_problems_panel_scroll_wheel() {
+        let mut panel = ProblemsPanel::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 400.0);
+
+        let scroll_event = InputEvent::ScrollWheel(rustcode_platform::render::ScrollEvent {
+            position: Point::new(100.0, 100.0),
+            delta_x: 0.0,
+            delta_y: -44.0, // scroll down
+            modifiers: rustcode_platform::Modifiers::none(),
+        });
+
+        let res = panel.handle_event(&scroll_event, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert_eq!(panel.scroll_top, 44.0);
+    }
+
+    #[test]
+    fn test_problems_panel_lsp_diagnostics_conversion() {
+        use rustcode_protocols::lsp::types::{DiagnosticCode, DiagnosticSeverity as LspSeverity, LspDiagnostic, LspPosition, LspRange};
+
+        let mut panel = ProblemsPanel::new();
+        let lsp_diag = LspDiagnostic {
+            range: LspRange::new(LspPosition::new(10, 5), LspPosition::new(10, 15)),
+            severity: Some(LspSeverity::Error),
+            message: "mismatched types".to_string(),
+            source: Some("rust-analyzer".to_string()),
+            code: Some(DiagnosticCode::String("E0308".to_string())),
+        };
+
+        panel.set_lsp_diagnostics("file:///src/main.rs", &[lsp_diag]);
+
+        assert_eq!(panel.total_errors(), 1);
+        let diags = panel.files.get("file:///src/main.rs").unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].severity, DiagnosticSeverity::Error);
+        assert_eq!(diags[0].range.start, Position::new(10, 5));
+        assert_eq!(diags[0].range.end, Position::new(10, 15));
+        assert_eq!(diags[0].source.as_deref(), Some("rust-analyzer"));
+        assert_eq!(diags[0].code.as_deref(), Some("E0308"));
     }
 }

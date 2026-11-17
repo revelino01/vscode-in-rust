@@ -2,7 +2,7 @@
 
 use super::{ProviderRegistry, ProviderType};
 use crate::rpc::RpcBridge;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use rustcode_protocols::lsp::{
     CompletionContext, CompletionTriggerKind, Hover, LspClientManager, LspCompletionItem,
     LspDiagnostic, LspLocation, LspPosition, MarkupContent,
@@ -11,38 +11,72 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+pub type ExtDiagnosticsListener = Arc<dyn Fn(&str, &[LspDiagnostic]) + Send + Sync>;
+
 #[derive(Default)]
 pub struct DiagnosticCollectionManager {
     collections: RwLock<HashMap<String, HashMap<String, Vec<LspDiagnostic>>>>,
+    listeners: Arc<Mutex<Vec<ExtDiagnosticsListener>>>,
 }
 
 impl DiagnosticCollectionManager {
     pub fn new() -> Self {
         Self {
             collections: RwLock::new(HashMap::new()),
+            listeners: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn on_diagnostics<F>(&self, listener: F)
+    where
+        F: Fn(&str, &[LspDiagnostic]) + Send + Sync + 'static,
+    {
+        self.listeners.lock().push(Arc::new(listener));
+    }
+
+    fn notify_listeners(&self, uri: &str) {
+        let diags = self.get_diagnostics_for_uri(uri);
+        let listeners = self.listeners.lock().clone();
+        for listener in listeners {
+            listener(uri, &diags);
         }
     }
 
     pub fn set_diagnostics(&self, collection: &str, uri: &str, diagnostics: Vec<LspDiagnostic>) {
-        let mut guard = self.collections.write();
-        let map = guard.entry(collection.to_string()).or_default();
-        if diagnostics.is_empty() {
-            map.remove(uri);
-        } else {
-            map.insert(uri.to_string(), diagnostics);
+        {
+            let mut guard = self.collections.write();
+            let map = guard.entry(collection.to_string()).or_default();
+            if diagnostics.is_empty() {
+                map.remove(uri);
+            } else {
+                map.insert(uri.to_string(), diagnostics);
+            }
         }
+        self.notify_listeners(uri);
     }
 
     pub fn clear_diagnostics(&self, collection: &str, uri: &str) {
-        let mut guard = self.collections.write();
-        if let Some(map) = guard.get_mut(collection) {
-            map.remove(uri);
+        {
+            let mut guard = self.collections.write();
+            if let Some(map) = guard.get_mut(collection) {
+                map.remove(uri);
+            }
         }
+        self.notify_listeners(uri);
     }
 
     pub fn clear_all_in_collection(&self, collection: &str) {
-        let mut guard = self.collections.write();
-        guard.remove(collection);
+        let uris: Vec<String> = {
+            let mut guard = self.collections.write();
+            if let Some(map) = guard.remove(collection) {
+                map.into_keys().collect()
+            } else {
+                Vec::new()
+            }
+        };
+        for uri in uris {
+            self.notify_listeners(&uri);
+        }
     }
 
     pub fn get_diagnostics_for_uri(&self, uri: &str) -> Vec<LspDiagnostic> {
@@ -387,6 +421,11 @@ mod tests {
     #[test]
     fn test_diagnostic_collection_manager_and_rpc() {
         let manager = DiagnosticCollectionManager::new();
+        let notified = Arc::new(Mutex::new(Vec::new()));
+        let notified_clone = notified.clone();
+        manager.on_diagnostics(move |uri, diags| {
+            notified_clone.lock().push((uri.to_string(), diags.len()));
+        });
 
         // 1. Ingest via RPC notification: languages.setDiagnostics
         let params = json!({
@@ -422,5 +461,10 @@ mod tests {
         let handled_clear = manager.handle_rpc_message("languages.clearDiagnostics", &clear_params);
         assert!(handled_clear);
         assert!(manager.get_diagnostics_for_uri("file:///src/index.js").is_empty());
+
+        let events = notified.lock().clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0], ("file:///src/index.js".to_string(), 1));
+        assert_eq!(events[1], ("file:///src/index.js".to_string(), 0));
     }
 }

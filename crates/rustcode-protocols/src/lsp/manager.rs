@@ -248,6 +248,10 @@ impl LspClientManager {
         }
     }
 
+    pub fn register_client(&self, language_id: &str, client: Arc<LspClient>) {
+        self.clients.write().insert(language_id.to_string(), client);
+    }
+
     pub async fn shutdown_all(&self) {
         let clients: Vec<Arc<LspClient>> = self.clients.write().drain().map(|(_, c)| c).collect();
         for client in clients {
@@ -257,14 +261,12 @@ impl LspClientManager {
     }
 
     pub fn get_diagnostics(&self, uri: &str) -> Vec<LspDiagnostic> {
+        let mut all = Vec::new();
         let clients = self.clients.read();
         for client in clients.values() {
-            let diags = client.get_diagnostics(uri);
-            if !diags.is_empty() {
-                return diags;
-            }
+            all.extend(client.get_diagnostics(uri));
         }
-        Vec::new()
+        all
     }
 
     pub fn get_all_diagnostics(&self) -> HashMap<String, Vec<LspDiagnostic>> {
@@ -301,5 +303,53 @@ mod tests {
             trigger_characters: vec!['.'],
         });
         assert_eq!(manager.get_config("go").unwrap().command, "gopls");
+    }
+
+    #[tokio::test]
+    async fn test_lsp_client_manager_multi_client_diagnostics_aggregation() {
+        use crate::lsp::types::{DiagnosticSeverity, LspDiagnostic, LspPosition, LspRange};
+        use tokio::io::duplex;
+
+        let manager = LspClientManager::new();
+        let (server_w1, client_r1) = duplex(1024);
+        let (client_w1, _server_r1) = duplex(1024);
+        let client1 = Arc::new(LspClient::from_io(client_r1, client_w1));
+
+        let (server_w2, client_r2) = duplex(1024);
+        let (client_w2, _server_r2) = duplex(1024);
+        let client2 = Arc::new(LspClient::from_io(client_r2, client_w2));
+
+        let diag1 = LspDiagnostic {
+            range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 5)),
+            severity: Some(DiagnosticSeverity::Error),
+            message: "syntax error".to_string(),
+            source: Some("rust-analyzer".to_string()),
+            code: None,
+        };
+        let diag2 = LspDiagnostic {
+            range: LspRange::new(LspPosition::new(0, 6), LspPosition::new(0, 10)),
+            severity: Some(DiagnosticSeverity::Warning),
+            message: "variable not snake_case".to_string(),
+            source: Some("clippy".to_string()),
+            code: None,
+        };
+
+        client1.set_diagnostics("file:///main.rs", vec![diag1]);
+        client2.set_diagnostics("file:///main.rs", vec![diag2]);
+
+        manager.register_client("rust", client1);
+        manager.register_client("clippy", client2);
+
+        // Verify get_diagnostics aggregates both clients
+        let aggregated = manager.get_diagnostics("file:///main.rs");
+        assert_eq!(aggregated.len(), 2);
+        assert!(aggregated.iter().any(|d| d.source.as_deref() == Some("rust-analyzer")));
+        assert!(aggregated.iter().any(|d| d.source.as_deref() == Some("clippy")));
+
+        let all_map = manager.get_all_diagnostics();
+        assert_eq!(all_map.get("file:///main.rs").unwrap().len(), 2);
+
+        let _ = server_w1;
+        let _ = server_w2;
     }
 }

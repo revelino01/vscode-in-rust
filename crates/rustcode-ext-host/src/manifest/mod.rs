@@ -78,6 +78,7 @@ pub struct KeybindingContribution {
     pub when: Option<String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct LoadedExtension {
     pub root_dir: PathBuf,
     pub manifest: ExtensionManifest,

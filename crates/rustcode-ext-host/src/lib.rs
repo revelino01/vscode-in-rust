@@ -16,8 +16,9 @@ pub use manifest::{
     ViewContribution,
 };
 pub use marketplace::{
-    CurlHttpTransport, ExtensionDownloader, ExtensionFiles, ExtensionInstaller, ExtensionMetadata,
-    HttpTransport, MarketplaceClient, MarketplaceError, MockHttpTransport, SearchResponse,
+    curated_catalog, search_curated_catalog, CurlHttpTransport, ExtensionDownloader,
+    ExtensionFiles, ExtensionInstaller, ExtensionMetadata, HttpTransport, MarketplaceClient,
+    MarketplaceError, MockHttpTransport, SearchResponse,
 };
 pub use notebook::{
     ExtHostNotebookManager, ExtNotebookCellData, ExtNotebookCellKind, ExtNotebookCellOutput,

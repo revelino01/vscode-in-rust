@@ -6,6 +6,7 @@ use crate::debug::{
 };
 use crate::editor_area::EditorAreaView;
 use crate::explorer::{ExplorerAction, FileExplorerView};
+use crate::extensions_view::{ExtensionsSidebarView, ExtensionsViewAction};
 use crate::layout::WorkbenchLayout;
 use crate::problems::{ProblemsAction, ProblemsPanel};
 use crate::quickinput::{CommandPaletteView, PaletteAction};
@@ -47,6 +48,7 @@ pub enum WorkbenchAction {
     DebugToolbar(DebugToolbarAction),
     DebugAction(DebugViewAction),
     ScmAction(ScmAction),
+    ExtensionsAction(ExtensionsViewAction),
     SidebarToggled(bool),
     PanelToggled(bool),
 }
@@ -57,6 +59,7 @@ pub struct WorkbenchView {
     pub explorer: FileExplorerView,
     pub scm_view: ScmView,
     pub search_view: SearchView,
+    pub extensions_view: ExtensionsSidebarView,
     pub workspace: Workspace,
     pub debug_sidebar: DebugSidebarView,
     pub debug_toolbar: DebugToolbarView,
@@ -95,6 +98,7 @@ impl WorkbenchView {
             explorer: FileExplorerView::default(),
             scm_view: ScmView::default(),
             search_view: SearchView::default(),
+            extensions_view: ExtensionsSidebarView::default(),
             workspace: Workspace::default(),
             debug_sidebar: DebugSidebarView::default(),
             debug_toolbar: DebugToolbarView::default(),
@@ -180,6 +184,12 @@ impl WorkbenchView {
         let title = format!("Untitled-{}.ipynb", n);
         self.editor_area.open_notebook(&uri, &title, "", false);
         self.focused_region = FocusedRegion::Editor;
+    }
+
+    fn process_extensions_action(&mut self) {
+        if let Some(act) = self.extensions_view.last_action.take() {
+            self.last_action = Some(WorkbenchAction::ExtensionsAction(act));
+        }
     }
 
     // --- Layout Region Calculations ---
@@ -278,7 +288,7 @@ impl View for WorkbenchView {
             self.activity_bar.render(regions.activity_bar, theme, font, scene);
         }
 
-        // 3. Primary sidebar (Explorer / SCM / Debug)
+        // 3. Primary sidebar (Explorer / SCM / Debug / Search / Extensions)
         if self.layout.sidebar_visible {
             let view_id = self.layout.active_sidebar_view.as_str();
             if view_id == "scm" || view_id == "workbench.view.scm" {
@@ -287,6 +297,8 @@ impl View for WorkbenchView {
                 self.debug_sidebar.render(regions.sidebar, theme, font, scene);
             } else if view_id == "search" || view_id == "workbench.view.search" {
                 self.search_view.render(regions.sidebar, theme, font, scene);
+            } else if view_id == "extensions" || view_id == "workbench.view.extensions" {
+                self.extensions_view.render(regions.sidebar, theme, font, scene);
             } else {
                 self.explorer.render(regions.sidebar, theme, font, scene);
             }
@@ -568,6 +580,10 @@ impl View for WorkbenchView {
                             }
                         }
                         res
+                    } else if view_id == "extensions" || view_id == "workbench.view.extensions" {
+                        let res = self.extensions_view.handle_event(event, regions.sidebar);
+                        self.process_extensions_action();
+                        res
                     } else {
                         let res = self.explorer.handle_event(event, regions.sidebar);
                         if let Some(action) = &self.explorer.last_action {
@@ -738,6 +754,10 @@ impl View for WorkbenchView {
                                 }
                             }
                             res
+                        } else if view_id == "extensions" || view_id == "workbench.view.extensions" {
+                            let res = self.extensions_view.handle_event(event, regions.sidebar);
+                            self.process_extensions_action();
+                            res
                         } else {
                             self.explorer.handle_event(event, regions.sidebar)
                         }
@@ -764,6 +784,8 @@ impl View for WorkbenchView {
                         self.scm_view.handle_event(event, regions.sidebar)
                     } else if view_id == "debug" || view_id == "workbench.view.debug" {
                         self.debug_sidebar.handle_event(event, regions.sidebar)
+                    } else if view_id == "extensions" || view_id == "workbench.view.extensions" {
+                        self.extensions_view.handle_event(event, regions.sidebar)
                     } else {
                         self.explorer.handle_event(event, regions.sidebar)
                     }
@@ -963,5 +985,93 @@ mod tests {
         let mut scm_scene = Scene::new();
         wb.scm_view.render(regions.sidebar, &theme, &font, &mut scm_scene);
         assert!(scm_scene.contains_text("Cannot commit empty message"));
+    }
+
+    #[test]
+    fn test_workbench_view_extensions_sidebar_routing() {
+        use crate::extensions_view::ExtensionsClickTarget;
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{KeyEvent, MouseButton, MouseEvent, ScrollEvent};
+
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+
+        // 1. Click ActivityBar slot 4 (Extensions)
+        let slot4_pt = Point::new(24.0, 4.0 * 48.0 + 24.0);
+        let click_ext = InputEvent::MouseDown(MouseEvent::new(slot4_pt, MouseButton::Left));
+        assert_eq!(wb.handle_event(&click_ext, bounds), EventResult::Consumed);
+        assert_eq!(wb.layout.active_sidebar_view, "extensions");
+        assert!(wb.layout.sidebar_visible);
+
+        // 2. Render -> EXTENSIONS rendered, NOT EXPLORER
+        let mut scene = Scene::new();
+        wb.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("EXTENSIONS"));
+        assert!(!scene.contains_text("EXPLORER"));
+
+        // 3. Also test "workbench.view.extensions" alias
+        wb.layout.active_sidebar_view = "workbench.view.extensions".to_string();
+        let mut scene_alias = Scene::new();
+        wb.render(bounds, &theme, &font, &mut scene_alias);
+        assert!(scene_alias.contains_text("EXTENSIONS"));
+        assert!(!scene_alias.contains_text("EXPLORER"));
+
+        // 4. Click search box in sidebar -> focuses extensions_view search
+        let search_rect = wb
+            .extensions_view
+            .click_targets
+            .read()
+            .iter()
+            .find_map(|(r, t)| match t {
+                ExtensionsClickTarget::SearchInput => Some(*r),
+                _ => None,
+            })
+            .unwrap();
+        let click_search = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(search_rect.min_x() + 6.0, search_rect.min_y() + 6.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(wb.handle_event(&click_search, bounds), EventResult::Consumed);
+        assert_eq!(wb.focused_region, FocusedRegion::Sidebar);
+        assert!(wb.extensions_view.search_focused);
+
+        // 5. Type "rust" -> updates extensions_view.search_query & emits ExtensionsAction
+        for ch in "rust".chars() {
+            let key_ev = InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none()));
+            assert_eq!(wb.handle_event(&key_ev, bounds), EventResult::Consumed);
+        }
+        assert_eq!(wb.extensions_view.search_query, "rust");
+        assert_eq!(
+            wb.last_action,
+            Some(WorkbenchAction::ExtensionsAction(
+                ExtensionsViewAction::Search("rust".to_string())
+            ))
+        );
+
+        // 6. ScrollWheel inside sidebar -> clears filter first so list is scrollable, re-renders, scrolls extensions_view
+        wb.extensions_view.apply_search_query("");
+        wb.render(bounds, &theme, &font, &mut Scene::new());
+        let regions = wb.compute_regions(bounds);
+        // Use small bounds height to guarantee scrollable overflow
+        let small_bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 260.0);
+        wb.render(small_bounds, &theme, &font, &mut Scene::new());
+        let small_regions = wb.compute_regions(small_bounds);
+        let scroll_ev = InputEvent::ScrollWheel(ScrollEvent::new(
+            Point::new(
+                small_regions.sidebar.min_x() + 20.0,
+                small_regions.sidebar.min_y() + 100.0,
+            ),
+            0.0,
+            -80.0,
+        ));
+        assert_eq!(
+            wb.handle_event(&scroll_ev, small_bounds),
+            EventResult::Consumed
+        );
+        assert!(wb.extensions_view.scroll_top > 0.0);
+        assert!(wb.explorer.last_action.is_none());
+        let _ = regions;
     }
 }

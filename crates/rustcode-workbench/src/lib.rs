@@ -12,6 +12,7 @@ pub mod activitybar;
 pub mod debug;
 pub mod editor_area;
 pub mod explorer;
+pub mod extensions_view;
 pub mod layout;
 pub mod notebook;
 pub mod problems;
@@ -32,6 +33,10 @@ pub use debug::{
 };
 pub use editor_area::{EditorArea, EditorAreaAction, EditorAreaView, EditorGroup, EditorTab};
 pub use explorer::{ExplorerAction, ExplorerRow, FileExplorer, FileExplorerView, FileTreeNode};
+pub use extensions_view::{
+    curated_marketplace_extensions, ExtensionsClickTarget, ExtensionsSidebarView,
+    ExtensionsViewAction, InstalledExtensionItem, MarketplaceExtensionItem,
+};
 pub use layout::WorkbenchLayout;
 pub use notebook::{
     CellKind, CellOutput, KernelValue, NotebookAction, NotebookCell, NotebookClickTarget,

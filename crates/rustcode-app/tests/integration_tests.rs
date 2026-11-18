@@ -1538,5 +1538,274 @@ fn test_end_to_end_notebook_editor_kernel_and_save() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+#[tokio::test]
+async fn test_end_to_end_extensions_marketplace_sidebar_ui() {
+    use rustcode_ext_host::marketplace::{
+        ExtensionInstaller, MarketplaceClient, MockHttpTransport,
+    };
+    use rustcode_workbench::ExtensionsClickTarget;
+    use std::io::Write;
+    use std::sync::Arc;
+    use zip::write::SimpleFileOptions;
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "rustcode_e2e_ext_ui_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    // Build synthetic .vsix with a contributed command & theme
+    let manifest_json = r#"{
+        "name": "e2e-ext",
+        "publisher": "e2epub",
+        "version": "1.0.0",
+        "displayName": "E2E Ext",
+        "description": "End-to-end marketplace extension",
+        "contributes": {
+            "commands": [
+                {
+                    "command": "e2eExt.hello",
+                    "title": "E2E Hello",
+                    "category": "E2E"
+                }
+            ],
+            "themes": [
+                {
+                    "label": "E2E Dark",
+                    "uiTheme": "vs-dark",
+                    "path": "./themes/e2e-dark.json"
+                }
+            ]
+        }
+    }"#;
+    let theme_json = r##"{
+        "name": "E2E Dark",
+        "type": "dark",
+        "colors": { "editor.background": "#121314" }
+    }"##;
+    let mut vsix_buf = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut vsix_buf);
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("extension/package.json", opts).unwrap();
+        zip.write_all(manifest_json.as_bytes()).unwrap();
+        zip.start_file("extension/themes/e2e-dark.json", opts)
+            .unwrap();
+        zip.write_all(theme_json.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+    let vsix_bytes = vsix_buf.into_inner();
+
+    let transport = Arc::new(MockHttpTransport::new());
+    let dl_url = "https://open-vsx.org/api/e2epub/e2e-ext/1.0.0/file/e2e-ext.vsix";
+    transport.set_response(
+        "https://open-vsx.org/api/-/search?query=e2e&size=20&offset=0",
+        serde_json::to_vec(&json!({
+            "totalSize": 1,
+            "extensions": [{
+                "namespace": "e2epub",
+                "name": "e2e-ext",
+                "version": "1.0.0",
+                "displayName": "E2E Ext",
+                "description": "End-to-end marketplace extension",
+                "downloadUrl": dl_url
+            }]
+        }))
+        .unwrap(),
+    );
+    transport.set_response(
+        "https://open-vsx.org/api/e2epub/e2e-ext/1.0.0",
+        serde_json::to_vec(&json!({
+            "namespace": "e2epub",
+            "name": "e2e-ext",
+            "version": "1.0.0",
+            "displayName": "E2E Ext",
+            "downloadUrl": dl_url
+        }))
+        .unwrap(),
+    );
+    transport.set_response(dl_url, vsix_bytes);
+
+    let client = Arc::new(MarketplaceClient::new(
+        "https://open-vsx.org/api",
+        transport,
+    ));
+    let installer = Arc::new(ExtensionInstaller::new(client, &tmp_dir));
+
+    // 1. Bootstrap RustCodeContext & WorkbenchWindow
+    let app = RustCodeContext::new();
+    assert!(app.commands.has_command("workbench.view.extensions"));
+    assert!(app
+        .commands
+        .has_command("workbench.extensions.action.showInstalledExtensions"));
+
+    let mut window = app.create_window();
+    window.view.extensions_view.set_installer(installer.clone());
+
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+
+    // 2. Dispatch Ctrl+Shift+X -> opens Extensions sidebar
+    let ctrl_shift_x = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('x'),
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_shift_x, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.layout.active_sidebar_view, "extensions");
+    assert_eq!(window.view.activity_bar.model.active_item_index, 4);
+
+    // 3. Render -> verifies EXTENSIONS rendered, NOT EXPLORER
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("EXTENSIONS"));
+    assert!(!scene.contains_text("EXPLORER"));
+
+    // Verify "workbench.view.extensions" alias also renders EXTENSIONS, NOT EXPLORER
+    window.view.layout.active_sidebar_view = "workbench.view.extensions".to_string();
+    let scene_alias = window.render(&mut surface);
+    assert!(scene_alias.contains_text("EXTENSIONS"));
+    assert!(!scene_alias.contains_text("EXPLORER"));
+
+    // 4. Focus search input, type "e2e", press Enter
+    let search_rect = window
+        .view
+        .extensions_view
+        .click_targets
+        .read()
+        .iter()
+        .find_map(|(r, t)| match t {
+            ExtensionsClickTarget::SearchInput => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(search_rect.min_x() + 6.0, search_rect.min_y() + 6.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    for ch in "e2e".chars() {
+        window.dispatch_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+            bounds,
+        );
+    }
+    window.dispatch_event(
+        &InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none())),
+        bounds,
+    );
+
+    let scene_search = window.render(&mut surface);
+    assert!(scene_search.contains_text("E2E Ext"));
+    assert!(scene_search.contains_text("Install"));
+
+    // 5. Click [Install] -> unpacks into tmp_dir and registers contributed command/theme
+    let install_rect = window
+        .view
+        .extensions_view
+        .click_targets
+        .read()
+        .iter()
+        .find_map(|(r, t)| match t {
+            ExtensionsClickTarget::InstallBtn { name, .. } if name == "e2e-ext" => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(install_rect.min_x() + 6.0, install_rect.min_y() + 6.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(installer.list_installed().len(), 1);
+    assert!(window.commands.has_command("e2eExt.hello"));
+    assert_eq!(window.theme.current().name, "E2E Dark");
+
+    let scene_inst = window.render(&mut surface);
+    assert!(scene_inst.contains_text("INSTALLED (1)"));
+    assert!(scene_inst.contains_text("Disable"));
+
+    // 6. Click [Disable] -> persists .disabled.json & disposes contributed command
+    let disable_rect = window
+        .view
+        .extensions_view
+        .click_targets
+        .read()
+        .iter()
+        .find_map(|(r, t)| match t {
+            ExtensionsClickTarget::DisableBtn(id) if id == "e2epub.e2e-ext" => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(disable_rect.min_x() + 6.0, disable_rect.min_y() + 6.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert!(!installer.is_enabled("e2epub.e2e-ext"));
+    assert!(tmp_dir.join(".disabled.json").exists());
+    assert!(!window.commands.has_command("e2eExt.hello"));
+
+    // 7. Re-render and click [Enable] -> re-enables and re-registers contributed command
+    let scene_dis = window.render(&mut surface);
+    assert!(scene_dis.contains_text("Enable"));
+    let enable_rect = window
+        .view
+        .extensions_view
+        .click_targets
+        .read()
+        .iter()
+        .find_map(|(r, t)| match t {
+            ExtensionsClickTarget::EnableBtn(id) if id == "e2epub.e2e-ext" => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(enable_rect.min_x() + 6.0, enable_rect.min_y() + 6.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert!(installer.is_enabled("e2epub.e2e-ext"));
+    assert!(window.commands.has_command("e2eExt.hello"));
+
+    // 8. Re-render and click [Uninstall] -> removes folder & disposes command
+    window.render(&mut surface);
+    let uninstall_rect = window
+        .view
+        .extensions_view
+        .click_targets
+        .read()
+        .iter()
+        .find_map(|(r, t)| match t {
+            ExtensionsClickTarget::UninstallBtn(id) if id == "e2epub.e2e-ext" => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(uninstall_rect.min_x() + 6.0, uninstall_rect.min_y() + 6.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert!(installer.list_installed().is_empty());
+    assert!(!window.commands.has_command("e2eExt.hello"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+
 
 

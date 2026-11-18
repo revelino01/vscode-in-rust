@@ -44,5 +44,9 @@
   {
     "key": "ctrl+,",
     "command": "workbench.action.openSettings"
+  },
+  {
+    "key": "ctrl+shift+x",
+    "command": "workbench.view.extensions"
   }
 ]

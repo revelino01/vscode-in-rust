@@ -106,6 +106,17 @@ impl RustCodeContext {
         store.add_boxed(self.commands.register("notebook.cell.execute", |_| {
             Ok(json!({ "cellExecuted": true }))
         }));
+
+        store.add_boxed(self.commands.register("workbench.view.extensions", |_| {
+            Ok(json!({ "view": "extensions" }))
+        }));
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.extensions.action.showInstalledExtensions", |_| {
+                    Ok(json!({ "view": "extensions", "filter": "installed" }))
+                }),
+        );
     }
 
     /// Instantiate a GPUI WorkbenchWindow host wired to this service container.

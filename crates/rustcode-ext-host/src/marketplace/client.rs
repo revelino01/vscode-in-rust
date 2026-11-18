@@ -31,6 +31,10 @@ impl MarketplaceClient {
         Self::new("https://open-vsx.org/api", Arc::new(CurlHttpTransport::new()))
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Query Open VSX search endpoint by keyword.
     pub async fn search(
         &self,

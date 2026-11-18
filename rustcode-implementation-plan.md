@@ -67,7 +67,7 @@
 ### Active Feature Milestones (R1–R4)
 - [x] **M1 (R1) Visual Settings UI**: `ConfigurationService` (`Clone`, `update`/`reset`, all schema defaults), `SettingsUiView` GPUI `View` + category/search filtering + mouse/keyboard/scroll interaction + two-way config sync, `EditorAreaView`/`WorkbenchView`/`WorkbenchWindow`/`RustCodeContext` wiring, `ctrl+,` keymap & `workbench.action.openSettings`, and unit/E2E tests
 - [x] **M2 (R2) Notebook Support**: `NotebookDocument` / `.ipynb` JSON parser & serializer / pure-Rust `NotebookKernel` / `NotebookEditorView` GPUI `View`, `EditorAreaView`/`WorkbenchView` `.ipynb` routing, `ext-host-js/vscode-api/notebooks.js` + `rustcode-ext-host` RPC bridge, and unit/E2E tests
-- [ ] **M3 (R3) Extension Marketplace Sidebar UI**: `rustcode-ext-host::marketplace` (`list_installed`, `uninstall`, `set_enabled`/`is_enabled`), `ExtensionsSidebarView` GPUI `View`, `WorkbenchView` sidebar routing (`"extensions"` / `"workbench.view.extensions"`), and unit/E2E tests
+- [x] **M3 (R3) Extension Marketplace Sidebar UI**: `rustcode-ext-host::marketplace` (`list_installed`, `uninstall`, `set_enabled`/`is_enabled`), `ExtensionsSidebarView` GPUI `View`, `WorkbenchView` sidebar routing (`"extensions"` / `"workbench.view.extensions"`), and unit/E2E tests
 - [ ] **M4 (R4) Breadcrumbs, Minimap & Accessibility Tree**: Editor minimap (`editor.minimap.enabled`), breadcrumbs bar (`breadcrumbs.enabled`), semantic accessibility node tree (`crates/rustcode-platform/src/accessibility.rs` + `WorkbenchWindow::accessibility_tree`), live config sync, and unit/E2E tests
 
 ---

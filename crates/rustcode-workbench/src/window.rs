@@ -1,8 +1,11 @@
 //! GPUI WorkbenchWindow host managing rendering surfaces, theme updates, and input routing.
 
+use crate::extensions_view::ExtensionsViewAction;
 use crate::quickinput::{CommandPalette, CommandPaletteView, PaletteItem};
 use crate::workbench_view::{WorkbenchAction, WorkbenchView};
 use rustcode_base::context_key::ContextKeyService;
+use rustcode_base::disposable::DisposableStore;
+use rustcode_ext_host::marketplace::ExtensionInstaller;
 use rustcode_ext_host::provider::LanguageFeatureBridge;
 use rustcode_platform::commands::CommandRegistry;
 use rustcode_platform::configuration::ConfigurationService;
@@ -15,6 +18,7 @@ use rustcode_platform::theme::ThemeService;
 use rustcode_protocols::lsp::{
     CodeAction, CodeActionContext, FormattingOptions, LspPosition, LspRange, WorkspaceEdit,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct WorkbenchWindow {
@@ -27,6 +31,7 @@ pub struct WorkbenchWindow {
     pub font_metrics: FontMetrics,
     pub language_bridge: Option<Arc<LanguageFeatureBridge>>,
     pub pending_code_actions: Vec<CodeAction>,
+    pub extension_disposables: HashMap<String, DisposableStore>,
 }
 
 impl Default for WorkbenchWindow {
@@ -60,6 +65,7 @@ impl WorkbenchWindow {
             font_metrics,
             language_bridge: None,
             pending_code_actions: Vec::new(),
+            extension_disposables: HashMap::new(),
         }
     }
 
@@ -175,10 +181,56 @@ impl WorkbenchWindow {
                 WorkbenchAction::DebugToolbar(_) => {}
                 WorkbenchAction::DebugAction(_) => {}
                 WorkbenchAction::ScmAction(_) => {}
+                WorkbenchAction::ExtensionsAction(act) => {
+                    self.handle_extensions_action(&act);
+                }
             }
         }
 
         res
+    }
+
+    fn handle_extensions_action(&mut self, action: &ExtensionsViewAction) {
+        match action {
+            ExtensionsViewAction::Install {
+                namespace, name, ..
+            } => {
+                let id = ExtensionInstaller::extension_id(namespace, name);
+                self.register_extension_contributions_by_id(&id);
+            }
+            ExtensionsViewAction::Enable { id } => {
+                self.register_extension_contributions_by_id(id);
+            }
+            ExtensionsViewAction::Disable { id } | ExtensionsViewAction::Uninstall { id } => {
+                self.extension_disposables.remove(&id.to_ascii_lowercase());
+            }
+            ExtensionsViewAction::Search(_) | ExtensionsViewAction::SelectExtension(_) => {}
+        }
+    }
+
+    fn register_extension_contributions_by_id(&mut self, id: &str) {
+        let Some(installer) = self.view.extensions_view.installer.clone() else {
+            return;
+        };
+        if !installer.is_enabled(id) {
+            return;
+        }
+        let installed = installer.list_installed();
+        if let Some(ext) = installed.into_iter().find(|ext| {
+            ExtensionInstaller::extension_id(&ext.manifest.publisher, &ext.manifest.name)
+                .eq_ignore_ascii_case(id)
+        }) {
+            self.extension_disposables.remove(&id.to_ascii_lowercase());
+            if let Ok((_, store)) = installer.register_contributions(
+                &ext,
+                &self.commands,
+                Some(&mut self.theme),
+                |_lang, _path| Ok(()),
+            ) {
+                self.extension_disposables
+                    .insert(id.to_ascii_lowercase(), store);
+            }
+        }
     }
 
     fn handle_builtin_command_effects(&mut self, command_id: &str) {
@@ -207,6 +259,21 @@ impl WorkbenchWindow {
                 self.view.layout.sidebar_visible = true;
                 self.view.layout.set_sidebar_view("search");
                 self.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
+            }
+            "workbench.view.extensions" => {
+                self.view.layout.active_sidebar_view = "extensions".to_string();
+                self.view.layout.sidebar_visible = true;
+                self.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
+                self.view.activity_bar.set_active_index(4);
+            }
+            "workbench.extensions.action.showInstalledExtensions" => {
+                self.view.layout.active_sidebar_view = "extensions".to_string();
+                self.view.layout.sidebar_visible = true;
+                self.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
+                self.view.activity_bar.set_active_index(4);
+                self.view.extensions_view.apply_search_query("");
+                self.view.extensions_view.installed_collapsed = false;
+                self.view.extensions_view.refresh_installed();
             }
             "workbench.action.openSettings" => {
                 self.open_settings();
@@ -263,16 +330,26 @@ impl WorkbenchWindow {
         }
     }
 
+    fn format_command_palette_label(cmd_id: &str) -> String {
+        match cmd_id {
+            "workbench.view.extensions" => "View: Show Extensions".to_string(),
+            "workbench.extensions.action.showInstalledExtensions" => {
+                "Extensions: Show Installed".to_string()
+            }
+            _ => cmd_id
+                .replace("workbench.action.files.", "")
+                .replace("workbench.action.", "")
+                .replace("editor.action.", ""),
+        }
+    }
+
     pub fn open_command_palette(&mut self) {
         let mut items = Vec::new();
         for cmd_id in self.commands.list_commands() {
             let keybinding = self.keybindings.lookup_keybinding(&cmd_id);
             items.push(PaletteItem::command(
                 cmd_id.clone(),
-                cmd_id
-                    .replace("workbench.action.files.", "")
-                    .replace("workbench.action.", "")
-                    .replace("editor.action.", ""),
+                Self::format_command_palette_label(&cmd_id),
                 Some("Command".to_string()),
                 keybinding,
             ));
@@ -301,10 +378,7 @@ impl WorkbenchWindow {
             let keybinding = self.keybindings.lookup_keybinding(&cmd_id);
             items.push(PaletteItem::command(
                 cmd_id.clone(),
-                cmd_id
-                    .replace("workbench.action.files.", "")
-                    .replace("workbench.action.", "")
-                    .replace("editor.action.", ""),
+                Self::format_command_palette_label(&cmd_id),
                 Some("Command".to_string()),
                 keybinding,
             ));
@@ -1117,5 +1191,138 @@ mod tests {
             window.context_keys.get("notebookEditorFocused"),
             Some(serde_json::Value::Bool(true))
         );
+    }
+
+    #[test]
+    fn test_workbench_window_extensions_commands_and_actions() {
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{KeyCode, KeyEvent, MockRenderSurface};
+
+        let mut window = WorkbenchWindow::default();
+        let _ = window.keybindings.load_keybindings_json(
+            r#"[{"key": "ctrl+shift+x", "command": "workbench.view.extensions"}]"#,
+        );
+        window.commands.register("workbench.view.extensions", |_| {
+            Ok(serde_json::json!({ "view": "extensions" }))
+        });
+        window
+            .commands
+            .register("workbench.extensions.action.showInstalledExtensions", |_| {
+                Ok(serde_json::json!({ "view": "extensions", "filter": "installed" }))
+            });
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let ctrl_shift_x = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('x'),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: false,
+                meta: false,
+            },
+        ));
+        assert_eq!(
+            window.dispatch_event(&ctrl_shift_x, bounds),
+            EventResult::Consumed
+        );
+        assert_eq!(window.view.layout.active_sidebar_view, "extensions");
+        assert!(window.view.layout.sidebar_visible);
+        assert_eq!(
+            window.view.focused_region,
+            crate::workbench_view::FocusedRegion::Sidebar
+        );
+        assert_eq!(window.view.activity_bar.model.active_item_index, 4);
+        assert_eq!(
+            window.context_keys.get("sideBarFocus"),
+            Some(serde_json::Value::Bool(true))
+        );
+
+        // Re-triggering workbench.view.extensions keeps sidebar open (does NOT toggle closed)
+        assert_eq!(
+            window.dispatch_event(&ctrl_shift_x, bounds),
+            EventResult::Consumed
+        );
+        assert!(window.view.layout.sidebar_visible);
+        assert_eq!(window.view.layout.active_sidebar_view, "extensions");
+
+        let mut surface = MockRenderSurface::new(1024.0, 768.0);
+        let scene = window.render(&mut surface);
+        assert!(scene.contains_text("EXTENSIONS"));
+        assert!(!scene.contains_text("EXPLORER"));
+
+        // showInstalledExtensions opens installed section and clears search query + live results
+        window.view.extensions_view.search_query = "stale".to_string();
+        window.view.extensions_view.set_marketplace_results(
+            rustcode_ext_host::marketplace::SearchResponse {
+                total_size: 1,
+                extensions: vec![rustcode_ext_host::marketplace::ExtensionMetadata {
+                    namespace: "only".to_string(),
+                    name: "one".to_string(),
+                    version: "1.0.0".to_string(),
+                    display_name: Some("Only One".to_string()),
+                    description: None,
+                    download_url: None,
+                    files: None,
+                    all_versions: None,
+                }],
+            },
+        );
+        assert_eq!(window.view.extensions_view.marketplace_results.len(), 1);
+        window.view.extensions_view.installed_collapsed = true;
+        window.handle_builtin_command_effects("workbench.extensions.action.showInstalledExtensions");
+        assert_eq!(window.view.extensions_view.search_query, "");
+        assert!(!window.view.extensions_view.installed_collapsed);
+        assert_eq!(
+            window.view.extensions_view.marketplace_results.len(),
+            window.view.extensions_view.catalog.len()
+        );
+    }
+
+    #[test]
+    fn test_reinstall_preserves_registered_extension_commands() {
+        use rustcode_ext_host::marketplace::{MarketplaceClient, MockHttpTransport};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustcode_win_reinstall_{}_{}", std::process::id(), now));
+        let ext_dir = temp_dir.join("pub.reinstall-1.0.0");
+        std::fs::create_dir_all(&ext_dir).unwrap();
+        std::fs::write(
+            ext_dir.join("package.json"),
+            r#"{
+                "name": "reinstall",
+                "publisher": "pub",
+                "version": "1.0.0",
+                "contributes": {
+                    "commands": [
+                        { "command": "reinstall.ping", "title": "Ping" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let transport = Arc::new(MockHttpTransport::new());
+        let client = Arc::new(MarketplaceClient::new("https://open-vsx.org/api", transport));
+        let installer = Arc::new(ExtensionInstaller::new(client, &temp_dir));
+
+        let mut window = WorkbenchWindow::default();
+        window.view.extensions_view.set_installer(installer);
+
+        // Register once, then re-register (simulating re-install/upgrade)
+        window.register_extension_contributions_by_id("pub.reinstall");
+        assert!(window.commands.has_command("reinstall.ping"));
+
+        window.register_extension_contributions_by_id("pub.reinstall");
+        assert!(
+            window.commands.has_command("reinstall.ping"),
+            "old DisposableStore must be dropped before registering new commands"
+        );
+        assert!(window.commands.execute("reinstall.ping", None).is_ok());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

@@ -59,7 +59,7 @@
 - [x] Cross-folder file & symbol search (`SearchEngine` with regex/glob/case/whole-word, `SymbolExtractor` for Rust/JS/TS/Python/Go, multi-mode `QuickInput`: `Ctrl+P` files, `>` commands, `#` workspace symbols)
 - [x] Formatting & Code Actions provider integration (`languages.registerDocumentFormattingEditProvider`, `languages.registerCodeActionsProvider`, `languages.format`, `languages.codeAction`, transactional descending-offset PieceTable text edit application, atomic undo/redo, LSP 3.17 `WorkspaceEdit` and `CodeActionKind` DTOs, `editor.action.formatDocument` and `editor.action.quickFix` commands)
 - [x] LSP UTF-16 coordinate alignment (`byte_offset_to_utf16_col`, `utf16_col_to_byte_offset`) for accurate non-ASCII position synchronization with language servers
-- [x] Extension compatibility test suite (10/10 tests in `crates/rustcode-ext-host/tests/compat_suite.rs` covering manifest contributions, activation lifecycle, RPC command dispatch, formatting, diagnostics, code actions, workspace edits, theme loading, and tree views via synthetic extension fixtures)
+- [x] Extension compatibility test suite (10/10 tests in `crates/rustcode-ext-host/tests/compat_suite.rs` covering manifest contributions, activation lifecycle, RPC command dispatch, formatting, diagnostics, code actions, workspace edits, theme loading, and tree views via synthetic extension fixtures; expanded to 26/26 in Phase 6)
 - [x] Performance benchmarking suite (`crates/rustcode-app/benches/startup_time.rs`, `crates/rustcode-app/benches/memory_footprint.rs`, `crates/rustcode-editor/benches/editor_latency.rs`; measured baselines: startup ~134 µs < 500 ms target, keystroke latency ~425 µs < 3 ms target, empty window RSS ~5 MB < 120 MB target)
 - [x] Packaging & release optimization (workspace `[profile.release]` with `lto="thin"`, `codegen-units=1`, `opt-level=3`, `strip="symbols"`, `panic="abort"`; `scripts/package.sh` distribution packaging script; `resources/rustcode.desktop` Linux desktop entry)
 - [x] Documentation polish (README vibe-coded declaration preserved; `PROJECT.md` 20-feature roadmap; architecture documentation updated across all crates)
@@ -69,6 +69,13 @@
 - [x] **M2 (R2) Notebook Support**: `NotebookDocument` / `.ipynb` JSON parser & serializer / pure-Rust `NotebookKernel` / `NotebookEditorView` GPUI `View`, `EditorAreaView`/`WorkbenchView` `.ipynb` routing, `ext-host-js/vscode-api/notebooks.js` + `rustcode-ext-host` RPC bridge, and unit/E2E tests
 - [x] **M3 (R3) Extension Marketplace Sidebar UI**: `rustcode-ext-host::marketplace` (`list_installed`, `uninstall`, `set_enabled`/`is_enabled`), `ExtensionsSidebarView` GPUI `View`, `WorkbenchView` sidebar routing (`"extensions"` / `"workbench.view.extensions"`), and unit/E2E tests
 - [x] **M4 (R4) Breadcrumbs, Minimap & Accessibility Tree**: Editor minimap (`editor.minimap.enabled`), breadcrumbs bar (`breadcrumbs.enabled`), semantic accessibility node tree (`crates/rustcode-platform/src/accessibility.rs` + `WorkbenchWindow::accessibility_tree`), live config sync, and unit/E2E tests
+
+### Phase 6: Interactive Panels, Full API Surface, Advanced Editor & Split Grid (Milestones M1–M5)
+- [x] **M1 (`0487c0c`) — Interactive Terminal & Output Panel Views**: `rustcode-terminal` multi-tab/split sessions, command history & pure-Rust `std::process::Command` execution; `ExtHostOutputManager` & `ExtHostTerminalManager`; `window.createOutputChannel` (`OutputChannelProxy`) & `window.createTerminal`; interactive `TerminalPanelView` & `OutputPanelView`; `WorkbenchView`/`WorkbenchWindow` panel routing, keymaps & sync (`339` workspace tests, `16/16` `compat_suite`, `0` clippy warnings)
+- [x] **M2 (`020b874`) — Remaining `vscode.*` Extension Host APIs**: `vscode.EventEmitter` in `types.js`; `ext-host-js/vscode-api/{scm,debug,tasks,tests,authentication}.js`, `index.js`, and `rpc-bridge.js`; `ProviderType` variants & 5 Rust managers (`ExtHostScmManager`, `ExtHostDebugManager`, `ExtHostTaskManager`, `ExtHostTestManager`, `ExtHostAuthManager`); `LanguageFeatureBridge` & `Contributions` updates; `compat_suite.rs` lifecycle & roundtrip tests (`362` workspace tests, `23/23` `compat_suite`, `0` clippy warnings)
+- [x] **M3 (`45a5954`) — Code Folding, Soft Word-Wrap & Multi-Cursor Commands**: `FoldingModel` & gutter fold chevrons (`editor.fold`, `editor.unfold`, `editor.foldAll`, `editor.unfoldAll`); `WordWrapMode` & `VisualLayout` + `editor.wordWrap` / `editor.wordWrapColumn` (`80`) + `WorkbenchWindow::sync_configuration()`; atomic multi-cursor editing/movement & `Ctrl+D` (`addSelectionToNextFindMatch`), `Ctrl+Alt+Up/Down` (`insertCursorAbove`/`Below`), `Escape` collapse (`385` workspace tests, `23/23` `compat_suite`, `0` clippy warnings)
+- [x] **M4 (`d048885`) — Split Editor Grid & Custom Editors**: Recursive `EditorGridNode` & `EditorSash` split grid with per-group tabs/breadcrumbs/shared `TextDocument` (`workbench.action.splitEditor`, `splitEditorDown`, `focusPreviousGroup`, `focusNextGroup`, `focusFirstEditorGroup`, `focusSecondEditorGroup`, `closeEditorsInGroup`); `window.registerCustomEditorProvider`, `ExtHostCustomEditorManager`, `CustomEditorContribution::matches_path`, `WorkbenchWindow` & `EditorAreaView` `WebviewEditorView` dispatch (`404` workspace tests, `26/26` `compat_suite`, `0` clippy warnings)
+- [x] **M5 — Documentation & Compatibility Matrix Refresh**: Refreshed `docs/extension-compat-matrix.md`, `docs/architecture.md`, `README.md`, and `rustcode-implementation-plan.md` (+ brain sync), with final full workspace/compat_suite/clippy verification (`404` workspace tests, `26/26` `compat_suite`, `0` clippy warnings)
 
 ---
 
@@ -1659,35 +1666,38 @@ flowchart LR
 
 ### Automated Tests
 
+Verified status on `main` (Phase 6 M5): **404 workspace tests passing**, **26/26 `compat_suite` tests passing**, **0 `clippy` warnings**.
+
 ```bash
-# Unit tests for all crates
+# Unit and integration tests for all crates
 cargo test --workspace
 
 # Piece Table stress tests (random edits, verify content integrity)
 cargo test -p rustcode-editor -- piece_table --test-threads=1
 
 # Extension compatibility suite
-cargo test -p rustcode-ext-host -- compat_suite
+cargo test -p rustcode-ext-host --test compat_suite
+
+# Workspace lint check (warnings treated as errors)
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Performance benchmarks
 cargo bench --bench startup_time
-cargo bench --bench keystroke_latency
-cargo bench --bench memory_usage
-cargo bench --bench file_open
+cargo bench --bench memory_footprint
+cargo bench --bench editor_latency
 ```
 
 ### Extension Compatibility Matrix
 
-Maintain a living document tracking which extensions work:
+See the living compatibility matrix in [docs/extension-compat-matrix.md](docs/extension-compat-matrix.md) for the complete breakdown of all 12 `vscode.*` namespaces, 16 `ProviderType` variants, 12 Rust extension host managers, 11 manifest contribution types, 6 synthetic fixture extensions, 8-item Open VSX curated catalog, and `compat_suite` / `ext-host-js/test.js` test coverage.
 
-| Extension | Status | Blocking API | Notes |
+| Extension | Status | Blocking / Key API | Notes |
 |---|---|---|---|
-| One Dark Pro (theme) | ✅ | — | Theme loading |
-| Prettier | ✅ | `languages.registerDocumentFormattingEditProvider` | |
-| ESLint | ✅ | `languages.registerCodeActionsProvider`, `workspace.getConfiguration` | |
-| Python (ms-python) | 🟡 | Full `languages.*`, `debug.*` | Complex LSP + DAP |
-| GitLens | 🟡 | `scm.*`, `window.createWebviewPanel` | Needs webview |
-| GitHub Copilot | 🔴 | `inlineCompletions`, auth, complex IPC | Very complex |
+| One Dark Pro (theme) | ✅ | — | JSON theme loader & TextMate scopes |
+| Monokai Pro (theme) | ✅ | — | Color and token scopes load via `ThemeService` |
+| Prettier (`prettier-vscode`) | 🟡 | `languages.registerDocumentFormattingEditProvider` | Formatting + `PieceTable` verified via `formatter_ext` fixture |
+| ESLint (`vscode-eslint`) | 🟡 | `DiagnosticCollection`, `languages.registerCodeActionsProvider` | Diagnostics + `WorkspaceEdit` verified via `linter_ext` / `codeactions_ext` |
+| Rust-Analyzer (`rust-analyzer`) | 🟡 | LSP 3.17 JSON-RPC + UTF-16 alignment | `LspClientManager` + `LanguageFeatureBridge` |
 
 ### Manual Verification
 

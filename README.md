@@ -27,12 +27,12 @@ A ground-up, high-performance Rust rewrite of Visual Studio Code. **RustCode** a
 | Component | Choice | Description |
 |---|---|---|
 | **GUI / Presentation** | **GPUI** / Scene Graph (`rustcode-platform::render`) | Hardware-accelerated display lists, mockable render surface, zero Chromium DOM |
-| **Extension Host** | **Embedded V8 (`deno_core`) & `ext-host-js`** | Pure-Rust IPC + JS `vscode.*` shim and Node.js compat layer |
+| **Extension Host** | **Pure-Rust `RpcBridge` & `ext-host-js`** | Pure-Rust MessagePack/JSON IPC (`rustcode-ext-host`) + CommonJS `vscode.*` API shims & Node.js compat layer (`deno_core` V8 binding targeted for full desktop toolchains) |
 | **IPC Protocol** | **MessagePack RPC (`rmp-serde`)** | Compact binary RPC between Rust Core and Extension Host |
 | **Text Buffer** | **Custom Piece Table** | Red-Black tree piece table with O(log n) inserts/deletes, UTF-8 safety, and atomic undo/redo |
 | **Syntax Highlighting** | **Pure-Rust State-Machine / Tree-sitter Pipeline** | Incremental line caching for Rust, JS, TS, Python, JSON, and Markdown + VS Code scope colors |
 | **Language & Debug Protocols** | **LSP 3.17, DAP & Myers Diff** | Stdio `Content-Length` JSON-RPC for LSP/DAP, UTF-16 alignment, and Eugene Myers O(ND) diff |
-| **Terminal** | **`alacritty_terminal`** | Terminal session manager and VT100/xterm buffer support |
+| **Terminal** | **Pure-Rust `rustcode-terminal`** | `TerminalManager` / `TerminalInstance` multi-tab & split sessions, command history, and pure-Rust `std::process::Command` execution wired to `TerminalPanelView` |
 
 ---
 
@@ -44,18 +44,22 @@ vscode-in-rust/
 │   ├── rustcode-base/          # Layer 0: Disposables, typed Emitter/Event, CancellationToken, `when`-clause parser
 │   ├── rustcode-platform/      # Layer 1: ConfigurationService (JSONC + per-folder), KeybindingService, CommandRegistry,
 │   │                           #          ThemeService, FS/AutoSave/Watcher, Scene Graph renderer, AccessibilityTree
-│   ├── rustcode-editor/        # Layer 2: Piece Table, Undo/Redo, Multi-cursor, Syntax tokenizers,
+│   ├── rustcode-editor/        # Layer 2: Piece Table, Undo/Redo, Multi-cursor editing & commands (`Ctrl+D`, `Ctrl+Alt+Up/Down`),
+│   │                           #          FoldingModel (code folding), Soft Word-Wrap (`WordWrapMode`), Syntax tokenizers,
 │   │                           #          Autocomplete, Minimap, DiffEditorView
-│   ├── rustcode-terminal/      # TerminalManager & TerminalInstance sessions
+│   ├── rustcode-terminal/      # TerminalManager & TerminalInstance split/tab sessions, command history & pure-Rust execution
 │   ├── rustcode-protocols/     # Layer 5: LSP 3.17, DAP, and Git SCM protocol definitions & Myers diff
-│   ├── rustcode-ext-host/      # Layer 4: Extension manifests, RPC bridge, Provider callbacks, Webview & Notebook managers,
-│   │                           #          Open VSX marketplace client & VSIX installer
+│   ├── rustcode-ext-host/      # Layer 4: Extension manifests (`customEditors`, etc.), RPC bridge, 16 ProviderTypes,
+│   │                           #          Output, Terminal, Notebook, SCM, Debug, Tasks, Testing, Auth, Webview & CustomEditor managers,
+│   │                           #          Open VSX marketplace client, VSIX installer & `compat_suite` (26 tests)
 │   ├── rustcode-workbench/     # Layer 3: ActivityBar, Explorer, Search, SCM, Debug, ExtensionsSidebarView,
-│   │                           #          EditorArea, SettingsUiView, NotebookEditorView, WebviewEditorView,
-│   │                           #          BreadcrumbsBar, ProblemsPanel, CommandPalette/QuickInput, StatusBar
+│   │                           #          EditorArea split grid (`EditorGridNode`/`EditorSash`) & CustomEditor routing,
+│   │                           #          TerminalPanelView, OutputPanelView, SettingsUiView, NotebookEditorView,
+│   │                           #          WebviewEditorView, BreadcrumbsBar, ProblemsPanel, CommandPalette/QuickInput, StatusBar
 │   └── rustcode-app/           # Bootstrap, service container (`RustCodeContext`), benchmarks & integration tests
 ├── ext-host-js/
-│   ├── vscode-api/             # `require('vscode')`: index, commands, window, workspace, languages, notebooks, env, types
+│   ├── vscode-api/             # `require('vscode')` (13 modules): index, commands, window, workspace, languages, notebooks,
+│   │                           # scm, debug, tasks, tests, authentication, env, types (`EventEmitter`)
 │   └── node-compat/            # Node.js compat polyfills (`events`, `path`, `fs`)
 ├── resources/                  # Default Dark+/Light+ themes, Linux keymaps, sample extensions, `rustcode.desktop`
 ├── scripts/package.sh          # Release packaging script
@@ -69,7 +73,7 @@ vscode-in-rust/
 
 See [rustcode-implementation-plan.md](rustcode-implementation-plan.md) for the complete module-by-module tracker.
 
-### Completed (Phases 0–5 / Milestones M1–M4)
+### Completed (Phases 0–6 / Milestones M1–M5)
 - [x] **Phase 0 — Scaffold & Core Foundation**: 8-crate workspace, `rustcode-base`, Piece Table & Undo/Redo, platform services, MessagePack RPC bridge, GPUI presentation layer & scene graph, UTF-8 hardening
 - [x] **Phase 1 — Minimal Editor & File Workflows**: `settings.json` (JSONC) & `keybindings.json` resolution, JSON theme loader, syntax highlighting pipeline (Rust, JS, TS, Python, JSON, Markdown), atomic save + auto-save + `notify` file watcher
 - [x] **Phase 2 — Language Intelligence & Marketplace**: LSP client lifecycle, interactive Autocomplete widget (snippets + doc preview), Diagnostics squiggles + Problems panel + status badges, Open VSX client & `.vsix` unpacker
@@ -79,20 +83,20 @@ See [rustcode-implementation-plan.md](rustcode-implementation-plan.md) for the c
 - [x] **M2 (R2) — Notebook Support**: `.ipynb` (nbformat v4) `NotebookDocument` / `NotebookEditorView`, pure-Rust `NotebookKernel`, `vscode.notebooks.*` JS shim (`notebooks.js`) & `ExtHostNotebookManager`
 - [x] **M3 (R3) — Extension Marketplace Sidebar UI**: `ExtensionsSidebarView` (`workbench.view.extensions`) with search, Installed/Marketplace sections, install/enable/disable/uninstall wired to `rustcode-ext-host::marketplace`
 - [x] **M4 (R4) — Breadcrumbs, Minimap & Accessibility Tree**: `BreadcrumbsBar` (`breadcrumbs.enabled`), `Minimap` (`editor.minimap.enabled`), semantic `AccessibilityTree` across editor/workbench views, live `ConfigurationService` sync
+- [x] **Phase 6 M1 — Interactive Terminal & Output Panels**: Interactive `TerminalPanelView` & `OutputPanelView`, `rustcode-terminal` split/tab & pure-Rust process execution, `ExtHostOutputManager` & `vscode.window.createOutputChannel`
+- [x] **Phase 6 M2 — Full `vscode.*` Extension Host APIs**: `vscode.EventEmitter`, `scm`, `debug`, `tasks`, `tests`, `authentication` JS shims + `ExtHost{Scm,Debug,Task,Test,Auth}Manager` RPC wiring
+- [x] **Phase 6 M3 — Code Folding, Word-Wrap & Multi-Cursor Commands**: `FoldingModel` & gutter fold chevrons, soft word-wrap (`editor.wordWrap`, `editor.wordWrapColumn`) & `VisualLayout`, multi-cursor editing & commands (`Ctrl+D`, `Ctrl+Alt+Up/Down`, `Escape`)
+- [x] **Phase 6 M4 — Split Editor Grid & Custom Editors**: Recursive `EditorGridNode` & `EditorSash` split grid (`workbench.action.splitEditor`), `vscode.window.registerCustomEditorProvider`, `ExtHostCustomEditorManager`, `CustomEditorContribution`, and `WebviewEditorView` dispatch
+- [x] **Phase 6 M5 — Documentation & Compatibility Matrix Refresh**: Refreshed `docs/extension-compat-matrix.md`, `docs/architecture.md`, `README.md`, and `rustcode-implementation-plan.md`
 
-### Upcoming (Phase 6)
-- [ ] Interactive integrated Terminal & Output panel views (`TerminalPanelView`, `OutputPanelView`)
-- [ ] Remaining `vscode.*` API namespaces (`scm`, `debug`, `tasks`, `tests`, `authentication`)
-- [ ] Editor code folding, soft word wrap (`editor.wordWrap`), and multi-cursor editing commands (`Ctrl+D`)
-- [ ] Split editor grid (`workbench.action.splitEditor`) & custom editors (`registerCustomEditorProvider`)
-- [ ] Refresh `docs/extension-compat-matrix.md` and `docs/architecture.md`
+### Future (Desktop Toolchain Targets)
 - [ ] Live hardware GPU runtime (`wgpu` / GPUI native window) & live V8 binding when building on full desktop toolchains
 
 ---
 
 ## 🧪 Building, Testing & Packaging
 
-Verified test & lint status: **313 workspace tests passing**, **13/13 `compat_suite` tests passing**, **0 `clippy` warnings**.
+Verified test & lint status: **404 workspace tests passing**, **26/26 `compat_suite` tests passing**, **0 `clippy` warnings**.
 
 ```bash
 # Clone the repository

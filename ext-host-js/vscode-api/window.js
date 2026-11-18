@@ -61,7 +61,115 @@ class StatusBarItemProxy {
   }
 }
 
+class OutputChannelProxy {
+  constructor(id, name, languageId = null, log = false) {
+    this._id = id;
+    this._name = name;
+    this._languageId = languageId;
+    this._log = log;
+    this._disposed = false;
+  }
+
+  get name() {
+    return this._name;
+  }
+
+  append(value) {
+    if (this._disposed) return;
+    rpc.call('window.appendOutputChannel', {
+      id: this._id,
+      name: this._name,
+      value: String(value ?? ''),
+    });
+  }
+
+  appendLine(value) {
+    if (this._disposed) return;
+    rpc.call('window.appendOutputChannel', {
+      id: this._id,
+      name: this._name,
+      value: `${value ?? ''}\n`,
+    });
+  }
+
+  replace(value) {
+    if (this._disposed) return;
+    rpc.call('window.replaceOutputChannel', {
+      id: this._id,
+      name: this._name,
+      value: String(value ?? ''),
+    });
+  }
+
+  clear() {
+    if (this._disposed) return;
+    rpc.call('window.clearOutputChannel', {
+      id: this._id,
+      name: this._name,
+    });
+  }
+
+  show(columnOrPreserveFocus, preserveFocus) {
+    if (this._disposed) return;
+    let resolvedPreserveFocus = false;
+    let viewColumn = null;
+    if (typeof columnOrPreserveFocus === 'boolean') {
+      resolvedPreserveFocus = columnOrPreserveFocus;
+    } else if (typeof columnOrPreserveFocus === 'number') {
+      viewColumn = columnOrPreserveFocus;
+      resolvedPreserveFocus = Boolean(preserveFocus);
+    } else if (preserveFocus !== undefined) {
+      resolvedPreserveFocus = Boolean(preserveFocus);
+    }
+    rpc.call('window.showOutputChannel', {
+      id: this._id,
+      name: this._name,
+      preserveFocus: resolvedPreserveFocus,
+      viewColumn,
+    });
+  }
+
+  hide() {
+    if (this._disposed) return;
+    rpc.call('window.hideOutputChannel', {
+      id: this._id,
+      name: this._name,
+    });
+  }
+
+  dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    rpc.call('window.disposeOutputChannel', {
+      id: this._id,
+      name: this._name,
+    });
+  }
+
+  trace(message) {
+    this.appendLine(`[trace] ${message ?? ''}`);
+  }
+
+  debug(message) {
+    this.appendLine(`[debug] ${message ?? ''}`);
+  }
+
+  info(message) {
+    this.appendLine(`[info] ${message ?? ''}`);
+  }
+
+  warn(message) {
+    this.appendLine(`[warn] ${message ?? ''}`);
+  }
+
+  error(message) {
+    this.appendLine(`[error] ${message ?? ''}`);
+  }
+}
+
 let nextStatusBarId = 1;
+let nextOutputChannelId = 1;
+let nextTerminalId = 1;
 
 const window = {
   // Messages
@@ -104,16 +212,37 @@ const window = {
     ]);
   },
 
+  // Output Channel
+  createOutputChannel(name, languageIdOrOptions) {
+    const channelName = name ? String(name) : 'Output';
+    let languageId = null;
+    let log = false;
+    if (typeof languageIdOrOptions === 'string') {
+      languageId = languageIdOrOptions;
+    } else if (languageIdOrOptions && typeof languageIdOrOptions === 'object') {
+      languageId = languageIdOrOptions.languageId || null;
+      log = Boolean(languageIdOrOptions.log);
+    }
+    const id = `output_${nextOutputChannelId++}`;
+    rpc.call('window.createOutputChannel', {
+      id,
+      name: channelName,
+      languageId,
+      log,
+    });
+    return new OutputChannelProxy(id, channelName, languageId, log);
+  },
+
   // Terminal
   createTerminal(nameOrOptions) {
     const options = typeof nameOrOptions === 'string' ? { name: nameOrOptions } : (nameOrOptions || {});
-    const id = `term_${Date.now()}`;
+    const id = `term_${Date.now()}_${nextTerminalId++}`;
     rpc.call('window.createTerminal', { id, ...options });
 
     return {
       name: options.name || 'Terminal',
-      show() {
-        rpc.call('window.showTerminal', { id });
+      show(preserveFocus = false) {
+        rpc.call('window.showTerminal', { id, preserveFocus: Boolean(preserveFocus) });
       },
       sendText(text, addNewLine = true) {
         rpc.call('window.sendTerminalText', { id, text, addNewLine });

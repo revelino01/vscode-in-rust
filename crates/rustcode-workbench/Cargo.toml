@@ -13,6 +13,7 @@ rustcode-platform = { path = "../rustcode-platform" }
 rustcode-editor = { path = "../rustcode-editor" }
 rustcode-protocols = { path = "../rustcode-protocols" }
 rustcode-ext-host = { path = "../rustcode-ext-host" }
+rustcode-terminal = { path = "../rustcode-terminal" }
 parking_lot = "0.12"
 regex = "1"
 serde = { version = "1", features = ["derive"] }

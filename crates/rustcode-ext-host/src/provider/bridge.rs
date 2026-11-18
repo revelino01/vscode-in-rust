@@ -256,6 +256,8 @@ pub struct LanguageFeatureBridge {
     pub diagnostic_manager: Arc<DiagnosticCollectionManager>,
     pub status_bar_manager: Arc<ExtStatusBarManager>,
     pub notebook_manager: Arc<crate::notebook::ExtHostNotebookManager>,
+    pub output_manager: Arc<crate::output::ExtHostOutputManager>,
+    pub terminal_manager: Arc<crate::terminal::ExtHostTerminalManager>,
 }
 
 impl LanguageFeatureBridge {
@@ -271,6 +273,8 @@ impl LanguageFeatureBridge {
             diagnostic_manager: Arc::new(DiagnosticCollectionManager::new()),
             status_bar_manager: Arc::new(ExtStatusBarManager::new()),
             notebook_manager: Arc::new(crate::notebook::ExtHostNotebookManager::new()),
+            output_manager: Arc::new(crate::output::ExtHostOutputManager::new()),
+            terminal_manager: Arc::new(crate::terminal::ExtHostTerminalManager::new()),
         }
     }
 
@@ -289,6 +293,22 @@ impl LanguageFeatureBridge {
         nm: Arc<crate::notebook::ExtHostNotebookManager>,
     ) -> Self {
         self.notebook_manager = nm;
+        self
+    }
+
+    pub fn with_output_manager(
+        mut self,
+        om: Arc<crate::output::ExtHostOutputManager>,
+    ) -> Self {
+        self.output_manager = om;
+        self
+    }
+
+    pub fn with_terminal_manager(
+        mut self,
+        tm: Arc<crate::terminal::ExtHostTerminalManager>,
+    ) -> Self {
+        self.terminal_manager = tm;
         self
     }
 
@@ -626,6 +646,25 @@ impl LanguageFeatureBridge {
 
         if method.starts_with("notebooks.") {
             return self.notebook_manager.handle_rpc_call(method, params).ok();
+        }
+
+        match method {
+            "window.createOutputChannel"
+            | "window.appendOutputChannel"
+            | "window.replaceOutputChannel"
+            | "window.clearOutputChannel"
+            | "window.showOutputChannel"
+            | "window.hideOutputChannel"
+            | "window.disposeOutputChannel" => {
+                return self.output_manager.handle_rpc_call(method, params).ok();
+            }
+            "window.createTerminal"
+            | "window.showTerminal"
+            | "window.sendTerminalText"
+            | "window.disposeTerminal" => {
+                return self.terminal_manager.handle_rpc_call(method, params).ok();
+            }
+            _ => {}
         }
 
         match method {

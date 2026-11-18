@@ -2259,6 +2259,361 @@ fn test_end_to_end_extensions_sidebar_in_accessibility_tree() {
     assert_eq!(tree.focused_node().unwrap().id, "workbench.sidebar");
 }
 
+#[test]
+fn test_end_to_end_interactive_terminal_panel_and_commands() {
+    use rustcode_platform::accessibility::AccessibleRole;
+    use rustcode_platform::render::{MouseButton, MouseEvent, ScrollEvent};
+    use rustcode_workbench::FocusedRegion;
+
+    let app = RustCodeContext::new();
+    assert!(app.commands.has_command("workbench.action.problems.focus"));
+    assert!(app
+        .commands
+        .has_command("workbench.action.terminal.toggleTerminal"));
+    assert!(app.commands.has_command("workbench.action.terminal.new"));
+    assert!(app.commands.has_command("workbench.action.terminal.split"));
+    assert!(app.commands.has_command("workbench.action.terminal.kill"));
+    assert!(app.commands.has_command("workbench.action.terminal.focus"));
+    assert!(app
+        .commands
+        .has_command("workbench.action.output.toggleOutput"));
+    assert!(app
+        .commands
+        .has_command("workbench.action.output.clearOutput"));
+
+    let mut window = app.create_window();
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+
+    // Toggle terminal via Ctrl+`
+    let ctrl_backtick = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('`'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_backtick, bounds),
+        EventResult::Consumed
+    );
+    assert!(window.view.layout.panel_visible);
+    assert_eq!(window.view.layout.active_panel_tab, "terminal");
+    assert_eq!(window.view.focused_region, FocusedRegion::Panel);
+    assert_eq!(
+        window.context_keys.get("panelFocus"),
+        Some(serde_json::json!(true))
+    );
+    assert_eq!(
+        window.context_keys.get("terminalFocus"),
+        Some(serde_json::json!(true))
+    );
+    assert_eq!(
+        window.context_keys.get("editorTextFocus"),
+        Some(serde_json::json!(false))
+    );
+
+    // Type and execute shell command interactively
+    for ch in "echo rustcode_m1".chars() {
+        assert_eq!(
+            window.dispatch_event(
+                &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+                bounds,
+            ),
+            EventResult::Consumed
+        );
+    }
+    assert_eq!(
+        window.dispatch_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none())),
+            bounds,
+        ),
+        EventResult::Consumed
+    );
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("rustcode_m1"));
+
+    // Create new terminal tab (Ctrl+Shift+`) and split pane (Ctrl+Shift+5, gated by terminalFocus)
+    let ctrl_shift_backtick = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('`'),
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_shift_backtick, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.terminal_panel.manager.tabs().len(), 2);
+
+    let ctrl_shift_5 = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('5'),
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_shift_5, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(
+        window
+            .view
+            .terminal_panel
+            .manager
+            .active_tab_terminals()
+            .len(),
+        2
+    );
+
+    // Switch back to first tab by clicking its tab rect
+    let _ = window.render(&mut surface);
+    let first_tab_rect = window
+        .view
+        .terminal_panel
+        .click_targets
+        .read()
+        .iter()
+        .find(|(_, t)| *t == rustcode_workbench::TerminalClickTarget::SelectTab(0))
+        .unwrap()
+        .0;
+    let tab0_pt = Point::new(
+        first_tab_rect.min_x() + 10.0,
+        first_tab_rect.min_y() + first_tab_rect.height() / 2.0,
+    );
+    assert_eq!(
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(tab0_pt, MouseButton::Left)),
+            bounds,
+        ),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.terminal_panel.manager.active_tab_index(), Some(0));
+
+    // Verify accessibility_tree focused node is terminal.pane.*
+    let tree = window.accessibility_tree(bounds);
+    assert!(tree.find_by_id("workbench.panel.terminal").is_some());
+    let focused = tree.focused_node().unwrap();
+    assert!(focused.id.starts_with("terminal.pane."));
+    assert_eq!(focused.role, AccessibleRole::TextInput);
+
+    // ScrollWheel inside regions.panel is consumed
+    let regions = window.view.compute_regions(bounds);
+    let scroll_pt = Point::new(regions.panel.min_x() + 80.0, regions.panel.min_y() + 60.0);
+    assert_eq!(
+        window.dispatch_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(scroll_pt, 0.0, 200.0)),
+            bounds,
+        ),
+        EventResult::Consumed
+    );
+
+    // Toggle terminal closed -> restores Editor focus
+    assert_eq!(
+        window.dispatch_event(&ctrl_backtick, bounds),
+        EventResult::Consumed
+    );
+    assert!(!window.view.layout.panel_visible);
+    assert_eq!(window.view.focused_region, FocusedRegion::Editor);
+    assert_eq!(
+        window.context_keys.get("panelFocus"),
+        Some(serde_json::json!(false))
+    );
+    assert_eq!(
+        window.context_keys.get("terminalFocus"),
+        Some(serde_json::json!(false))
+    );
+}
+
+#[tokio::test]
+async fn test_end_to_end_output_channel_ext_host_sync_and_panel_controls() {
+    use rustcode_ext_host::provider::{LanguageFeatureBridge, ProviderRegistry};
+    use rustcode_ext_host::rpc::RpcBridge;
+    use rustcode_platform::render::{MouseButton, MouseEvent, ScrollEvent};
+    use rustcode_protocols::lsp::LspClientManager;
+    use rustcode_workbench::OutputClickTarget;
+    use std::sync::Arc;
+
+    let app = RustCodeContext::new();
+    let registry = Arc::new(ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp));
+
+    let mut window = app.create_window().with_language_bridge(bridge.clone());
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+
+    bridge
+        .handle_rpc_message(
+            "window.createOutputChannel",
+            &serde_json::json!({ "id": "out_build", "name": "RustCode Build", "languageId": "log" }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "window.createOutputChannel",
+            &serde_json::json!({ "id": "out_ext", "name": "Extension Host" }),
+        )
+        .await
+        .unwrap();
+
+    for i in 0..35 {
+        bridge
+            .handle_rpc_message(
+                "window.appendOutputChannel",
+                &serde_json::json!({
+                    "id": "out_build",
+                    "value": format!("build_step_{:02}\n", i)
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    bridge
+        .handle_rpc_message(
+            "window.appendOutputChannel",
+            &serde_json::json!({ "id": "out_ext", "value": "ext_host_ready\n" }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "window.showOutputChannel",
+            &serde_json::json!({ "id": "out_build", "preserveFocus": false }),
+        )
+        .await
+        .unwrap();
+
+    window.sync_output_channels();
+    assert!(window.view.layout.panel_visible);
+    assert_eq!(window.view.layout.active_panel_tab, "output");
+    assert_eq!(
+        window.context_keys.get("panelFocus"),
+        Some(serde_json::json!(true))
+    );
+    assert_eq!(
+        window.context_keys.get("terminalFocus"),
+        Some(serde_json::json!(false))
+    );
+
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("RustCode Build"));
+    assert!(scene.contains_text("build_step_34"));
+
+    // ScrollWheel up inside regions.panel disables auto_scroll
+    let regions = window.view.compute_regions(bounds);
+    let scroll_pt = Point::new(regions.panel.min_x() + 100.0, regions.panel.min_y() + 80.0);
+    assert_eq!(
+        window.dispatch_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(scroll_pt, 0.0, 2000.0)),
+            bounds,
+        ),
+        EventResult::Consumed
+    );
+    assert!(!window.view.output_panel.auto_scroll);
+
+    // Click channel dropdown toggle then select "Extension Host"
+    let selector_rect = window
+        .view
+        .output_panel
+        .click_targets
+        .read()
+        .iter()
+        .find(|(_, t)| *t == OutputClickTarget::ChannelDropdownToggle)
+        .unwrap()
+        .0;
+    let sel_pt = Point::new(
+        selector_rect.min_x() + selector_rect.width() / 2.0,
+        selector_rect.min_y() + selector_rect.height() / 2.0,
+    );
+    assert_eq!(
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(sel_pt, MouseButton::Left)),
+            bounds,
+        ),
+        EventResult::Consumed
+    );
+    assert!(window.view.output_panel.dropdown_open);
+
+    let _ = window.render(&mut surface);
+    let opt_rect = window
+        .view
+        .output_panel
+        .click_targets
+        .read()
+        .iter()
+        .find(|(_, t)| *t == OutputClickTarget::ChannelOption("out_ext".to_string()))
+        .unwrap()
+        .0;
+    let opt_pt = Point::new(
+        opt_rect.min_x() + opt_rect.width() / 2.0,
+        opt_rect.min_y() + opt_rect.height() / 2.0,
+    );
+    assert_eq!(
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(opt_pt, MouseButton::Left)),
+            bounds,
+        ),
+        EventResult::Consumed
+    );
+    assert_eq!(
+        window.view.output_panel.active_channel_id.as_deref(),
+        Some("out_ext")
+    );
+    let ext_scene = window.render(&mut surface);
+    assert!(ext_scene.contains_text("ext_host_ready"));
+
+    // Click Clear button -> clears both OutputPanelView and ExtHostOutputManager
+    let clear_rect = window
+        .view
+        .output_panel
+        .click_targets
+        .read()
+        .iter()
+        .find(|(_, t)| *t == OutputClickTarget::ClearButton)
+        .unwrap()
+        .0;
+    let clear_pt = Point::new(
+        clear_rect.min_x() + clear_rect.width() / 2.0,
+        clear_rect.min_y() + clear_rect.height() / 2.0,
+    );
+    assert_eq!(
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(clear_pt, MouseButton::Left)),
+            bounds,
+        ),
+        EventResult::Consumed
+    );
+    assert!(window.view.output_panel.display_lines().is_empty());
+    assert!(bridge
+        .output_manager
+        .get_channel("out_ext")
+        .unwrap()
+        .lines()
+        .is_empty());
+
+    // Re-syncing does not resurrect cleared lines
+    window.sync_output_channels();
+    assert!(window.view.output_panel.display_lines().is_empty());
+
+    let tree = window.accessibility_tree(bounds);
+    assert!(tree.find_by_id("workbench.panel.output").is_some());
+    assert!(tree.find_by_id("output.channelSelector").is_some());
+    assert!(tree.find_by_id("output.clear").is_some());
+    assert!(tree.find_by_id("output.autoScroll").is_some());
+    assert!(tree.find_by_id("output.lines").is_some());
+}
+
 
 
 

@@ -36,6 +36,8 @@ assert(path.extname('/a/b/c.rs') === '.rs', 'path.extname failed');
 console.log('[Test] Testing vscode namespace APIs...');
 assert(typeof vscode.commands.registerCommand === 'function');
 assert(typeof vscode.window.showInformationMessage === 'function');
+assert(typeof vscode.window.createOutputChannel === 'function');
+assert(typeof vscode.window.createTerminal === 'function');
 assert(typeof vscode.workspace.getConfiguration === 'function');
 assert(typeof vscode.languages.registerCompletionItemProvider === 'function');
 assert(typeof vscode.languages.registerDocumentFormattingEditProvider === 'function');
@@ -56,6 +58,24 @@ const action = new vscode.CodeAction('Fix issue', vscode.CodeActionKind.QuickFix
 assert(action.title === 'Fix issue', 'CodeAction title mismatch');
 assert(action.kind === 'quickfix', 'CodeAction kind mismatch');
 action.edit = wsEdit;
+
+console.log('[Test] Testing vscode.window OutputChannel and Terminal...');
+const outChannel = vscode.window.createOutputChannel('RustCode Build', 'log');
+assert(outChannel.name === 'RustCode Build', 'OutputChannel name mismatch');
+outChannel.append('compiling ');
+outChannel.appendLine('done');
+outChannel.replace('replaced line\n');
+outChannel.show(true);
+outChannel.show(1, false);
+outChannel.hide();
+outChannel.clear();
+outChannel.dispose();
+
+const termHandle = vscode.window.createTerminal('Rust Shell');
+assert(termHandle.name === 'Rust Shell', 'Terminal name mismatch');
+termHandle.show(true);
+termHandle.sendText('echo ok');
+termHandle.dispose();
 
 console.log('[Test] Testing vscode.notebooks API...');
 const rpc = require('./rpc-bridge');

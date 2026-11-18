@@ -8,12 +8,14 @@ use crate::editor_area::EditorAreaView;
 use crate::explorer::{ExplorerAction, FileExplorerView};
 use crate::extensions_view::{ExtensionsSidebarView, ExtensionsViewAction};
 use crate::layout::WorkbenchLayout;
+use crate::output_panel::{OutputAction, OutputPanelView};
 use crate::problems::{ProblemsAction, ProblemsPanel};
 use crate::quickinput::{CommandPaletteView, PaletteAction};
 use crate::scm::{ScmAction, ScmView};
 use crate::search::{SearchAction, SearchInputFocus, SearchView};
 use crate::settings_ui::SettingsFocus;
 use crate::statusbar::{StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
+use crate::terminal_panel::{TerminalAction, TerminalPanelView};
 use crate::webview::WebviewElementKind;
 use crate::workspace::Workspace;
 use parking_lot::RwLock;
@@ -52,6 +54,8 @@ pub enum WorkbenchAction {
     DebugAction(DebugViewAction),
     ScmAction(ScmAction),
     ExtensionsAction(ExtensionsViewAction),
+    OutputAction(OutputAction),
+    TerminalAction(TerminalAction),
     SidebarToggled(bool),
     PanelToggled(bool),
 }
@@ -70,6 +74,8 @@ pub struct WorkbenchView {
     pub editor_area: EditorAreaView,
     pub status_bar: StatusBarView,
     pub problems_panel: ProblemsPanel,
+    pub terminal_panel: TerminalPanelView,
+    pub output_panel: OutputPanelView,
     pub panel_tab_bounds: RwLock<Vec<(String, Rect)>>,
     pub command_palette: Option<CommandPaletteView>,
     pub is_command_palette_open: bool,
@@ -109,6 +115,8 @@ impl WorkbenchView {
             editor_area: EditorAreaView::default(),
             status_bar,
             problems_panel: ProblemsPanel::new(),
+            terminal_panel: TerminalPanelView::new(),
+            output_panel: OutputPanelView::new(),
             panel_tab_bounds: RwLock::new(Vec::new()),
             command_palette: None,
             is_command_palette_open: false,
@@ -163,8 +171,21 @@ impl WorkbenchView {
         self.last_action = Some(WorkbenchAction::SidebarToggled(self.layout.sidebar_visible));
     }
 
+    pub fn panel_content_rect(panel_rect: Rect) -> Rect {
+        let tab_h = 26.0f32;
+        Rect::from_xywh(
+            panel_rect.min_x(),
+            panel_rect.min_y() + tab_h,
+            panel_rect.width(),
+            (panel_rect.height() - tab_h).max(0.0),
+        )
+    }
+
     pub fn toggle_panel(&mut self) {
         self.layout.toggle_panel();
+        if !self.layout.panel_visible && self.focused_region == FocusedRegion::Panel {
+            self.focused_region = FocusedRegion::Editor;
+        }
         self.last_action = Some(WorkbenchAction::PanelToggled(self.layout.panel_visible));
     }
 
@@ -858,13 +879,17 @@ impl WorkbenchView {
             let debug_input_focused = panel_focused
                 && self.layout.active_panel_tab == "debug_console"
                 && self.debug_console.input_focused;
+            let terminal_input_focused = panel_focused
+                && self.layout.active_panel_tab == "terminal"
+                && self.terminal_panel.has_active_terminal()
+                && self.terminal_panel.is_focused;
             let mut panel_node = AccessibleNode::new(
                 "workbench.panel",
                 AccessibleRole::Panel,
                 "Panel",
                 regions.panel,
             )
-            .with_focused(panel_focused && !debug_input_focused);
+            .with_focused(panel_focused && !debug_input_focused && !terminal_input_focused);
 
             let tab_h = 26.0;
             let mut panel_tabs = AccessibleNode::new(
@@ -899,12 +924,7 @@ impl WorkbenchView {
             }
             panel_node.add_child(panel_tabs);
 
-            let panel_content_rect = Rect::from_xywh(
-                regions.panel.min_x(),
-                regions.panel.min_y() + tab_h,
-                regions.panel.width(),
-                (regions.panel.height() - tab_h).max(0.0),
-            );
+            let panel_content_rect = Self::panel_content_rect(regions.panel);
             if self.layout.active_panel_tab == "problems" {
                 let mut tree = AccessibleNode::new(
                     "workbench.panel.problems",
@@ -939,6 +959,16 @@ impl WorkbenchView {
                     .with_value(self.debug_console.input_text.clone())
                     .with_focused(debug_input_focused)
                     .with_action("input"),
+                );
+            } else if self.layout.active_panel_tab == "terminal" {
+                panel_node.add_child(
+                    self.terminal_panel
+                        .accessibility_node(panel_content_rect, panel_focused),
+                );
+            } else if self.layout.active_panel_tab == "output" {
+                panel_node.add_child(
+                    self.output_panel
+                        .accessibility_node(panel_content_rect, font),
                 );
             } else {
                 panel_node.add_child(AccessibleNode::new(
@@ -1167,30 +1197,19 @@ impl View for WorkbenchView {
             *self.panel_tab_bounds.write() = tab_bounds;
 
             // Content below tab bar
-            let content_rect = Rect::from_xywh(
-                regions.panel.min_x(),
-                regions.panel.min_y() + tab_h,
-                regions.panel.width(),
-                (regions.panel.height() - tab_h).max(0.0),
-            );
+            let content_rect = Self::panel_content_rect(regions.panel);
 
-            if self.layout.active_panel_tab == "problems" {
-                self.problems_panel.render(content_rect, theme, font, scene);
-            } else if self.layout.active_panel_tab == "debug_console" {
-                self.debug_console.render(content_rect, theme, font, scene);
-            } else {
-                scene.push_quad(Quad::new(content_rect).with_background(theme.panel_bg));
-                scene.push_text(GlyphRun::new(
-                    if self.layout.active_panel_tab == "terminal" {
-                        "Terminal session active."
-                    } else {
-                        "Output console empty."
-                    }.to_string(),
-                    Point::new(content_rect.min_x() + 16.0, content_rect.min_y() + 12.0),
-                    Rect::from_xywh(content_rect.min_x() + 16.0, content_rect.min_y() + 12.0, 300.0, font.line_height),
-                    theme.sidebar_header_fg,
-                    font.font_size * 0.9,
-                ));
+            match self.layout.active_panel_tab.as_str() {
+                "problems" => self.problems_panel.render(content_rect, theme, font, scene),
+                "debug_console" => self.debug_console.render(content_rect, theme, font, scene),
+                "terminal" => self.terminal_panel.render(content_rect, theme, font, scene),
+                "output" => self.output_panel.render(content_rect, theme, font, scene),
+                _ => {
+                    crate::push_finite_quad(
+                        scene,
+                        Quad::new(content_rect).with_background(theme.panel_bg),
+                    );
+                }
             }
         }
 
@@ -1421,62 +1440,90 @@ impl View for WorkbenchView {
                     let tab_bar_rect = Rect::from_xywh(regions.panel.min_x(), regions.panel.min_y(), regions.panel.width(), tab_h);
 
                     if tab_bar_rect.contains(mouse.position) {
+                        self.output_panel.dropdown_open = false;
                         let tabs = self.panel_tab_bounds.read().clone();
                         for (tab_id, rect) in tabs {
                             if rect.contains(mouse.position) {
                                 if tab_id == "close" {
                                     self.layout.panel_visible = false;
+                                    if self.focused_region == FocusedRegion::Panel {
+                                        self.focused_region = FocusedRegion::Editor;
+                                    }
                                     self.last_action = Some(WorkbenchAction::PanelToggled(false));
                                 } else {
                                     self.layout.set_panel_tab(&tab_id);
+                                    if tab_id == "terminal" {
+                                        let default_cwd = self
+                                            .workspace
+                                            .folders()
+                                            .first()
+                                            .map(|f| f.path.clone());
+                                        self.terminal_panel.ensure_default_terminal(default_cwd);
+                                        self.terminal_panel.is_focused = true;
+                                    }
                                 }
                                 return EventResult::Consumed;
                             }
                         }
                         EventResult::Consumed
-                    } else if self.layout.active_panel_tab == "problems" {
-                        let content_rect = Rect::from_xywh(
-                            regions.panel.min_x(),
-                            regions.panel.min_y() + tab_h,
-                            regions.panel.width(),
-                            (regions.panel.height() - tab_h).max(0.0),
-                        );
-                        let res = self.problems_panel.handle_event(event, content_rect);
-                        if let Some(ProblemsAction::JumpToLocation { uri, position }) = self.problems_panel.last_action.take() {
-                            let clean_path = uri.strip_prefix("file://").unwrap_or(&uri);
-                            let path = PathBuf::from(clean_path);
-                            let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
-                            let content = std::fs::read_to_string(&path).unwrap_or_default();
-                            self.editor_area.open_file(&uri, title, &content, true);
-                            if let Some(active_editor) = self.editor_area.active_editor_mut() {
-                                active_editor.set_primary_position(position);
-                                if let Some(file_diags) = self.problems_panel.files.get(&uri) {
-                                    active_editor.set_diagnostics(file_diags.clone());
-                                }
-                            }
-                            self.editor_area.sync_breadcrumbs(Some(&self.workspace));
-                            self.focused_region = FocusedRegion::Editor;
-                            self.last_action = Some(WorkbenchAction::JumpToDiagnostic {
-                                uri,
-                                line: position.line,
-                                column: position.column,
-                            });
-                        }
-                        res
-                    } else if self.layout.active_panel_tab == "debug_console" {
-                        let content_rect = Rect::from_xywh(
-                            regions.panel.min_x(),
-                            regions.panel.min_y() + tab_h,
-                            regions.panel.width(),
-                            (regions.panel.height() - tab_h).max(0.0),
-                        );
-                        let res = self.debug_console.handle_event(event, content_rect);
-                        if let Some(act) = self.debug_console.last_action.take() {
-                            self.last_action = Some(WorkbenchAction::DebugAction(act));
-                        }
-                        res
                     } else {
-                        EventResult::Consumed
+                        let content_rect = Self::panel_content_rect(regions.panel);
+                        match self.layout.active_panel_tab.as_str() {
+                            "problems" => {
+                                let res = self.problems_panel.handle_event(event, content_rect);
+                                if let Some(ProblemsAction::JumpToLocation { uri, position }) =
+                                    self.problems_panel.last_action.take()
+                                {
+                                    let clean_path = uri.strip_prefix("file://").unwrap_or(&uri);
+                                    let path = PathBuf::from(clean_path);
+                                    let title = path
+                                        .file_name()
+                                        .map_or("untitled", |n| n.to_str().unwrap_or(""));
+                                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                                    self.editor_area.open_file(&uri, title, &content, true);
+                                    if let Some(active_editor) =
+                                        self.editor_area.active_editor_mut()
+                                    {
+                                        active_editor.set_primary_position(position);
+                                        if let Some(file_diags) =
+                                            self.problems_panel.files.get(&uri)
+                                        {
+                                            active_editor.set_diagnostics(file_diags.clone());
+                                        }
+                                    }
+                                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
+                                    self.focused_region = FocusedRegion::Editor;
+                                    self.last_action = Some(WorkbenchAction::JumpToDiagnostic {
+                                        uri,
+                                        line: position.line,
+                                        column: position.column,
+                                    });
+                                }
+                                res
+                            }
+                            "debug_console" => {
+                                let res = self.debug_console.handle_event(event, content_rect);
+                                if let Some(act) = self.debug_console.last_action.take() {
+                                    self.last_action = Some(WorkbenchAction::DebugAction(act));
+                                }
+                                res
+                            }
+                            "terminal" => {
+                                let res = self.terminal_panel.handle_event(event, content_rect);
+                                if let Some(act) = self.terminal_panel.last_action.take() {
+                                    self.last_action = Some(WorkbenchAction::TerminalAction(act));
+                                }
+                                res
+                            }
+                            "output" => {
+                                let res = self.output_panel.handle_event(event, content_rect);
+                                if let Some(act) = self.output_panel.last_action.take() {
+                                    self.last_action = Some(WorkbenchAction::OutputAction(act));
+                                }
+                                res
+                            }
+                            _ => EventResult::Consumed,
+                        }
                     }
                 } else if regions.editor_area.contains(mouse.position) {
                     self.focused_region = FocusedRegion::Editor;
@@ -1570,14 +1617,34 @@ impl View for WorkbenchView {
                         }
                     }
                     FocusedRegion::Panel => {
-                        if self.layout.active_panel_tab == "debug_console" {
-                            let res = self.debug_console.handle_event(event, regions.panel);
-                            if let Some(act) = self.debug_console.last_action.take() {
-                                self.last_action = Some(WorkbenchAction::DebugAction(act));
+                        if !self.layout.panel_visible {
+                            return EventResult::Ignored;
+                        }
+                        let content_rect = Self::panel_content_rect(regions.panel);
+                        match self.layout.active_panel_tab.as_str() {
+                            "debug_console" => {
+                                let res = self.debug_console.handle_event(event, content_rect);
+                                if let Some(act) = self.debug_console.last_action.take() {
+                                    self.last_action = Some(WorkbenchAction::DebugAction(act));
+                                }
+                                res
                             }
-                            res
-                        } else {
-                            EventResult::Ignored
+                            "terminal" => {
+                                let res = self.terminal_panel.handle_event(event, content_rect);
+                                if let Some(act) = self.terminal_panel.last_action.take() {
+                                    self.last_action = Some(WorkbenchAction::TerminalAction(act));
+                                }
+                                res
+                            }
+                            "output" => {
+                                let res = self.output_panel.handle_event(event, content_rect);
+                                if let Some(act) = self.output_panel.last_action.take() {
+                                    self.last_action = Some(WorkbenchAction::OutputAction(act));
+                                }
+                                res
+                            }
+                            "problems" => self.problems_panel.handle_event(event, content_rect),
+                            _ => EventResult::Ignored,
                         }
                     }
                     _ => EventResult::Ignored,
@@ -1595,6 +1662,18 @@ impl View for WorkbenchView {
                         self.extensions_view.handle_event(event, regions.sidebar)
                     } else {
                         self.explorer.handle_event(event, regions.sidebar)
+                    }
+                } else if self.layout.panel_visible && regions.panel.contains(scroll.position) {
+                    let content_rect = Self::panel_content_rect(regions.panel);
+                    if !content_rect.contains(scroll.position) {
+                        return EventResult::Ignored;
+                    }
+                    match self.layout.active_panel_tab.as_str() {
+                        "problems" => self.problems_panel.handle_event(event, content_rect),
+                        "output" => self.output_panel.handle_event(event, content_rect),
+                        "debug_console" => self.debug_console.handle_event(event, content_rect),
+                        "terminal" => self.terminal_panel.handle_event(event, content_rect),
+                        _ => EventResult::Ignored,
                     }
                 } else if regions.editor_area.contains(scroll.position) {
                     self.editor_area.handle_event(event, regions.editor_area)
@@ -2364,5 +2443,79 @@ mod tests {
         let mut wb_scene = Scene::new();
         win.view.render(bounds, &theme, &max_font, &mut wb_scene);
         assert_scene_finite(&wb_scene, "workbench_max_font");
+    }
+
+    #[test]
+    fn test_workbench_panel_terminal_and_output_routing_and_accessibility() {
+        use rustcode_platform::accessibility::AccessibleRole;
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{KeyEvent, ScrollEvent};
+
+        let mut view = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        view.layout.set_panel_tab("terminal");
+        view.focused_region = FocusedRegion::Panel;
+
+        for ch in "echo wb_term".chars() {
+            assert_eq!(
+                view.handle_event(
+                    &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+                    bounds,
+                ),
+                EventResult::Consumed
+            );
+        }
+        assert_eq!(
+            view.handle_event(
+                &InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none())),
+                bounds,
+            ),
+            EventResult::Consumed
+        );
+
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("wb_term"));
+
+        let tree = view.accessibility_tree(bounds, &font);
+        assert!(tree.find_by_id("workbench.panel.terminal").is_some());
+        let focused = tree.focused_node().unwrap();
+        assert!(focused.id.starts_with("terminal.pane."));
+        assert_eq!(focused.role, AccessibleRole::TextInput);
+
+        // Switch to Output tab and test ScrollWheel routing inside regions.panel
+        view.layout.set_panel_tab("output");
+        view.output_panel.ensure_channel("out_1", "Build");
+        for i in 0..40 {
+            view.output_panel
+                .append_line("out_1", &format!("wb_out_{:02}", i));
+        }
+        let mut out_scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut out_scene);
+        assert!(out_scene.contains_text("wb_out_39"));
+
+        let regions = view.compute_regions(bounds);
+        let panel_scroll_pt = Point::new(
+            regions.panel.min_x() + 100.0,
+            regions.panel.min_y() + 60.0,
+        );
+        assert_eq!(
+            view.handle_event(
+                &InputEvent::ScrollWheel(ScrollEvent::new(panel_scroll_pt, 0.0, 2000.0)),
+                bounds,
+            ),
+            EventResult::Consumed
+        );
+        assert!(!view.output_panel.auto_scroll);
+
+        let out_tree = view.accessibility_tree(bounds, &font);
+        assert!(out_tree.find_by_id("workbench.panel.output").is_some());
+
+        view.toggle_panel();
+        assert!(!view.layout.panel_visible);
+        assert_eq!(view.focused_region, FocusedRegion::Editor);
     }
 }

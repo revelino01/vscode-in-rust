@@ -6,8 +6,10 @@
 pub mod manifest;
 pub mod marketplace;
 pub mod notebook;
+pub mod output;
 pub mod provider;
 pub mod rpc;
+pub mod terminal;
 pub mod webview;
 
 pub use manifest::{
@@ -25,11 +27,17 @@ pub use notebook::{
     ExtNotebookCellOutputItem, ExtNotebookData, NotebookCellExecutionState,
     NotebookControllerInfo, NotebookEventListener, NotebookSerializerInfo,
 };
+pub use output::{
+    ExtHostOutputManager, OutputChannelEvent, OutputChannelState, OutputEventListener,
+};
 pub use provider::{
     DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, LanguageFeatureBridge,
     ProviderRegistration, ProviderRegistry, ProviderType, TreeItem, TreeItemCollapsibleState,
 };
 pub use rpc::{RpcBridge, RpcMessage};
+pub use terminal::{
+    ExtHostTerminalManager, ExtTerminalEvent, ExtTerminalState, TerminalEventListener,
+};
 pub use webview::{
     ExtHostWebviewManager, WebviewMessageListener, WebviewOptions, WebviewPanelState,
 };

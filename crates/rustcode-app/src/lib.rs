@@ -72,6 +72,59 @@ impl RustCodeContext {
             Ok(json!({ "panel_toggled": true }))
         }));
 
+        store.add_boxed(self.commands.register("workbench.action.problems.focus", |_| {
+            Ok(json!({ "focused": "problems" }))
+        }));
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.terminal.toggleTerminal", |_| {
+                    Ok(json!({ "terminal_toggled": true }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.terminal.new", |_| {
+                    Ok(json!({ "terminal": "created" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.terminal.split", |_| {
+                    Ok(json!({ "terminal": "split" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.terminal.kill", |_| {
+                    Ok(json!({ "terminal": "killed" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.terminal.focus", |_| {
+                    Ok(json!({ "focused": "terminal" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.output.toggleOutput", |_| {
+                    Ok(json!({ "output_toggled": true }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.output.clearOutput", |_| {
+                    Ok(json!({ "output_cleared": true }))
+                }),
+        );
+
         store.add_boxed(self.commands.register("workbench.action.openSettings", |_| {
             Ok(json!({ "opened": "settings.json" }))
         }));

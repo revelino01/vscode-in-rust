@@ -1045,3 +1045,348 @@ fn test_compat_notebook_js_api_export_surface() {
         assert_eq!(brackets, 0, "Unbalanced [] in {}", name);
     }
 }
+
+fn assert_js_delimiters_balanced(name: &str, src: &str) {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Code,
+        LineComment,
+        BlockComment,
+        SingleQuote,
+        DoubleQuote,
+        Template,
+    }
+
+    let chars: Vec<char> = src.chars().collect();
+    let mut i = 0usize;
+    let mut state = State::Code;
+    let mut template_expr_brace_stack: Vec<i32> = Vec::new();
+    let mut parens = 0i32;
+    let mut braces = 0i32;
+    let mut brackets = 0i32;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        let next = chars.get(i + 1).copied();
+
+        match state {
+            State::LineComment => {
+                if ch == '\n' {
+                    state = State::Code;
+                }
+            }
+            State::BlockComment => {
+                if ch == '*' && next == Some('/') {
+                    state = State::Code;
+                    i += 1;
+                }
+            }
+            State::SingleQuote => {
+                if ch == '\\' {
+                    i += 1;
+                } else if ch == '\'' {
+                    state = State::Code;
+                }
+            }
+            State::DoubleQuote => {
+                if ch == '\\' {
+                    i += 1;
+                } else if ch == '"' {
+                    state = State::Code;
+                }
+            }
+            State::Template => {
+                if ch == '\\' {
+                    i += 1;
+                } else if ch == '`' {
+                    state = State::Code;
+                } else if ch == '$' && next == Some('{') {
+                    braces += 1;
+                    template_expr_brace_stack.push(braces);
+                    state = State::Code;
+                    i += 1;
+                }
+            }
+            State::Code => {
+                if ch == '/' && next == Some('/') {
+                    state = State::LineComment;
+                    i += 1;
+                } else if ch == '/' && next == Some('*') {
+                    state = State::BlockComment;
+                    i += 1;
+                } else if ch == '\'' {
+                    state = State::SingleQuote;
+                } else if ch == '"' {
+                    state = State::DoubleQuote;
+                } else if ch == '`' {
+                    state = State::Template;
+                } else {
+                    match ch {
+                        '(' => parens += 1,
+                        ')' => parens -= 1,
+                        '{' => braces += 1,
+                        '}' => {
+                            if template_expr_brace_stack.last().copied() == Some(braces) {
+                                template_expr_brace_stack.pop();
+                                braces -= 1;
+                                state = State::Template;
+                            } else {
+                                braces -= 1;
+                            }
+                        }
+                        '[' => brackets += 1,
+                        ']' => brackets -= 1,
+                        _ => {}
+                    }
+                    assert!(
+                        parens >= 0 && braces >= 0 && brackets >= 0,
+                        "Unbalanced closer in {}",
+                        name
+                    );
+                }
+            }
+        }
+        i += 1;
+    }
+
+    assert!(
+        state == State::Code || state == State::LineComment,
+        "Unterminated string or comment in {}",
+        name
+    );
+    assert_eq!(parens, 0, "Unbalanced () in {}", name);
+    assert_eq!(braces, 0, "Unbalanced {{}} in {}", name);
+    assert_eq!(brackets, 0, "Unbalanced [] in {}", name);
+}
+
+#[tokio::test]
+async fn test_compat_output_channel_rpc_lifecycle() {
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(registry, rpc, lsp);
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    bridge.output_manager.on_output_event(move |ev| {
+        events_clone.lock().push(ev.clone());
+    });
+
+    let created = bridge
+        .handle_rpc_message(
+            "window.createOutputChannel",
+            &serde_json::json!({
+                "id": "out_1",
+                "name": "RustCode Build",
+                "languageId": "log",
+                "log": false
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created["created"], true);
+    assert_eq!(
+        bridge.output_manager.active_channel_id().as_deref(),
+        Some("out_1")
+    );
+
+    assert!(bridge
+        .handle_rpc_message(
+            "window.appendOutputChannel",
+            &serde_json::json!({ "id": "out_1", "value": "step 1: " })
+        )
+        .await
+        .is_some());
+    assert!(bridge
+        .handle_rpc_message(
+            "window.appendOutputChannel",
+            &serde_json::json!({ "id": "out_1", "value": "ok\nstep 2\n" })
+        )
+        .await
+        .is_some());
+
+    let state = bridge.output_manager.get_channel("out_1").unwrap();
+    assert_eq!(state.lines(), vec!["step 1: ok", "step 2"]);
+
+    assert!(bridge
+        .handle_rpc_message(
+            "window.replaceOutputChannel",
+            &serde_json::json!({ "id": "out_1", "value": "fresh line\n" })
+        )
+        .await
+        .is_some());
+    assert_eq!(
+        bridge.output_manager.get_channel("out_1").unwrap().lines(),
+        vec!["fresh line"]
+    );
+
+    assert!(bridge
+        .handle_rpc_message(
+            "window.showOutputChannel",
+            &serde_json::json!({ "id": "out_1", "preserveFocus": true })
+        )
+        .await
+        .is_some());
+    let shown = bridge.output_manager.get_channel("out_1").unwrap();
+    assert!(shown.is_visible);
+    assert!(shown.preserve_focus);
+
+    assert!(bridge
+        .handle_rpc_message("window.hideOutputChannel", &serde_json::json!({ "id": "out_1" }))
+        .await
+        .is_some());
+    assert!(!bridge.output_manager.get_channel("out_1").unwrap().is_visible);
+
+    assert!(bridge
+        .handle_rpc_message("window.clearOutputChannel", &serde_json::json!({ "id": "out_1" }))
+        .await
+        .is_some());
+    assert!(bridge
+        .output_manager
+        .get_channel("out_1")
+        .unwrap()
+        .lines()
+        .is_empty());
+
+    assert!(bridge
+        .handle_rpc_message("window.disposeOutputChannel", &serde_json::json!({ "id": "out_1" }))
+        .await
+        .is_some());
+    assert!(bridge.output_manager.get_channel("out_1").unwrap().is_disposed);
+    assert!(bridge.output_manager.list_channels().is_empty());
+    assert!(bridge
+        .handle_rpc_message(
+            "window.appendOutputChannel",
+            &serde_json::json!({ "id": "out_1", "value": "ignored" })
+        )
+        .await
+        .is_none());
+    assert_eq!(events.lock().len(), 8);
+}
+
+#[test]
+fn test_compat_output_channel_js_api_export_surface() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let window_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/window.js")).unwrap();
+    let index_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/index.js")).unwrap();
+    let test_js = std::fs::read_to_string(repo_root.join("ext-host-js/test.js")).unwrap();
+
+    for symbol in [
+        "OutputChannelProxy",
+        "createOutputChannel",
+        "append(",
+        "appendLine(",
+        "replace(",
+        "clear(",
+        "show(",
+        "hide(",
+        "dispose(",
+        "window.createOutputChannel",
+        "window.appendOutputChannel",
+        "window.replaceOutputChannel",
+        "window.clearOutputChannel",
+        "window.showOutputChannel",
+        "window.hideOutputChannel",
+        "window.disposeOutputChannel",
+        "createTerminal",
+        "window.createTerminal",
+        "window.showTerminal",
+        "window.sendTerminalText",
+        "window.disposeTerminal",
+    ] {
+        assert!(
+            window_js.contains(symbol),
+            "window.js missing symbol {}",
+            symbol
+        );
+    }
+
+    assert!(index_js.contains("require('./window')"));
+    assert!(index_js.contains("window,"));
+    assert!(test_js.contains("createOutputChannel"));
+    assert!(test_js.contains("createTerminal"));
+
+    for (name, src) in [
+        ("window.js", &window_js),
+        ("index.js", &index_js),
+        ("test.js", &test_js),
+    ] {
+        assert_js_delimiters_balanced(name, src);
+    }
+}
+
+#[tokio::test]
+async fn test_compat_terminal_rpc_lifecycle() {
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(registry, rpc, lsp);
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    bridge.terminal_manager.on_terminal_event(move |ev| {
+        events_clone.lock().push(ev.clone());
+    });
+
+    let created = bridge
+        .handle_rpc_message(
+            "window.createTerminal",
+            &serde_json::json!({
+                "id": "term_1",
+                "name": "Ext Shell",
+                "shellPath": "/bin/sh",
+                "cwd": "/tmp"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created["created"], true);
+    assert_eq!(bridge.terminal_manager.list_terminals().len(), 1);
+
+    assert!(bridge
+        .handle_rpc_message(
+            "window.showTerminal",
+            &serde_json::json!({ "id": "term_1", "preserveFocus": false })
+        )
+        .await
+        .is_some());
+    assert!(bridge.terminal_manager.get_terminal("term_1").unwrap().is_visible);
+
+    assert!(bridge
+        .handle_rpc_message(
+            "window.sendTerminalText",
+            &serde_json::json!({ "id": "term_1", "text": "echo hi", "addNewLine": true })
+        )
+        .await
+        .is_some());
+    assert!(bridge
+        .handle_rpc_message(
+            "window.sendTerminalText",
+            &serde_json::json!({ "id": "term_1", "text": "partial", "addNewLine": false })
+        )
+        .await
+        .is_some());
+    assert_eq!(
+        bridge.terminal_manager.get_terminal("term_1").unwrap().sent_texts,
+        vec!["echo hi\n", "partial"]
+    );
+
+    assert!(bridge
+        .handle_rpc_message(
+            "window.disposeTerminal",
+            &serde_json::json!({ "id": "term_1" })
+        )
+        .await
+        .is_some());
+    assert!(bridge.terminal_manager.get_terminal("term_1").unwrap().is_disposed);
+    assert!(bridge.terminal_manager.list_terminals().is_empty());
+    assert_eq!(events.lock().len(), 5);
+}

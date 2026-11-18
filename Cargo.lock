@@ -556,6 +556,7 @@ dependencies = [
  "rustcode-ext-host",
  "rustcode-platform",
  "rustcode-protocols",
+ "rustcode-terminal",
  "serde",
  "serde_json",
  "thiserror",

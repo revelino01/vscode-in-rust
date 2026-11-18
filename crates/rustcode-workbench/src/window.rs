@@ -1,12 +1,15 @@
 //! GPUI WorkbenchWindow host managing rendering surfaces, theme updates, and input routing.
 
 use crate::extensions_view::ExtensionsViewAction;
+use crate::output_panel::OutputAction;
 use crate::quickinput::{CommandPalette, CommandPaletteView, PaletteItem};
-use crate::workbench_view::{WorkbenchAction, WorkbenchView};
+use crate::workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchView};
 use rustcode_base::context_key::ContextKeyService;
 use rustcode_base::disposable::DisposableStore;
 use rustcode_ext_host::marketplace::ExtensionInstaller;
+use rustcode_ext_host::output::OutputChannelEvent;
 use rustcode_ext_host::provider::LanguageFeatureBridge;
+use rustcode_ext_host::terminal::ExtTerminalEvent;
 use rustcode_platform::accessibility::AccessibilityTree;
 use rustcode_platform::commands::CommandRegistry;
 use rustcode_platform::configuration::ConfigurationService;
@@ -34,6 +37,9 @@ pub struct WorkbenchWindow {
     pub language_bridge: Option<Arc<LanguageFeatureBridge>>,
     pub pending_code_actions: Vec<CodeAction>,
     pub extension_disposables: HashMap<String, DisposableStore>,
+    synced_output_revision: u64,
+    synced_terminal_revision: u64,
+    ext_terminal_map: HashMap<String, String>,
 }
 
 impl Default for WorkbenchWindow {
@@ -68,8 +74,12 @@ impl WorkbenchWindow {
             language_bridge: None,
             pending_code_actions: Vec::new(),
             extension_disposables: HashMap::new(),
+            synced_output_revision: 0,
+            synced_terminal_revision: 0,
+            ext_terminal_map: HashMap::new(),
         };
         win.sync_configuration();
+        win.sync_focus_context_keys();
         win
     }
 
@@ -125,6 +135,10 @@ impl WorkbenchWindow {
         self.view
             .editor_area
             .sync_breadcrumbs(Some(&self.view.workspace));
+
+        self.view.terminal_panel.default_shell = self
+            .config
+            .get_for_resource::<String>("terminal.integrated.shell.linux", active_path.as_deref());
     }
 
     pub fn open_settings(&mut self) {
@@ -140,40 +154,205 @@ impl WorkbenchWindow {
     }
 
     fn sync_focus_context_keys(&mut self) {
+        let panel_open = self.view.layout.panel_visible;
         match self.view.focused_region {
-            crate::workbench_view::FocusedRegion::Editor => {
+            FocusedRegion::Editor => {
                 self.context_keys.set_bool("editorTextFocus", true);
                 self.context_keys.set_bool("sideBarFocus", false);
+                self.context_keys.set_bool("panelFocus", false);
+                self.context_keys.set_bool("terminalFocus", false);
                 self.context_keys.set_bool("inCommandPalette", false);
                 self.context_keys.set_bool(
                     "notebookEditorFocused",
                     self.view.editor_area.active_notebook().is_some(),
                 );
             }
-            crate::workbench_view::FocusedRegion::Sidebar => {
+            FocusedRegion::Sidebar => {
                 self.context_keys.set_bool("editorTextFocus", false);
                 self.context_keys.set_bool("sideBarFocus", true);
+                self.context_keys.set_bool("panelFocus", false);
+                self.context_keys.set_bool("terminalFocus", false);
                 self.context_keys.set_bool("inCommandPalette", false);
                 self.context_keys.set_bool("notebookEditorFocused", false);
             }
-            crate::workbench_view::FocusedRegion::CommandPalette => {
+            FocusedRegion::Panel => {
+                let in_terminal = panel_open && self.view.layout.active_panel_tab == "terminal";
+                self.context_keys.set_bool("editorTextFocus", false);
+                self.context_keys.set_bool("sideBarFocus", false);
+                self.context_keys.set_bool("panelFocus", panel_open);
+                self.context_keys.set_bool("terminalFocus", in_terminal);
+                self.context_keys.set_bool("inCommandPalette", false);
+                self.context_keys.set_bool("notebookEditorFocused", false);
+            }
+            FocusedRegion::CommandPalette => {
+                self.context_keys.set_bool("editorTextFocus", false);
+                self.context_keys.set_bool("sideBarFocus", false);
+                self.context_keys.set_bool("panelFocus", false);
+                self.context_keys.set_bool("terminalFocus", false);
                 self.context_keys.set_bool("inCommandPalette", true);
-                self.context_keys.set_bool("notebookEditorFocused", false);
-            }
-            _ => {
-                self.context_keys.set_bool("inCommandPalette", false);
                 self.context_keys.set_bool("notebookEditorFocused", false);
             }
         }
     }
 
+    pub fn sync_output_channels(&mut self) {
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let rev = bridge.output_manager.revision();
+        if rev == self.synced_output_revision {
+            return;
+        }
+
+        let events = bridge.output_manager.take_pending_events();
+        if events.is_empty() {
+            for ch in bridge.output_manager.list_channels() {
+                self.view.output_panel.sync_channel_content(
+                    &ch.id,
+                    &ch.name,
+                    &ch.content,
+                    ch.is_visible,
+                );
+            }
+        } else {
+            for ev in events {
+                match ev {
+                    OutputChannelEvent::Created { id, name, .. } => {
+                        self.view.output_panel.ensure_channel(&id, &name);
+                    }
+                    OutputChannelEvent::Appended { id, name, text } => {
+                        self.view.output_panel.ensure_channel(&id, &name);
+                        self.view.output_panel.append(&id, &text);
+                    }
+                    OutputChannelEvent::Replaced { id, name, text } => {
+                        self.view.output_panel.ensure_channel(&id, &name);
+                        self.view.output_panel.replace(&id, &text);
+                    }
+                    OutputChannelEvent::Cleared { id, .. } => {
+                        self.view.output_panel.clear_channel(&id);
+                    }
+                    OutputChannelEvent::Shown {
+                        id,
+                        name,
+                        preserve_focus,
+                    } => {
+                        let panel_ch = self.view.output_panel.ensure_channel(&id, &name);
+                        panel_ch.visible = true;
+                        self.view.output_panel.select_channel(&id);
+                        self.view.layout.set_panel_tab("output");
+                        if !preserve_focus {
+                            self.view.focused_region = FocusedRegion::Panel;
+                        }
+                    }
+                    OutputChannelEvent::Hidden { id, .. } => {
+                        if let Some(ch) = self
+                            .view
+                            .output_panel
+                            .channels
+                            .iter_mut()
+                            .find(|c| c.id == id)
+                        {
+                            ch.visible = false;
+                        }
+                        if self.view.layout.panel_visible
+                            && self.view.layout.active_panel_tab == "output"
+                        {
+                            self.view.layout.panel_visible = false;
+                            if self.view.focused_region == FocusedRegion::Panel {
+                                self.view.focused_region = FocusedRegion::Editor;
+                            }
+                        }
+                    }
+                    OutputChannelEvent::Disposed { id, .. } => {
+                        self.view.output_panel.remove_channel(&id);
+                    }
+                }
+            }
+        }
+
+        if self.view.output_panel.active_channel_id.is_none() {
+            if let Some(active_id) = bridge.output_manager.active_channel_id() {
+                self.view.output_panel.select_channel(&active_id);
+            }
+        }
+
+        self.synced_output_revision = rev;
+        self.sync_focus_context_keys();
+    }
+
+    pub fn sync_ext_terminals(&mut self) {
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let rev = bridge.terminal_manager.revision();
+        if rev == self.synced_terminal_revision {
+            return;
+        }
+
+        for ev in bridge.terminal_manager.take_pending_events() {
+            match ev {
+                ExtTerminalEvent::Created {
+                    id,
+                    name,
+                    shell_path,
+                    cwd,
+                    ..
+                } => {
+                    let local_id = self.view.terminal_panel.create_terminal(
+                        Some(&name),
+                        shell_path.as_deref(),
+                        cwd.map(PathBuf::from),
+                    );
+                    self.ext_terminal_map.insert(id, local_id);
+                }
+                ExtTerminalEvent::Shown { id, preserve_focus } => {
+                    if let Some(local_id) = self.ext_terminal_map.get(&id).cloned() {
+                        self.view.terminal_panel.manager.set_active_terminal(&local_id);
+                    }
+                    self.view.layout.set_panel_tab("terminal");
+                    if !preserve_focus {
+                        self.view.terminal_panel.is_focused = true;
+                        self.view.focused_region = FocusedRegion::Panel;
+                    }
+                }
+                ExtTerminalEvent::TextSent {
+                    id,
+                    text,
+                    add_new_line,
+                } => {
+                    if let Some(local_id) = self.ext_terminal_map.get(&id).cloned() {
+                        if let Some(term) = self.view.terminal_panel.manager.terminal_mut(&local_id)
+                        {
+                            term.insert_str(&text);
+                            if add_new_line {
+                                term.submit_input();
+                            }
+                        }
+                    }
+                }
+                ExtTerminalEvent::Disposed { id } => {
+                    if let Some(local_id) = self.ext_terminal_map.remove(&id) {
+                        self.view.terminal_panel.manager.close_terminal(&local_id);
+                    }
+                }
+            }
+        }
+
+        self.synced_terminal_revision = rev;
+        self.sync_focus_context_keys();
+    }
+
     pub fn with_language_bridge(mut self, bridge: Arc<LanguageFeatureBridge>) -> Self {
         self.language_bridge = Some(bridge);
+        self.sync_output_channels();
+        self.sync_ext_terminals();
         self
     }
 
     pub fn set_language_bridge(&mut self, bridge: Arc<LanguageFeatureBridge>) {
         self.language_bridge = Some(bridge);
+        self.sync_output_channels();
+        self.sync_ext_terminals();
     }
 
     /// Renders the workbench window into the given render surface and returns the display list.
@@ -198,6 +377,8 @@ impl WorkbenchWindow {
                 if let Some(cmd_id) = self.keybindings.handle_key(&combo, &self.context_keys) {
                     let _ = self.commands.execute(&cmd_id, None);
                     self.handle_builtin_command_effects(&cmd_id);
+                    self.sync_output_channels();
+                    self.sync_ext_terminals();
                     self.sync_focus_context_keys();
                     self.sync_configuration();
                     return EventResult::Consumed;
@@ -236,10 +417,25 @@ impl WorkbenchWindow {
                 WorkbenchAction::ExtensionsAction(act) => {
                     self.handle_extensions_action(&act);
                 }
+                WorkbenchAction::OutputAction(act) => {
+                    if let OutputAction::ClearChannel(id) = act {
+                        self.sync_output_channels();
+                        self.view.output_panel.clear_channel(&id);
+                        if let Some(bridge) = &self.language_bridge {
+                            if bridge.output_manager.clear(&id).is_ok() {
+                                let _ = bridge.output_manager.take_pending_events();
+                                self.synced_output_revision = bridge.output_manager.revision();
+                            }
+                        }
+                    }
+                }
+                WorkbenchAction::TerminalAction(_) => {}
             }
         }
 
         if !matches!(event, InputEvent::MouseMove(_)) {
+            self.sync_output_channels();
+            self.sync_ext_terminals();
             self.sync_configuration();
         }
 
@@ -294,13 +490,99 @@ impl WorkbenchWindow {
             "workbench.action.toggleSidebar" => {
                 self.view.toggle_sidebar();
             }
-            "workbench.action.togglePanel" | "workbench.action.terminal.toggleTerminal" => {
+            "workbench.action.togglePanel" => {
                 self.view.toggle_panel();
+            }
+            "workbench.action.terminal.toggleTerminal" => {
+                if self.view.layout.panel_visible
+                    && self.view.layout.active_panel_tab == "terminal"
+                {
+                    self.view.layout.panel_visible = false;
+                    if self.view.focused_region == FocusedRegion::Panel {
+                        self.view.focused_region = FocusedRegion::Editor;
+                    }
+                    self.view.last_action = Some(WorkbenchAction::PanelToggled(false));
+                } else {
+                    let default_cwd = self
+                        .view
+                        .workspace
+                        .folders()
+                        .first()
+                        .map(|f| f.path.clone());
+                    self.view.layout.set_panel_tab("terminal");
+                    self.view.terminal_panel.ensure_default_terminal(default_cwd);
+                    self.view.terminal_panel.is_focused = true;
+                    self.view.focused_region = FocusedRegion::Panel;
+                    self.view.last_action = Some(WorkbenchAction::PanelToggled(true));
+                }
+            }
+            "workbench.action.terminal.focus" => {
+                let default_cwd = self
+                    .view
+                    .workspace
+                    .folders()
+                    .first()
+                    .map(|f| f.path.clone());
+                self.view.layout.set_panel_tab("terminal");
+                self.view.terminal_panel.ensure_default_terminal(default_cwd);
+                self.view.terminal_panel.is_focused = true;
+                self.view.focused_region = FocusedRegion::Panel;
+            }
+            "workbench.action.terminal.new" => {
+                let default_cwd = self
+                    .view
+                    .workspace
+                    .folders()
+                    .first()
+                    .map(|f| f.path.clone());
+                self.view.layout.set_panel_tab("terminal");
+                self.view
+                    .terminal_panel
+                    .create_terminal(Some("sh"), None, default_cwd);
+                self.view.focused_region = FocusedRegion::Panel;
+            }
+            "workbench.action.terminal.split" => {
+                self.view.layout.set_panel_tab("terminal");
+                self.view.terminal_panel.split_active_terminal();
+                self.view.focused_region = FocusedRegion::Panel;
+            }
+            "workbench.action.terminal.kill" => {
+                self.view.terminal_panel.kill_active_terminal();
+                if !self.view.terminal_panel.has_active_terminal() {
+                    self.view.layout.panel_visible = false;
+                    if self.view.focused_region == FocusedRegion::Panel {
+                        self.view.focused_region = FocusedRegion::Editor;
+                    }
+                }
+            }
+            "workbench.action.output.toggleOutput" => {
+                if self.view.layout.panel_visible && self.view.layout.active_panel_tab == "output" {
+                    self.view.layout.panel_visible = false;
+                    if self.view.focused_region == FocusedRegion::Panel {
+                        self.view.focused_region = FocusedRegion::Editor;
+                    }
+                    self.view.last_action = Some(WorkbenchAction::PanelToggled(false));
+                } else {
+                    self.view.layout.set_panel_tab("output");
+                    self.view.focused_region = FocusedRegion::Panel;
+                    self.view.last_action = Some(WorkbenchAction::PanelToggled(true));
+                }
+            }
+            "workbench.action.output.clearOutput" => {
+                self.sync_output_channels();
+                if let Some(id) = self.view.output_panel.clear_active() {
+                    if let Some(bridge) = &self.language_bridge {
+                        if bridge.output_manager.clear(&id).is_ok() {
+                            let _ = bridge.output_manager.take_pending_events();
+                            self.synced_output_revision = bridge.output_manager.revision();
+                        }
+                    }
+                }
             }
             "workbench.action.problems.focus" => {
                 self.view.layout.panel_visible = true;
                 self.view.layout.set_panel_tab("problems");
-                self.view.focused_region = crate::workbench_view::FocusedRegion::Panel;
+                self.view.focused_region = FocusedRegion::Panel;
             }
             "workbench.action.showCommands" => {
                 self.open_command_palette();
@@ -1434,5 +1716,185 @@ mod tests {
         let tree_enabled = window.accessibility_tree(bounds);
         assert!(!tree_enabled.find_by_role(AccessibleRole::Breadcrumb).is_empty());
         assert!(!tree_enabled.find_by_role(AccessibleRole::ScrollBar).is_empty());
+    }
+
+    #[test]
+    fn test_window_terminal_output_sync_and_focus_context_keys() {
+        use rustcode_ext_host::provider::{LanguageFeatureBridge, ProviderRegistry};
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_protocols::lsp::LspClientManager;
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let rpc = Arc::new(RpcBridge::new());
+        let lsp = Arc::new(LspClientManager::new());
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp));
+
+        let mut window = WorkbenchWindow::default().with_language_bridge(bridge.clone());
+        assert_eq!(window.context_keys.get("panelFocus"), Some(serde_json::json!(false)));
+        assert_eq!(window.context_keys.get("terminalFocus"), Some(serde_json::json!(false)));
+
+        // Toggle terminal open
+        window.handle_builtin_command_effects("workbench.action.terminal.toggleTerminal");
+        window.sync_focus_context_keys();
+        assert!(window.view.layout.panel_visible);
+        assert_eq!(window.view.layout.active_panel_tab, "terminal");
+        assert_eq!(window.context_keys.get("panelFocus"), Some(serde_json::json!(true)));
+        assert_eq!(window.context_keys.get("terminalFocus"), Some(serde_json::json!(true)));
+        assert_eq!(window.context_keys.get("editorTextFocus"), Some(serde_json::json!(false)));
+
+        // Split & kill
+        window.handle_builtin_command_effects("workbench.action.terminal.split");
+        assert_eq!(window.view.terminal_panel.manager.active_tab_terminals().len(), 2);
+        window.handle_builtin_command_effects("workbench.action.terminal.kill");
+        assert_eq!(window.view.terminal_panel.manager.active_tab_terminals().len(), 1);
+
+        // Output channel sync + bidirectional clear
+        bridge
+            .output_manager
+            .create_channel("out_1", "Build", Some("log".to_string()), false);
+        bridge.output_manager.append("out_1", "line 1\n").unwrap();
+        bridge.output_manager.show("out_1", false).unwrap();
+        window.sync_output_channels();
+
+        assert_eq!(window.view.layout.active_panel_tab, "output");
+        assert_eq!(window.context_keys.get("panelFocus"), Some(serde_json::json!(true)));
+        assert_eq!(window.context_keys.get("terminalFocus"), Some(serde_json::json!(false)));
+        assert_eq!(window.view.output_panel.display_lines(), vec!["line 1"]);
+
+        window.handle_builtin_command_effects("workbench.action.output.clearOutput");
+        assert!(window.view.output_panel.display_lines().is_empty());
+        assert!(bridge.output_manager.get_channel("out_1").unwrap().lines().is_empty());
+
+        // Re-syncing must not resurrect cleared lines
+        window.sync_output_channels();
+        assert!(window.view.output_panel.display_lines().is_empty());
+
+        // ExtHostTerminalManager sync
+        bridge
+            .terminal_manager
+            .create_terminal("ext_t1", "Ext", None, Vec::new(), None);
+        bridge
+            .terminal_manager
+            .send_text("ext_t1", "echo synced_term", true)
+            .unwrap();
+        bridge.terminal_manager.show_terminal("ext_t1", false).unwrap();
+        window.sync_ext_terminals();
+        assert_eq!(window.view.layout.active_panel_tab, "terminal");
+        assert!(window
+            .view
+            .terminal_panel
+            .manager
+            .active_terminal()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|l| l.contains("synced_term")));
+    }
+
+    #[test]
+    fn test_window_output_sync_preserves_scroll_top_and_clear_preserves_pending_events() {
+        use rustcode_ext_host::provider::{LanguageFeatureBridge, ProviderRegistry};
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_platform::render::{MockRenderSurface, MouseButton, MouseEvent, Point};
+        use rustcode_protocols::lsp::LspClientManager;
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let rpc = Arc::new(RpcBridge::new());
+        let lsp = Arc::new(LspClientManager::new());
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp));
+
+        bridge
+            .output_manager
+            .create_channel("out_a", "Alpha", Some("log".to_string()), false);
+        for i in 0..60 {
+            bridge
+                .output_manager
+                .append("out_a", &format!("line {}\n", i))
+                .unwrap();
+        }
+        bridge.output_manager.show("out_a", false).unwrap();
+
+        let mut window = WorkbenchWindow::default().with_language_bridge(bridge.clone());
+        window.view.output_panel.auto_scroll = false;
+        window.view.output_panel.scroll_top = 123.5;
+
+        // Appending more output while auto_scroll == false must NOT reset scroll_top to 0.0
+        bridge
+            .output_manager
+            .append("out_a", "streamed line\n")
+            .unwrap();
+        window.sync_output_channels();
+        assert!(!window.view.output_panel.auto_scroll);
+        assert_eq!(window.view.output_panel.scroll_top, 123.5);
+        assert!(window
+            .view
+            .output_panel
+            .display_lines()
+            .contains(&"streamed line"));
+
+        // Creating & appending to a second channel before clicking ClearButton on out_a must NOT drop out_b
+        let mut surface = MockRenderSurface::new(1024.0, 768.0);
+        let _ = window.render(&mut surface);
+        let clear_rect = window
+            .view
+            .output_panel
+            .click_targets
+            .read()
+            .iter()
+            .find(|(_, t)| *t == crate::output_panel::OutputClickTarget::ClearButton)
+            .unwrap()
+            .0;
+        let clear_center = Point::new(
+            clear_rect.min_x() + clear_rect.width() / 2.0,
+            clear_rect.min_y() + clear_rect.height() / 2.0,
+        );
+
+        bridge
+            .output_manager
+            .create_channel("out_b", "Beta", None, false);
+        bridge
+            .output_manager
+            .append("out_b", "lint ok\n")
+            .unwrap();
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(clear_center, MouseButton::Left)),
+            bounds,
+        );
+        assert!(bridge
+            .output_manager
+            .get_channel("out_a")
+            .unwrap()
+            .lines()
+            .is_empty());
+        let out_b = window
+            .view
+            .output_panel
+            .channels
+            .iter()
+            .find(|c| c.id == "out_b")
+            .expect("out_b must not be dropped by ClearButton");
+        assert_eq!(out_b.lines, vec!["lint ok"]);
+
+        // Similarly, workbench.action.output.clearOutput must preserve pending events on out_b
+        bridge
+            .output_manager
+            .append("out_a", "before clearOutput\n")
+            .unwrap();
+        window.sync_output_channels();
+        bridge
+            .output_manager
+            .append("out_b", "second beta line\n")
+            .unwrap();
+        window.handle_builtin_command_effects("workbench.action.output.clearOutput");
+        let out_b_after = window
+            .view
+            .output_panel
+            .channels
+            .iter()
+            .find(|c| c.id == "out_b")
+            .unwrap();
+        assert_eq!(out_b_after.lines, vec!["lint ok", "second beta line"]);
     }
 }

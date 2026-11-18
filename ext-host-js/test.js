@@ -144,6 +144,184 @@ exec.end(true, 200);
 
   ctrl.dispose();
   serDisp.dispose();
+
+  console.log('[Test] Testing vscode.EventEmitter...');
+  const vsEmitter = new vscode.EventEmitter();
+  const vsReceived = [];
+  const vsDisposables = [];
+  const vsSub = vsEmitter.event(function (val) {
+    vsReceived.push(this.prefix + ':' + val);
+  }, { prefix: 'ok' }, vsDisposables);
+  assert(vsDisposables.length === 1, 'EventEmitter should push to disposables');
+  vsEmitter.fire('one');
+  vsSub.dispose();
+  vsEmitter.fire('two');
+  assert(vsReceived.length === 1 && vsReceived[0] === 'ok:one', 'vscode.EventEmitter failed');
+  vsEmitter.dispose();
+
+  const siblingEmitter = new vscode.EventEmitter();
+  const siblingLog = [];
+  let secondSub = null;
+  siblingEmitter.event(function (val) {
+    siblingLog.push(this + ':' + val);
+    if (secondSub) secondSub.dispose();
+  }, 0);
+  secondSub = siblingEmitter.event((val) => {
+    siblingLog.push('second:' + val);
+  });
+  siblingEmitter.fire('x');
+  assert(siblingLog.length === 1 && siblingLog[0] === '0:x', 'EventEmitter falsy thisArgs or sibling dispose failed');
+  siblingEmitter.dispose();
+
+  console.log('[Test] Testing vscode.scm API...');
+  const sc = vscode.scm.createSourceControl('git', 'Git', vscode.Uri.file('/workspace'));
+  sc.inputBox.value = 'feat: test';
+  sc.quickDiffProvider = {
+    provideOriginalResource(docUri) {
+      return vscode.Uri.parse('git:' + docUri);
+    },
+  };
+  const scGroup = sc.createResourceGroup('workingTree', 'Changes');
+  scGroup.resourceStates = [{ resourceUri: vscode.Uri.file('/workspace/main.rs') }];
+  assert(vscode.scm.inputBox.value === 'feat: test', 'scm.inputBox mismatch');
+  const origRes = await rpc.handleIncomingRequest('scm.provideOriginalResource', {
+    providerId: 'git',
+    uri: 'file:///workspace/main.rs',
+  });
+  assert(origRes && origRes.scheme === 'git', 'scm.provideOriginalResource RPC failed');
+  const acceptNullRes = await rpc.handleIncomingRequest('scm.acceptInput', {
+    providerId: 'git',
+    value: null,
+  });
+  assert(sc.inputBox.value === 'feat: test' && acceptNullRes && acceptNullRes.value === 'feat: test', 'scm.acceptInput with null must preserve inputBox.value');
+  scGroup.dispose();
+  sc.dispose();
+
+  console.log('[Test] Testing vscode.debug API...');
+  const dbgCfgDisp = vscode.debug.registerDebugConfigurationProvider('lldb', {
+    provideDebugConfigurations() {
+      return [{ type: 'lldb', name: 'Launch', request: 'launch' }];
+    },
+    resolveDebugConfiguration(_folder, config) {
+      return { ...config, stopOnEntry: true };
+    },
+  });
+  const dbgFactoryDisp = vscode.debug.registerDebugAdapterDescriptorFactory('lldb', {
+    createDebugAdapterDescriptor() {
+      return new vscode.DebugAdapterExecutable('lldb-vscode', ['--port', '0']);
+    },
+  });
+  const sbp = new vscode.SourceBreakpoint({
+    uri: vscode.Uri.file('/workspace/main.rs'),
+    range: new vscode.Range(10, 0, 10, 0),
+  });
+  const fbp = new vscode.FunctionBreakpoint('main');
+  vscode.debug.addBreakpoints([sbp, fbp]);
+  assert(vscode.debug.breakpoints.length === 2, 'debug.breakpoints length mismatch');
+  const resolvedCfg = await rpc.handleIncomingRequest('debug.resolveDebugConfiguration', {
+    debugType: 'lldb',
+    debugConfiguration: { type: 'lldb', name: 'Launch', request: 'launch' },
+  });
+  assert(resolvedCfg && resolvedCfg.stopOnEntry === true, 'debug.resolveDebugConfiguration failed');
+  const adapterDesc = await rpc.handleIncomingRequest('debug.createDebugAdapterDescriptor', {
+    debugType: 'lldb',
+    session: { id: 'dbg_1', type: 'lldb', name: 'Launch' },
+  });
+  assert(adapterDesc && adapterDesc.command === 'lldb-vscode', 'debug.createDebugAdapterDescriptor failed');
+  vscode.debug.removeBreakpoints([sbp, fbp]);
+  assert(vscode.debug.breakpoints.length === 0, 'debug.removeBreakpoints failed');
+  dbgFactoryDisp.dispose();
+  dbgCfgDisp.dispose();
+
+  console.log('[Test] Testing vscode.tasks API...');
+  const cargoTask = new vscode.Task(
+    { type: 'cargo', command: 'test' },
+    vscode.TaskScope.Workspace,
+    'cargo test',
+    'cargo',
+    new vscode.ShellExecution('cargo test')
+  );
+  cargoTask.group = vscode.TaskGroup.Build;
+  const taskDisp = vscode.tasks.registerTaskProvider('cargo', {
+    provideTasks() {
+      return [cargoTask];
+    },
+    resolveTask(t) {
+      return t;
+    },
+  });
+  const providedTasks = await rpc.handleIncomingRequest('tasks.provideTasks', { taskType: 'cargo' });
+  assert(Array.isArray(providedTasks) && providedTasks.length === 1, 'tasks.provideTasks failed');
+  const resolvedTask = await rpc.handleIncomingRequest('tasks.resolveTask', {
+    taskType: 'cargo',
+    task: cargoTask,
+  });
+  assert(resolvedTask && resolvedTask.name === 'cargo test', 'tasks.resolveTask failed');
+  taskDisp.dispose();
+
+  console.log('[Test] Testing vscode.tests API...');
+  const testCtrl = vscode.tests.createTestController('rust-tests', 'Rust Tests');
+  const testItem = testCtrl.createTestItem('unit_1', 'test_one', vscode.Uri.file('/workspace/lib.rs'));
+  testCtrl.items.replace([testItem]);
+  assert(testItem.toJSON().parent === undefined, 'TestItem.toJSON must strip parent');
+  let testsRan = 0;
+  const runProfile = testCtrl.createRunProfile(
+    'Run',
+    vscode.TestRunProfileKind.Run,
+    (request) => {
+      const run = testCtrl.createTestRun(request, 'Quick Run', true);
+      run.started(testItem);
+      run.passed(testItem, 12);
+      run.end();
+      testsRan += 1;
+    },
+    true
+  );
+  await rpc.handleIncomingRequest('tests.runTests', {
+    controllerId: 'rust-tests',
+    request: { profileId: runProfile.id },
+  });
+  assert(testsRan === 1, 'tests.runTests failed');
+  runProfile.dispose();
+  testCtrl.dispose();
+
+  console.log('[Test] Testing vscode.authentication API...');
+  const authSessions = [{ id: 'sess_1', accessToken: 'tok_123', account: { id: 'u1', label: 'dev' }, scopes: ['read'] }];
+  const authDisp = vscode.authentication.registerAuthenticationProvider('github', 'GitHub', {
+    getSessions() {
+      return authSessions;
+    },
+    createSession(scopes) {
+      return { id: 'sess_2', accessToken: 'tok_new', account: { id: 'u1', label: 'dev' }, scopes };
+    },
+    removeSession() {
+      return true;
+    },
+  });
+  const gotSessions = await rpc.handleIncomingRequest('authentication.getSessions', {
+    providerId: 'github',
+    scopes: ['read'],
+  });
+  assert(Array.isArray(gotSessions) && gotSessions.length === 1, 'authentication.getSessions failed');
+  const createdSession = await rpc.handleIncomingRequest('authentication.createSession', {
+    providerId: 'github',
+    scopes: ['repo'],
+  });
+  assert(createdSession && createdSession.id === 'sess_2', 'authentication.createSession failed');
+  const removedSession = await rpc.handleIncomingRequest('authentication.removeSession', {
+    providerId: 'github',
+    sessionId: 'sess_2',
+  });
+  assert(removedSession === true, 'authentication.removeSession failed');
+  let crossTypeFailed = false;
+  try {
+    await rpc.invokeProvider('SourceControl', 'github', 'provideOriginalResource');
+  } catch (err) {
+    crossTypeFailed = String(err && err.message ? err.message : err).indexOf('Provider not found: SourceControl:github') !== -1;
+  }
+  assert(crossTypeFailed, 'invokeProvider must not collide across provider types');
+  authDisp.dispose();
+
   console.log('All JavaScript extension host tests passed successfully!');
 })();
 

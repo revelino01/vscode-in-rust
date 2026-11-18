@@ -414,6 +414,82 @@ class CodeAction {
   }
 }
 
+class EventEmitter {
+  constructor(options) {
+    this._options = options || {};
+    this._listeners = [];
+    this._disposed = false;
+    this._event = null;
+  }
+
+  get event() {
+    if (!this._event) {
+      this._event = (listener, thisArgs, disposables) => {
+        if (this._disposed) {
+          return new Disposable(() => {});
+        }
+        if (this._listeners.length === 0 && typeof this._options.onWillAddFirstListener === 'function') {
+          this._options.onWillAddFirstListener(this);
+        }
+        const fn =
+          thisArgs !== undefined && thisArgs !== null ? listener.bind(thisArgs) : listener;
+        const entry = { listener, fn, removed: false };
+        this._listeners.push(entry);
+        if (this._listeners.length === 1 && typeof this._options.onDidAddFirstListener === 'function') {
+          this._options.onDidAddFirstListener(this);
+        }
+
+        const disposable = new Disposable(() => {
+          if (entry.removed) return;
+          entry.removed = true;
+          const idx = this._listeners.indexOf(entry);
+          if (idx !== -1) {
+            this._listeners.splice(idx, 1);
+            if (this._listeners.length === 0 && typeof this._options.onDidRemoveLastListener === 'function') {
+              this._options.onDidRemoveLastListener(this);
+            }
+          }
+        });
+
+        if (Array.isArray(disposables)) {
+          disposables.push(disposable);
+        }
+        return disposable;
+      };
+    }
+    return this._event;
+  }
+
+  fire(data) {
+    if (this._disposed) {
+      return;
+    }
+    const snapshot = this._listeners.slice();
+    for (const entry of snapshot) {
+      if (this._disposed || entry.removed) {
+        continue;
+      }
+      try {
+        entry.fn(data);
+      } catch (err) {
+        console.error('[RustCode ExtHost] Error in EventEmitter listener:', err);
+      }
+    }
+  }
+
+  dispose() {
+    if (this._disposed) {
+      return;
+    }
+    this._disposed = true;
+    for (const entry of this._listeners) {
+      entry.removed = true;
+    }
+    this._listeners.length = 0;
+    this._event = null;
+  }
+}
+
 module.exports = {
   Position,
   Range,
@@ -422,6 +498,7 @@ module.exports = {
   Disposable,
   CancellationTokenSource,
   CancellationToken,
+  EventEmitter,
   DiagnosticSeverity,
   Diagnostic,
   CompletionItemKind,

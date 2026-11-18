@@ -258,6 +258,11 @@ pub struct LanguageFeatureBridge {
     pub notebook_manager: Arc<crate::notebook::ExtHostNotebookManager>,
     pub output_manager: Arc<crate::output::ExtHostOutputManager>,
     pub terminal_manager: Arc<crate::terminal::ExtHostTerminalManager>,
+    pub scm_manager: Arc<crate::scm::ExtHostScmManager>,
+    pub debug_manager: Arc<crate::debug::ExtHostDebugManager>,
+    pub task_manager: Arc<crate::tasks::ExtHostTaskManager>,
+    pub test_manager: Arc<crate::testing::ExtHostTestManager>,
+    pub auth_manager: Arc<crate::auth::ExtHostAuthManager>,
 }
 
 impl LanguageFeatureBridge {
@@ -275,6 +280,11 @@ impl LanguageFeatureBridge {
             notebook_manager: Arc::new(crate::notebook::ExtHostNotebookManager::new()),
             output_manager: Arc::new(crate::output::ExtHostOutputManager::new()),
             terminal_manager: Arc::new(crate::terminal::ExtHostTerminalManager::new()),
+            scm_manager: Arc::new(crate::scm::ExtHostScmManager::new()),
+            debug_manager: Arc::new(crate::debug::ExtHostDebugManager::new()),
+            task_manager: Arc::new(crate::tasks::ExtHostTaskManager::new()),
+            test_manager: Arc::new(crate::testing::ExtHostTestManager::new()),
+            auth_manager: Arc::new(crate::auth::ExtHostAuthManager::new()),
         }
     }
 
@@ -310,6 +320,51 @@ impl LanguageFeatureBridge {
     ) -> Self {
         self.terminal_manager = tm;
         self
+    }
+
+    pub fn with_scm_manager(mut self, sm: Arc<crate::scm::ExtHostScmManager>) -> Self {
+        self.scm_manager = sm;
+        self
+    }
+
+    pub fn with_debug_manager(mut self, dm: Arc<crate::debug::ExtHostDebugManager>) -> Self {
+        self.debug_manager = dm;
+        self
+    }
+
+    pub fn with_task_manager(mut self, tm: Arc<crate::tasks::ExtHostTaskManager>) -> Self {
+        self.task_manager = tm;
+        self
+    }
+
+    pub fn with_test_manager(mut self, tm: Arc<crate::testing::ExtHostTestManager>) -> Self {
+        self.test_manager = tm;
+        self
+    }
+
+    pub fn with_auth_manager(mut self, am: Arc<crate::auth::ExtHostAuthManager>) -> Self {
+        self.auth_manager = am;
+        self
+    }
+
+    pub fn scm_manager(&self) -> &Arc<crate::scm::ExtHostScmManager> {
+        &self.scm_manager
+    }
+
+    pub fn debug_manager(&self) -> &Arc<crate::debug::ExtHostDebugManager> {
+        &self.debug_manager
+    }
+
+    pub fn task_manager(&self) -> &Arc<crate::tasks::ExtHostTaskManager> {
+        &self.task_manager
+    }
+
+    pub fn test_manager(&self) -> &Arc<crate::testing::ExtHostTestManager> {
+        &self.test_manager
+    }
+
+    pub fn auth_manager(&self) -> &Arc<crate::auth::ExtHostAuthManager> {
+        &self.auth_manager
     }
 
     pub fn get_diagnostics(&self, uri: &str) -> Vec<LspDiagnostic> {
@@ -630,6 +685,140 @@ impl LanguageFeatureBridge {
             .await
     }
 
+    pub async fn request_scm_original_resource(
+        &self,
+        provider_id: &str,
+        uri: &str,
+    ) -> Result<Option<String>, String> {
+        self.scm_manager
+            .request_provide_original_resource(&self.rpc_bridge, provider_id, uri)
+            .await
+    }
+
+    pub async fn request_scm_accept_input(
+        &self,
+        provider_id: &str,
+        value: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.scm_manager
+            .request_accept_input(&self.rpc_bridge, provider_id, value)
+            .await
+    }
+
+    pub async fn request_debug_configurations(
+        &self,
+        provider_id: &str,
+        folder: Option<serde_json::Value>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.debug_manager
+            .request_provide_debug_configurations(&self.rpc_bridge, provider_id, folder)
+            .await
+    }
+
+    pub async fn request_resolve_debug_configuration(
+        &self,
+        provider_id: &str,
+        folder: Option<serde_json::Value>,
+        configuration: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.debug_manager
+            .request_resolve_debug_configuration(
+                &self.rpc_bridge,
+                provider_id,
+                folder,
+                configuration,
+            )
+            .await
+    }
+
+    pub async fn request_debug_adapter_descriptor(
+        &self,
+        provider_id: &str,
+        session: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.debug_manager
+            .request_create_debug_adapter_descriptor(&self.rpc_bridge, provider_id, session)
+            .await
+    }
+
+    pub async fn request_provide_tasks(
+        &self,
+        provider_id: &str,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        self.task_manager
+            .request_provide_tasks(&self.rpc_bridge, provider_id)
+            .await
+    }
+
+    pub async fn request_resolve_task(
+        &self,
+        provider_id: &str,
+        task: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.task_manager
+            .request_resolve_task(&self.rpc_bridge, provider_id, task)
+            .await
+    }
+
+    pub async fn request_resolve_test_children(
+        &self,
+        controller_id: &str,
+        item_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.test_manager
+            .request_resolve_children(&self.rpc_bridge, controller_id, item_id)
+            .await
+    }
+
+    pub async fn request_refresh_tests(
+        &self,
+        controller_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.test_manager
+            .request_refresh_tests(&self.rpc_bridge, controller_id)
+            .await
+    }
+
+    pub async fn request_run_tests(
+        &self,
+        controller_id: &str,
+        request: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.test_manager
+            .request_run_tests(&self.rpc_bridge, controller_id, request)
+            .await
+    }
+
+    pub async fn request_auth_sessions(
+        &self,
+        provider_id: &str,
+        scopes: &[String],
+    ) -> Result<Vec<crate::auth::ExtAuthSessionInfo>, String> {
+        self.auth_manager
+            .request_get_sessions(&self.rpc_bridge, provider_id, scopes)
+            .await
+    }
+
+    pub async fn request_create_auth_session(
+        &self,
+        provider_id: &str,
+        scopes: &[String],
+    ) -> Result<crate::auth::ExtAuthSessionInfo, String> {
+        self.auth_manager
+            .request_create_session(&self.rpc_bridge, provider_id, scopes)
+            .await
+    }
+
+    pub async fn request_remove_auth_session(
+        &self,
+        provider_id: &str,
+        session_id: &str,
+    ) -> Result<bool, String> {
+        self.auth_manager
+            .request_remove_session(&self.rpc_bridge, provider_id, session_id)
+            .await
+    }
+
     /// Handle incoming RPC calls from JS runtime (e.g. provider registration, format, codeAction).
     pub async fn handle_rpc_message(
         &self,
@@ -646,6 +835,26 @@ impl LanguageFeatureBridge {
 
         if method.starts_with("notebooks.") {
             return self.notebook_manager.handle_rpc_call(method, params).ok();
+        }
+
+        if method.starts_with("scm.") {
+            return self.scm_manager.handle_rpc_call(method, params).ok();
+        }
+
+        if method.starts_with("debug.") {
+            return self.debug_manager.handle_rpc_call(method, params).ok();
+        }
+
+        if method.starts_with("tasks.") {
+            return self.task_manager.handle_rpc_call(method, params).ok();
+        }
+
+        if method.starts_with("tests.") {
+            return self.test_manager.handle_rpc_call(method, params).ok();
+        }
+
+        if method.starts_with("authentication.") {
+            return self.auth_manager.handle_rpc_call(method, params).ok();
         }
 
         match method {

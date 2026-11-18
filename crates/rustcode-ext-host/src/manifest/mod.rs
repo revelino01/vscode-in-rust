@@ -29,6 +29,44 @@ pub struct Contributions {
     pub keybindings: Option<Vec<KeybindingContribution>>,
     pub configuration: Option<Value>,
     pub views: Option<std::collections::HashMap<String, Vec<ViewContribution>>>,
+    #[serde(default)]
+    pub debuggers: Option<Vec<DebuggerContribution>>,
+    #[serde(rename = "taskDefinitions", default)]
+    pub task_definitions: Option<Vec<TaskDefinitionContribution>>,
+    #[serde(default)]
+    pub authentication: Option<Vec<AuthenticationContribution>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DebuggerContribution {
+    #[serde(rename = "type")]
+    pub debugger_type: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub program: Option<String>,
+    #[serde(default)]
+    pub runtime: Option<String>,
+    #[serde(default)]
+    pub languages: Vec<String>,
+    #[serde(rename = "configurationAttributes", default)]
+    pub configuration_attributes: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskDefinitionContribution {
+    #[serde(rename = "type")]
+    pub task_type: String,
+    #[serde(default)]
+    pub required: Vec<String>,
+    #[serde(default)]
+    pub properties: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthenticationContribution {
+    pub id: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,5 +257,55 @@ mod tests {
         let languages = contributes.languages.unwrap();
         assert_eq!(languages[0].id, "rust");
         assert_eq!(languages[0].extensions, vec![".rs"]);
+        assert!(contributes.debuggers.is_none());
+        assert!(contributes.task_definitions.is_none());
+        assert!(contributes.authentication.is_none());
+    }
+
+    #[test]
+    fn test_parse_manifest_m2_contributions() {
+        let json = r#"{
+            "name": "rustcode-m2-ext",
+            "publisher": "rustcode",
+            "version": "1.0.0",
+            "contributes": {
+                "debuggers": [
+                    {
+                        "type": "lldb",
+                        "label": "LLDB",
+                        "languages": ["rust", "cpp"]
+                    }
+                ],
+                "taskDefinitions": [
+                    {
+                        "type": "cargo",
+                        "required": ["command"]
+                    }
+                ],
+                "authentication": [
+                    {
+                        "id": "github",
+                        "label": "GitHub"
+                    }
+                ]
+            }
+        }"#;
+
+        let manifest = ExtensionLoader::parse_manifest(json).unwrap();
+        let contributes = manifest.contributes.unwrap();
+        let debuggers = contributes.debuggers.unwrap();
+        assert_eq!(debuggers.len(), 1);
+        assert_eq!(debuggers[0].debugger_type, "lldb");
+        assert_eq!(debuggers[0].languages, vec!["rust", "cpp"]);
+
+        let task_defs = contributes.task_definitions.unwrap();
+        assert_eq!(task_defs.len(), 1);
+        assert_eq!(task_defs[0].task_type, "cargo");
+        assert_eq!(task_defs[0].required, vec!["command"]);
+
+        let auth = contributes.authentication.unwrap();
+        assert_eq!(auth.len(), 1);
+        assert_eq!(auth[0].id, "github");
+        assert_eq!(auth[0].label, "GitHub");
     }
 }

@@ -23,6 +23,12 @@ pub enum ProviderType {
     TreeData,
     NotebookSerializer,
     NotebookController,
+    SourceControl,
+    DebugConfiguration,
+    DebugAdapterFactory,
+    Task,
+    TestController,
+    Authentication,
 }
 
 impl ProviderType {
@@ -37,6 +43,12 @@ impl ProviderType {
             "TreeData" => Some(Self::TreeData),
             "NotebookSerializer" => Some(Self::NotebookSerializer),
             "NotebookController" => Some(Self::NotebookController),
+            "SourceControl" => Some(Self::SourceControl),
+            "DebugConfiguration" => Some(Self::DebugConfiguration),
+            "DebugAdapterFactory" => Some(Self::DebugAdapterFactory),
+            "Task" => Some(Self::Task),
+            "TestController" => Some(Self::TestController),
+            "Authentication" => Some(Self::Authentication),
             _ => None,
         }
     }
@@ -138,5 +150,44 @@ mod tests {
             ProviderType::from_str_name("NotebookController"),
             Some(ProviderType::NotebookController)
         );
+        assert_eq!(
+            ProviderType::from_str_name("SourceControl"),
+            Some(ProviderType::SourceControl)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("DebugConfiguration"),
+            Some(ProviderType::DebugConfiguration)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("DebugAdapterFactory"),
+            Some(ProviderType::DebugAdapterFactory)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("Task"),
+            Some(ProviderType::Task)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("TestController"),
+            Some(ProviderType::TestController)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("Authentication"),
+            Some(ProviderType::Authentication)
+        );
+        assert_eq!(ProviderType::from_str_name("UnknownProvider"), None);
+
+        registry.register(ProviderRegistration {
+            id: "git-scm".to_string(),
+            provider_type: ProviderType::SourceControl,
+            language_selector: Some("git".to_string()),
+        });
+        assert_eq!(
+            registry.get_providers_for_language(ProviderType::SourceControl, "git").len(),
+            1
+        );
+        registry.unregister("git-scm");
+        assert!(registry
+            .get_providers_for_language(ProviderType::SourceControl, "git")
+            .is_empty());
     }
 }

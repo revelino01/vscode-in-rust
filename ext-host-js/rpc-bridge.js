@@ -174,6 +174,146 @@ const rpc = {
         notebook || {}
       );
     }
+    if (method === 'scm.provideOriginalResource' || method === 'SourceControl.provideOriginalResource') {
+      const { providerId, sourceControlId, uri, token } = params;
+      return await this.invokeProvider(
+        'SourceControl',
+        providerId || sourceControlId,
+        'provideOriginalResource',
+        uri,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'scm.acceptInput' || method === 'SourceControl.acceptInput') {
+      const { providerId, sourceControlId, value } = params;
+      return await this.invokeProvider(
+        'SourceControl',
+        providerId || sourceControlId,
+        'acceptInput',
+        value
+      );
+    }
+    if (method === 'debug.provideDebugConfigurations' || method === 'DebugConfiguration.provideDebugConfigurations') {
+      const { providerId, debugType, folder, token } = params;
+      return await this.invokeProvider(
+        'DebugConfiguration',
+        providerId || debugType,
+        'provideDebugConfigurations',
+        folder,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'debug.resolveDebugConfiguration' || method === 'DebugConfiguration.resolveDebugConfiguration') {
+      const { providerId, debugType, folder, debugConfiguration, configuration, token } = params;
+      return await this.invokeProvider(
+        'DebugConfiguration',
+        providerId || debugType,
+        'resolveDebugConfiguration',
+        folder,
+        debugConfiguration || configuration,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (
+      method === 'debug.resolveDebugConfigurationWithSubstitutedVariables' ||
+      method === 'DebugConfiguration.resolveDebugConfigurationWithSubstitutedVariables'
+    ) {
+      const { providerId, debugType, folder, debugConfiguration, configuration, token } = params;
+      return await this.invokeProvider(
+        'DebugConfiguration',
+        providerId || debugType,
+        'resolveDebugConfigurationWithSubstitutedVariables',
+        folder,
+        debugConfiguration || configuration,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'debug.createDebugAdapterDescriptor' || method === 'DebugAdapterFactory.createDebugAdapterDescriptor') {
+      const { providerId, debugType, session, executable } = params;
+      return await this.invokeProvider(
+        'DebugAdapterFactory',
+        providerId || debugType,
+        'createDebugAdapterDescriptor',
+        session,
+        executable
+      );
+    }
+    if (method === 'tasks.provideTasks' || method === 'Task.provideTasks') {
+      const { providerId, taskType, token } = params;
+      return await this.invokeProvider(
+        'Task',
+        providerId || taskType,
+        'provideTasks',
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'tasks.resolveTask' || method === 'Task.resolveTask') {
+      const { providerId, taskType, task, token } = params;
+      return await this.invokeProvider(
+        'Task',
+        providerId || taskType,
+        'resolveTask',
+        task,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'tests.resolveChildren' || method === 'TestController.resolveChildren') {
+      const { controllerId, providerId, itemId } = params;
+      return await this.invokeProvider(
+        'TestController',
+        controllerId || providerId,
+        'resolveChildren',
+        itemId
+      );
+    }
+    if (method === 'tests.refreshTests' || method === 'TestController.refreshTests') {
+      const { controllerId, providerId, token } = params;
+      return await this.invokeProvider(
+        'TestController',
+        controllerId || providerId,
+        'refreshTests',
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'tests.runTests' || method === 'TestController.runTests') {
+      const { controllerId, providerId, request, token } = params;
+      return await this.invokeProvider(
+        'TestController',
+        controllerId || providerId,
+        'runTests',
+        request || {},
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'authentication.getSessions' || method === 'Authentication.getSessions') {
+      const { providerId, scopes, options } = params;
+      return await this.invokeProvider(
+        'Authentication',
+        providerId,
+        'getSessions',
+        scopes || [],
+        options || {}
+      );
+    }
+    if (method === 'authentication.createSession' || method === 'Authentication.createSession') {
+      const { providerId, scopes, options } = params;
+      return await this.invokeProvider(
+        'Authentication',
+        providerId,
+        'createSession',
+        scopes || [],
+        options || {}
+      );
+    }
+    if (method === 'authentication.removeSession' || method === 'Authentication.removeSession') {
+      const { providerId, sessionId } = params;
+      return await this.invokeProvider(
+        'Authentication',
+        providerId,
+        'removeSession',
+        sessionId
+      );
+    }
     throw new Error(`Unknown incoming method: ${method}`);
   },
 
@@ -183,7 +323,7 @@ const rpc = {
     let proxy = objectProxies.get(key);
     if (!proxy) {
       for (const [k, p] of objectProxies.entries()) {
-        if (k.endsWith(`:${id}`) || k === id) {
+        if (k.startsWith(`${type}:`) && p.metadata && p.metadata.selector === id) {
           proxy = p;
           break;
         }

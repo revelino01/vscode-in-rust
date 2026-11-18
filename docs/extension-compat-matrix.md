@@ -127,3 +127,20 @@ The pure-Rust Open VSX marketplace client (`MarketplaceClient`) and VSIX unpacke
 - **`crates/rustcode-ext-host/tests/compat_suite.rs` (`26/26` integration tests passing):** Covers manifest contributions, activation lifecycle, themes, commands & bidirectional RPC, document formatting & `PieceTable`, code actions & `WorkspaceEdit`, tree view items, status bar lifecycle, linter diagnostics, full extension E2E workflow, notebooks (lifecycle, RPC roundtrip, JS surface), output channels (RPC lifecycle & JS surface), terminals (RPC lifecycle), M2 APIs (`scm`, `debug`, `tasks`, `tests`, `authentication`, M2 RPC roundtrip, M2 JS surface), and M4 custom editors & webviews (lifecycle, RPC roundtrip, JS surface).
 - **`crates/rustcode-ext-host` unit tests (`48/48` passing):** Covers `auth` (3), `debug` (3), `manifest` (4), `marketplace` (14), `notebook` (2), `output` (1), `provider` (1), `provider::bridge` (5), `rpc` (2), `scm` (3), `tasks` (3), `terminal` (1), `testing` (3), and `webview` (3).
 - **`ext-host-js/test.js` (`68` assertions across `15` `[Test]` sections):** Covers `Position`/`Range`, `Uri`, `node-compat/{events,path}`, `vscode` namespaces, `TextEdit`/`WorkspaceEdit`/`CodeAction`, `OutputChannel` & `Terminal`, `vscode.notebooks`, `vscode.EventEmitter`, `vscode.scm`, `vscode.debug`, `vscode.tasks`, `vscode.tests`, `vscode.authentication`, and `vscode.window` Webview & Custom Editors. In environments without `node`/`deno` (such as Termux), `compat_suite.rs` verifies balanced JS delimiters (`assert_js_delimiters_balanced`) and required exports/handlers across `ext-host-js/`.
+
+---
+
+## Phase 7 Parity Roadmap
+
+To reach 100% end-to-end Rust <-> JS `RpcBridge` parity and broaden extension compatibility, **Phase 7** targets the remaining deltas documented above:
+
+### M1 — Closing Remaining `LanguageFeatureBridge` & `rpc-bridge.js` Deltas
+- [ ] **`vscode.window` UI Prompts & TreeViews**: Handle `window.{showInformationMessage, showWarningMessage, showErrorMessage, showQuickPick, showInputBox}` in `LanguageFeatureBridge::handle_rpc_message` (bridged to Notification Toasts / QuickInput), normalize `'TreeDataProvider'` vs `'TreeData'` naming, and implement outbound `"treeView.getChildren"` handling in `ext-host-js/rpc-bridge.js`.
+- [ ] **`vscode.workspace` RPC Handlers**: Add `workspace.{getConfiguration, updateConfiguration, openTextDocument}` match arms backed by `ConfigurationService`, `Workspace`, and disk/editor state.
+- [ ] **`vscode.commands` RPC Routing**: Route `commands.{registerCommand, unregisterCommand, executeCommand, getCommands}` between `ext-host-js` and `CommandRegistry` in `rustcode-platform`.
+- [ ] **`vscode.env` & `vscode.extensions`**: Route `env.{clipboardRead, clipboardWrite, openExternal}` in `LanguageFeatureBridge`, and hydrate `vscode.extensions.all` / `getExtension(id)` from `ExtensionLoader`.
+- [ ] **`node-compat/fs.js` Host Routing**: Implement `fs.{readFile, writeFile, readdir, stat, mkdir, unlink}` match arms backed by `FileSystemService`.
+
+### M5 — Additional `node-compat` Polyfills & Language Grammars
+- [ ] **`ext-host-js/node-compat/` Expansion**: Add `buffer.js`, `url.js`, `util.js`, `os.js`, `crypto.js`, and `child_process.js` polyfills + unit tests in `ext-host-js/test.js` and `compat_suite.rs`.
+- [ ] **Syntax Tokenizer Expansion (`rustcode-editor`)**: Add pure-Rust state-machine tokenizers for Go, C/C++, HTML/CSS, and TOML/YAML.

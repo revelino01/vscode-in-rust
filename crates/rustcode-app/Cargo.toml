@@ -2,6 +2,15 @@
 name = "rustcode-app"
 version = "0.1.0"
 edition = "2021"
+description = "RustCode desktop editor application and GPUI bootstrap"
+authors = ["RustCode Contributors"]
+license = "MIT"
+repository = "https://github.com/revelino01/vscode-in-rust"
+default-run = "rustcode"
+
+[[bin]]
+name = "rustcode"
+path = "src/main.rs"
 
 [features]
 default = []
@@ -23,4 +32,13 @@ serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "9.6.1", default-features = false, features = ["deflate"] }
+
+[[bench]]
+name = "startup_time"
+harness = false
+
+[[bench]]
+name = "memory_footprint"
+harness = false
+
 

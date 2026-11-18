@@ -5,6 +5,25 @@ use rustcode_platform::render::{
     View, WorkbenchThemeStyles,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaletteItemKind {
+    Command,
+    File,
+    WorkspaceSymbol,
+    DocumentSymbol,
+    Line,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickInputMode {
+    Command,
+    File,
+    WorkspaceSymbol,
+    DocumentSymbol,
+    Line,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaletteItem {
@@ -12,6 +31,94 @@ pub struct PaletteItem {
     pub label: String,
     pub category: Option<String>,
     pub keybinding: Option<String>,
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+    #[serde(default)]
+    pub line: Option<usize>,
+    #[serde(default)]
+    pub column: Option<usize>,
+    #[serde(default = "default_item_kind")]
+    pub item_kind: PaletteItemKind,
+}
+
+fn default_item_kind() -> PaletteItemKind {
+    PaletteItemKind::Command
+}
+
+impl Default for PaletteItem {
+    fn default() -> Self {
+        Self {
+            command_id: String::new(),
+            label: String::new(),
+            category: None,
+            keybinding: None,
+            path: None,
+            line: None,
+            column: None,
+            item_kind: PaletteItemKind::Command,
+        }
+    }
+}
+
+impl PaletteItem {
+    pub fn command(
+        command_id: impl Into<String>,
+        label: impl Into<String>,
+        category: Option<String>,
+        keybinding: Option<String>,
+    ) -> Self {
+        Self {
+            command_id: command_id.into(),
+            label: label.into(),
+            category,
+            keybinding,
+            path: None,
+            line: None,
+            column: None,
+            item_kind: PaletteItemKind::Command,
+        }
+    }
+
+    pub fn file(path: PathBuf, relative_label: impl Into<String>) -> Self {
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".to_string());
+        Self {
+            command_id: format!("file:{}", path.to_string_lossy()),
+            label: file_name,
+            category: Some(relative_label.into()),
+            keybinding: None,
+            path: Some(path),
+            line: None,
+            column: None,
+            item_kind: PaletteItemKind::File,
+        }
+    }
+
+    pub fn symbol(
+        name: impl Into<String>,
+        container: Option<String>,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+    ) -> Self {
+        let name_str = name.into();
+        let cat = match container {
+            Some(c) => format!("{} ({}:{})", c, path.to_string_lossy(), line),
+            None => format!("{}:{}", path.to_string_lossy(), line),
+        };
+        Self {
+            command_id: format!("symbol:{}:{}:{}", path.to_string_lossy(), line, column),
+            label: name_str,
+            category: Some(cat),
+            keybinding: None,
+            path: Some(path),
+            line: Some(line),
+            column: Some(column),
+            item_kind: PaletteItemKind::WorkspaceSymbol,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +127,7 @@ pub struct CommandPalette {
     pub query: String,
     pub filtered: Vec<usize>,
     pub selected_index: usize,
+    pub mode: QuickInputMode,
 }
 
 impl Default for CommandPalette {
@@ -35,6 +143,7 @@ impl CommandPalette {
             query: String::new(),
             filtered: Vec::new(),
             selected_index: 0,
+            mode: QuickInputMode::Command,
         }
     }
 
@@ -45,6 +154,18 @@ impl CommandPalette {
 
     pub fn set_query(&mut self, query: &str) {
         self.query = query.to_string();
+        self.refilter();
+    }
+
+    pub fn open_mode(&mut self, mode: QuickInputMode) {
+        self.mode = mode;
+        self.query = match mode {
+            QuickInputMode::Command => ">".to_string(),
+            QuickInputMode::WorkspaceSymbol => "#".to_string(),
+            QuickInputMode::DocumentSymbol => "@".to_string(),
+            QuickInputMode::Line => ":".to_string(),
+            QuickInputMode::File => String::new(),
+        };
         self.refilter();
     }
 
@@ -73,23 +194,57 @@ impl CommandPalette {
     }
 
     pub fn refilter(&mut self) {
-        let q = self.query.trim().to_ascii_lowercase();
+        let (detected_mode, target_query) = if let Some(stripped) = self.query.strip_prefix('>') {
+            (QuickInputMode::Command, stripped.trim().to_lowercase())
+        } else if let Some(stripped) = self.query.strip_prefix('#') {
+            (QuickInputMode::WorkspaceSymbol, stripped.trim().to_lowercase())
+        } else if let Some(stripped) = self.query.strip_prefix('@') {
+            (QuickInputMode::DocumentSymbol, stripped.trim().to_lowercase())
+        } else if let Some(stripped) = self.query.strip_prefix(':') {
+            (QuickInputMode::Line, stripped.trim().to_lowercase())
+        } else {
+            (QuickInputMode::File, self.query.trim().to_lowercase())
+        };
+
+        self.mode = detected_mode;
         self.filtered.clear();
         self.selected_index = 0;
 
-        if q.is_empty() {
-            self.filtered.extend(0..self.items.len());
-            return;
-        }
+        let has_files = self.items.iter().any(|i| i.item_kind == PaletteItemKind::File);
 
-        // Fuzzy match against category and label
         for (idx, item) in self.items.iter().enumerate() {
-            let full_text = match &item.category {
-                Some(cat) => format!("{}: {}", cat, item.label).to_ascii_lowercase(),
-                None => item.label.to_ascii_lowercase(),
+            // Mode filter
+            let kind_matches = match detected_mode {
+                QuickInputMode::Command => item.item_kind == PaletteItemKind::Command,
+                QuickInputMode::WorkspaceSymbol => item.item_kind == PaletteItemKind::WorkspaceSymbol,
+                QuickInputMode::DocumentSymbol => item.item_kind == PaletteItemKind::DocumentSymbol,
+                QuickInputMode::Line => item.item_kind == PaletteItemKind::Line,
+                QuickInputMode::File => {
+                    if has_files {
+                        item.item_kind == PaletteItemKind::File
+                    } else {
+                        // Fallback: match any item (e.g. in command-only tests)
+                        true
+                    }
+                }
             };
 
-            if fuzzy_match(&full_text, &q) {
+            if !kind_matches {
+                continue;
+            }
+
+            if target_query.is_empty() {
+                self.filtered.push(idx);
+                continue;
+            }
+
+            // Fuzzy match against category and label
+            let full_text = match &item.category {
+                Some(cat) => format!("{}: {}", cat, item.label).to_lowercase(),
+                None => item.label.to_lowercase(),
+            };
+
+            if fuzzy_match(&full_text, &target_query) || fuzzy_match(&item.label.to_lowercase(), &target_query) {
                 self.filtered.push(idx);
             }
         }
@@ -114,6 +269,11 @@ fn fuzzy_match(target: &str, pattern: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
     Execute(String),
+    OpenFile {
+        path: PathBuf,
+        line: Option<usize>,
+        column: Option<usize>,
+    },
     Close,
 }
 
@@ -167,21 +327,36 @@ impl View for CommandPaletteView {
         let prompt_x = bounds.min_x() + 12.0;
         let text_y = bounds.min_y() + (input_h - font.line_height) / 2.0;
 
-        // Prompt "> "
+        // Prompt string & query
+        let (prompt_str, display_query) = if let Some(stripped) = self.model.query.strip_prefix('>') {
+            ("> ", stripped)
+        } else if let Some(stripped) = self.model.query.strip_prefix('#') {
+            ("# ", stripped)
+        } else if let Some(stripped) = self.model.query.strip_prefix('@') {
+            ("@ ", stripped)
+        } else if let Some(stripped) = self.model.query.strip_prefix(':') {
+            (": ", stripped)
+        } else {
+            ("> ", self.model.query.as_str())
+        };
+
+        let prompt_w = font.text_width(prompt_str);
+
+        // Prompt
         scene.push_text(GlyphRun::new(
-            "> ".to_string(),
+            prompt_str.to_string(),
             Point::new(prompt_x, text_y),
-            Rect::from_xywh(prompt_x, text_y, 2.0 * font.char_width, font.line_height),
+            Rect::from_xywh(prompt_x, text_y, prompt_w, font.line_height),
             theme.command_palette_fg,
             font.font_size,
         ));
 
         // Query text
-        let query_x = prompt_x + 2.0 * font.char_width;
-        let query_w = font.text_width(&self.model.query);
-        if !self.model.query.is_empty() {
+        let query_x = prompt_x + prompt_w;
+        let query_w = font.text_width(display_query);
+        if !display_query.is_empty() {
             scene.push_text(GlyphRun::new(
-                self.model.query.clone(),
+                display_query.to_string(),
                 Point::new(query_x, text_y),
                 Rect::from_xywh(query_x, text_y, query_w, font.line_height),
                 theme.command_palette_fg,
@@ -261,7 +436,15 @@ impl View for CommandPaletteView {
                 }
                 KeyCode::Enter => {
                     if let Some(item) = self.model.selected_item() {
-                        self.last_action = Some(PaletteAction::Execute(item.command_id.clone()));
+                        if let Some(path) = &item.path {
+                            self.last_action = Some(PaletteAction::OpenFile {
+                                path: path.clone(),
+                                line: item.line,
+                                column: item.column,
+                            });
+                        } else {
+                            self.last_action = Some(PaletteAction::Execute(item.command_id.clone()));
+                        }
                         EventResult::Consumed
                     } else {
                         EventResult::Ignored
@@ -302,9 +485,23 @@ impl View for CommandPaletteView {
                 if mouse.position.y > bounds.min_y() + input_h {
                     let idx = ((mouse.position.y - (bounds.min_y() + input_h + 1.0)) / row_h)
                         .floor() as usize;
-                    if let Some(cmd_id) = self.model.results().get(idx).map(|item| item.command_id.clone()) {
+                    let maybe_action = if let Some(item) = self.model.results().get(idx) {
+                        if let Some(path) = &item.path {
+                            Some(PaletteAction::OpenFile {
+                                path: path.clone(),
+                                line: item.line,
+                                column: item.column,
+                            })
+                        } else {
+                            Some(PaletteAction::Execute(item.command_id.clone()))
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(act) = maybe_action {
                         self.model.selected_index = idx;
-                        self.last_action = Some(PaletteAction::Execute(cmd_id));
+                        self.last_action = Some(act);
                         return EventResult::Consumed;
                     }
                 }
@@ -325,24 +522,24 @@ mod tests {
     fn test_command_palette_fuzzy_search() {
         let mut palette = CommandPalette::new();
         palette.set_items(vec![
-            PaletteItem {
-                command_id: "workbench.action.reloadWindow".to_string(),
-                label: "Reload Window".to_string(),
-                category: Some("Developer".to_string()),
-                keybinding: None,
-            },
-            PaletteItem {
-                command_id: "editor.action.formatDocument".to_string(),
-                label: "Format Document".to_string(),
-                category: None,
-                keybinding: Some("Shift+Alt+F".to_string()),
-            },
-            PaletteItem {
-                command_id: "git.commit".to_string(),
-                label: "Commit".to_string(),
-                category: Some("Git".to_string()),
-                keybinding: None,
-            },
+            PaletteItem::command(
+                "workbench.action.reloadWindow",
+                "Reload Window",
+                Some("Developer".to_string()),
+                None,
+            ),
+            PaletteItem::command(
+                "editor.action.formatDocument",
+                "Format Document",
+                None,
+                Some("Shift+Alt+F".to_string()),
+            ),
+            PaletteItem::command(
+                "git.commit",
+                "Commit",
+                Some("Git".to_string()),
+                None,
+            ),
         ]);
 
         assert_eq!(palette.results().len(), 3);
@@ -363,21 +560,54 @@ mod tests {
     }
 
     #[test]
+    fn test_command_palette_unicode_case_folding() {
+        let mut palette = CommandPalette::new();
+        palette.set_items(vec![
+            PaletteItem::command(
+                "workbench.action.openFile",
+                "Öffnen",
+                Some("Datei".to_string()),
+                None,
+            ),
+            PaletteItem::command(
+                "workbench.action.closeFile",
+                "Schließen",
+                Some("Datei".to_string()),
+                None,
+            ),
+        ]);
+
+        // Query with lowercase umlaut matching uppercase umlaut
+        palette.set_query(">öffnen");
+        assert_eq!(palette.results().len(), 1);
+        assert_eq!(palette.results()[0].label, "Öffnen");
+
+        // Query category with lowercase
+        palette.set_query(">datei");
+        assert_eq!(palette.results().len(), 2);
+
+        // Query lowercase matching German eszett
+        palette.set_query(">schließen");
+        assert_eq!(palette.results().len(), 1);
+        assert_eq!(palette.results()[0].label, "Schließen");
+    }
+
+    #[test]
     fn test_command_palette_view_interaction() {
         let mut palette = CommandPalette::new();
         palette.set_items(vec![
-            PaletteItem {
-                command_id: "workbench.action.toggleSidebar".to_string(),
-                label: "Toggle Sidebar".to_string(),
-                category: Some("View".to_string()),
-                keybinding: Some("Ctrl+B".to_string()),
-            },
-            PaletteItem {
-                command_id: "workbench.action.openSettings".to_string(),
-                label: "Open Settings".to_string(),
-                category: Some("Preferences".to_string()),
-                keybinding: Some("Ctrl+,".to_string()),
-            },
+            PaletteItem::command(
+                "workbench.action.toggleSidebar",
+                "Toggle Sidebar",
+                Some("View".to_string()),
+                Some("Ctrl+B".to_string()),
+            ),
+            PaletteItem::command(
+                "workbench.action.openSettings",
+                "Open Settings",
+                Some("Preferences".to_string()),
+                Some("Ctrl+,".to_string()),
+            ),
         ]);
 
         let mut view = CommandPaletteView::new(palette);
@@ -423,12 +653,12 @@ mod tests {
         // Test space typing in command palette
         let mut space_palette = CommandPalette::new();
         space_palette.set_items(vec![
-            PaletteItem {
-                command_id: "workbench.action.toggleSidebar".to_string(),
-                label: "Toggle Sidebar".to_string(),
-                category: Some("View".to_string()),
-                keybinding: None,
-            },
+            PaletteItem::command(
+                "workbench.action.toggleSidebar",
+                "Toggle Sidebar",
+                Some("View".to_string()),
+                None,
+            ),
         ]);
         let mut space_view = CommandPaletteView::new(space_palette);
         for key in [KeyCode::Char('v'), KeyCode::Space, KeyCode::Char('t')] {
@@ -447,5 +677,68 @@ mod tests {
             rustcode_platform::render::MouseButton::Left,
         ));
         assert_eq!(space_view.handle_event(&outside_ev, bounds), EventResult::Ignored);
+    }
+
+    #[test]
+    fn test_quick_open_multi_mode_and_open_file() {
+        let mut palette = CommandPalette::new();
+        palette.set_items(vec![
+            PaletteItem::command(
+                "workbench.action.reloadWindow",
+                "Reload Window",
+                Some("Developer".to_string()),
+                None,
+            ),
+            PaletteItem::file(
+                PathBuf::from("/project/backend/src/main.rs"),
+                "backend/src/main.rs",
+            ),
+            PaletteItem::file(
+                PathBuf::from("/project/frontend/src/app.tsx"),
+                "frontend/src/app.tsx",
+            ),
+            PaletteItem::symbol(
+                "process_order",
+                Some("OrderService".to_string()),
+                PathBuf::from("/project/backend/src/order.rs"),
+                42,
+                8,
+            ),
+        ]);
+
+        // 1. Default / prefix-less: file search
+        palette.set_query("main");
+        assert_eq!(palette.mode, QuickInputMode::File);
+        assert_eq!(palette.results().len(), 1);
+        assert_eq!(palette.results()[0].label, "main.rs");
+
+        // 2. Command mode with '>'
+        palette.set_query(">reload");
+        assert_eq!(palette.mode, QuickInputMode::Command);
+        assert_eq!(palette.results().len(), 1);
+        assert_eq!(palette.results()[0].command_id, "workbench.action.reloadWindow");
+
+        // 3. Workspace symbol mode with '#'
+        palette.set_query("#order");
+        assert_eq!(palette.mode, QuickInputMode::WorkspaceSymbol);
+        assert_eq!(palette.results().len(), 1);
+        assert_eq!(palette.results()[0].label, "process_order");
+
+        // 4. Test Enter emits OpenFile action
+        let mut view = CommandPaletteView::new(palette);
+        view.model.set_query("app");
+        let bounds = Rect::from_xywh(100.0, 50.0, 600.0, 300.0);
+        view.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none())),
+            bounds,
+        );
+        assert_eq!(
+            view.last_action,
+            Some(PaletteAction::OpenFile {
+                path: PathBuf::from("/project/frontend/src/app.tsx"),
+                line: None,
+                column: None,
+            })
+        );
     }
 }

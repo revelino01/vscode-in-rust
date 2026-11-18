@@ -1,0 +1,19 @@
+{
+  "name": "theme-oceanic",
+  "displayName": "Oceanic Next Theme",
+  "publisher": "rustcode",
+  "version": "1.0.0",
+  "description": "Oceanic Next color theme for RustCode",
+  "activationEvents": [
+    "*"
+  ],
+  "contributes": {
+    "themes": [
+      {
+        "label": "Oceanic Next",
+        "uiTheme": "vs-dark",
+        "path": "./themes/oceanic-next.json"
+      }
+    ]
+  }
+}

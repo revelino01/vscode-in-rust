@@ -1,0 +1,25 @@
+{
+  "name": "git-status-ext",
+  "displayName": "Git Status Bar Extension",
+  "publisher": "rustcode",
+  "version": "1.0.0",
+  "description": "Contributes Git branch and sync indicators to status bar",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "*"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "git.checkoutBranch",
+        "title": "Git: Checkout Branch",
+        "category": "Git"
+      },
+      {
+        "command": "git.syncRepository",
+        "title": "Git: Sync Changes",
+        "category": "Git"
+      }
+    ]
+  }
+}

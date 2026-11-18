@@ -12,14 +12,15 @@ pub mod webview;
 pub use manifest::{
     ContributedCommand, Contributions, ExtensionLoader, ExtensionManifest, GrammarContribution,
     KeybindingContribution, LanguageContribution, LoadedExtension, ThemeContribution,
+    ViewContribution,
 };
 pub use marketplace::{
     CurlHttpTransport, ExtensionDownloader, ExtensionFiles, ExtensionInstaller, ExtensionMetadata,
     HttpTransport, MarketplaceClient, MarketplaceError, MockHttpTransport, SearchResponse,
 };
 pub use provider::{
-    DiagnosticCollectionManager, LanguageFeatureBridge, ProviderRegistration, ProviderRegistry,
-    ProviderType,
+    DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, LanguageFeatureBridge,
+    ProviderRegistration, ProviderRegistry, ProviderType, TreeItem, TreeItemCollapsibleState,
 };
 pub use rpc::{RpcBridge, RpcMessage};
 pub use webview::{

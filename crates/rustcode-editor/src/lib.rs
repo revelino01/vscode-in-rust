@@ -16,13 +16,16 @@ pub use completion::{
     expand_snippet, fuzzy_match, AutocompleteWidget, CompletionItem, CompletionItemKind,
     CompletionList,
 };
-pub use cursor::{CursorState, Position, Range, Selection};
+pub use cursor::{CursorState, Position, Range, RangeEdit, Selection};
 pub use diff::{
     myers_diff, DiffCell, DiffChange, DiffEditorView, DiffModel, DiffOpKind, DiffViewMode, EditOp,
     InlineDiffRow, SideBySideDiffRow,
 };
 pub use document::{AutoSaveConfig, AutoSaveMode, AutoSaveService, TextDocument};
-pub use model::{Piece, PieceSource, PieceTable, TextEdit, UndoElement, UndoRedoStack};
+pub use model::{
+    byte_offset_to_utf16_col, utf16_col_to_byte_offset, Piece, PieceSource, PieceTable, TextEdit,
+    UndoElement, UndoRedoStack,
+};
 pub use syntax::{
     Grammar, GrammarRegistry, GrammarState, JavaScriptGrammar, JsonGrammar, MarkdownGrammar,
     PlainTextGrammar, PythonGrammar, RustGrammar, SyntaxHighlighter, SyntaxScope, TokenMetadata,

@@ -1,7 +1,9 @@
 //! Editor group and tab model mirroring VS Code's editor grid, and GPUI EditorAreaView component.
 
 use parking_lot::RwLock;
-use rustcode_editor::{DiffEditorView, EditorView, GrammarRegistry, TextDocument};
+use rustcode_editor::{
+    DiffEditorView, EditorView, GrammarRegistry, Position, Range, RangeEdit, TextDocument,
+};
 use rustcode_ext_host::webview::{ExtHostWebviewManager, WebviewOptions};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
@@ -9,6 +11,7 @@ use rustcode_platform::render::{
     WorkbenchThemeStyles,
 };
 use rustcode_platform::theme::ThemeService;
+use rustcode_protocols::lsp::WorkspaceEdit;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -256,6 +259,60 @@ impl EditorAreaView {
     pub fn active_editor(&self) -> Option<&EditorView> {
         let uri = self.model.current_group_ref().active_tab()?.uri.clone();
         self.editors.get(&uri)
+    }
+
+    pub fn apply_text_edits(&mut self, uri: &str, edits: &[RangeEdit]) -> bool {
+        if let Some(editor) = self.editors.get_mut(uri) {
+            let changed = editor.apply_text_edits(edits);
+            if changed {
+                for group in &mut self.model.groups {
+                    for tab in &mut group.tabs {
+                        if tab.uri == uri {
+                            tab.is_dirty = true;
+                            tab.is_preview = false;
+                        }
+                    }
+                }
+            }
+            changed
+        } else {
+            false
+        }
+    }
+
+    pub fn apply_workspace_edit(&mut self, edit: &WorkspaceEdit) -> usize {
+        let mut total_applied = 0;
+        if let Some(changes) = &edit.changes {
+            for (uri, lsp_edits) in changes {
+                let range_edits: Vec<RangeEdit> = lsp_edits
+                    .iter()
+                    .map(|e| RangeEdit {
+                        range: Range::new(
+                            Position::new(e.range.start.line as usize, e.range.start.character as usize),
+                            Position::new(e.range.end.line as usize, e.range.end.character as usize),
+                        ),
+                        new_text: e.new_text.clone(),
+                    })
+                    .collect();
+
+                if self.apply_text_edits(uri, &range_edits) {
+                    total_applied += range_edits.len();
+                } else {
+                    let path = uri.strip_prefix("file://").unwrap_or(uri);
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        let title = std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(path);
+                        self.open_file(uri, title, &content, false);
+                        if self.apply_text_edits(uri, &range_edits) {
+                            total_applied += range_edits.len();
+                        }
+                    }
+                }
+            }
+        }
+        total_applied
     }
 }
 
@@ -559,7 +616,95 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), " fn initial() {}");
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
 
+    #[test]
+    fn test_editor_area_apply_text_edits() {
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(
+            "file:///src/calc.rs",
+            "calc.rs",
+            "fn add(a: i32, b: i32) -> i32 {\na + b\n}\n",
+            false,
+        );
+
+        let edits = vec![RangeEdit::new(
+            Range::new(Position::new(1, 0), Position::new(1, 5)),
+            "    a + b",
+        )];
+
+        let ok = area_view.apply_text_edits("file:///src/calc.rs", &edits);
+        assert!(ok);
+        assert_eq!(
+            area_view.editors.get("file:///src/calc.rs").unwrap().text(),
+            "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n"
+        );
+        assert!(area_view.model.current_group_ref().tabs[0].is_dirty);
+    }
+
+    #[test]
+    fn test_editor_area_apply_workspace_edit() {
+        use rustcode_protocols::lsp::{LspPosition, LspRange, LspTextEdit};
+        use std::collections::HashMap;
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(
+            "file:///src/file1.rs",
+            "file1.rs",
+            "let x = 1;\n",
+            false,
+        );
+
+        let mut changes = HashMap::new();
+        changes.insert(
+            "file:///src/file1.rs".to_string(),
+            vec![LspTextEdit::new(
+                LspRange::new(LspPosition::new(0, 8), LspPosition::new(0, 9)),
+                "100",
+            )],
+        );
+
+        let ws_edit = WorkspaceEdit::with_changes(changes);
+        let applied = area_view.apply_workspace_edit(&ws_edit);
+        assert_eq!(applied, 1);
+        assert_eq!(
+            area_view.editors.get("file:///src/file1.rs").unwrap().text(),
+            "let x = 100;\n"
+        );
+        assert!(area_view.model.current_group_ref().tabs[0].is_dirty);
+    }
+
+    #[test]
+    fn test_editor_area_apply_workspace_edit_multibyte_unicode() {
+        use rustcode_protocols::lsp::{LspPosition, LspRange, LspTextEdit};
+        use std::collections::HashMap;
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(
+            "file:///src/unicode.rs",
+            "unicode.rs",
+            "let s = \"🦀abc\";\n",
+            false,
+        );
+
+        let mut changes = HashMap::new();
+        // Replace "abc" at UTF-16 col 11..14 with "xyz"
+        changes.insert(
+            "file:///src/unicode.rs".to_string(),
+            vec![LspTextEdit::new(
+                LspRange::new(LspPosition::new(0, 11), LspPosition::new(0, 14)),
+                "xyz",
+            )],
+        );
+
+        let ws_edit = WorkspaceEdit::with_changes(changes);
+        let applied = area_view.apply_workspace_edit(&ws_edit);
+        assert_eq!(applied, 1);
+        assert_eq!(
+            area_view.editors.get("file:///src/unicode.rs").unwrap().text(),
+            "let s = \"🦀xyz\";\n"
+        );
+        assert!(area_view.model.current_group_ref().tabs[0].is_dirty);
     }
 }
 

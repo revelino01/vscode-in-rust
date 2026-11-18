@@ -79,6 +79,36 @@ const languages = {
       selector: sel,
     });
   },
+
+  registerCodeActionsProvider(selector, provider, metadata = {}) {
+    const id = `codeaction_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('CodeAction', id, provider, ['provideCodeActions'], {
+      selector: sel,
+      providedCodeActionKinds: metadata.providedCodeActionKinds || [],
+    });
+  },
+
+  async format(documentOrUri, options = { tabSize: 4, insertSpaces: true }) {
+    const uri = (documentOrUri && documentOrUri.uri) ? documentOrUri.uri.toString() : (documentOrUri ? documentOrUri.toString() : '');
+    const languageId = (documentOrUri && documentOrUri.languageId) ? documentOrUri.languageId : '*';
+    return await rpc.call('languages.format', {
+      uri,
+      languageId,
+      options,
+    });
+  },
+
+  async codeAction(documentOrUri, range, context = { diagnostics: [] }) {
+    const uri = (documentOrUri && documentOrUri.uri) ? documentOrUri.uri.toString() : (documentOrUri ? documentOrUri.toString() : '');
+    const languageId = (documentOrUri && documentOrUri.languageId) ? documentOrUri.languageId : '*';
+    return await rpc.call('languages.codeAction', {
+      uri,
+      languageId,
+      range,
+      context,
+    });
+  },
 };
 
 module.exports = languages;

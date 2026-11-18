@@ -16,10 +16,12 @@ pub mod layout;
 pub mod problems;
 pub mod quickinput;
 pub mod scm;
+pub mod search;
 pub mod statusbar;
 pub mod webview;
 pub mod window;
 pub mod workbench_view;
+pub mod workspace;
 
 pub use activitybar::{ActivityBar, ActivityBarAction, ActivityBarItem, ActivityBarView};
 pub use debug::{
@@ -32,9 +34,11 @@ pub use layout::WorkbenchLayout;
 pub use problems::{ProblemEntry, ProblemsAction, ProblemsPanel};
 pub use quickinput::{CommandPalette, CommandPaletteView, PaletteAction, PaletteItem};
 pub use scm::{ScmAction, ScmView};
+pub use search::{SearchAction, SearchQuery, SearchResults, SearchView};
 pub use statusbar::{
     StatusBar, StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView,
 };
 pub use webview::{ParsedWebviewNode, WebviewEditorView, WebviewElementKind};
 pub use window::WorkbenchWindow;
 pub use workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchRegions, WorkbenchView};
+pub use workspace::{Workspace, WorkspaceFolder};

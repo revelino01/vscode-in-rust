@@ -498,8 +498,10 @@ dependencies = [
  "parking_lot",
  "rmp-serde",
  "rustcode-base",
+ "rustcode-editor",
  "rustcode-platform",
  "rustcode-protocols",
+ "rustcode-workbench",
  "serde",
  "serde_json",
  "thiserror",
@@ -548,6 +550,7 @@ name = "rustcode-workbench"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "regex",
  "rustcode-base",
  "rustcode-editor",
  "rustcode-ext-host",
@@ -556,6 +559,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "uuid",
 ]
 
@@ -661,6 +665,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket2"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -711,8 +725,10 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
+ "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]

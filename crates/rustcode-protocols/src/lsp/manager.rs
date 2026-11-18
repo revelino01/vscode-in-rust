@@ -248,6 +248,73 @@ impl LspClientManager {
         }
     }
 
+    pub async fn request_formatting(
+        &self,
+        uri: &str,
+        language_id: &str,
+        options: FormattingOptions,
+    ) -> Result<Vec<LspTextEdit>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.formatting(uri, options).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_code_actions(
+        &self,
+        uri: &str,
+        language_id: &str,
+        range: LspRange,
+        context: CodeActionContext,
+    ) -> Result<Vec<CodeAction>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.code_action(uri, range, context).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_workspace_symbols(
+        &self,
+        query: &str,
+    ) -> Result<Vec<SymbolInformation>, LspError> {
+        let clients: Vec<Arc<LspClient>> = self.clients.read().values().cloned().collect();
+        let mut all_symbols = Vec::new();
+        for client in clients {
+            if let Ok(symbols) = client.workspace_symbol(query).await {
+                all_symbols.extend(symbols);
+            }
+        }
+        Ok(all_symbols)
+    }
+
+    pub async fn request_document_symbols(
+        &self,
+        uri: &str,
+        language_id: &str,
+    ) -> Result<Vec<SymbolInformation>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.document_symbol(uri).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn notify_workspace_folders_changed(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: Vec<WorkspaceFolder>,
+    ) -> Result<(), LspError> {
+        let clients: Vec<Arc<LspClient>> = self.clients.read().values().cloned().collect();
+        for client in clients {
+            let _ = client
+                .did_change_workspace_folders(added.clone(), removed.clone())
+                .await;
+        }
+        Ok(())
+    }
+
     pub fn register_client(&self, language_id: &str, client: Arc<LspClient>) {
         self.clients.write().insert(language_id.to_string(), client);
     }
@@ -351,5 +418,27 @@ mod tests {
 
         let _ = server_w1;
         let _ = server_w2;
+    }
+
+    #[tokio::test]
+    async fn test_lsp_client_manager_formatting_and_code_actions_routing() {
+        let manager = LspClientManager::new();
+        // If no client registered, should return empty Vec
+        let edits = manager
+            .request_formatting("file:///test.rs", "rust", FormattingOptions::new(4, true))
+            .await
+            .unwrap();
+        assert!(edits.is_empty());
+
+        let actions = manager
+            .request_code_actions(
+                "file:///test.rs",
+                "rust",
+                LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 1)),
+                CodeActionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert!(actions.is_empty());
     }
 }

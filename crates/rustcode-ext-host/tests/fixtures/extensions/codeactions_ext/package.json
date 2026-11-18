@@ -1,0 +1,26 @@
+{
+  "name": "rust-quickfix-ext",
+  "displayName": "Rust Code Actions & QuickFix Extension",
+  "publisher": "rustcode",
+  "version": "1.0.0",
+  "description": "Provides QuickFix code actions and workspace edits",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:rust"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rust",
+        "extensions": [".rs"]
+      }
+    ],
+    "commands": [
+      {
+        "command": "rustQuickFix.autoImport",
+        "title": "Auto Import Missing Symbol",
+        "category": "Quick Fix"
+      }
+    ]
+  }
+}

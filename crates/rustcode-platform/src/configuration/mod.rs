@@ -4,6 +4,8 @@ use parking_lot::RwLock;
 use rustcode_base::event::Emitter;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -11,16 +13,18 @@ pub struct ConfigurationChangeEvent {
     pub affected_keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigurationTarget {
     User,
     Workspace,
+    WorkspaceFolder(PathBuf),
 }
 
 pub struct ConfigurationService {
     defaults: Arc<RwLock<Value>>,
     user: Arc<RwLock<Value>>,
     workspace: Arc<RwLock<Value>>,
+    folders: Arc<RwLock<HashMap<PathBuf, Value>>>,
     merged: Arc<RwLock<Value>>,
     pub on_did_change: Emitter<ConfigurationChangeEvent>,
 }
@@ -59,6 +63,7 @@ impl ConfigurationService {
             defaults: Arc::new(RwLock::new(defaults.clone())),
             user: Arc::new(RwLock::new(json!({}))),
             workspace: Arc::new(RwLock::new(json!({}))),
+            folders: Arc::new(RwLock::new(HashMap::new())),
             merged: Arc::new(RwLock::new(defaults)),
             on_did_change: Emitter::new(),
         };
@@ -84,16 +89,73 @@ impl ConfigurationService {
         Ok(())
     }
 
-    /// Query a setting by dot-separated path (e.g. "editor.fontSize").
-    pub fn get<T: DeserializeOwned>(&self, path: &str) -> Option<T> {
-        let guard = self.merged.read();
-        let mut cur = &*guard;
+    /// Load folder-specific settings from JSON or JSONC string for a workspace folder.
+    pub fn load_folder_settings(&self, folder: &Path, content: &str) -> Result<(), String> {
+        let stripped = strip_json_comments(content);
+        let val: Value = serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
+        let mut normalized = json!({});
+        merge_json_values(&mut normalized, &val);
+        self.folders.write().insert(folder.to_path_buf(), normalized);
+        self.on_did_change.fire(ConfigurationChangeEvent {
+            affected_keys: vec!["*".to_string()],
+        });
+        Ok(())
+    }
 
-        for part in path.split('.') {
-            cur = cur.get(part)?;
+    /// Remove folder-specific settings for a workspace folder.
+    pub fn remove_folder_settings(&self, folder: &Path) {
+        if self.folders.write().remove(folder).is_some() {
+            self.on_did_change.fire(ConfigurationChangeEvent {
+                affected_keys: vec!["*".to_string()],
+            });
+        }
+    }
+
+    /// Query a setting by dot-separated path (e.g. "editor.fontSize"), scoped to a resource path.
+    /// Follows hierarchical fallback: folder (longest prefix) <- workspace <- user <- defaults.
+    pub fn get_for_resource<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        resource: Option<&Path>,
+    ) -> Option<T> {
+        let val = self.get_value_for_resource(path, resource)?;
+        serde_json::from_value(val).ok()
+    }
+
+    /// Query raw Value at dot-separated path, scoped to a resource path.
+    pub fn get_value_for_resource(&self, path: &str, resource: Option<&Path>) -> Option<Value> {
+        if let Some(res) = resource {
+            let folders_guard = self.folders.read();
+            let mut matching: Vec<(&PathBuf, &Value)> = folders_guard
+                .iter()
+                .filter(|(folder_path, _)| res.starts_with(folder_path))
+                .collect();
+            // Sort in descending order of path length (deepest prefix first)
+            matching.sort_by_key(|(folder_path, _)| std::cmp::Reverse(folder_path.as_os_str().len()));
+
+            for (_, folder_val) in matching {
+                let mut cur = folder_val;
+                let mut found = true;
+                for part in path.split('.') {
+                    if let Some(next) = cur.get(part) {
+                        cur = next;
+                    } else {
+                        found = false;
+                        break;
+                    }
+                }
+                if found && !cur.is_null() {
+                    return Some(cur.clone());
+                }
+            }
         }
 
-        serde_json::from_value(cur.clone()).ok()
+        self.get_value(path)
+    }
+
+    /// Query a setting by dot-separated path (e.g. "editor.fontSize").
+    pub fn get<T: DeserializeOwned>(&self, path: &str) -> Option<T> {
+        self.get_for_resource(path, None)
     }
 
     /// Query raw Value at dot-separated path.
@@ -300,5 +362,117 @@ mod tests {
         config.load_workspace_settings(ws_settings).unwrap();
         let ws_font_size: u32 = config.get("editor.fontSize").unwrap();
         assert_eq!(ws_font_size, 20);
+    }
+
+    #[test]
+    fn test_per_folder_configuration_hierarchical_fallback() {
+        let config = ConfigurationService::new();
+
+        // 1. Defaults: tabSize is 4
+        assert_eq!(config.get::<u32>("editor.tabSize"), Some(4));
+
+        // 2. User sets tabSize to 8
+        config
+            .load_user_settings(r#"{"editor.tabSize": 8}"#)
+            .unwrap();
+        assert_eq!(config.get::<u32>("editor.tabSize"), Some(8));
+
+        // 3. Workspace sets tabSize to 2
+        config
+            .load_workspace_settings(r#"{"editor.tabSize": 2}"#)
+            .unwrap();
+        assert_eq!(config.get::<u32>("editor.tabSize"), Some(2));
+
+        // 4. Folder A has no override -> inherits workspace (2)
+        let _folder_a = Path::new("/workspace/folder_a");
+        let file_in_a = Path::new("/workspace/folder_a/src/main.rs");
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.tabSize", Some(file_in_a)),
+            Some(2)
+        );
+
+        // 5. Folder B overrides tabSize to 6
+        let folder_b = Path::new("/workspace/folder_b");
+        let file_in_b = Path::new("/workspace/folder_b/src/lib.rs");
+        config
+            .load_folder_settings(folder_b, r#"{"editor.tabSize": 6}"#)
+            .unwrap();
+
+        // Resource in Folder B gets 6
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.tabSize", Some(file_in_b)),
+            Some(6)
+        );
+
+        // Resource in Folder A still gets workspace 2
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.tabSize", Some(file_in_a)),
+            Some(2)
+        );
+
+        // Nested folder C inside B overrides tabSize to 10
+        let folder_c = Path::new("/workspace/folder_b/sub");
+        let file_in_c = Path::new("/workspace/folder_b/sub/test.rs");
+        config
+            .load_folder_settings(folder_c, r#"{"editor.tabSize": 10}"#)
+            .unwrap();
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.tabSize", Some(file_in_c)),
+            Some(10)
+        );
+
+        // Remove folder C override -> falls back to folder B (6)
+        config.remove_folder_settings(folder_c);
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.tabSize", Some(file_in_c)),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn test_nested_folder_fallback_to_parent_folder() {
+        let config = ConfigurationService::new();
+        // Workspace sets editor.fontSize = 20, editor.tabSize = 4
+        config
+            .load_workspace_settings(r#"{"editor.fontSize": 20, "editor.tabSize": 4}"#)
+            .unwrap();
+
+        let parent_folder = Path::new("/workspace");
+        let child_folder = Path::new("/workspace/sub");
+        let file_in_child = Path::new("/workspace/sub/main.rs");
+
+        // Parent folder overrides editor.fontSize = 18 and editor.tabSize = 8
+        config
+            .load_folder_settings(
+                parent_folder,
+                r#"{"editor.fontSize": 18, "editor.tabSize": 8}"#,
+            )
+            .unwrap();
+
+        // Child folder only overrides editor.tabSize = 2, leaving fontSize undefined
+        config
+            .load_folder_settings(child_folder, r#"{"editor.tabSize": 2}"#)
+            .unwrap();
+
+        // 1. Child folder override applies for tabSize (2)
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.tabSize", Some(file_in_child)),
+            Some(2)
+        );
+
+        // 2. Child folder lacks fontSize -> falls back to parent folder (18), NOT workspace (20)
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.fontSize", Some(file_in_child)),
+            Some(18)
+        );
+
+        // 3. Setting missing in both child and parent folders falls back to workspace/defaults
+        config
+            .load_workspace_settings(r#"{"editor.wordWrap": "on"}"#)
+            .unwrap();
+        assert_eq!(
+            config.get_for_resource::<String>("editor.wordWrap", Some(file_in_child)),
+            Some("on".to_string())
+        );
     }
 }

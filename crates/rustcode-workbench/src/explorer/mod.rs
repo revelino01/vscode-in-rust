@@ -5,7 +5,7 @@ use rustcode_platform::render::{
     WorkbenchThemeStyles,
 };
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct FileTreeNode {
@@ -38,10 +38,52 @@ impl FileTreeNode {
             is_expanded: false,
         }
     }
+
+    pub fn from_path(path: PathBuf) -> Self {
+        Self::from_path_with_depth(path, 0, 15)
+    }
+
+    pub fn from_path_with_depth(path: PathBuf, depth: usize, max_depth: usize) -> Self {
+        if path.is_dir() {
+            let mut node = Self::new_dir(path.clone());
+            if depth >= max_depth {
+                return node;
+            }
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                let mut children = Vec::new();
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if crate::search::engine::is_ignored_directory(&name) {
+                        continue;
+                    }
+                    if p.is_dir() {
+                        children.push(Self::from_path_with_depth(p, depth + 1, max_depth));
+                    } else {
+                        children.push(Self::new_file(p));
+                    }
+                }
+                children.sort_by(|a, b| {
+                    if a.is_dir == b.is_dir {
+                        a.name.cmp(&b.name)
+                    } else if a.is_dir {
+                        std::cmp::Ordering::Less
+                    } else {
+                        std::cmp::Ordering::Greater
+                    }
+                });
+                node.children = Some(children);
+            }
+            node
+        } else {
+            Self::new_file(path)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct FileExplorer {
+    pub roots: Vec<FileTreeNode>,
     pub root: Option<FileTreeNode>,
     pub expanded_paths: HashSet<PathBuf>,
     pub selected_path: Option<PathBuf>,
@@ -56,10 +98,40 @@ impl Default for FileExplorer {
 impl FileExplorer {
     pub fn new() -> Self {
         Self {
+            roots: Vec::new(),
             root: None,
             expanded_paths: HashSet::new(),
             selected_path: None,
         }
+    }
+
+    pub fn set_roots(&mut self, roots: Vec<FileTreeNode>) {
+        self.root = roots.first().cloned();
+        self.roots = roots;
+    }
+
+    pub fn add_root(&mut self, root: FileTreeNode) {
+        if !self.roots.iter().any(|r| r.path == root.path) {
+            self.roots.push(root);
+            if self.root.is_none() {
+                self.root = self.roots.first().cloned();
+            }
+        }
+    }
+
+    pub fn remove_root(&mut self, path: &Path) {
+        self.roots.retain(|r| r.path != path);
+        if self.root.as_ref().map(|r| &r.path) == Some(&path.to_path_buf()) {
+            self.root = self.roots.first().cloned();
+        }
+    }
+
+    pub fn sync_from_workspace(&mut self, ws: &crate::workspace::Workspace) {
+        let mut new_roots = Vec::new();
+        for folder in ws.folders() {
+            new_roots.push(FileTreeNode::from_path(folder.path.clone()));
+        }
+        self.set_roots(new_roots);
     }
 
     pub fn toggle_expanded(&mut self, path: &PathBuf) {
@@ -108,7 +180,17 @@ impl FileExplorerView {
 
     pub fn flattened_rows(&self) -> Vec<ExplorerRow> {
         let mut rows = Vec::new();
-        if let Some(root) = &self.model.root {
+        if !self.model.roots.is_empty() {
+            for root in &self.model.roots {
+                Self::flatten_node(
+                    root,
+                    0,
+                    &self.model.expanded_paths,
+                    &self.model.selected_path,
+                    &mut rows,
+                );
+            }
+        } else if let Some(root) = &self.model.root {
             Self::flatten_node(
                 root,
                 0,
@@ -295,5 +377,70 @@ mod tests {
             view.last_action,
             Some(ExplorerAction::OpenFile(PathBuf::from("/workspace/src/main.rs")))
         );
+    }
+
+    #[test]
+    fn test_multi_root_file_explorer() {
+        let mut root1 = FileTreeNode::new_dir(PathBuf::from("/backend"));
+        root1.children = Some(vec![FileTreeNode::new_file(PathBuf::from("/backend/main.rs"))]);
+
+        let mut root2 = FileTreeNode::new_dir(PathBuf::from("/frontend"));
+        root2.children = Some(vec![FileTreeNode::new_file(PathBuf::from("/frontend/index.ts"))]);
+
+        let mut explorer = FileExplorer::new();
+        explorer.set_roots(vec![root1, root2]);
+        explorer.expanded_paths.insert(PathBuf::from("/backend"));
+        explorer.expanded_paths.insert(PathBuf::from("/frontend"));
+
+        let view = FileExplorerView::new(explorer);
+        let rows = view.flattened_rows();
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[0].name, "backend");
+        assert_eq!(rows[1].name, "main.rs");
+        assert_eq!(rows[2].name, "frontend");
+        assert_eq!(rows[3].name, "index.ts");
+    }
+
+    #[test]
+    fn test_file_explorer_recursive_subdirectory_expansion() {
+        let temp_dir = std::env::temp_dir().join(format!("rustcode_explorer_test_{}", uuid::Uuid::new_v4().simple()));
+        let sub_dir = temp_dir.join("src");
+        let nested_dir = sub_dir.join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        let main_file = sub_dir.join("main.rs");
+        let deep_file = nested_dir.join("deep.rs");
+        let root_file = temp_dir.join("Cargo.toml");
+        std::fs::write(&main_file, "fn main() {}\n").unwrap();
+        std::fs::write(&deep_file, "// deep\n").unwrap();
+        std::fs::write(&root_file, "[package]\n").unwrap();
+
+        let root_node = FileTreeNode::from_path(temp_dir.clone());
+        assert!(root_node.is_dir);
+
+        let mut explorer = FileExplorer::new();
+        explorer.set_roots(vec![root_node]);
+        // Expand root and sub_dir, keep nested_dir collapsed
+        explorer.expanded_paths.insert(temp_dir.clone());
+        explorer.expanded_paths.insert(sub_dir.clone());
+
+        let view = FileExplorerView::new(explorer);
+        let rows = view.flattened_rows();
+
+        // Subdirectory and its file must be visible in flattened rows
+        assert!(rows.iter().any(|r| r.name == "src" && r.is_dir));
+        assert!(rows.iter().any(|r| r.name == "main.rs" && !r.is_dir));
+        assert!(rows.iter().any(|r| r.name == "Cargo.toml" && !r.is_dir));
+        assert!(rows.iter().any(|r| r.name == "nested" && r.is_dir));
+        // Deep file should not be visible yet while nested is collapsed
+        assert!(!rows.iter().any(|r| r.name == "deep.rs"));
+
+        // Now expand nested_dir
+        let mut explorer2 = view.model.clone();
+        explorer2.expanded_paths.insert(nested_dir.clone());
+        let view2 = FileExplorerView::new(explorer2);
+        let rows2 = view2.flattened_rows();
+        assert!(rows2.iter().any(|r| r.name == "deep.rs" && !r.is_dir));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

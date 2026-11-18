@@ -80,6 +80,14 @@ impl RustCodeContext {
         store.add_boxed(self.commands.register("editor.action.triggerSuggest", |_| {
             Ok(json!({ "suggest": "triggered" }))
         }));
+
+        store.add_boxed(self.commands.register("editor.action.formatDocument", |_| {
+            Ok(json!({ "formatted": true }))
+        }));
+
+        store.add_boxed(self.commands.register("editor.action.quickFix", |_| {
+            Ok(json!({ "quickFix": true }))
+        }));
     }
 
     /// Instantiate a GPUI WorkbenchWindow host wired to this service container.
@@ -102,6 +110,8 @@ mod tests {
         let app = RustCodeContext::new();
         assert!(app.commands.has_command("workbench.action.toggleSidebar"));
         assert!(app.commands.has_command("editor.action.triggerSuggest"));
+        assert!(app.commands.has_command("editor.action.formatDocument"));
+        assert!(app.commands.has_command("editor.action.quickFix"));
         assert_eq!(app.config.get::<u32>("editor.fontSize"), Some(14));
 
         let window = app.create_window();

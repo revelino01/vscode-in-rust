@@ -484,9 +484,34 @@ impl PieceTable {
         }
     }
 
+    /// Returns the raw byte at the given 0-indexed byte offset, if within buffer bounds.
+    pub fn get_byte(&self, offset: usize) -> Option<u8> {
+        if offset >= self.len() {
+            return None;
+        }
+        let mut pieces = Vec::new();
+        self.collect_pieces(&self.root, &mut pieces);
+        let mut cur_offset = 0;
+        for piece in pieces {
+            let piece_end = cur_offset + piece.length;
+            if offset >= cur_offset && offset < piece_end {
+                let rel = offset - cur_offset;
+                let b = match piece.source {
+                    PieceSource::Original => self.original.as_bytes()[piece.start + rel],
+                    PieceSource::Add => self.add_buffer.as_bytes()[piece.start + rel],
+                };
+                return Some(b);
+            }
+            cur_offset = piece_end;
+        }
+        None
+    }
+
     /// Convert a 0-indexed byte offset to (line, column) Position.
+    /// The returned column is in UTF-16 code units (per LSP protocol specification).
     pub fn offset_to_position(&self, offset: usize) -> (usize, usize) {
         let offset = std::cmp::min(offset, self.len());
+        let offset = self.floor_char_boundary(offset);
         let mut pieces = Vec::new();
         self.collect_pieces(&self.root, &mut pieces);
 
@@ -503,7 +528,11 @@ impl PieceTable {
             for (idx, b) in slice.bytes().enumerate() {
                 let abs_pos = cur_offset + idx;
                 if abs_pos >= offset {
-                    let col = abs_pos - last_newline_offset;
+                    let mut line_prefix = self.get_range(last_newline_offset, offset);
+                    if line_prefix.ends_with('\r') {
+                        line_prefix.pop();
+                    }
+                    let col = line_prefix.chars().map(|c| c.len_utf16()).sum();
                     return (cur_line, col);
                 }
                 if b == b'\n' {
@@ -514,30 +543,33 @@ impl PieceTable {
             cur_offset += piece.length;
         }
 
-        let col = offset - last_newline_offset;
+        let mut line_prefix = self.get_range(last_newline_offset, offset);
+        if line_prefix.ends_with('\r') {
+            line_prefix.pop();
+        }
+        let col = line_prefix.chars().map(|c| c.len_utf16()).sum();
         (cur_line, col)
     }
 
     /// Convert (line, column) Position to 0-indexed byte offset.
+    /// `col` represents character offset in UTF-16 code units (per LSP protocol specification).
     pub fn position_to_offset(&self, line: usize, col: usize) -> usize {
         match self.get_line_offsets(line) {
             Some((start, end)) => {
-                let content_end = if end > start {
-                    let end_str = self.get_range(end.saturating_sub(1), end);
-                    if end_str == "\n" {
-                        let prev_str = if end >= 2 { self.get_range(end - 2, end - 1) } else { String::new() };
-                        if prev_str == "\r" {
-                            end - 2
-                        } else {
-                            end - 1
-                        }
-                    } else {
-                        end
-                    }
+                if start >= end {
+                    return start;
+                }
+                let line_str = self.get_range(start, end);
+                let content_str = if line_str.ends_with("\r\n") {
+                    &line_str[..line_str.len() - 2]
+                } else if line_str.ends_with('\n') {
+                    &line_str[..line_str.len() - 1]
                 } else {
-                    end
+                    &line_str[..]
                 };
-                std::cmp::min(start + col, content_end)
+
+                let rel_offset = utf16_col_to_byte_offset(content_str, col);
+                start + rel_offset
             }
             None => self.len(),
         }
@@ -572,6 +604,36 @@ impl fmt::Display for PieceTable {
 
 fn count_line_feeds(s: &str) -> usize {
     s.bytes().filter(|&b| b == b'\n').count()
+}
+
+/// Translate a 0-indexed column in UTF-16 code units to a 0-indexed byte offset within a string slice.
+/// If `col` exceeds the UTF-16 length of `s`, `s.len()` is returned.
+pub fn utf16_col_to_byte_offset(s: &str, col: usize) -> usize {
+    let mut utf16_count = 0;
+    let mut byte_offset = 0;
+
+    for ch in s.chars() {
+        let ch_utf16_len = ch.len_utf16();
+        if utf16_count + ch_utf16_len > col {
+            break;
+        }
+        utf16_count += ch_utf16_len;
+        byte_offset += ch.len_utf8();
+    }
+
+    byte_offset
+}
+
+/// Translate a 0-indexed byte offset to a 0-indexed column in UTF-16 code units within a string slice.
+/// If `byte_offset` exceeds `s.len()`, it is clamped to `s.len()`.
+/// If `byte_offset` falls within a multi-byte character, it is floored to that character's start.
+pub fn byte_offset_to_utf16_col(s: &str, byte_offset: usize) -> usize {
+    let byte_offset = std::cmp::min(byte_offset, s.len());
+    let mut aligned = byte_offset;
+    while aligned > 0 && !s.is_char_boundary(aligned) {
+        aligned -= 1;
+    }
+    s[..aligned].chars().map(|c| c.len_utf16()).sum()
 }
 
 #[cfg(test)]
@@ -693,5 +755,82 @@ mod tests {
         assert_eq!(table.next_char_boundary(1), 5);
         assert_eq!(table.next_char_boundary(5), 6);
         assert_eq!(table.next_char_boundary(6), 6);
+    }
+
+    #[test]
+    fn test_piece_table_multibyte_no_trailing_newline_no_panic() {
+        let table = PieceTable::from_str("Hello 🦀");
+        assert_eq!(table.len(), 10);
+        assert_eq!(table.line_count(), 1);
+
+        // Verify position_to_offset never panics on multi-byte characters at EOF without newline
+        assert_eq!(table.position_to_offset(0, 0), 0);
+        assert_eq!(table.position_to_offset(0, 5), 5); // after 'Hello'
+        assert_eq!(table.position_to_offset(0, 6), 6); // before '🦀'
+        assert_eq!(table.position_to_offset(0, 7), 6); // inside '🦀' (floored to char start)
+        assert_eq!(table.position_to_offset(0, 8), 10); // after '🦀'
+        assert_eq!(table.position_to_offset(0, 100), 10); // clamped at content end
+
+        // Verify offset_to_position translates UTF-8 bytes to UTF-16 columns
+        assert_eq!(table.offset_to_position(0), (0, 0));
+        assert_eq!(table.offset_to_position(6), (0, 6));
+        assert_eq!(table.offset_to_position(10), (0, 8));
+
+        // Test with accented character at EOF
+        let table_accent = PieceTable::from_str("abc é");
+        assert_eq!(table_accent.len(), 6);
+        assert_eq!(table_accent.position_to_offset(0, 0), 0);
+        assert_eq!(table_accent.position_to_offset(0, 4), 4);
+        assert_eq!(table_accent.position_to_offset(0, 5), 6);
+        assert_eq!(table_accent.offset_to_position(6), (0, 5));
+    }
+
+    #[test]
+    fn test_piece_table_multibyte_with_trailing_newline_no_panic() {
+        let table = PieceTable::from_str("Hello 🦀\n");
+        assert_eq!(table.len(), 11);
+        assert_eq!(table.line_count(), 2);
+
+        // Verify position_to_offset never panics on multi-byte char preceded by newline
+        assert_eq!(table.position_to_offset(0, 0), 0);
+        assert_eq!(table.position_to_offset(0, 6), 6); // before '🦀'
+        assert_eq!(table.position_to_offset(0, 7), 6); // inside '🦀'
+        assert_eq!(table.position_to_offset(0, 8), 10); // after '🦀' (before '\n')
+        assert_eq!(table.position_to_offset(0, 100), 10); // clamped before '\n'
+
+        // Line 1 is empty line after '\n'
+        assert_eq!(table.position_to_offset(1, 0), 11);
+        assert_eq!(table.position_to_offset(1, 5), 11);
+
+        assert_eq!(table.offset_to_position(10), (0, 8));
+        assert_eq!(table.offset_to_position(11), (1, 0));
+
+        // Test with CRLF
+        let table_crlf = PieceTable::from_str("Hello 🦀\r\nworld");
+        assert_eq!(table_crlf.position_to_offset(0, 8), 10); // before \r\n
+        assert_eq!(table_crlf.position_to_offset(1, 0), 12);
+        assert_eq!(table_crlf.offset_to_position(10), (0, 8));
+        assert_eq!(table_crlf.offset_to_position(12), (1, 0));
+    }
+
+    #[test]
+    fn test_piece_table_cjk_and_surrogate_utf16_mapping() {
+        // Line containing emoji and ASCII
+        let table = PieceTable::from_str("let s = \"🦀abc\";\n");
+        assert_eq!(table.position_to_offset(0, 9), 9);   // before '🦀'
+        assert_eq!(table.position_to_offset(0, 11), 13); // after '🦀' = start of "abc"
+        assert_eq!(table.position_to_offset(0, 14), 16); // after "abc" = start of '";'
+
+        assert_eq!(table.offset_to_position(9), (0, 9));
+        assert_eq!(table.offset_to_position(13), (0, 11));
+        assert_eq!(table.offset_to_position(16), (0, 14));
+
+        // Line containing CJK characters: 3 bytes each in UTF-8, 1 UTF-16 code unit
+        let cjk_table = PieceTable::from_str("let msg = \"你好世界!\";\n");
+        // "let msg = \"" is 11 ASCII chars
+        assert_eq!(cjk_table.position_to_offset(0, 11), 11);
+        // "你好世界" is 4 characters (4 UTF-16 code units, 12 UTF-8 bytes)
+        assert_eq!(cjk_table.position_to_offset(0, 15), 11 + 12); // = 23 (before '!')
+        assert_eq!(cjk_table.offset_to_position(23), (0, 15));
     }
 }

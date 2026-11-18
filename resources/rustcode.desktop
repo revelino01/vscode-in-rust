@@ -1,0 +1,16 @@
+[Desktop Entry]
+Name=RustCode
+Comment=High-Performance Rust Rewrite of Visual Studio Code
+GenericName=Text Editor
+Exec=rustcode %F
+Icon=rustcode
+Type=Application
+StartupNotify=true
+StartupWMClass=rustcode
+Categories=Development;TextEditor;IDE;
+MimeType=text/plain;inode/directory;
+Actions=new-window;
+
+[Desktop Action new-window]
+Name=New Empty Window
+Exec=rustcode --new-window

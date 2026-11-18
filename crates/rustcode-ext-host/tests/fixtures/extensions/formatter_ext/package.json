@@ -1,0 +1,27 @@
+{
+  "name": "rust-formatter-ext",
+  "displayName": "Rust Formatting Provider Extension",
+  "publisher": "rustcode",
+  "version": "1.0.0",
+  "description": "Provides document formatting for Rust files",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:rust"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "rust",
+        "extensions": [".rs"],
+        "aliases": ["Rust", "rust"]
+      }
+    ],
+    "commands": [
+      {
+        "command": "rustFormatter.formatDocument",
+        "title": "Format Document with RustFmt",
+        "category": "Rust"
+      }
+    ]
+  }
+}

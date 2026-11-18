@@ -252,7 +252,7 @@ fn test_end_to_end_gpui_presentation_layer() {
     editor.set_primary_position(rustcode_editor::cursor::Position::new(0, 0));
     editor.insert_text("🚀");
     assert!(editor.text().starts_with("🚀fn main()"));
-    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 4));
+    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 2));
 
     // Delete backwards removes emoji completely
     editor.delete_backwards();
@@ -262,7 +262,7 @@ fn test_end_to_end_gpui_presentation_layer() {
     // Undo restores emoji and cursor position
     assert!(editor.undo());
     assert!(editor.text().starts_with("🚀fn main()"));
-    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 4));
+    assert_eq!(editor.primary_position(), rustcode_editor::cursor::Position::new(0, 2));
 
     // Redo reverts to deleted state
     assert!(editor.redo());
@@ -1123,6 +1123,139 @@ fn test_end_to_end_webview_host_integration() {
     assert_eq!(
         webview_view.nodes[1].kind,
         WebviewElementKind::Paragraph("Nested paragraph with & entity.".to_string())
+    );
+}
+
+#[tokio::test]
+async fn test_end_to_end_formatting_and_code_actions_integration() {
+    use rustcode_app::RustCodeContext;
+    use rustcode_ext_host::provider::{ProviderRegistration, ProviderRegistry, ProviderType};
+    use rustcode_ext_host::rpc::RpcBridge;
+    use rustcode_protocols::lsp::LspClientManager;
+    use std::sync::Arc;
+
+    let app = RustCodeContext::new();
+    assert!(app.commands.has_command("editor.action.formatDocument"));
+    assert!(app.commands.has_command("editor.action.quickFix"));
+
+    let reg = Arc::new(ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp_mgr = Arc::new(LspClientManager::new());
+
+    reg.register(ProviderRegistration {
+        id: "rust-fmt".to_string(),
+        provider_type: ProviderType::DocumentFormatting,
+        language_selector: Some("rust".to_string()),
+    });
+
+    reg.register(ProviderRegistration {
+        id: "rust-actions".to_string(),
+        provider_type: ProviderType::CodeAction,
+        language_selector: Some("rust".to_string()),
+    });
+
+    let bridge = Arc::new(rustcode_ext_host::LanguageFeatureBridge::new(
+        reg,
+        rpc.clone(),
+        lsp_mgr,
+    ));
+
+    let mut window = app.create_window().with_language_bridge(bridge);
+    window.open_file(
+        "file:///test_e2e.rs",
+        "test_e2e.rs",
+        "fn main(){\nlet a=1;\nlet b=2;\n}\n",
+        false,
+    );
+
+    // 1. Formatting
+    let rpc_fmt = rpc.clone();
+    tokio::spawn(async move {
+        rpc_fmt.handle_incoming_response(
+            1,
+            Some(serde_json::json!([
+                {
+                    "range": {
+                        "start": { "line": 0, "character": 9 },
+                        "end": { "line": 0, "character": 10 }
+                    },
+                    "newText": " {"
+                },
+                {
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end": { "line": 1, "character": 8 }
+                    },
+                    "newText": "    let a = 1;"
+                },
+                {
+                    "range": {
+                        "start": { "line": 2, "character": 0 },
+                        "end": { "line": 2, "character": 8 }
+                    },
+                    "newText": "    let b = 2;"
+                }
+            ])),
+            None,
+        );
+    });
+
+    assert!(window.format_active_document().await);
+    assert_eq!(
+        window.view.editor_area.editors.get("file:///test_e2e.rs").unwrap().text(),
+        "fn main() {\n    let a = 1;\n    let b = 2;\n}\n"
+    );
+
+    // Verify undo restores original
+    assert!(window.view.editor_area.editors.get_mut("file:///test_e2e.rs").unwrap().undo());
+    assert_eq!(
+        window.view.editor_area.editors.get("file:///test_e2e.rs").unwrap().text(),
+        "fn main(){\nlet a=1;\nlet b=2;\n}\n"
+    );
+
+    // Redo restores formatted
+    assert!(window.view.editor_area.editors.get_mut("file:///test_e2e.rs").unwrap().redo());
+    assert_eq!(
+        window.view.editor_area.editors.get("file:///test_e2e.rs").unwrap().text(),
+        "fn main() {\n    let a = 1;\n    let b = 2;\n}\n"
+    );
+
+    // 2. Code Action
+    let rpc_action = rpc.clone();
+    tokio::spawn(async move {
+        rpc_action.handle_incoming_response(
+            2,
+            Some(serde_json::json!([
+                {
+                    "title": "Rename variable a to val_a",
+                    "kind": "quickfix",
+                    "edit": {
+                        "changes": {
+                            "file:///test_e2e.rs": [
+                                {
+                                    "range": {
+                                        "start": { "line": 1, "character": 8 },
+                                        "end": { "line": 1, "character": 9 }
+                                    },
+                                    "newText": "val_a"
+                                }
+                            ]
+                        }
+                    }
+                }
+            ])),
+            None,
+        );
+    });
+
+    assert!(window.show_quick_fixes().await);
+    assert!(window.view.is_command_palette_open);
+    assert_eq!(window.pending_code_actions.len(), 1);
+
+    assert!(window.apply_code_action_by_index(0));
+    assert_eq!(
+        window.view.editor_area.editors.get("file:///test_e2e.rs").unwrap().text(),
+        "fn main() {\n    let val_a = 1;\n    let b = 2;\n}\n"
     );
 }
 

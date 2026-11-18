@@ -305,6 +305,115 @@ class SnippetString {
   }
 }
 
+class TextEdit {
+  constructor(range, newText) {
+    this.range = range;
+    this.newText = newText;
+  }
+
+  static replace(range, newText) {
+    return new TextEdit(range, newText);
+  }
+
+  static insert(position, newText) {
+    return new TextEdit(new Range(position, position), newText);
+  }
+
+  static delete(range) {
+    return new TextEdit(range, '');
+  }
+}
+
+class WorkspaceEdit {
+  constructor() {
+    this._changes = new Map();
+  }
+
+  set(uri, edits) {
+    const key = uri.toString();
+    this._changes.set(key, (edits || []).slice());
+  }
+
+  get(uri) {
+    const key = uri.toString();
+    return this._changes.get(key) || [];
+  }
+
+  has(uri) {
+    const key = uri.toString();
+    return this._changes.has(key);
+  }
+
+  replace(uri, range, newText) {
+    const edit = TextEdit.replace(range, newText);
+    const edits = this.get(uri);
+    edits.push(edit);
+    this.set(uri, edits);
+  }
+
+  insert(uri, position, newText) {
+    const edit = TextEdit.insert(position, newText);
+    const edits = this.get(uri);
+    edits.push(edit);
+    this.set(uri, edits);
+  }
+
+  delete(uri, range) {
+    const edit = TextEdit.delete(range);
+    const edits = this.get(uri);
+    edits.push(edit);
+    this.set(uri, edits);
+  }
+
+  entries() {
+    return Array.from(this._changes.entries()).map(([k, edits]) => [Uri.parse(k), edits]);
+  }
+
+  get size() {
+    let count = 0;
+    for (const edits of this._changes.values()) {
+      count += edits.length;
+    }
+    return count;
+  }
+
+  toJSON() {
+    const changes = {};
+    for (const [uri, edits] of this._changes.entries()) {
+      changes[uri] = edits;
+    }
+    return { changes };
+  }
+}
+
+const CodeActionKind = {
+  Empty: '',
+  QuickFix: 'quickfix',
+  Refactor: 'refactor',
+  RefactorExtract: 'refactor.extract',
+  RefactorInline: 'refactor.inline',
+  RefactorRewrite: 'refactor.rewrite',
+  Source: 'source',
+  SourceOrganizeImports: 'source.organizeImports',
+  SourceFixAll: 'source.fixAll',
+};
+
+const CodeActionTriggerKind = {
+  Invoke: 1,
+  Automatic: 2,
+};
+
+class CodeAction {
+  constructor(title, kind) {
+    this.title = title;
+    this.kind = kind;
+    this.diagnostics = [];
+    this.isPreferred = false;
+    this.edit = undefined;
+    this.command = undefined;
+  }
+}
+
 module.exports = {
   Position,
   Range,
@@ -322,4 +431,9 @@ module.exports = {
   ThemeColor,
   ThemeIcon,
   SnippetString,
+  TextEdit,
+  WorkspaceEdit,
+  CodeActionKind,
+  CodeActionTriggerKind,
+  CodeAction,
 };

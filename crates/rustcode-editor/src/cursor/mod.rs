@@ -31,6 +31,21 @@ impl Range {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RangeEdit {
+    pub range: Range,
+    pub new_text: String,
+}
+
+impl RangeEdit {
+    pub fn new(range: Range, new_text: impl Into<String>) -> Self {
+        Self {
+            range,
+            new_text: new_text.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Selection {
     pub anchor: Position,
     pub active: Position,

@@ -1,0 +1,29 @@
+{
+  "name": "project-outline-ext",
+  "displayName": "Project Outline Tree View Extension",
+  "publisher": "rustcode",
+  "version": "1.0.0",
+  "description": "Custom hierarchical project outline tree view provider",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onView:projectOutlineView"
+  ],
+  "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "id": "projectOutlineView",
+          "name": "Project Outline",
+          "when": "workspaceHasProjects"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "projectOutline.refresh",
+        "title": "Refresh Outline",
+        "category": "Outline"
+      }
+    ]
+  }
+}

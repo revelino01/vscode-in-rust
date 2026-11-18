@@ -98,10 +98,43 @@ const rpc = {
     };
   },
 
+  // Handle incoming request dispatched from Rust Core
+  async handleIncomingRequest(method, params = {}) {
+    if (method === 'languages.provideDocumentFormattingEdits' || method === 'DocumentFormatting.provideDocumentFormattingEdits') {
+      const { providerId, uri, options } = params;
+      return await this.invokeProvider('DocumentFormatting', providerId, 'provideDocumentFormattingEdits', uri, options);
+    }
+    if (method === 'languages.provideCodeActions' || method === 'CodeAction.provideCodeActions') {
+      const { providerId, uri, range, context } = params;
+      return await this.invokeProvider('CodeAction', providerId, 'provideCodeActions', uri, range, context);
+    }
+    if (method === 'languages.provideCompletionItems') {
+      const { providerId, uri, position, triggerCharacter } = params;
+      return await this.invokeProvider('Completion', providerId, 'provideCompletionItems', uri, position, triggerCharacter);
+    }
+    if (method === 'languages.provideHover') {
+      const { providerId, uri, position } = params;
+      return await this.invokeProvider('Hover', providerId, 'provideHover', uri, position);
+    }
+    if (method === 'languages.provideDefinition') {
+      const { providerId, uri, position } = params;
+      return await this.invokeProvider('Definition', providerId, 'provideDefinition', uri, position);
+    }
+    throw new Error(`Unknown incoming method: ${method}`);
+  },
+
   // Invoke a method on a registered provider proxy (called from Rust Core)
   async invokeProvider(type, id, method, ...args) {
-    const key = `${type}:${id}`;
-    const proxy = objectProxies.get(key);
+    let key = `${type}:${id}`;
+    let proxy = objectProxies.get(key);
+    if (!proxy) {
+      for (const [k, p] of objectProxies.entries()) {
+        if (k.endsWith(`:${id}`) || k === id) {
+          proxy = p;
+          break;
+        }
+      }
+    }
     if (!proxy || !proxy.provider) {
       throw new Error(`Provider not found: ${key}`);
     }

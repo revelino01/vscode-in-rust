@@ -1,0 +1,35 @@
+{
+  "name": "Oceanic Next",
+  "type": "dark",
+  "colors": {
+    "editor.background": "#1b2b34",
+    "editor.foreground": "#d8dee9",
+    "activityBar.background": "#16252b",
+    "sideBar.background": "#1b2b34",
+    "statusBar.background": "#1b2b34",
+    "statusBar.foreground": "#ffffff"
+  },
+  "tokenColors": [
+    {
+      "name": "Keywords",
+      "scope": "keyword, storage.type",
+      "settings": {
+        "foreground": "#c594c5"
+      }
+    },
+    {
+      "name": "Strings",
+      "scope": "string",
+      "settings": {
+        "foreground": "#99c794"
+      }
+    },
+    {
+      "name": "Functions",
+      "scope": "entity.name.function",
+      "settings": {
+        "foreground": "#6699cc"
+      }
+    }
+  ]
+}

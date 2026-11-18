@@ -1,7 +1,7 @@
 //! GPUI EditorView component rendering text lines, line numbers, cursor, selections, and routing input.
 
 use crate::completion::{AutocompleteWidget, CompletionItem, CompletionItemKind};
-use crate::cursor::{CursorState, Position};
+use crate::cursor::{CursorState, Position, RangeEdit};
 use crate::document::TextDocument;
 use crate::model::piece_table::PieceTable;
 use crate::model::undo_redo::{TextEdit, UndoRedoStack};
@@ -538,9 +538,15 @@ impl EditorView {
             let target_line = pos.line - 1;
             let buf = self.buffer.read();
             let content = buf.get_line_content(target_line).unwrap_or_default();
-            let mut target_col = pos.column.min(content.len());
-            while target_col > 0 && !content.is_char_boundary(target_col) {
-                target_col -= 1;
+            let mut target_col = 0;
+            let mut utf16_count = 0;
+            for ch in content.chars() {
+                let ch_utf16 = ch.len_utf16();
+                if utf16_count + ch_utf16 > pos.column {
+                    break;
+                }
+                utf16_count += ch_utf16;
+                target_col = utf16_count;
             }
             let target = Position::new(target_line, target_col);
             if select {
@@ -558,9 +564,15 @@ impl EditorView {
         if pos.line + 1 < line_count {
             let target_line = pos.line + 1;
             let content = buf.get_line_content(target_line).unwrap_or_default();
-            let mut target_col = pos.column.min(content.len());
-            while target_col > 0 && !content.is_char_boundary(target_col) {
-                target_col -= 1;
+            let mut target_col = 0;
+            let mut utf16_count = 0;
+            for ch in content.chars() {
+                let ch_utf16 = ch.len_utf16();
+                if utf16_count + ch_utf16 > pos.column {
+                    break;
+                }
+                utf16_count += ch_utf16;
+                target_col = utf16_count;
             }
             let target = Position::new(target_line, target_col);
             if select {
@@ -587,7 +599,7 @@ impl EditorView {
             .buffer
             .read()
             .get_line_content(pos.line)
-            .map_or(0, |l| l.len());
+            .map_or(0, |l| l.chars().map(|c| c.len_utf16()).sum());
         let target = Position::new(pos.line, line_len);
         if select {
             self.cursor_state.primary_mut().active = target;
@@ -634,6 +646,66 @@ impl EditorView {
         }
     }
 
+    pub fn apply_text_edits(&mut self, edits: &[RangeEdit]) -> bool {
+        if edits.is_empty() {
+            return false;
+        }
+
+        let mut offset_edits = Vec::with_capacity(edits.len());
+        {
+            let buf = self.buffer.read();
+            for edit in edits {
+                let s = buf.position_to_offset(edit.range.start.line, edit.range.start.column);
+                let e = buf.position_to_offset(edit.range.end.line, edit.range.end.column);
+                let (start_offset, end_offset) = if s <= e { (s, e) } else { (e, s) };
+                offset_edits.push((start_offset, end_offset, edit.new_text.clone()));
+            }
+        }
+
+        // Sort descending by start offset, then descending by end offset
+        offset_edits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+        self.undo_stack.begin_group();
+        {
+            let mut buf = self.buffer.write();
+            for (start_offset, end_offset, new_text) in offset_edits {
+                let del_len = end_offset.saturating_sub(start_offset);
+                let deleted_text = if del_len > 0 {
+                    buf.delete(start_offset, del_len)
+                } else {
+                    String::new()
+                };
+
+                if !new_text.is_empty() {
+                    buf.insert(start_offset, &new_text);
+                }
+
+                self.undo_stack.push_edit(TextEdit::replace(
+                    start_offset,
+                    &deleted_text,
+                    &new_text,
+                ));
+            }
+        }
+        self.undo_stack.end_group();
+
+        let (new_line, new_col) = {
+            let buf = self.buffer.read();
+            let primary = self.primary_position();
+            let offset = buf.position_to_offset(primary.line, primary.column).min(buf.len());
+            buf.offset_to_position(offset)
+        };
+        self.cursor_state.set_primary(Position::new(new_line, new_col));
+
+        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+            sh.invalidate_all();
+        }
+        if let Some(doc) = &self.document {
+            doc.write().mark_edited();
+        }
+
+        true
+    }
 }
 
 impl View for EditorView {
@@ -767,12 +839,24 @@ impl View for EditorView {
                     };
 
                     if line_idx >= min_pos.line && line_idx <= max_pos.line {
+                        let line_utf16_len: usize = line_content.chars().map(|c| c.len_utf16()).sum();
                         let start_col = if line_idx == min_pos.line { min_pos.column } else { 0 };
-                        let end_col = if line_idx == max_pos.line { max_pos.column } else { line_content.len() };
+                        let end_col = if line_idx == max_pos.line { max_pos.column } else { line_utf16_len };
 
                         if end_col > start_col {
-                            let start_visual = line_content[..start_col.min(line_content.len())].chars().count();
-                            let end_visual = line_content[..end_col.min(line_content.len())].chars().count();
+                            let mut start_visual = 0;
+                            let mut end_visual = 0;
+                            let mut utf16_count = 0;
+                            for ch in line_content.chars() {
+                                let ch_utf16 = ch.len_utf16();
+                                if utf16_count + ch_utf16 <= start_col {
+                                    start_visual += 1;
+                                }
+                                if utf16_count + ch_utf16 <= end_col {
+                                    end_visual += 1;
+                                }
+                                utf16_count += ch_utf16;
+                            }
                             let sel_x = text_area_x + (start_visual as f32 - self.scroll_left) * font.char_width;
                             let sel_w = ((end_visual - start_visual) as f32 * font.char_width).max(4.0);
                             let sel_rect = Rect::from_xywh(sel_x, line_y, sel_w, font.line_height);
@@ -886,23 +970,15 @@ impl View for EditorView {
                 } else {
                     0
                 };
+                let line_utf16_len: usize = line_content.chars().map(|c| c.len_utf16()).sum();
                 let end_col = if line_idx == diag.range.end.line {
                     diag.range.end.column
                 } else {
-                    line_content.len()
-                };
-                let safe_start = safe_char_boundary(&line_content, start_col);
-                let safe_end = {
-                    let end_aligned = safe_char_boundary(&line_content, end_col);
-                    if end_aligned <= safe_start {
-                        next_char_boundary(&line_content, safe_start)
-                    } else {
-                        end_aligned
-                    }
+                    line_utf16_len
                 };
 
-                let start_vis = line_content[..safe_start].chars().count();
-                let end_vis = line_content[..safe_end.min(line_content.len())].chars().count().max(start_vis + 1);
+                let start_vis = utf16_col_to_char_count(&line_content, start_col);
+                let end_vis = utf16_col_to_char_count(&line_content, end_col).max(start_vis + 1);
 
                 let sq_x = text_area_x + (start_vis as f32 - self.scroll_left) * font.char_width;
                 let sq_w = ((end_vis - start_vis) as f32 * font.char_width).max(4.0);
@@ -922,8 +998,7 @@ impl View for EditorView {
             if self.is_focused {
                 for sel in &self.cursor_state.selections {
                     if sel.active.line == line_idx {
-                        let safe_col = safe_char_boundary(&line_content, sel.active.column);
-                        let visual_col = line_content[..safe_col].chars().count();
+                        let visual_col = utf16_col_to_char_count(&line_content, sel.active.column);
                         let cursor_x = text_area_x
                             + (visual_col as f32 - self.scroll_left) * font.char_width;
                         let cursor_rect =
@@ -938,8 +1013,7 @@ impl View for EditorView {
         if self.autocomplete.is_visible {
             let buf = self.buffer.read();
             let line_content = buf.get_line_content(primary_pos.line).unwrap_or_default();
-            let safe_col = safe_char_boundary(&line_content, primary_pos.column);
-            let visual_col = line_content[..safe_col].chars().count();
+            let visual_col = utf16_col_to_char_count(&line_content, primary_pos.column);
             let cursor_x = text_area_x + (visual_col as f32 - self.scroll_left) * font.char_width;
             let cursor_y = bounds.min_y() + (primary_pos.line as f32 - self.scroll_top) * font.line_height;
             drop(buf);
@@ -1072,11 +1146,7 @@ impl View for EditorView {
                     let line_content = buf.get_line_content(line_idx).unwrap_or_default();
                     let total_chars = line_content.chars().count();
                     let char_idx = clicked_char_col.min(total_chars);
-                    let col = if char_idx >= total_chars {
-                        line_content.len()
-                    } else {
-                        line_content.char_indices().nth(char_idx).map_or(line_content.len(), |(b, _)| b)
-                    };
+                    let col: usize = line_content.chars().take(char_idx).map(|c| c.len_utf16()).sum();
 
                     let target = Position::new(line_idx, col);
                     if mouse.modifiers.shift {
@@ -1095,7 +1165,7 @@ impl View for EditorView {
                             .floor()
                             .max(0.0) as usize)
                             .min(count.saturating_sub(1));
-                        let len = buf.get_line_content(idx).map_or(0, |l| l.len());
+                        let len = buf.get_line_content(idx).map_or(0, |l| l.chars().map(|c| c.len_utf16()).sum());
                         (count, len)
                     };
                     let clicked_line = ((mouse.position.y - bounds.min_y()) / font.line_height
@@ -1148,7 +1218,7 @@ impl View for EditorView {
                         let buf = self.buffer.read();
                         let line_count = buf.line_count();
                         let last_line = line_count.saturating_sub(1);
-                        let last_col = buf.get_line_content(last_line).map_or(0, |l| l.len());
+                        let last_col = buf.get_line_content(last_line).map_or(0, |l| l.chars().map(|c| c.len_utf16()).sum());
                         self.cursor_state.primary_mut().anchor = Position::new(0, 0);
                         self.cursor_state.primary_mut().active = Position::new(last_line, last_col);
                         return EventResult::Consumed;
@@ -1184,17 +1254,16 @@ impl View for EditorView {
                             } else {
                                 let buf = self.buffer.read();
                                 if let Some(content) = buf.get_line_content(new_pos.line) {
-                                    let start = trigger_pos.column.min(content.len());
-                                    let end = new_pos.column.min(content.len());
-                                    let prefix = if end >= start
-                                        && content.is_char_boundary(start)
-                                        && content.is_char_boundary(end)
-                                    {
-                                        &content[start..end]
-                                    } else {
-                                        ""
-                                    };
-                                    self.autocomplete.update_filter(prefix);
+                                    let mut prefix = String::new();
+                                    let mut utf16_count = 0;
+                                    for ch in content.chars() {
+                                        let ch_utf16 = ch.len_utf16();
+                                        if utf16_count >= trigger_pos.column && utf16_count < new_pos.column {
+                                            prefix.push(ch);
+                                        }
+                                        utf16_count += ch_utf16;
+                                    }
+                                    self.autocomplete.update_filter(&prefix);
                                 }
                             }
                             return EventResult::Consumed;
@@ -1217,17 +1286,16 @@ impl View for EditorView {
                                 let trigger_pos = self.autocomplete.trigger_position;
                                 let buf = self.buffer.read();
                                 if let Some(content) = buf.get_line_content(new_pos.line) {
-                                    let start = trigger_pos.column.min(content.len());
-                                    let end = new_pos.column.min(content.len());
-                                    let prefix = if end >= start
-                                        && content.is_char_boundary(start)
-                                        && content.is_char_boundary(end)
-                                    {
-                                        &content[start..end]
-                                    } else {
-                                        ""
-                                    };
-                                    self.autocomplete.update_filter(prefix);
+                                    let mut prefix = String::new();
+                                    let mut utf16_count = 0;
+                                    for ch in content.chars() {
+                                        let ch_utf16 = ch.len_utf16();
+                                        if utf16_count >= trigger_pos.column && utf16_count < new_pos.column {
+                                            prefix.push(ch);
+                                        }
+                                        utf16_count += ch_utf16;
+                                    }
+                                    self.autocomplete.update_filter(&prefix);
                                 }
                             }
                             return EventResult::Consumed;
@@ -1341,11 +1409,7 @@ impl View for EditorView {
                         let line_content = buf.get_line_content(line).unwrap_or_default();
                         let total_chars = line_content.chars().count();
                         let char_idx = char_col.min(total_chars);
-                        let col = if char_idx >= total_chars {
-                            line_content.len()
-                        } else {
-                            line_content.char_indices().nth(char_idx).map_or(line_content.len(), |(b, _)| b)
-                        };
+                        let col: usize = line_content.chars().take(char_idx).map(|c| c.len_utf16()).sum();
                         drop(buf);
 
                         let pos = Position::new(line, col);
@@ -1371,26 +1435,20 @@ impl View for EditorView {
     }
 }
 
-fn safe_char_boundary(s: &str, mut idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
+fn utf16_col_to_char_count(s: &str, col: usize) -> usize {
+    let mut count = 0;
+    let mut utf16_count = 0;
+    for ch in s.chars() {
+        let ch_utf16 = ch.len_utf16();
+        if utf16_count + ch_utf16 > col {
+            break;
+        }
+        utf16_count += ch_utf16;
+        count += 1;
     }
-    while idx > 0 && !s.is_char_boundary(idx) {
-        idx -= 1;
-    }
-    idx
+    count
 }
 
-fn next_char_boundary(s: &str, mut idx: usize) -> usize {
-    if idx >= s.len() {
-        return s.len();
-    }
-    idx += 1;
-    while idx < s.len() && !s.is_char_boundary(idx) {
-        idx += 1;
-    }
-    idx
-}
 
 fn render_squiggly_wave(scene: &mut Scene, start_x: f32, end_x: f32, y: f32, color: Rgba) {
     if !start_x.is_finite() || !end_x.is_finite() || start_x >= end_x {
@@ -1782,9 +1840,9 @@ mod tests {
         let mut view = EditorView::from_str(content);
         let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
 
-        // Move cursor right past '🦀' (4 bytes)
+        // Move cursor right past '🦀' (2 UTF-16 code units, 4 UTF-8 bytes)
         view.move_cursor_right(false);
-        assert_eq!(view.primary_position(), Position::new(0, 4));
+        assert_eq!(view.primary_position(), Position::new(0, 2));
 
         // Backspace deletes '🦀' cleanly
         let bs_ev = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
@@ -1795,10 +1853,10 @@ mod tests {
         assert_eq!(view.text(), "hello");
         assert_eq!(view.primary_position(), Position::new(0, 0));
 
-        // Undo restores '🦀hello' with cursor at (0, 4)
+        // Undo restores '🦀hello' with cursor at (0, 2)
         assert!(view.undo());
         assert_eq!(view.text(), "🦀hello");
-        assert_eq!(view.primary_position(), Position::new(0, 4));
+        assert_eq!(view.primary_position(), Position::new(0, 2));
 
         // Move to start, then delete forwards
         view.move_cursor_home(false);
@@ -2486,6 +2544,131 @@ mod tests {
         let mut inline_scene = Scene::new();
         diff_view.render(bounds, &theme, &font, &mut inline_scene);
         assert!(!inline_scene.quads().is_empty());
+    }
+
+    #[test]
+    fn test_piece_table_apply_text_edits_multiple_disjoint() {
+        let initial = "fn foo() {\n    let x = 1;\n    let y = 2;\n    x + y\n}\n";
+        let mut view = EditorView::from_str(initial);
+
+        // Multiple edits in arbitrary (ascending) order
+        let edits = vec![
+            RangeEdit::new(Range::new(Position::new(1, 4), Position::new(1, 14)), "let x = 10;"),
+            RangeEdit::new(Range::new(Position::new(2, 4), Position::new(2, 14)), "let y = 20;"),
+            RangeEdit::new(Range::new(Position::new(3, 4), Position::new(3, 9)), "x * y"),
+        ];
+
+        let ok = view.apply_text_edits(&edits);
+        assert!(ok);
+
+        let expected = "fn foo() {\n    let x = 10;\n    let y = 20;\n    x * y\n}\n";
+        assert_eq!(view.text(), expected);
+    }
+
+    #[test]
+    fn test_piece_table_apply_text_edits_whole_document() {
+        let initial = "line1\nline2\nline3\n";
+        let mut view = EditorView::from_str(initial);
+
+        let replacement = "new file content\nformatted perfectly\n";
+        let edits = vec![RangeEdit::new(
+            Range::new(Position::new(0, 0), Position::new(3, 0)),
+            replacement,
+        )];
+
+        let ok = view.apply_text_edits(&edits);
+        assert!(ok);
+        assert_eq!(view.text(), replacement);
+    }
+
+    #[test]
+    fn test_piece_table_formatting_undo_redo_atomic() {
+        let initial = "fn bar(){\nlet a=1;\nlet b=2;\n}\n";
+        let mut view = EditorView::from_str(initial);
+
+        let edits = vec![
+            RangeEdit::new(Range::new(Position::new(0, 8), Position::new(0, 9)), " {"),
+            RangeEdit::new(Range::new(Position::new(1, 0), Position::new(1, 8)), "    let a = 1;"),
+            RangeEdit::new(Range::new(Position::new(2, 0), Position::new(2, 8)), "    let b = 2;"),
+        ];
+
+        assert!(view.apply_text_edits(&edits));
+        let formatted = "fn bar() {\n    let a = 1;\n    let b = 2;\n}\n";
+        assert_eq!(view.text(), formatted);
+
+        // Single undo reverts entire format transaction atomically
+        assert!(view.undo());
+        assert_eq!(view.text(), initial);
+
+        // Single redo restores entire format transaction atomically
+        assert!(view.redo());
+        assert_eq!(view.text(), formatted);
+    }
+
+    #[test]
+    fn test_piece_table_apply_text_edits_multibyte_emoji_lsp_offset() {
+        let initial = "let s = \"🦀abc\";\n";
+        let mut view = EditorView::from_str(initial);
+
+        // In LSP UTF-16 code units:
+        // "let s = \"" is 9 code units.
+        // '🦀' is 2 code units (indices 9..11, 4 UTF-8 bytes 9..13).
+        // "abc" starts at column 11 and ends at column 14 (3 UTF-8 bytes 13..16).
+        let edits = vec![RangeEdit::new(
+            Range::new(Position::new(0, 11), Position::new(0, 14)),
+            "xyz",
+        )];
+
+        assert!(view.apply_text_edits(&edits));
+        let expected = "let s = \"🦀xyz\";\n";
+        assert_eq!(view.text(), expected);
+
+        // Undo atomically restores
+        assert!(view.undo());
+        assert_eq!(view.text(), initial);
+
+        // Redo restores
+        assert!(view.redo());
+        assert_eq!(view.text(), expected);
+    }
+
+    #[test]
+    fn test_piece_table_apply_text_edits_multibyte_no_trailing_newline() {
+        let initial = "Hello 🦀";
+        let mut view = EditorView::from_str(initial);
+
+        // Replace '🦀' at col 6..8 with "World 🚀"
+        let edits = vec![RangeEdit::new(
+            Range::new(Position::new(0, 6), Position::new(0, 8)),
+            "World 🚀",
+        )];
+
+        assert!(view.apply_text_edits(&edits));
+        assert_eq!(view.text(), "Hello World 🚀");
+
+        assert!(view.undo());
+        assert_eq!(view.text(), initial);
+    }
+
+    #[test]
+    fn test_piece_table_apply_text_edits_cjk_lsp_offset() {
+        let initial = "let msg = \"你好世界\";\n";
+        let mut view = EditorView::from_str(initial);
+
+        // "let msg = \"" is 11 ASCII chars.
+        // "你好" is 2 CJK characters = 2 UTF-16 code units (cols 11..13, 6 UTF-8 bytes 11..17).
+        // "世界" is 2 CJK characters = 2 UTF-16 code units (cols 13..15, 6 UTF-8 bytes 17..23).
+        let edits = vec![RangeEdit::new(
+            Range::new(Position::new(0, 13), Position::new(0, 15)),
+            "RustCode 🦀",
+        )];
+
+        assert!(view.apply_text_edits(&edits));
+        let expected = "let msg = \"你好RustCode 🦀\";\n";
+        assert_eq!(view.text(), expected);
+
+        assert!(view.undo());
+        assert_eq!(view.text(), initial);
     }
 }
 

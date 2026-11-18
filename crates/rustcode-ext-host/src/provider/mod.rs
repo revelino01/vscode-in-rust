@@ -2,8 +2,12 @@
 
 pub mod bridge;
 
-pub use bridge::{DiagnosticCollectionManager, LanguageFeatureBridge};
+pub use bridge::{
+    DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, LanguageFeatureBridge,
+    TreeItem, TreeItemCollapsibleState,
+};
 use parking_lot::RwLock;
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +19,23 @@ pub enum ProviderType {
     Definition,
     References,
     DocumentFormatting,
+    CodeAction,
     TreeData,
+}
+
+impl ProviderType {
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        match s {
+            "Completion" => Some(Self::Completion),
+            "Hover" => Some(Self::Hover),
+            "Definition" => Some(Self::Definition),
+            "References" => Some(Self::References),
+            "DocumentFormatting" => Some(Self::DocumentFormatting),
+            "CodeAction" => Some(Self::CodeAction),
+            "TreeData" => Some(Self::TreeData),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

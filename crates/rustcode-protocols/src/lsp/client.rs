@@ -435,6 +435,168 @@ impl LspClient {
             Ok(Vec::new())
         }
     }
+
+    pub async fn formatting(
+        &self,
+        uri: &str,
+        options: FormattingOptions,
+    ) -> Result<Vec<LspTextEdit>, LspError> {
+        let params = DocumentFormattingParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.to_string(),
+            },
+            options,
+        };
+
+        let res = self
+            .send_request("textDocument/formatting", serde_json::to_value(params)?)
+            .await?;
+
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+
+        if let Ok(edits) = serde_json::from_value::<Vec<LspTextEdit>>(res) {
+            Ok(edits)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn code_action(
+        &self,
+        uri: &str,
+        range: LspRange,
+        context: CodeActionContext,
+    ) -> Result<Vec<CodeAction>, LspError> {
+        let params = CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.to_string(),
+            },
+            range,
+            context,
+        };
+
+        let res = self
+            .send_request("textDocument/codeAction", serde_json::to_value(params)?)
+            .await?;
+
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+
+        if let Ok(actions) = serde_json::from_value::<Vec<CodeAction>>(res.clone()) {
+            Ok(actions)
+        } else if let Ok(commands) = serde_json::from_value::<Vec<LspCommand>>(res) {
+            Ok(commands
+                .into_iter()
+                .map(|cmd| CodeAction {
+                    title: cmd.title.clone(),
+                    kind: Some(CodeActionKind::QUICKFIX.to_string()),
+                    diagnostics: None,
+                    is_preferred: None,
+                    edit: None,
+                    command: Some(cmd),
+                })
+                .collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    // --- Symbols & Workspace Folders Routing ---
+
+    pub async fn workspace_symbol(
+        &self,
+        query: &str,
+    ) -> Result<Vec<SymbolInformation>, LspError> {
+        let params = WorkspaceSymbolParams {
+            query: query.to_string(),
+        };
+
+        let res = self
+            .send_request("workspace/symbol", serde_json::to_value(params)?)
+            .await?;
+
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+
+        if let Ok(symbols) = serde_json::from_value::<Vec<SymbolInformation>>(res) {
+            Ok(symbols)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn document_symbol(
+        &self,
+        uri: &str,
+    ) -> Result<Vec<SymbolInformation>, LspError> {
+        let params = DocumentSymbolParams {
+            text_document: TextDocumentIdentifier {
+                uri: uri.to_string(),
+            },
+        };
+
+        let res = self
+            .send_request("textDocument/documentSymbol", serde_json::to_value(params)?)
+            .await?;
+
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+
+        // Response can be Vec<SymbolInformation> or Vec<DocumentSymbol> (hierarchical)
+        if let Ok(infos) = serde_json::from_value::<Vec<SymbolInformation>>(res.clone()) {
+            Ok(infos)
+        } else if let Ok(doc_symbols) = serde_json::from_value::<Vec<DocumentSymbol>>(res) {
+            let mut list = Vec::new();
+            Self::flatten_document_symbols(&doc_symbols, uri, None, &mut list);
+            Ok(list)
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    fn flatten_document_symbols(
+        symbols: &[DocumentSymbol],
+        uri: &str,
+        container_name: Option<String>,
+        acc: &mut Vec<SymbolInformation>,
+    ) {
+        for s in symbols {
+            acc.push(SymbolInformation {
+                name: s.name.clone(),
+                kind: s.kind,
+                tags: s.tags.clone(),
+                deprecated: s.deprecated,
+                location: LspLocation {
+                    uri: uri.to_string(),
+                    range: s.range,
+                },
+                container_name: container_name.clone(),
+            });
+            if let Some(children) = &s.children {
+                Self::flatten_document_symbols(children, uri, Some(s.name.clone()), acc);
+            }
+        }
+    }
+
+    pub async fn did_change_workspace_folders(
+        &self,
+        added: Vec<WorkspaceFolder>,
+        removed: Vec<WorkspaceFolder>,
+    ) -> Result<(), LspError> {
+        let params = DidChangeWorkspaceFoldersParams {
+            event: WorkspaceFoldersChangeEvent { added, removed },
+        };
+        self.send_notification(
+            "workspace/didChangeWorkspaceFolders",
+            serde_json::to_value(params)?,
+        )
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -622,5 +784,90 @@ mod tests {
 
         let res = client.send_request("test/ping", Value::Null).await;
         assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_lsp_client_formatting_and_code_action() {
+        let (client_read, mut server_write) = duplex(4096);
+        let (mut server_read, client_write) = duplex(4096);
+
+        let client = LspClient::from_io(client_read, client_write);
+
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+
+            // 1. Formatting request
+            let msg = read_framed_message(&mut server_read, &mut buf).await.unwrap().unwrap();
+            let req: Value = serde_json::from_slice(&msg).unwrap();
+            assert_eq!(req["method"], "textDocument/formatting");
+            assert_eq!(req["params"]["options"]["tabSize"], 4);
+            let id = req["id"].as_u64().unwrap();
+
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [
+                    {
+                        "range": {
+                            "start": { "line": 0, "character": 0 },
+                            "end": { "line": 0, "character": 5 }
+                        },
+                        "newText": "    "
+                    }
+                ]
+            });
+            write_framed_message(&mut server_write, &serde_json::to_vec(&resp).unwrap()).await.unwrap();
+
+            // 2. Code Action request
+            let msg = read_framed_message(&mut server_read, &mut buf).await.unwrap().unwrap();
+            let req: Value = serde_json::from_slice(&msg).unwrap();
+            assert_eq!(req["method"], "textDocument/codeAction");
+            let id = req["id"].as_u64().unwrap();
+
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": [
+                    {
+                        "title": "Fix typo",
+                        "kind": "quickfix",
+                        "edit": {
+                            "changes": {
+                                "file:///test.rs": [
+                                    {
+                                        "range": {
+                                            "start": { "line": 0, "character": 0 },
+                                            "end": { "line": 0, "character": 4 }
+                                        },
+                                        "newText": "fixed"
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                ]
+            });
+            write_framed_message(&mut server_write, &serde_json::to_vec(&resp).unwrap()).await.unwrap();
+        });
+
+        let edits = client
+            .formatting("file:///test.rs", FormattingOptions::new(4, true))
+            .await
+            .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].new_text, "    ");
+
+        let actions = client
+            .code_action(
+                "file:///test.rs",
+                LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 4)),
+                CodeActionContext::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].title, "Fix typo");
+        assert_eq!(actions[0].kind.as_deref(), Some("quickfix"));
+        assert!(actions[0].edit.is_some());
     }
 }

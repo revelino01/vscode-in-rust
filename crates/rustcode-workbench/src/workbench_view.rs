@@ -10,7 +10,9 @@ use crate::layout::WorkbenchLayout;
 use crate::problems::{ProblemsAction, ProblemsPanel};
 use crate::quickinput::{CommandPaletteView, PaletteAction};
 use crate::scm::{ScmAction, ScmView};
+use crate::search::{SearchAction, SearchView};
 use crate::statusbar::{StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
+use crate::workspace::Workspace;
 use parking_lot::RwLock;
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba, Scene, View,
@@ -53,6 +55,8 @@ pub struct WorkbenchView {
     pub activity_bar: ActivityBarView,
     pub explorer: FileExplorerView,
     pub scm_view: ScmView,
+    pub search_view: SearchView,
+    pub workspace: Workspace,
     pub debug_sidebar: DebugSidebarView,
     pub debug_toolbar: DebugToolbarView,
     pub debug_console: DebugConsoleView,
@@ -89,6 +93,8 @@ impl WorkbenchView {
             activity_bar: ActivityBarView::default(),
             explorer: FileExplorerView::default(),
             scm_view: ScmView::default(),
+            search_view: SearchView::default(),
+            workspace: Workspace::default(),
             debug_sidebar: DebugSidebarView::default(),
             debug_toolbar: DebugToolbarView::default(),
             debug_console: DebugConsoleView::default(),
@@ -254,6 +260,8 @@ impl View for WorkbenchView {
                 self.scm_view.render(regions.sidebar, theme, font, scene);
             } else if view_id == "debug" || view_id == "workbench.view.debug" {
                 self.debug_sidebar.render(regions.sidebar, theme, font, scene);
+            } else if view_id == "search" || view_id == "workbench.view.search" {
+                self.search_view.render(regions.sidebar, theme, font, scene);
             } else {
                 self.explorer.render(regions.sidebar, theme, font, scene);
             }
@@ -390,6 +398,23 @@ impl View for WorkbenchView {
                             self.last_action = Some(WorkbenchAction::ExecuteCommand(cmd_str));
                             return EventResult::Consumed;
                         }
+                        PaletteAction::OpenFile { path, line, column } => {
+                            let path_clone = path.clone();
+                            let line_val = *line;
+                            let col_val = *column;
+                            self.close_command_palette();
+                            let path_str = path_clone.to_string_lossy().to_string();
+                            let title = path_clone.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                            let content = std::fs::read_to_string(&path_clone).unwrap_or_default();
+                            self.editor_area.open_file(&path_str, title, &content, false);
+                            if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                if let Some(l) = line_val {
+                                    active_editor.set_primary_position(rustcode_editor::Position::new(l.saturating_sub(1), col_val.unwrap_or(0)));
+                                }
+                            }
+                            self.last_action = Some(WorkbenchAction::OpenFile(path_clone));
+                            return EventResult::Consumed;
+                        }
                         PaletteAction::Close => {
                             self.close_command_palette();
                             return EventResult::Consumed;
@@ -492,6 +517,30 @@ impl View for WorkbenchView {
                                 _ => {}
                             }
                             self.last_action = Some(WorkbenchAction::DebugAction(act));
+                        }
+                        res
+                    } else if view_id == "search" || view_id == "workbench.view.search" {
+                        let res = self.search_view.handle_event(event, regions.sidebar);
+                        if let Some(act) = self.search_view.last_action.take() {
+                            match act {
+                                SearchAction::OpenMatch { path, line, col } => {
+                                    let path_str = path.to_string_lossy().to_string();
+                                    let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                                    self.editor_area.open_file(&path_str, title, &content, true);
+                                    if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                        active_editor.set_primary_position(rustcode_editor::Position::new(line.saturating_sub(1), col));
+                                    }
+                                    self.last_action = Some(WorkbenchAction::OpenFile(path));
+                                }
+                                SearchAction::ExecuteSearch => {
+                                    self.search_view.execute_search(self.workspace.folders());
+                                }
+                                SearchAction::ClearSearch => {
+                                    self.search_view.clear();
+                                }
+                                _ => {}
+                            }
                         }
                         res
                     } else {
@@ -640,6 +689,30 @@ impl View for WorkbenchView {
                             res
                         } else if view_id == "debug" || view_id == "workbench.view.debug" {
                             self.debug_sidebar.handle_event(event, regions.sidebar)
+                        } else if view_id == "search" || view_id == "workbench.view.search" {
+                            let res = self.search_view.handle_event(event, regions.sidebar);
+                            if let Some(act) = self.search_view.last_action.take() {
+                                match act {
+                                    SearchAction::OpenMatch { path, line, col } => {
+                                        let path_str = path.to_string_lossy().to_string();
+                                        let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                                        let content = std::fs::read_to_string(&path).unwrap_or_default();
+                                        self.editor_area.open_file(&path_str, title, &content, true);
+                                        if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                            active_editor.set_primary_position(rustcode_editor::Position::new(line.saturating_sub(1), col));
+                                        }
+                                        self.last_action = Some(WorkbenchAction::OpenFile(path));
+                                    }
+                                    SearchAction::ExecuteSearch => {
+                                        self.search_view.execute_search(self.workspace.folders());
+                                    }
+                                    SearchAction::ClearSearch => {
+                                        self.search_view.clear();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            res
                         } else {
                             self.explorer.handle_event(event, regions.sidebar)
                         }
@@ -716,12 +789,12 @@ mod tests {
     fn test_workbench_modal_command_palette_routing() {
         let mut wb = WorkbenchView::new();
         let mut palette = CommandPalette::new();
-        palette.set_items(vec![PaletteItem {
-            command_id: "workbench.action.toggleSidebar".to_string(),
-            label: "Toggle Sidebar".to_string(),
-            category: Some("View".to_string()),
-            keybinding: Some("Ctrl+B".to_string()),
-        }]);
+        palette.set_items(vec![PaletteItem::command(
+            "workbench.action.toggleSidebar",
+            "Toggle Sidebar",
+            Some("View".to_string()),
+            Some("Ctrl+B".to_string()),
+        )]);
 
         wb.open_command_palette(CommandPaletteView::new(palette));
         assert!(wb.is_command_palette_open);

@@ -1,0 +1,31 @@
+{
+  "name": "eslint-diagnostics-ext",
+  "displayName": "ESLint Diagnostics Linter Extension",
+  "publisher": "rustcode",
+  "version": "1.0.0",
+  "description": "Publishes JavaScript/TypeScript diagnostic squigglies",
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "onLanguage:javascript",
+    "onLanguage:typescript"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "javascript",
+        "extensions": [".js", ".mjs"]
+      },
+      {
+        "id": "typescript",
+        "extensions": [".ts"]
+      }
+    ],
+    "commands": [
+      {
+        "command": "eslint.runLinter",
+        "title": "ESLint: Lint Current File",
+        "category": "ESLint"
+      }
+    ]
+  }
+}

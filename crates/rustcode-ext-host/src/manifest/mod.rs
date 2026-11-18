@@ -28,6 +28,15 @@ pub struct Contributions {
     pub themes: Option<Vec<ThemeContribution>>,
     pub keybindings: Option<Vec<KeybindingContribution>>,
     pub configuration: Option<Value>,
+    pub views: Option<std::collections::HashMap<String, Vec<ViewContribution>>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewContribution {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub when: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +141,34 @@ impl ExtensionLoader {
 
     pub fn loaded_extensions(&self) -> &[LoadedExtension] {
         &self.extensions
+    }
+
+    /// Mark an extension as activated by its manifest name. Returns true if found.
+    pub fn activate(&mut self, name: &str) -> bool {
+        if let Some(ext) = self.extensions.iter_mut().find(|e| e.manifest.name == name) {
+            ext.is_activated = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark an extension as deactivated by its manifest name. Returns true if found.
+    pub fn deactivate(&mut self, name: &str) -> bool {
+        if let Some(ext) = self.extensions.iter_mut().find(|e| e.manifest.name == name) {
+            ext.is_activated = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Check if an extension is activated.
+    pub fn is_activated(&self, name: &str) -> bool {
+        self.extensions
+            .iter()
+            .find(|e| e.manifest.name == name)
+            .is_some_and(|e| e.is_activated)
     }
 }
 

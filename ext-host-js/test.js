@@ -38,6 +38,24 @@ assert(typeof vscode.commands.registerCommand === 'function');
 assert(typeof vscode.window.showInformationMessage === 'function');
 assert(typeof vscode.workspace.getConfiguration === 'function');
 assert(typeof vscode.languages.registerCompletionItemProvider === 'function');
+assert(typeof vscode.languages.registerDocumentFormattingEditProvider === 'function');
+assert(typeof vscode.languages.registerCodeActionsProvider === 'function');
+assert(typeof vscode.languages.format === 'function');
+assert(typeof vscode.languages.codeAction === 'function');
+
+console.log('[Test] Testing TextEdit, WorkspaceEdit, CodeAction...');
+const edit1 = vscode.TextEdit.replace(range, 'replacement text');
+assert(edit1.newText === 'replacement text', 'TextEdit newText mismatch');
+
+const wsEdit = new vscode.WorkspaceEdit();
+wsEdit.set(uri, [edit1]);
+assert(wsEdit.has(uri), 'WorkspaceEdit should have uri');
+assert(wsEdit.get(uri).length === 1, 'WorkspaceEdit get(uri) length mismatch');
+
+const action = new vscode.CodeAction('Fix issue', vscode.CodeActionKind.QuickFix);
+assert(action.title === 'Fix issue', 'CodeAction title mismatch');
+assert(action.kind === 'quickfix', 'CodeAction kind mismatch');
+action.edit = wsEdit;
 
 console.log('All JavaScript extension host tests passed successfully!');
 

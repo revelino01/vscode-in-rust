@@ -34,6 +34,9 @@ impl RustCodeContext {
         let config = ConfigurationService::new();
         let commands = CommandRegistry::new();
         let keybindings = KeybindingService::new();
+        let _ = keybindings.load_keybindings_json(include_str!(
+            "../../../resources/default-keymaps/linux.json"
+        ));
         let context_keys = ContextKeyService::new();
         let theme = ThemeService::new();
         let layout = WorkbenchLayout::new();
@@ -98,6 +101,7 @@ impl RustCodeContext {
             self.commands.clone(),
             self.context_keys.clone(),
         )
+        .with_config(self.config.clone())
     }
 }
 

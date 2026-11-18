@@ -20,6 +20,7 @@ pub enum ConfigurationTarget {
     WorkspaceFolder(PathBuf),
 }
 
+#[derive(Clone)]
 pub struct ConfigurationService {
     defaults: Arc<RwLock<Value>>,
     user: Arc<RwLock<Value>>,
@@ -43,16 +44,55 @@ impl ConfigurationService {
                 "tabSize": 4,
                 "insertSpaces": true,
                 "wordWrap": "off",
-                "lineNumbers": "on"
+                "minimap": {
+                    "enabled": true
+                },
+                "lineNumbers": "on",
+                "formatOnSave": false,
+                "formatOnPaste": false,
+                "autoSave": "off",
+                "cursorStyle": "line",
+                "renderWhitespace": "selection"
             },
             "workbench": {
                 "colorTheme": "Default Dark+",
-                "iconTheme": "vs-seti"
+                "iconTheme": "vs-seti",
+                "sideBar": {
+                    "location": "left"
+                }
             },
             "files": {
                 "autoSave": "off",
+                "encoding": "utf8",
+                "eol": "auto",
                 "exclude": {
                     "**/.git": true,
+                    "**/node_modules": true,
+                    "**/target": true
+                }
+            },
+            "terminal": {
+                "integrated": {
+                    "fontSize": 14,
+                    "shell": {
+                        "linux": "/bin/bash"
+                    }
+                }
+            },
+            "git": {
+                "enableSmartCommit": false
+            },
+            "extensions": {
+                "autoUpdate": "true"
+            },
+            "window": {
+                "zoomLevel": 0
+            },
+            "breadcrumbs": {
+                "enabled": true
+            },
+            "search": {
+                "exclude": {
                     "**/node_modules": true,
                     "**/target": true
                 }
@@ -75,6 +115,9 @@ impl ConfigurationService {
     pub fn load_user_settings(&self, content: &str) -> Result<(), String> {
         let stripped = strip_json_comments(content);
         let val: Value = serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
+        if !val.is_object() {
+            return Err("User settings root must be a JSON object".to_string());
+        }
         *self.user.write() = val;
         self.recompute();
         Ok(())
@@ -84,6 +127,9 @@ impl ConfigurationService {
     pub fn load_workspace_settings(&self, content: &str) -> Result<(), String> {
         let stripped = strip_json_comments(content);
         let val: Value = serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
+        if !val.is_object() {
+            return Err("Workspace settings root must be a JSON object".to_string());
+        }
         *self.workspace.write() = val;
         self.recompute();
         Ok(())
@@ -93,6 +139,9 @@ impl ConfigurationService {
     pub fn load_folder_settings(&self, folder: &Path, content: &str) -> Result<(), String> {
         let stripped = strip_json_comments(content);
         let val: Value = serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
+        if !val.is_object() {
+            return Err("Folder settings root must be a JSON object".to_string());
+        }
         let mut normalized = json!({});
         merge_json_values(&mut normalized, &val);
         self.folders.write().insert(folder.to_path_buf(), normalized);
@@ -170,8 +219,117 @@ impl ConfigurationService {
         Some(cur.clone())
     }
 
+    /// Update a setting at `path` for the specified `ConfigurationTarget`.
+    pub fn update(
+        &self,
+        path: &str,
+        value: Value,
+        target: ConfigurationTarget,
+    ) -> Result<(), String> {
+        if path.is_empty() || path.split('.').any(str::is_empty) {
+            return Err(format!("Invalid configuration key path: '{}'", path));
+        }
+
+        match target {
+            ConfigurationTarget::User => {
+                {
+                    let mut guard = self.user.write();
+                    let map = guard
+                        .as_object_mut()
+                        .ok_or_else(|| "User configuration is not a JSON object".to_string())?;
+                    remove_nested_value(map, path);
+                    set_nested_value(map, path, value);
+                }
+                self.recompute_with_keys(vec![path.to_string()]);
+            }
+            ConfigurationTarget::Workspace => {
+                {
+                    let mut guard = self.workspace.write();
+                    let map = guard.as_object_mut().ok_or_else(|| {
+                        "Workspace configuration is not a JSON object".to_string()
+                    })?;
+                    remove_nested_value(map, path);
+                    set_nested_value(map, path, value);
+                }
+                self.recompute_with_keys(vec![path.to_string()]);
+            }
+            ConfigurationTarget::WorkspaceFolder(folder) => {
+                {
+                    let mut folders_guard = self.folders.write();
+                    let entry = folders_guard.entry(folder).or_insert_with(|| json!({}));
+                    let map = entry
+                        .as_object_mut()
+                        .ok_or_else(|| "Folder configuration is not a JSON object".to_string())?;
+                    remove_nested_value(map, path);
+                    set_nested_value(map, path, value);
+                }
+                self.on_did_change.fire(ConfigurationChangeEvent {
+                    affected_keys: vec![path.to_string()],
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Reset (remove) a setting at `path` from the specified `ConfigurationTarget`.
+    pub fn reset(&self, path: &str, target: ConfigurationTarget) {
+        if path.is_empty() || path.split('.').any(str::is_empty) {
+            return;
+        }
+
+        match target {
+            ConfigurationTarget::User => {
+                let removed = {
+                    let mut guard = self.user.write();
+                    guard
+                        .as_object_mut()
+                        .is_some_and(|map| remove_nested_value(map, path))
+                };
+                if removed {
+                    self.recompute_with_keys(vec![path.to_string()]);
+                }
+            }
+            ConfigurationTarget::Workspace => {
+                let removed = {
+                    let mut guard = self.workspace.write();
+                    guard
+                        .as_object_mut()
+                        .is_some_and(|map| remove_nested_value(map, path))
+                };
+                if removed {
+                    self.recompute_with_keys(vec![path.to_string()]);
+                }
+            }
+            ConfigurationTarget::WorkspaceFolder(folder) => {
+                let removed = {
+                    let mut folders_guard = self.folders.write();
+                    let mut was_removed = false;
+                    let mut should_remove_folder = false;
+                    if let Some(Value::Object(map)) = folders_guard.get_mut(&folder) {
+                        was_removed = remove_nested_value(map, path);
+                        should_remove_folder = map.is_empty();
+                    }
+                    if should_remove_folder {
+                        folders_guard.remove(&folder);
+                    }
+                    was_removed
+                };
+                if removed {
+                    self.on_did_change.fire(ConfigurationChangeEvent {
+                        affected_keys: vec![path.to_string()],
+                    });
+                }
+            }
+        }
+    }
+
     /// Recompute merged view: defaults <- user <- workspace.
     fn recompute(&self) {
+        self.recompute_with_keys(vec!["*".to_string()]);
+    }
+
+    fn recompute_with_keys(&self, affected_keys: Vec<String>) {
         let defs = self.defaults.read().clone();
         let user = self.user.read().clone();
         let ws = self.workspace.read().clone();
@@ -181,32 +339,115 @@ impl ConfigurationService {
         merge_json_values(&mut merged, &ws);
 
         *self.merged.write() = merged;
-        self.on_did_change.fire(ConfigurationChangeEvent {
-            affected_keys: vec!["*".to_string()],
-        });
+        self.on_did_change
+            .fire(ConfigurationChangeEvent { affected_keys });
     }
+}
+
+fn is_leaf_object_setting(path: &str) -> bool {
+    matches!(path, "files.exclude" | "search.exclude")
+        || path.ends_with(".files.exclude")
+        || path.ends_with(".search.exclude")
+}
+
+fn is_dotted_setting_key(k: &str) -> bool {
+    k.contains('.') && !k.contains('*') && !k.contains('/') && !k.split('.').any(str::is_empty)
 }
 
 /// Recursively merge `src` into `target`.
 fn merge_json_values(target: &mut Value, src: &Value) {
-    match (target, src) {
-        (Value::Object(target_map), Value::Object(src_map)) => {
+    merge_json_values_at(target, src, "");
+}
+
+fn merge_json_values_at(target: &mut Value, src: &Value, current_path: &str) {
+    if is_leaf_object_setting(current_path) {
+        *target = src.clone();
+        return;
+    }
+
+    match src {
+        Value::Object(src_map) => {
+            if !target.is_object() {
+                *target = Value::Object(serde_json::Map::new());
+            }
+            let Value::Object(target_map) = target else {
+                unreachable!();
+            };
+
             for (k, v) in src_map {
-                // Also support flattened keys like "editor.fontSize"
-                if k.contains('.') {
-                    set_nested_value(target_map, k, v.clone());
+                let full_path = if current_path.is_empty() {
+                    k.clone()
                 } else {
-                    merge_json_values(
-                        target_map.entry(k.clone()).or_insert(Value::Null),
-                        v,
-                    );
+                    format!("{}.{}", current_path, k)
+                };
+                if is_dotted_setting_key(k) {
+                    merge_nested_value(target_map, k, v, &full_path);
+                } else {
+                    let slot = target_map.entry(k.clone()).or_insert(Value::Null);
+                    merge_json_values_at(slot, v, &full_path);
                 }
             }
         }
-        (target_val, src_val) => {
-            *target_val = src_val.clone();
+        src_val => {
+            *target = src_val.clone();
         }
     }
+}
+
+fn merge_nested_value(
+    target_map: &mut serde_json::Map<String, Value>,
+    rel_path: &str,
+    value: &Value,
+    full_path: &str,
+) {
+    let parts: Vec<&str> = rel_path.split('.').collect();
+    if parts.is_empty() {
+        return;
+    }
+
+    let mut cur: &mut serde_json::Map<String, Value> = target_map;
+    for &key in parts.iter().take(parts.len().saturating_sub(1)) {
+        if !cur.contains_key(key) || !cur[key].is_object() {
+            cur.insert(key.to_string(), Value::Object(serde_json::Map::new()));
+        }
+        cur = match cur.get_mut(key) {
+            Some(Value::Object(map)) => map,
+            _ => unreachable!(),
+        };
+    }
+
+    if let Some(&last_key) = parts.last() {
+        let slot = cur.entry(last_key.to_string()).or_insert(Value::Null);
+        merge_json_values_at(slot, value, full_path);
+    }
+}
+
+fn remove_nested_value(target_map: &mut serde_json::Map<String, Value>, path: &str) -> bool {
+    let mut removed = target_map.remove(path).is_some();
+
+    let split_positions: Vec<usize> = path
+        .char_indices()
+        .filter_map(|(idx, ch)| if ch == '.' { Some(idx) } else { None })
+        .collect();
+
+    for idx in split_positions {
+        let head = &path[..idx];
+        let tail = &path[idx + 1..];
+        let mut should_remove_head = false;
+        if let Some(Value::Object(sub_map)) = target_map.get_mut(head) {
+            if remove_nested_value(sub_map, tail) {
+                removed = true;
+            }
+            if sub_map.is_empty() {
+                should_remove_head = true;
+            }
+        }
+        if should_remove_head {
+            target_map.remove(head);
+        }
+    }
+
+    removed
 }
 
 fn set_nested_value(target_map: &mut serde_json::Map<String, Value>, path: &str, value: Value) {
@@ -474,5 +715,307 @@ mod tests {
             config.get_for_resource::<String>("editor.wordWrap", Some(file_in_child)),
             Some("on".to_string())
         );
+    }
+
+    #[test]
+    fn test_seeded_schema_defaults() {
+        let config = ConfigurationService::new();
+
+        assert_eq!(config.get::<u32>("editor.fontSize"), Some(14));
+        assert_eq!(config.get::<u32>("editor.tabSize"), Some(4));
+        assert_eq!(config.get::<bool>("editor.insertSpaces"), Some(true));
+        assert_eq!(config.get::<String>("editor.wordWrap"), Some("off".into()));
+        assert_eq!(config.get::<bool>("editor.minimap.enabled"), Some(true));
+        assert_eq!(config.get::<String>("editor.lineNumbers"), Some("on".into()));
+        assert_eq!(config.get::<bool>("editor.formatOnSave"), Some(false));
+        assert_eq!(config.get::<bool>("editor.formatOnPaste"), Some(false));
+        assert_eq!(config.get::<String>("editor.autoSave"), Some("off".into()));
+        assert_eq!(config.get::<String>("editor.cursorStyle"), Some("line".into()));
+        assert_eq!(
+            config.get::<String>("editor.renderWhitespace"),
+            Some("selection".into())
+        );
+
+        assert_eq!(
+            config.get::<String>("workbench.colorTheme"),
+            Some("Default Dark+".into())
+        );
+        assert_eq!(
+            config.get::<String>("workbench.iconTheme"),
+            Some("vs-seti".into())
+        );
+        assert_eq!(
+            config.get::<String>("workbench.sideBar.location"),
+            Some("left".into())
+        );
+
+        assert_eq!(config.get::<String>("files.autoSave"), Some("off".into()));
+        assert_eq!(config.get::<String>("files.encoding"), Some("utf8".into()));
+        assert_eq!(config.get::<String>("files.eol"), Some("auto".into()));
+        assert_eq!(config.get::<bool>("files.exclude.**/.git"), None);
+        let files_excl = config.get_value("files.exclude").unwrap();
+        assert_eq!(files_excl["**/.git"], json!(true));
+
+        assert_eq!(config.get::<u32>("terminal.integrated.fontSize"), Some(14));
+        assert_eq!(
+            config.get::<String>("terminal.integrated.shell.linux"),
+            Some("/bin/bash".into())
+        );
+        assert_eq!(config.get::<bool>("git.enableSmartCommit"), Some(false));
+        assert_eq!(
+            config.get::<String>("extensions.autoUpdate"),
+            Some("true".into())
+        );
+        assert_eq!(config.get::<i32>("window.zoomLevel"), Some(0));
+        assert_eq!(config.get::<bool>("breadcrumbs.enabled"), Some(true));
+
+        let search_excl = config.get_value("search.exclude").unwrap();
+        assert_eq!(search_excl["**/node_modules"], json!(true));
+        assert_eq!(search_excl["**/target"], json!(true));
+    }
+
+    #[test]
+    fn test_clone_and_update_reset_across_targets() {
+        use parking_lot::Mutex;
+
+        let config = ConfigurationService::new();
+        let cloned = config.clone();
+
+        let recorded_events: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let rec_clone = Arc::clone(&recorded_events);
+        let _sub = config.on_did_change.event().attach(move |ev| {
+            rec_clone.lock().push(ev.affected_keys.clone());
+        });
+
+        // Invalid paths rejected
+        assert!(config
+            .update("", json!(1), ConfigurationTarget::User)
+            .is_err());
+        assert!(config
+            .update("editor..fontSize", json!(1), ConfigurationTarget::User)
+            .is_err());
+        assert!(config
+            .update(".editor", json!(1), ConfigurationTarget::User)
+            .is_err());
+
+        // Update User via clone -> original sees it
+        cloned
+            .update("editor.fontSize", json!(18), ConfigurationTarget::User)
+            .unwrap();
+        assert_eq!(config.get::<u32>("editor.fontSize"), Some(18));
+
+        // Update Workspace overrides User
+        config
+            .update("editor.fontSize", json!(22), ConfigurationTarget::Workspace)
+            .unwrap();
+        assert_eq!(cloned.get::<u32>("editor.fontSize"), Some(22));
+
+        // Update WorkspaceFolder overrides Workspace for resource
+        let folder = PathBuf::from("/proj/app");
+        let file_in_folder = PathBuf::from("/proj/app/src/main.rs");
+        config
+            .update(
+                "editor.fontSize",
+                json!(26),
+                ConfigurationTarget::WorkspaceFolder(folder.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            cloned.get_for_resource::<u32>("editor.fontSize", Some(&file_in_folder)),
+            Some(26)
+        );
+
+        // Reset WorkspaceFolder -> falls back to Workspace (22)
+        cloned.reset("editor.fontSize", ConfigurationTarget::WorkspaceFolder(folder));
+        assert_eq!(
+            config.get_for_resource::<u32>("editor.fontSize", Some(&file_in_folder)),
+            Some(22)
+        );
+
+        // Reset Workspace -> falls back to User (18)
+        config.reset("editor.fontSize", ConfigurationTarget::Workspace);
+        assert_eq!(cloned.get::<u32>("editor.fontSize"), Some(18));
+
+        // Reset User -> falls back to default (14), NOT Value::Null
+        cloned.reset("editor.fontSize", ConfigurationTarget::User);
+        assert_eq!(config.get::<u32>("editor.fontSize"), Some(14));
+        assert_eq!(config.get_value("editor.fontSize"), Some(json!(14)));
+
+        // Reset non-existent key is a no-op (no extra event)
+        let events_before = recorded_events.lock().len();
+        config.reset("editor.fontSize", ConfigurationTarget::User);
+        assert_eq!(recorded_events.lock().len(), events_before);
+
+        let events = recorded_events.lock();
+        assert!(events.iter().all(|keys| keys == &vec!["editor.fontSize".to_string()]));
+        assert_eq!(events.len(), 6);
+    }
+
+    #[test]
+    fn test_update_and_reset_flattened_dotted_keys() {
+        let config = ConfigurationService::new();
+        config
+            .load_user_settings(
+                r#"{
+                    "editor.fontSize": 24,
+                    "editor": {
+                        "minimap.enabled": false,
+                        "tabSize": 2
+                    }
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(config.get::<u32>("editor.fontSize"), Some(24));
+        assert_eq!(config.get::<bool>("editor.minimap.enabled"), Some(false));
+        assert_eq!(config.get::<u32>("editor.tabSize"), Some(2));
+
+        // Updating a setting that had a flattened dotted key replaces it cleanly
+        config
+            .update("editor.fontSize", json!(16), ConfigurationTarget::User)
+            .unwrap();
+        assert_eq!(config.get::<u32>("editor.fontSize"), Some(16));
+
+        // Resetting removes both nested and dotted forms, falling back to default
+        config.reset("editor.fontSize", ConfigurationTarget::User);
+        assert_eq!(config.get::<u32>("editor.fontSize"), Some(14));
+
+        // Partial dotted key reset falls back to default without touching sibling tabSize
+        config.reset("editor.minimap.enabled", ConfigurationTarget::User);
+        assert_eq!(config.get::<bool>("editor.minimap.enabled"), Some(true));
+        assert_eq!(config.get::<u32>("editor.tabSize"), Some(2));
+    }
+
+    #[test]
+    fn test_exclude_dotfile_keys_flat_nested_consistency_and_replacement() {
+        let val = json!({
+            "**/*.log": true,
+            ".DS_Store": true,
+            "Thumbs.db": true,
+            "Cargo.lock": false
+        });
+
+        // 1. Direct update() preserves dot-containing keys without splitting
+        let cfg_update = ConfigurationService::new();
+        cfg_update
+            .update("files.exclude", val.clone(), ConfigurationTarget::User)
+            .unwrap();
+        cfg_update
+            .update("search.exclude", val.clone(), ConfigurationTarget::User)
+            .unwrap();
+        // Trigger subsequent recompute on an unrelated key
+        cfg_update
+            .update("editor.fontSize", json!(18), ConfigurationTarget::User)
+            .unwrap();
+
+        assert_eq!(cfg_update.get_value("files.exclude"), Some(val.clone()));
+        assert_eq!(cfg_update.get_value("search.exclude"), Some(val.clone()));
+
+        // 2. Flattened dotted keys in load_user_settings match update() 100%
+        let cfg_flat = ConfigurationService::new();
+        cfg_flat
+            .load_user_settings(
+                r#"{
+                    "files.exclude": {
+                        "**/*.log": true,
+                        ".DS_Store": true,
+                        "Thumbs.db": true,
+                        "Cargo.lock": false
+                    },
+                    "search.exclude": {
+                        "**/*.log": true,
+                        ".DS_Store": true,
+                        "Thumbs.db": true,
+                        "Cargo.lock": false
+                    },
+                    "editor.fontSize": 18
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(cfg_flat.get_value("files.exclude"), Some(val.clone()));
+        assert_eq!(cfg_flat.get_value("search.exclude"), Some(val.clone()));
+        // Unrelated sibling defaults remain intact
+        assert_eq!(cfg_flat.get::<String>("files.encoding"), Some("utf8".into()));
+
+        // 3. Nested objects in load_user_settings match flat & update() 100%
+        let cfg_nested = ConfigurationService::new();
+        cfg_nested
+            .load_user_settings(
+                r#"{
+                    "files": {
+                        "exclude": {
+                            "**/*.log": true,
+                            ".DS_Store": true,
+                            "Thumbs.db": true,
+                            "Cargo.lock": false
+                        }
+                    },
+                    "search": {
+                        "exclude": {
+                            "**/*.log": true,
+                            ".DS_Store": true,
+                            "Thumbs.db": true,
+                            "Cargo.lock": false
+                        }
+                    }
+                }"#,
+            )
+            .unwrap();
+        assert_eq!(cfg_nested.get_value("files.exclude"), Some(val.clone()));
+        assert_eq!(cfg_nested.get_value("search.exclude"), Some(val.clone()));
+        assert_eq!(cfg_nested.get::<String>("files.encoding"), Some("utf8".into()));
+
+        // 4. Workspace folder settings also preserve dotfile keys
+        let folder = Path::new("/workspace/proj");
+        let file_in_folder = Path::new("/workspace/proj/src/lib.rs");
+        cfg_nested
+            .load_folder_settings(
+                folder,
+                r#"{"files.exclude": {".DS_Store": true, "Thumbs.db": true}}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            cfg_nested.get_value_for_resource("files.exclude", Some(file_in_folder)),
+            Some(json!({ ".DS_Store": true, "Thumbs.db": true }))
+        );
+
+        // 5. Resetting user search.exclude restores default exclude map cleanly
+        cfg_update.reset("search.exclude", ConfigurationTarget::User);
+        assert_eq!(
+            cfg_update.get_value("search.exclude"),
+            Some(json!({ "**/node_modules": true, "**/target": true }))
+        );
+    }
+
+    #[test]
+    fn test_non_object_root_json_rejected_without_wiping_defaults() {
+        let cfg = ConfigurationService::new();
+        cfg.update("editor.fontSize", json!(18), ConfigurationTarget::User)
+            .unwrap();
+
+        let folder = Path::new("/workspace/app");
+        for invalid_root in ["null", "123", "[]", "\"hello\"", "true"] {
+            assert!(
+                cfg.load_user_settings(invalid_root).is_err(),
+                "user settings should reject {}",
+                invalid_root
+            );
+            assert!(
+                cfg.load_workspace_settings(invalid_root).is_err(),
+                "workspace settings should reject {}",
+                invalid_root
+            );
+            assert!(
+                cfg.load_folder_settings(folder, invalid_root).is_err(),
+                "folder settings should reject {}",
+                invalid_root
+            );
+        }
+
+        // Defaults and prior user overrides must remain intact and updatable
+        assert_eq!(cfg.get::<u32>("editor.fontSize"), Some(18));
+        assert_eq!(cfg.get::<bool>("editor.minimap.enabled"), Some(true));
+        cfg.update("editor.tabSize", json!(2), ConfigurationTarget::User)
+            .unwrap();
+        assert_eq!(cfg.get::<u32>("editor.tabSize"), Some(2));
     }
 }

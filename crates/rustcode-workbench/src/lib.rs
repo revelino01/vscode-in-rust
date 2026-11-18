@@ -17,6 +17,7 @@ pub mod problems;
 pub mod quickinput;
 pub mod scm;
 pub mod search;
+pub mod settings_ui;
 pub mod statusbar;
 pub mod webview;
 pub mod window;
@@ -35,6 +36,10 @@ pub use problems::{ProblemEntry, ProblemsAction, ProblemsPanel};
 pub use quickinput::{CommandPalette, CommandPaletteView, PaletteAction, PaletteItem};
 pub use scm::{ScmAction, ScmView};
 pub use search::{SearchAction, SearchQuery, SearchResults, SearchView};
+pub use settings_ui::{
+    SettingsCategory, SettingsFocus, SettingsHitTarget, SettingsItem, SettingsUiAction,
+    SettingsUiState, SettingsUiView, SettingsValueType,
+};
 pub use statusbar::{
     StatusBar, StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView,
 };

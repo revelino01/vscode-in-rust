@@ -40,5 +40,9 @@
     "key": "ctrl+space",
     "command": "editor.action.triggerSuggest",
     "when": "editorTextFocus && !editorReadonly"
+  },
+  {
+    "key": "ctrl+,",
+    "command": "workbench.action.openSettings"
   }
 ]

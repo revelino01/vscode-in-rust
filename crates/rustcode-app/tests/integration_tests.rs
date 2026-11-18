@@ -1259,5 +1259,133 @@ async fn test_end_to_end_formatting_and_code_actions_integration() {
     );
 }
 
+#[test]
+fn test_end_to_end_visual_settings_ui_and_config_sync() {
+    use rustcode_workbench::SettingsHitTarget;
+
+    // 1. Bootstrap RustCodeContext (preloads linux.json with Ctrl+,) and create window
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+
+    // 2. Dispatch Ctrl+, to open Visual Settings UI tab
+    let ctrl_comma = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char(','),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    let res = window.dispatch_event(&ctrl_comma, bounds);
+    assert_eq!(res, EventResult::Consumed);
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .unwrap()
+            .uri,
+        "rustcode://settings"
+    );
+
+    // 3. Render window and search for "formatOnSave"
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("Settings"));
+    assert!(scene.contains_text("Font Size"));
+
+    let search_rect = window
+        .view
+        .editor_area
+        .settings_views
+        .get("rustcode://settings")
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|t| match t {
+            SettingsHitTarget::SearchBar(r) => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(search_rect.min_x() + 6.0, search_rect.min_y() + 6.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    for ch in "formatOnSave".chars() {
+        window.dispatch_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+            bounds,
+        );
+    }
+
+    // 4. Render filtered list and click bool toggle -> updates shared app.config
+    window.render(&mut surface);
+    let toggle_rect = window
+        .view
+        .editor_area
+        .settings_views
+        .get("rustcode://settings")
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|t| match t {
+            SettingsHitTarget::ToggleBool { key, rect } if key == "editor.formatOnSave" => {
+                Some(*rect)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    assert_eq!(app.config.get::<bool>("editor.formatOnSave"), Some(false));
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(toggle_rect.min_x() + 5.0, toggle_rect.min_y() + 5.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(app.config.get::<bool>("editor.formatOnSave"), Some(true));
+
+    // 5. Render modified item -> click Reset -> restores default in app.config
+    let scene_mod = window.render(&mut surface);
+    assert!(scene_mod.contains_text("Reset"));
+
+    let reset_rect = window
+        .view
+        .editor_area
+        .settings_views
+        .get("rustcode://settings")
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|t| match t {
+            SettingsHitTarget::ResetButton { key, rect } if key == "editor.formatOnSave" => {
+                Some(*rect)
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(reset_rect.min_x() + 5.0, reset_rect.min_y() + 5.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(app.config.get::<bool>("editor.formatOnSave"), Some(false));
+}
+
 
 

@@ -14,6 +14,7 @@ use crate::search::{SearchAction, SearchView};
 use crate::statusbar::{StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
 use crate::workspace::Workspace;
 use parking_lot::RwLock;
+use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba, Scene, View,
     WorkbenchThemeStyles,
@@ -155,6 +156,11 @@ impl WorkbenchView {
     pub fn toggle_panel(&mut self) {
         self.layout.toggle_panel();
         self.last_action = Some(WorkbenchAction::PanelToggled(self.layout.panel_visible));
+    }
+
+    pub fn open_settings(&mut self, config: Option<ConfigurationService>) {
+        self.editor_area.open_settings(config);
+        self.focused_region = FocusedRegion::Editor;
     }
 
     // --- Layout Region Calculations ---

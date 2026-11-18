@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use crate::settings_ui::SettingsUiView;
 use crate::webview::WebviewEditorView;
+use rustcode_platform::configuration::ConfigurationService;
 
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +152,7 @@ pub struct EditorAreaView {
     pub editors: HashMap<String, EditorView>,
     pub diff_editors: HashMap<String, DiffEditorView>,
     pub webviews: HashMap<String, WebviewEditorView>,
+    pub settings_views: HashMap<String, SettingsUiView>,
     pub grammar_registry: Arc<GrammarRegistry>,
     pub last_action: Option<EditorAreaAction>,
 }
@@ -167,9 +170,42 @@ impl EditorAreaView {
             editors: HashMap::new(),
             diff_editors: HashMap::new(),
             webviews: HashMap::new(),
+            settings_views: HashMap::new(),
             grammar_registry: Arc::new(GrammarRegistry::new()),
             last_action: None,
         }
+    }
+
+    pub fn open_settings(&mut self, config: Option<ConfigurationService>) {
+        let uri = "rustcode://settings";
+        let group = self.model.current_group();
+        group.open_tab(uri, "Settings", false);
+        let view = self
+            .settings_views
+            .entry(uri.to_string())
+            .or_default();
+        view.state.open();
+        if let Some(cfg) = config {
+            view.set_config(cfg);
+        }
+    }
+
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        let closed = self.model.current_group().close_tab(index);
+        if closed {
+            let open_uris: std::collections::HashSet<_> = self
+                .model
+                .groups
+                .iter()
+                .flat_map(|g| g.tabs.iter().map(|t| t.uri.clone()))
+                .collect();
+            self.editors.retain(|u, _| open_uris.contains(u));
+            self.diff_editors.retain(|u, _| open_uris.contains(u));
+            self.webviews.retain(|u, _| open_uris.contains(u));
+            self.settings_views.retain(|u, _| open_uris.contains(u));
+            self.last_action = Some(EditorAreaAction::TabClosed(index));
+        }
+        closed
     }
 
     pub fn open_diff(&mut self, uri: &str, title: &str, original: &str, modified: &str) {
@@ -422,6 +458,8 @@ impl View for EditorAreaView {
                 diff_view.render(content_rect, theme, font, scene);
             } else if let Some(webview) = self.webviews.get(&tab.uri) {
                 webview.render(content_rect, theme, font, scene);
+            } else if let Some(settings_view) = self.settings_views.get(&tab.uri) {
+                settings_view.render(content_rect, theme, font, scene);
             } else if let Some(editor) = self.editors.get(&tab.uri) {
                 editor.render(content_rect, theme, font, scene);
             } else {
@@ -454,12 +492,7 @@ impl View for EditorAreaView {
                         if tab_rect.contains(mouse.position) {
                             // Check if close button clicked
                             if mouse.position.x >= cur_x + tab_w - 22.0 {
-                                self.model.current_group().close_tab(idx);
-                                let open_uris: std::collections::HashSet<_> = self.model.groups.iter().flat_map(|g| g.tabs.iter().map(|t| &t.uri)).collect();
-                                self.editors.retain(|u, _| open_uris.contains(u));
-                                self.diff_editors.retain(|u, _| open_uris.contains(u));
-                                self.webviews.retain(|u, _| open_uris.contains(u));
-                                self.last_action = Some(EditorAreaAction::TabClosed(idx));
+                                self.close_tab(idx);
                             } else {
                                 self.model.current_group().active_tab_index = Some(idx);
                                 self.last_action = Some(EditorAreaAction::TabSelected(idx));
@@ -470,7 +503,7 @@ impl View for EditorAreaView {
                     }
                     EventResult::Ignored
                 } else {
-                    // Click within active editor / diff / webview
+                    // Click within active editor / diff / webview / settings
                     let content_rect = Rect::from_xywh(
                         bounds.min_x(),
                         bounds.min_y() + tab_bar_h,
@@ -483,6 +516,8 @@ impl View for EditorAreaView {
                             diff_view.handle_event(event, content_rect)
                         } else if let Some(webview) = self.webviews.get_mut(&uri) {
                             webview.handle_event(event, content_rect)
+                        } else if let Some(settings_view) = self.settings_views.get_mut(&uri) {
+                            settings_view.handle_event(event, content_rect)
                         } else if let Some(editor) = self.editors.get_mut(&uri) {
                             editor.handle_event(event, content_rect)
                         } else {
@@ -506,6 +541,8 @@ impl View for EditorAreaView {
                         diff_view.handle_event(event, content_rect)
                     } else if let Some(webview) = self.webviews.get_mut(&uri) {
                         webview.handle_event(event, content_rect)
+                    } else if let Some(settings_view) = self.settings_views.get_mut(&uri) {
+                        settings_view.handle_event(event, content_rect)
                     } else if let Some(editor) = self.editors.get_mut(&uri) {
                         editor.handle_event(event, content_rect)
                     } else {
@@ -705,6 +742,99 @@ mod tests {
             "let s = \"🦀xyz\";\n"
         );
         assert!(area_view.model.current_group_ref().tabs[0].is_dirty);
+    }
+
+    #[test]
+    fn test_editor_area_open_settings_render_events_and_close() {
+        use crate::settings_ui::{SettingsFocus, SettingsHitTarget};
+        use rustcode_platform::configuration::ConfigurationService;
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{KeyCode, KeyEvent, MouseButton, ScrollEvent};
+
+        let config = ConfigurationService::new();
+        let mut area_view = EditorAreaView::default();
+
+        area_view.open_settings(Some(config.clone()));
+        assert_eq!(area_view.model.current_group_ref().tabs.len(), 1);
+        let tab = area_view.model.current_group_ref().active_tab().unwrap();
+        assert_eq!(tab.uri, "rustcode://settings");
+        assert_eq!(tab.title, "Settings");
+        assert!(!tab.is_preview);
+        assert!(area_view.settings_views.contains_key("rustcode://settings"));
+
+        // Re-opening does not create a duplicate tab
+        area_view.open_settings(Some(config.clone()));
+        assert_eq!(area_view.model.current_group_ref().tabs.len(), 1);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let mut scene = Scene::new();
+        area_view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("Settings"));
+        assert!(scene.contains_text("Search settings..."));
+        assert!(scene.contains_text("Font Size"));
+
+        // Click SearchBar inside settings view
+        let search_rect = area_view
+            .settings_views
+            .get("rustcode://settings")
+            .unwrap()
+            .hit_targets
+            .read()
+            .iter()
+            .find_map(|t| match t {
+                SettingsHitTarget::SearchBar(r) => Some(*r),
+                _ => None,
+            })
+            .unwrap();
+
+        let res = area_view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(
+                Point::new(search_rect.min_x() + 5.0, search_rect.min_y() + 5.0),
+                MouseButton::Left,
+            )),
+            bounds,
+        );
+        assert_eq!(res, EventResult::Consumed);
+        assert_eq!(
+            area_view
+                .settings_views
+                .get("rustcode://settings")
+                .unwrap()
+                .focus,
+            SettingsFocus::Search
+        );
+
+        // Type into SearchBar via EditorAreaView::handle_event
+        for ch in "minimap".chars() {
+            let res = area_view.handle_event(
+                &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+                bounds,
+            );
+            assert_eq!(res, EventResult::Consumed);
+        }
+        assert_eq!(
+            area_view
+                .settings_views
+                .get("rustcode://settings")
+                .unwrap()
+                .state
+                .search_query,
+            "minimap"
+        );
+
+        // ScrollWheel routes to settings view
+        let scroll_res = area_view.handle_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(400.0, 200.0), 0.0, -40.0)),
+            bounds,
+        );
+        assert_eq!(scroll_res, EventResult::Consumed);
+
+        // Closing tab cleans up settings_views
+        assert!(area_view.close_tab(0));
+        assert!(area_view.model.current_group_ref().tabs.is_empty());
+        assert!(!area_view.settings_views.contains_key("rustcode://settings"));
     }
 }
 

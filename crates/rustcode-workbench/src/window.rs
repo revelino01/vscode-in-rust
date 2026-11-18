@@ -5,6 +5,7 @@ use crate::workbench_view::{WorkbenchAction, WorkbenchView};
 use rustcode_base::context_key::ContextKeyService;
 use rustcode_ext_host::provider::LanguageFeatureBridge;
 use rustcode_platform::commands::CommandRegistry;
+use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::keybindings::KeybindingService;
 use rustcode_platform::render::{
     EventResult, FontMetrics, InputEvent, Rect, RenderSurface, Scene, View,
@@ -18,6 +19,7 @@ use std::sync::Arc;
 
 pub struct WorkbenchWindow {
     pub view: WorkbenchView,
+    pub config: ConfigurationService,
     pub theme: ThemeService,
     pub keybindings: KeybindingService,
     pub commands: CommandRegistry,
@@ -50,6 +52,7 @@ impl WorkbenchWindow {
 
         Self {
             view,
+            config: ConfigurationService::new(),
             theme,
             keybindings,
             commands,
@@ -58,6 +61,21 @@ impl WorkbenchWindow {
             language_bridge: None,
             pending_code_actions: Vec::new(),
         }
+    }
+
+    pub fn with_config(mut self, config: ConfigurationService) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn set_config(&mut self, config: ConfigurationService) {
+        self.config = config;
+    }
+
+    pub fn open_settings(&mut self) {
+        self.view.open_settings(Some(self.config.clone()));
+        self.context_keys.set_bool("editorTextFocus", true);
+        self.context_keys.set_bool("sideBarFocus", false);
     }
 
     pub fn with_language_bridge(mut self, bridge: Arc<LanguageFeatureBridge>) -> Self {
@@ -168,9 +186,12 @@ impl WorkbenchWindow {
                 self.view.layout.set_sidebar_view("search");
                 self.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
             }
+            "workbench.action.openSettings" => {
+                self.open_settings();
+            }
             "workbench.action.closeActiveEditor" => {
                 if let Some(active_tab) = self.view.editor_area.model.current_group_ref().active_tab_index {
-                    self.view.editor_area.model.current_group().close_tab(active_tab);
+                    self.view.editor_area.close_tab(active_tab);
                 }
             }
             "undo" => {
@@ -640,6 +661,204 @@ mod tests {
         assert_eq!(
             window.view.editor_area.editors.get("file:///test.rs").unwrap().text(),
             "fn foo() {\n    let mut x = 1;\n}"
+        );
+    }
+
+    #[test]
+    fn test_workbench_window_settings_ui_shortcut_palette_sync_and_close() {
+        use crate::settings_ui::SettingsHitTarget;
+        use rustcode_platform::render::{MouseButton, MouseEvent, Point};
+
+        let mut window = WorkbenchWindow::default();
+        let _sub_open = window
+            .commands
+            .register("workbench.action.openSettings", |_| {
+                Ok(serde_json::json!({ "opened": "settings" }))
+            });
+        let _sub_pal = window
+            .commands
+            .register("workbench.action.showCommands", |_| {
+                Ok(serde_json::json!({ "palette": true }))
+            });
+        let _sub_close = window
+            .commands
+            .register("workbench.action.closeActiveEditor", |_| {
+                Ok(serde_json::json!({ "closed": true }))
+            });
+
+        window
+            .keybindings
+            .load_keybindings_json(include_str!("../../../resources/default-keymaps/linux.json"))
+            .unwrap();
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let mut surface = MockRenderSurface::new(1024.0, 768.0);
+
+        // Start focused on sidebar to ensure Ctrl+, switches focus + context keys
+        window.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
+        window.context_keys.set_bool("sideBarFocus", true);
+        window.context_keys.set_bool("editorTextFocus", false);
+
+        // 1. Ctrl+, opens Settings tab
+        let ctrl_comma = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char(','),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        let res = window.dispatch_event(&ctrl_comma, bounds);
+        assert_eq!(res, EventResult::Consumed);
+        assert_eq!(
+            window.view.focused_region,
+            crate::workbench_view::FocusedRegion::Editor
+        );
+        assert_eq!(
+            window.context_keys.get("editorTextFocus"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            window.context_keys.get("sideBarFocus"),
+            Some(serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .model
+                .current_group_ref()
+                .active_tab()
+                .unwrap()
+                .uri,
+            "rustcode://settings"
+        );
+
+        // Render and verify Settings UI content
+        let scene = window.render(&mut surface);
+        assert!(scene.contains_text("Settings"));
+        assert!(scene.contains_text("Search settings..."));
+
+        // 2. Interactive edit: search "minimap", render, click toggle, check window.config
+        let search_rect = window
+            .view
+            .editor_area
+            .settings_views
+            .get("rustcode://settings")
+            .unwrap()
+            .hit_targets
+            .read()
+            .iter()
+            .find_map(|t| match t {
+                SettingsHitTarget::SearchBar(r) => Some(*r),
+                _ => None,
+            })
+            .unwrap();
+
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(
+                Point::new(search_rect.min_x() + 8.0, search_rect.min_y() + 8.0),
+                MouseButton::Left,
+            )),
+            bounds,
+        );
+        for ch in "minimap".chars() {
+            window.dispatch_event(
+                &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+                bounds,
+            );
+        }
+        window.render(&mut surface);
+
+        let toggle_rect = window
+            .view
+            .editor_area
+            .settings_views
+            .get("rustcode://settings")
+            .unwrap()
+            .hit_targets
+            .read()
+            .iter()
+            .find_map(|t| match t {
+                SettingsHitTarget::ToggleBool { key, rect } if key == "editor.minimap.enabled" => {
+                    Some(*rect)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(window.config.get::<bool>("editor.minimap.enabled"), Some(true));
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(
+                Point::new(toggle_rect.min_x() + 5.0, toggle_rect.min_y() + 5.0),
+                MouseButton::Left,
+            )),
+            bounds,
+        );
+        assert_eq!(
+            window.config.get::<bool>("editor.minimap.enabled"),
+            Some(false)
+        );
+
+        // 3. Ctrl+W closes Settings tab and cleans up settings_views
+        let ctrl_w = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('w'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        let res_close = window.dispatch_event(&ctrl_w, bounds);
+        assert_eq!(res_close, EventResult::Consumed);
+        assert!(window
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .tabs
+            .is_empty());
+        assert!(window.view.editor_area.settings_views.is_empty());
+
+        // 4. Open via Command Palette ("openSettings")
+        window.open_command_palette();
+        assert!(window.view.is_command_palette_open);
+        for ch in "openSettings".chars() {
+            window.dispatch_event(
+                &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+                bounds,
+            );
+        }
+        let enter_ev = InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none()));
+        window.dispatch_event(&enter_ev, bounds);
+        assert!(!window.view.is_command_palette_open);
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .model
+                .current_group_ref()
+                .active_tab()
+                .unwrap()
+                .uri,
+            "rustcode://settings"
+        );
+        // Re-opening hydrated the updated config value (false)
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .settings_views
+                .get("rustcode://settings")
+                .unwrap()
+                .state
+                .all_items
+                .iter()
+                .find(|i| i.key == "editor.minimap.enabled")
+                .unwrap()
+                .current_value,
+            serde_json::Value::Bool(false)
         );
     }
 }

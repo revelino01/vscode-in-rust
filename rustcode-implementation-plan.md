@@ -64,6 +64,12 @@
 - [x] Packaging & release optimization (workspace `[profile.release]` with `lto="thin"`, `codegen-units=1`, `opt-level=3`, `strip="symbols"`, `panic="abort"`; `scripts/package.sh` distribution packaging script; `resources/rustcode.desktop` Linux desktop entry)
 - [x] Documentation polish (README vibe-coded declaration preserved; `PROJECT.md` 20-feature roadmap; architecture documentation updated across all crates)
 
+### Active Feature Milestones (R1–R4)
+- [x] **M1 (R1) Visual Settings UI**: `ConfigurationService` (`Clone`, `update`/`reset`, all schema defaults), `SettingsUiView` GPUI `View` + category/search filtering + mouse/keyboard/scroll interaction + two-way config sync, `EditorAreaView`/`WorkbenchView`/`WorkbenchWindow`/`RustCodeContext` wiring, `ctrl+,` keymap & `workbench.action.openSettings`, and unit/E2E tests
+- [ ] **M2 (R2) Notebook Support**: `NotebookDocument` / `.ipynb` JSON parser & serializer / pure-Rust `NotebookKernel` / `NotebookEditorView` GPUI `View`, `EditorAreaView`/`WorkbenchView` `.ipynb` routing, `ext-host-js/vscode-api/notebooks.js` + `rustcode-ext-host` RPC bridge, and unit/E2E tests
+- [ ] **M3 (R3) Extension Marketplace Sidebar UI**: `rustcode-ext-host::marketplace` (`list_installed`, `uninstall`, `set_enabled`/`is_enabled`), `ExtensionsSidebarView` GPUI `View`, `WorkbenchView` sidebar routing (`"extensions"` / `"workbench.view.extensions"`), and unit/E2E tests
+- [ ] **M4 (R4) Breadcrumbs, Minimap & Accessibility Tree**: Editor minimap (`editor.minimap.enabled`), breadcrumbs bar (`breadcrumbs.enabled`), semantic accessibility node tree (`crates/rustcode-platform/src/accessibility.rs` + `WorkbenchWindow::accessibility_tree`), live config sync, and unit/E2E tests
+
 ---
 
 ## Goal
@@ -112,7 +118,7 @@ Build **RustCode**, a ground-up Rust rewrite of VS Code that:
 - **Pixel-perfect rendering**: CSS → GPU rendering means slightly different font metrics, anti-aliasing, and spacing. This is acceptable as long as the *layout* matches.
 - **Animation timing**: GPU-rendered transitions may feel slightly different. Acceptable.
 - **Webview rendering**: Extension webviews will use the system webview (WebKit/WebView2) instead of Chromium. Minor rendering differences are acceptable.
-- **Settings UI**: Can be simplified initially (JSON-only editing is acceptable for v1).
+- **Settings UI**: Interactive Visual Settings UI (`Ctrl+,` / `workbench.action.openSettings`, `rustcode://settings` tab) is implemented alongside `settings.json` support.
 
 ---
 

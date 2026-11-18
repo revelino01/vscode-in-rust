@@ -113,6 +113,14 @@ pub fn default_settings_schema() -> Vec<SettingsItem> {
             Value::from("off"),
         ),
         SettingsItem::new(
+            "editor.wordWrapColumn",
+            "Editor",
+            "Word Wrap Column",
+            "Controls the wrapping column of the editor when word wrap is set to wordWrapColumn or bounded.",
+            SettingsValueType::Number,
+            Value::from(80),
+        ),
+        SettingsItem::new(
             "editor.minimap.enabled",
             "Editor",
             "Minimap: Enabled",
@@ -1498,7 +1506,7 @@ mod tests {
     fn test_settings_ui_category_and_search_filtering() {
         let mut view = SettingsUiView::default();
 
-        // Top-level category: editor (10 items)
+        // Top-level category: editor (11 items)
         view.handle_action(SettingsUiAction::SelectCategory("editor".into()));
         let editor_items: Vec<_> = view
             .state
@@ -1506,7 +1514,7 @@ mod tests {
             .into_iter()
             .map(|i| i.key.as_str())
             .collect();
-        assert_eq!(editor_items.len(), 10);
+        assert_eq!(editor_items.len(), 11);
         assert!(editor_items.contains(&"editor.fontSize"));
 
         // Combined category + search
@@ -1524,7 +1532,7 @@ mod tests {
 
         // Clear search while category remains selected
         view.handle_action(SettingsUiAction::Search(String::new()));
-        assert_eq!(view.state.get_filtered().len(), 10);
+        assert_eq!(view.state.get_filtered().len(), 11);
 
         // Nested categories
         view.handle_action(SettingsUiAction::SelectCategory("editor.font".into()));
@@ -2213,10 +2221,10 @@ mod tests {
         let mut view = SettingsUiView::default();
         view.handle_action(SettingsUiAction::Open);
 
-        // Initial render populates last_content_height for all 23 items (1840.0)
+        // Initial render populates last_content_height for all 24 items (1920.0)
         let mut scene = Scene::new();
         view.render(bounds, &theme, &font, &mut scene);
-        assert_eq!(*view.last_content_height.read(), 23.0 * 80.0);
+        assert_eq!(*view.last_content_height.read(), 24.0 * 80.0);
 
         // Filter down to 1 item and scroll BEFORE calling render() again
         view.handle_action(SettingsUiAction::Search("minimap".into()));
@@ -2229,14 +2237,14 @@ mod tests {
         assert_eq!(res, EventResult::Consumed);
         assert_eq!(view.scroll_top, 0.0);
 
-        // Also verify SelectCategory("editor") clamps to 10 items (800 - 660 = 140) before render()
+        // Also verify SelectCategory("editor") clamps to 11 items (880 - 660 = 220) before render()
         view.handle_action(SettingsUiAction::Search(String::new()));
         view.handle_action(SettingsUiAction::SelectCategory("editor".into()));
         view.handle_event(
             &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(500.0, 300.0), 0.0, -10000.0)),
             bounds,
         );
-        assert_eq!(view.scroll_top, 10.0 * 80.0 - 660.0);
+        assert_eq!(view.scroll_top, 11.0 * 80.0 - 660.0);
     }
 
     #[test]

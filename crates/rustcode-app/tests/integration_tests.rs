@@ -2614,6 +2614,283 @@ async fn test_end_to_end_output_channel_ext_host_sync_and_panel_controls() {
     assert!(tree.find_by_id("output.lines").is_some());
 }
 
+#[test]
+fn test_e2e_multi_cursor_ctrl_d_ctrl_alt_arrows_and_escape() {
+    use rustcode_platform::keybindings::Modifiers;
+    use rustcode_platform::render::{
+        KeyCode, KeyEvent, MockRenderSurface, MouseButton, MouseEvent, Point, Rect,
+    };
+
+    let app = RustCodeContext::new();
+    assert!(app.commands.has_command("editor.action.addSelectionToNextFindMatch"));
+    assert!(app.commands.has_command("editor.action.insertCursorAbove"));
+    assert!(app.commands.has_command("editor.action.insertCursorBelow"));
+
+    let mut window = app.create_window();
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+
+    window.open_file(
+        "file:///workspace/multi.rs",
+        "multi.rs",
+        "let item = 1;\nlet item = 2;\nlet item = 3;\n",
+        false,
+    );
+    let _ = window.render(&mut surface);
+
+    // Click on "item" on line 0 to ensure Editor focus and editorTextFocus context
+    let font = FontMetrics::default_monospace();
+    let regions = window.view.compute_regions(bounds);
+    let content_rect = window.view.editor_area.content_rect(regions.editor_area);
+    let gutter_w = window
+        .view
+        .editor_area
+        .active_editor()
+        .unwrap()
+        .gutter_width(&font);
+    let click = InputEvent::MouseDown(MouseEvent::new(
+        Point::new(
+            content_rect.min_x() + gutter_w + 8.0 + 5.0 * font.char_width,
+            content_rect.min_y() + 0.5 * font.line_height,
+        ),
+        MouseButton::Left,
+    ));
+    assert_eq!(window.dispatch_event(&click, bounds), EventResult::Consumed);
+
+    // Ctrl+D x3 via KeybindingService -> selects all three "item" occurrences
+    let ctrl_d = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('d'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(window.dispatch_event(&ctrl_d, bounds), EventResult::Consumed);
+    assert_eq!(window.dispatch_event(&ctrl_d, bounds), EventResult::Consumed);
+    assert_eq!(window.dispatch_event(&ctrl_d, bounds), EventResult::Consumed);
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .cursor_state
+            .selections
+            .len(),
+        3
+    );
+
+    // Type "val" to replace all three simultaneously
+    for ch in ['v', 'a', 'l'] {
+        let ev = InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none()));
+        assert_eq!(window.dispatch_event(&ev, bounds), EventResult::Consumed);
+    }
+    assert_eq!(
+        window.view.editor_area.active_editor().unwrap().text(),
+        "let val = 1;\nlet val = 2;\nlet val = 3;\n"
+    );
+
+    // Escape collapses secondary cursors
+    let esc = InputEvent::KeyDown(KeyEvent::new(KeyCode::Escape, Modifiers::none()));
+    assert_eq!(window.dispatch_event(&esc, bounds), EventResult::Consumed);
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .cursor_state
+            .selections
+            .len(),
+        1
+    );
+
+    // Ctrl+Alt+Up from line 2 adds cursors upward
+    window
+        .view
+        .editor_area
+        .active_editor_mut()
+        .unwrap()
+        .set_primary_position(rustcode_editor::Position::new(2, 4));
+    let ctrl_alt_up = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::ArrowUp,
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: true,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_alt_up, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .cursor_state
+            .selections
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn test_e2e_code_folding_gutter_and_keybinding_chords() {
+    use rustcode_platform::keybindings::Modifiers;
+    use rustcode_platform::render::{
+        KeyCode, KeyEvent, MockRenderSurface, MouseButton, MouseEvent, Point, Rect,
+    };
+
+    let app = RustCodeContext::new();
+    assert!(app.commands.has_command("editor.fold"));
+    assert!(app.commands.has_command("editor.unfold"));
+    assert!(app.commands.has_command("editor.foldAll"));
+    assert!(app.commands.has_command("editor.unfoldAll"));
+
+    let mut window = app.create_window();
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+
+    window.open_file(
+        "file:///workspace/fold.rs",
+        "fold.rs",
+        "fn first() {\n    let hidden_one = 1;\n}\nfn second() {\n    let hidden_two = 2;\n}\n",
+        false,
+    );
+    let scene_open = window.render(&mut surface);
+    assert!(scene_open.contains_text("hidden_one"));
+    assert!(scene_open.contains_text("hidden_two"));
+
+    // Click fold chevron on line 0
+    let font = FontMetrics::default_monospace();
+    let regions = window.view.compute_regions(bounds);
+    let content_rect = window.view.editor_area.content_rect(regions.editor_area);
+    let gutter_w = window
+        .view
+        .editor_area
+        .active_editor()
+        .unwrap()
+        .gutter_width(&font);
+    let fold_click = InputEvent::MouseDown(MouseEvent::new(
+        Point::new(
+            content_rect.min_x() + gutter_w - 8.0,
+            content_rect.min_y() + 0.5 * font.line_height,
+        ),
+        MouseButton::Left,
+    ));
+    assert_eq!(
+        window.dispatch_event(&fold_click, bounds),
+        EventResult::Consumed
+    );
+    let scene_folded = window.render(&mut surface);
+    assert!(!scene_folded.contains_text("hidden_one"));
+    assert!(scene_folded.contains_text(" ..."));
+    assert!(scene_folded.contains_text("hidden_two"));
+
+    // Chord Ctrl+K Ctrl+0 folds all
+    let ctrl_k = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('k'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    let ctrl_0 = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('0'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    window.dispatch_event(&ctrl_k, bounds);
+    assert_eq!(window.dispatch_event(&ctrl_0, bounds), EventResult::Consumed);
+    let scene_all_folded = window.render(&mut surface);
+    assert!(!scene_all_folded.contains_text("hidden_one"));
+    assert!(!scene_all_folded.contains_text("hidden_two"));
+
+    // Chord Ctrl+K Ctrl+J unfolds all
+    let ctrl_j = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('j'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    window.dispatch_event(&ctrl_k, bounds);
+    assert_eq!(window.dispatch_event(&ctrl_j, bounds), EventResult::Consumed);
+    let scene_unfolded = window.render(&mut surface);
+    assert!(scene_unfolded.contains_text("hidden_one"));
+    assert!(scene_unfolded.contains_text("hidden_two"));
+}
+
+#[test]
+fn test_e2e_word_wrap_config_sync_and_scene_rendering() {
+    use rustcode_platform::configuration::ConfigurationTarget;
+    use rustcode_platform::render::{MockRenderSurface, Rect};
+    use rustcode_workbench::settings_ui::default_settings_schema;
+    use serde_json::json;
+
+    // Verify Settings UI schema exposes both editor.wordWrap and editor.wordWrapColumn
+    let schema = default_settings_schema();
+    assert!(schema.iter().any(|s| s.key == "editor.wordWrap"));
+    assert!(schema.iter().any(|s| s.key == "editor.wordWrapColumn"));
+
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+
+    window.open_file(
+        "file:///workspace/wrap.txt",
+        "wrap.txt",
+        "firstword secondword thirdword fourthword\nnextline",
+        false,
+    );
+
+    app.config
+        .update("editor.wordWrap", json!("wordWrapColumn"), ConfigurationTarget::User)
+        .unwrap();
+    app.config
+        .update("editor.wordWrapColumn", json!(18), ConfigurationTarget::User)
+        .unwrap();
+    window.sync_configuration();
+
+    let ed = window.view.editor_area.active_editor().unwrap();
+    assert_eq!(ed.word_wrap, rustcode_editor::WordWrapMode::WordWrapColumn);
+    assert_eq!(ed.word_wrap_column, 18);
+
+    let scene = window.render(&mut surface);
+    let font = FontMetrics::default_monospace();
+    let regions = window.view.compute_regions(bounds);
+    let content_rect = window.view.editor_area.content_rect(regions.editor_area);
+    let gutter_w = window
+        .view
+        .editor_area
+        .active_editor()
+        .unwrap()
+        .gutter_width(&font);
+
+    // "nextline" must render below visual row 1 because line 0 wrapped across multiple rows
+    let next_run = scene
+        .glyph_runs()
+        .into_iter()
+        .find(|g| g.text == "nextline" && g.origin.x >= content_rect.min_x() + gutter_w)
+        .expect("nextline must render in editor scene");
+    assert!(next_run.origin.y >= content_rect.min_y() + font.line_height * 2.0);
+}
+
 
 
 

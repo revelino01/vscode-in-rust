@@ -7,6 +7,7 @@ pub mod completion;
 pub mod cursor;
 pub mod diff;
 pub mod document;
+pub mod folding;
 pub mod model;
 pub mod syntax;
 pub mod view;
@@ -22,6 +23,7 @@ pub use diff::{
     InlineDiffRow, SideBySideDiffRow,
 };
 pub use document::{AutoSaveConfig, AutoSaveMode, AutoSaveService, TextDocument};
+pub use folding::{FoldingModel, FoldingRange, FoldingRangeKind};
 pub use model::{
     byte_offset_to_utf16_col, utf16_col_to_byte_offset, Piece, PieceSource, PieceTable, TextEdit,
     UndoElement, UndoRedoStack,
@@ -31,7 +33,7 @@ pub use syntax::{
     PlainTextGrammar, PythonGrammar, RustGrammar, SyntaxHighlighter, SyntaxScope, TokenMetadata,
     TokenSpan, TypeScriptGrammar,
 };
-pub use view::{EditorGutterAction, EditorView, MinimapState};
+pub use view::{EditorGutterAction, EditorView, MinimapState, WordWrapMode};
 pub use viewmodel::{
     DecorationKind, DecorationModel, DiagnosticSeverity, EditorDiagnostic, LineDecoration,
 };

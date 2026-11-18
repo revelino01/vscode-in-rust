@@ -87,38 +87,82 @@ impl UndoRedoStack {
         !self.future.is_empty()
     }
 
+    pub fn past_len(&self) -> usize {
+        self.past.len()
+    }
+
+    pub fn future_len(&self) -> usize {
+        self.future.len()
+    }
+
     pub fn undo(&mut self, table: &mut PieceTable) -> Option<usize> {
+        self.undo_with_line_deltas(table).map(|(off, _)| off)
+    }
+
+    pub fn undo_with_line_deltas(
+        &mut self,
+        table: &mut PieceTable,
+    ) -> Option<(usize, Vec<(usize, isize)>)> {
         let element = self.past.pop()?;
+        let mut line_shifts = Vec::new();
+        let mut revert_and_record = |table: &mut PieceTable, edit: &TextEdit| -> usize {
+            let edit_start_line = table.offset_to_position(edit.offset.min(table.len())).0;
+            let ins_lines = edit.inserted_text.bytes().filter(|&b| b == b'\n').count() as isize;
+            let del_lines = edit.deleted_text.bytes().filter(|&b| b == b'\n').count() as isize;
+            let delta = del_lines - ins_lines;
+            if delta != 0 {
+                line_shifts.push((edit_start_line, delta));
+            }
+            Self::revert_edit(table, edit)
+        };
         let target_offset = match &element {
-            UndoElement::Single(edit) => Self::revert_edit(table, edit),
+            UndoElement::Single(edit) => revert_and_record(table, edit),
             UndoElement::Group(edits) => {
                 let mut last_off = None;
                 for edit in edits.iter().rev() {
-                    last_off = Some(Self::revert_edit(table, edit));
+                    last_off = Some(revert_and_record(table, edit));
                 }
                 last_off.unwrap_or(0)
             }
         };
 
         self.future.push(element);
-        Some(target_offset)
+        Some((target_offset, line_shifts))
     }
 
     pub fn redo(&mut self, table: &mut PieceTable) -> Option<usize> {
+        self.redo_with_line_deltas(table).map(|(off, _)| off)
+    }
+
+    pub fn redo_with_line_deltas(
+        &mut self,
+        table: &mut PieceTable,
+    ) -> Option<(usize, Vec<(usize, isize)>)> {
         let element = self.future.pop()?;
+        let mut line_shifts = Vec::new();
+        let mut apply_and_record = |table: &mut PieceTable, edit: &TextEdit| -> usize {
+            let edit_start_line = table.offset_to_position(edit.offset.min(table.len())).0;
+            let del_lines = edit.deleted_text.bytes().filter(|&b| b == b'\n').count() as isize;
+            let ins_lines = edit.inserted_text.bytes().filter(|&b| b == b'\n').count() as isize;
+            let delta = ins_lines - del_lines;
+            if delta != 0 {
+                line_shifts.push((edit_start_line, delta));
+            }
+            Self::apply_edit(table, edit)
+        };
         let target_offset = match &element {
-            UndoElement::Single(edit) => Self::apply_edit(table, edit),
+            UndoElement::Single(edit) => apply_and_record(table, edit),
             UndoElement::Group(edits) => {
                 let mut last_off = None;
                 for edit in edits {
-                    last_off = Some(Self::apply_edit(table, edit));
+                    last_off = Some(apply_and_record(table, edit));
                 }
                 last_off.unwrap_or(0)
             }
         };
 
         self.past.push(element);
-        Some(target_offset)
+        Some((target_offset, line_shifts))
     }
 
     fn revert_edit(table: &mut PieceTable, edit: &TextEdit) -> usize {

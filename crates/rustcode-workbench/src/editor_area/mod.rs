@@ -3,6 +3,7 @@
 use parking_lot::RwLock;
 use rustcode_editor::{
     DiffEditorView, EditorView, GrammarRegistry, Position, Range, RangeEdit, TextDocument,
+    WordWrapMode,
 };
 use rustcode_ext_host::webview::{ExtHostWebviewManager, WebviewOptions};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
@@ -162,6 +163,8 @@ pub struct EditorAreaView {
     pub last_action: Option<EditorAreaAction>,
     pub breadcrumbs_enabled: bool,
     pub minimap_enabled: bool,
+    pub word_wrap_mode: WordWrapMode,
+    pub word_wrap_column: usize,
     pub breadcrumbs: BreadcrumbsBar,
     known_workspace: Option<Workspace>,
 }
@@ -185,6 +188,8 @@ impl EditorAreaView {
             last_action: None,
             breadcrumbs_enabled: true,
             minimap_enabled: true,
+            word_wrap_mode: WordWrapMode::Off,
+            word_wrap_column: 80,
             breadcrumbs: BreadcrumbsBar::new(),
             known_workspace: None,
         }
@@ -241,6 +246,21 @@ impl EditorAreaView {
         self.minimap_enabled = enabled;
         for editor in self.editors.values_mut() {
             editor.set_minimap_enabled(enabled);
+        }
+    }
+
+    pub fn set_word_wrap(&mut self, mode: WordWrapMode) {
+        self.word_wrap_mode = mode;
+        for editor in self.editors.values_mut() {
+            editor.set_word_wrap(mode);
+        }
+    }
+
+    pub fn set_word_wrap_column(&mut self, col: usize) {
+        let clamped = col.max(1);
+        self.word_wrap_column = clamped;
+        for editor in self.editors.values_mut() {
+            editor.set_word_wrap_column(clamped);
         }
     }
 
@@ -412,7 +432,9 @@ impl EditorAreaView {
 
             let mut editor = EditorView::from_str(content)
                 .with_document(doc)
-                .with_minimap(self.minimap_enabled);
+                .with_minimap(self.minimap_enabled)
+                .with_word_wrap(self.word_wrap_mode)
+                .with_word_wrap_column(self.word_wrap_column);
             let theme = ThemeService::default_dark_theme();
             editor.set_language(grammar.language_id(), theme, &self.grammar_registry);
 
@@ -1292,6 +1314,34 @@ mod tests {
             assert!(scene.is_empty());
             assert!(area_view.breadcrumbs_rect(bad_bounds).is_none());
         }
+    }
+
+    #[test]
+    fn test_editor_area_word_wrap_propagation() {
+        let mut area_view = EditorAreaView::new(EditorArea::new());
+        area_view.open_file("file:///demo/first.rs", "first.rs", "let x = 1;", false);
+        area_view.set_word_wrap(WordWrapMode::Bounded);
+        area_view.set_word_wrap_column(64);
+
+        assert_eq!(
+            area_view.editors["file:///demo/first.rs"].word_wrap,
+            WordWrapMode::Bounded
+        );
+        assert_eq!(
+            area_view.editors["file:///demo/first.rs"].word_wrap_column,
+            64
+        );
+
+        // Newly opened files inherit current word_wrap_mode and word_wrap_column
+        area_view.open_file("file:///demo/second.rs", "second.rs", "let y = 2;", false);
+        assert_eq!(
+            area_view.editors["file:///demo/second.rs"].word_wrap,
+            WordWrapMode::Bounded
+        );
+        assert_eq!(
+            area_view.editors["file:///demo/second.rs"].word_wrap_column,
+            64
+        );
     }
 }
 

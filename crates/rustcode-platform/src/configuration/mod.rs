@@ -44,6 +44,7 @@ impl ConfigurationService {
                 "tabSize": 4,
                 "insertSpaces": true,
                 "wordWrap": "off",
+                "wordWrapColumn": 80,
                 "minimap": {
                     "enabled": true
                 },
@@ -725,6 +726,7 @@ mod tests {
         assert_eq!(config.get::<u32>("editor.tabSize"), Some(4));
         assert_eq!(config.get::<bool>("editor.insertSpaces"), Some(true));
         assert_eq!(config.get::<String>("editor.wordWrap"), Some("off".into()));
+        assert_eq!(config.get::<u32>("editor.wordWrapColumn"), Some(80));
         assert_eq!(config.get::<bool>("editor.minimap.enabled"), Some(true));
         assert_eq!(config.get::<String>("editor.lineNumbers"), Some("on".into()));
         assert_eq!(config.get::<bool>("editor.formatOnSave"), Some(false));

@@ -137,6 +137,43 @@ impl RustCodeContext {
             Ok(json!({ "suggest": "triggered" }))
         }));
 
+        store.add_boxed(
+            self.commands
+                .register("editor.action.insertCursorAbove", |_| {
+                    Ok(json!({ "cursor": "above" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("editor.action.insertCursorBelow", |_| {
+                    Ok(json!({ "cursor": "below" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("editor.action.addSelectionToNextFindMatch", |_| {
+                    Ok(json!({ "nextFindMatch": true }))
+                }),
+        );
+
+        store.add_boxed(self.commands.register("editor.fold", |_| {
+            Ok(json!({ "folded": true }))
+        }));
+
+        store.add_boxed(self.commands.register("editor.unfold", |_| {
+            Ok(json!({ "unfolded": true }))
+        }));
+
+        store.add_boxed(self.commands.register("editor.foldAll", |_| {
+            Ok(json!({ "foldedAll": true }))
+        }));
+
+        store.add_boxed(self.commands.register("editor.unfoldAll", |_| {
+            Ok(json!({ "unfoldedAll": true }))
+        }));
+
         store.add_boxed(self.commands.register("editor.action.formatDocument", |_| {
             Ok(json!({ "formatted": true }))
         }));

@@ -6,6 +6,7 @@ use crate::quickinput::{CommandPalette, CommandPaletteView, PaletteItem};
 use crate::workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchView};
 use rustcode_base::context_key::ContextKeyService;
 use rustcode_base::disposable::DisposableStore;
+use rustcode_editor::WordWrapMode;
 use rustcode_ext_host::marketplace::ExtensionInstaller;
 use rustcode_ext_host::output::OutputChannelEvent;
 use rustcode_ext_host::provider::LanguageFeatureBridge;
@@ -103,6 +104,16 @@ impl WorkbenchWindow {
             .config
             .get::<bool>("editor.minimap.enabled")
             .unwrap_or(true);
+        let default_word_wrap = self
+            .config
+            .get::<String>("editor.wordWrap")
+            .map(|s| WordWrapMode::from_config_str(&s))
+            .unwrap_or(WordWrapMode::Off);
+        let default_wrap_col = self
+            .config
+            .get::<usize>("editor.wordWrapColumn")
+            .unwrap_or(80)
+            .max(1);
         let active_path: Option<PathBuf> = self
             .view
             .editor_area
@@ -118,6 +129,8 @@ impl WorkbenchWindow {
             .unwrap_or(true);
 
         self.view.editor_area.set_minimap_enabled(default_minimap);
+        self.view.editor_area.set_word_wrap(default_word_wrap);
+        self.view.editor_area.set_word_wrap_column(default_wrap_col);
         for editor in self.view.editor_area.editors.values_mut() {
             let doc_path = editor
                 .document
@@ -128,6 +141,18 @@ impl WorkbenchWindow {
                 .get_for_resource::<bool>("editor.minimap.enabled", doc_path.as_deref())
                 .unwrap_or(default_minimap);
             editor.set_minimap_enabled(enabled);
+            let wrap_mode = self
+                .config
+                .get_for_resource::<String>("editor.wordWrap", doc_path.as_deref())
+                .map(|s| WordWrapMode::from_config_str(&s))
+                .unwrap_or(default_word_wrap);
+            editor.set_word_wrap(wrap_mode);
+            let wrap_col = self
+                .config
+                .get_for_resource::<usize>("editor.wordWrapColumn", doc_path.as_deref())
+                .unwrap_or(default_wrap_col)
+                .max(1);
+            editor.set_word_wrap_column(wrap_col);
         }
         self.view
             .editor_area
@@ -649,6 +674,41 @@ impl WorkbenchWindow {
             "editor.action.triggerSuggest" => {
                 if let Some(editor) = self.view.editor_area.active_editor_mut() {
                     editor.trigger_suggest(None);
+                }
+            }
+            "editor.action.insertCursorAbove" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.insert_cursor_above();
+                }
+            }
+            "editor.action.insertCursorBelow" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.insert_cursor_below();
+                }
+            }
+            "editor.action.addSelectionToNextFindMatch" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.add_selection_to_next_find_match();
+                }
+            }
+            "editor.fold" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.fold_at_cursor();
+                }
+            }
+            "editor.unfold" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.unfold_at_cursor();
+                }
+            }
+            "editor.foldAll" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.fold_all();
+                }
+            }
+            "editor.unfoldAll" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.unfold_all();
                 }
             }
             "editor.action.formatDocument" => {
@@ -1896,5 +1956,46 @@ mod tests {
             .find(|c| c.id == "out_b")
             .unwrap();
         assert_eq!(out_b_after.lines, vec!["lint ok", "second beta line"]);
+    }
+
+    #[test]
+    fn test_window_sync_word_wrap_configuration_and_preserve_editor_state() {
+        use rustcode_platform::configuration::ConfigurationTarget;
+        use serde_json::json;
+
+        let config = ConfigurationService::new();
+        let mut window = WorkbenchWindow::new(
+            ThemeService::new(),
+            KeybindingService::new(),
+            CommandRegistry::new(),
+            ContextKeyService::new(),
+        )
+        .with_config(config.clone());
+
+        window.open_file(
+            "file:///workspace/main.rs",
+            "main.rs",
+            "fn demo() {\n    println!(\"hello world\");\n}\nlet after = 1;",
+            false,
+        );
+        {
+            let ed = window.view.editor_area.active_editor_mut().unwrap();
+            ed.scroll_top = 1.0;
+            assert!(ed.folding_model.fold(0));
+        }
+
+        config
+            .update("editor.wordWrap", json!("wordWrapColumn"), ConfigurationTarget::User)
+            .unwrap();
+        config
+            .update("editor.wordWrapColumn", json!(40), ConfigurationTarget::User)
+            .unwrap();
+        window.sync_configuration();
+
+        let ed = window.view.editor_area.active_editor().unwrap();
+        assert_eq!(ed.word_wrap, WordWrapMode::WordWrapColumn);
+        assert_eq!(ed.word_wrap_column, 40);
+        assert_eq!(ed.scroll_top, 1.0);
+        assert!(ed.folding_model.is_collapsed(0));
     }
 }

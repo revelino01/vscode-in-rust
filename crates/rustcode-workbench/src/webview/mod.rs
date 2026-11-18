@@ -424,71 +424,102 @@ impl View for WebviewEditorView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        // Base Webview background
-        scene.push_quad(Quad::new(bounds).with_background(theme.editor_background));
+        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+            return;
+        }
 
-        let mut cur_y = bounds.min_y() + 20.0 - self.scroll_top;
+        // Base Webview background
+        crate::push_finite_quad(scene, Quad::new(bounds).with_background(theme.editor_background));
+
+        let safe_scroll = if self.scroll_top.is_finite() {
+            self.scroll_top.max(0.0)
+        } else {
+            0.0
+        };
+        let mut cur_y = bounds.min_y() + 20.0 - safe_scroll;
         let left_x = bounds.min_x() + 24.0;
         let content_w = (bounds.width() - 48.0).max(100.0);
+        if !cur_y.is_finite() || !left_x.is_finite() || !content_w.is_finite() {
+            *self.button_targets.write() = Vec::new();
+            return;
+        }
 
         let mut targets = Vec::new();
 
         for node in &self.nodes {
+            if !cur_y.is_finite() {
+                break;
+            }
             match &node.kind {
                 WebviewElementKind::Heading1(text) => {
                     let h1_size = font.font_size * 1.5;
                     let line_h = font.line_height * 1.5;
-                    scene.push_text(GlyphRun::new(
-                        text.clone(),
-                        Point::new(left_x, cur_y),
-                        Rect::from_xywh(left_x, cur_y, content_w, line_h),
-                        theme.editor_foreground,
-                        h1_size,
-                    ));
+                    crate::push_finite_text(
+                        scene,
+                        GlyphRun::new(
+                            text.clone(),
+                            Point::new(left_x, cur_y),
+                            Rect::from_xywh(left_x, cur_y, content_w, line_h),
+                            theme.editor_foreground,
+                            h1_size,
+                        ),
+                    );
                     cur_y += line_h + 12.0;
                 }
                 WebviewElementKind::Heading2(text) => {
                     let h2_size = font.font_size * 1.25;
                     let line_h = font.line_height * 1.25;
-                    scene.push_text(GlyphRun::new(
-                        text.clone(),
-                        Point::new(left_x, cur_y),
-                        Rect::from_xywh(left_x, cur_y, content_w, line_h),
-                        theme.editor_foreground,
-                        h2_size,
-                    ));
+                    crate::push_finite_text(
+                        scene,
+                        GlyphRun::new(
+                            text.clone(),
+                            Point::new(left_x, cur_y),
+                            Rect::from_xywh(left_x, cur_y, content_w, line_h),
+                            theme.editor_foreground,
+                            h2_size,
+                        ),
+                    );
                     cur_y += line_h + 10.0;
                 }
                 WebviewElementKind::Heading3(text) => {
                     let h3_size = font.font_size * 1.1;
-                    scene.push_text(GlyphRun::new(
-                        text.clone(),
-                        Point::new(left_x, cur_y),
-                        Rect::from_xywh(left_x, cur_y, content_w, font.line_height),
-                        theme.editor_foreground,
-                        h3_size,
-                    ));
+                    crate::push_finite_text(
+                        scene,
+                        GlyphRun::new(
+                            text.clone(),
+                            Point::new(left_x, cur_y),
+                            Rect::from_xywh(left_x, cur_y, content_w, font.line_height),
+                            theme.editor_foreground,
+                            h3_size,
+                        ),
+                    );
                     cur_y += font.line_height + 8.0;
                 }
                 WebviewElementKind::Paragraph(text) => {
-                    scene.push_text(GlyphRun::new(
-                        text.clone(),
-                        Point::new(left_x, cur_y),
-                        Rect::from_xywh(left_x, cur_y, content_w, font.line_height),
-                        theme.editor_foreground,
-                        font.font_size,
-                    ));
+                    crate::push_finite_text(
+                        scene,
+                        GlyphRun::new(
+                            text.clone(),
+                            Point::new(left_x, cur_y),
+                            Rect::from_xywh(left_x, cur_y, content_w, font.line_height),
+                            theme.editor_foreground,
+                            font.font_size,
+                        ),
+                    );
                     cur_y += font.line_height + 8.0;
                 }
                 WebviewElementKind::ListItem(text) => {
                     let bullet_text = format!("•  {}", text);
-                    scene.push_text(GlyphRun::new(
-                        bullet_text,
-                        Point::new(left_x + 8.0, cur_y),
-                        Rect::from_xywh(left_x + 8.0, cur_y, content_w - 8.0, font.line_height),
-                        theme.editor_foreground,
-                        font.font_size,
-                    ));
+                    crate::push_finite_text(
+                        scene,
+                        GlyphRun::new(
+                            bullet_text,
+                            Point::new(left_x + 8.0, cur_y),
+                            Rect::from_xywh(left_x + 8.0, cur_y, content_w - 8.0, font.line_height),
+                            theme.editor_foreground,
+                            font.font_size,
+                        ),
+                    );
                     cur_y += font.line_height + 4.0;
                 }
                 WebviewElementKind::CodeBlock(code) => {
@@ -496,7 +527,8 @@ impl View for WebviewEditorView {
                     let block_h = (block_lines.len() as f32 * font.line_height + 12.0).max(28.0);
                     let block_rect = Rect::from_xywh(left_x, cur_y, content_w, block_h);
 
-                    scene.push_quad(
+                    crate::push_finite_quad(
+                        scene,
                         Quad::new(block_rect)
                             .with_background(theme.command_palette_bg)
                             .with_border_edges(theme.panel_border, Edges::all(1.0))
@@ -505,13 +537,24 @@ impl View for WebviewEditorView {
 
                     for (l_idx, line) in block_lines.iter().enumerate() {
                         let line_y = cur_y + 6.0 + l_idx as f32 * font.line_height;
-                        scene.push_text(GlyphRun::new(
-                            line.to_string(),
-                            Point::new(left_x + 10.0, line_y),
-                            Rect::from_xywh(left_x + 10.0, line_y, content_w - 20.0, font.line_height),
-                            theme.editor_foreground,
-                            font.font_size * 0.9,
-                        ));
+                        if !line_y.is_finite() || !(line_y + font.line_height).is_finite() {
+                            break;
+                        }
+                        crate::push_finite_text(
+                            scene,
+                            GlyphRun::new(
+                                line.to_string(),
+                                Point::new(left_x + 10.0, line_y),
+                                Rect::from_xywh(
+                                    left_x + 10.0,
+                                    line_y,
+                                    (content_w - 20.0).max(0.0),
+                                    font.line_height,
+                                ),
+                                theme.editor_foreground,
+                                font.font_size * 0.9,
+                            ),
+                        );
                     }
 
                     cur_y += block_h + 12.0;
@@ -520,28 +563,39 @@ impl View for WebviewEditorView {
                     let btn_w = font.text_width(label) + 24.0;
                     let btn_h = 28.0;
                     let btn_rect = Rect::from_xywh(left_x, cur_y, btn_w, btn_h);
-                    targets.push((btn_rect, message_payload.clone()));
+                    if crate::is_finite_positive_rect(btn_rect) {
+                        targets.push((btn_rect, message_payload.clone()));
 
-                    scene.push_quad(
-                        Quad::new(btn_rect)
-                            .with_background(theme.command_palette_selected_bg)
-                            .with_border_edges(theme.panel_border, Edges::all(1.0))
-                            .with_corner_radius(4.0),
-                    );
+                        crate::push_finite_quad(
+                            scene,
+                            Quad::new(btn_rect)
+                                .with_background(theme.command_palette_selected_bg)
+                                .with_border_edges(theme.panel_border, Edges::all(1.0))
+                                .with_corner_radius(4.0),
+                        );
 
-                    scene.push_text(GlyphRun::new(
-                        label.clone(),
-                        Point::new(left_x + 12.0, cur_y + 4.0),
-                        Rect::from_xywh(left_x + 12.0, cur_y + 4.0, btn_w - 24.0, font.line_height),
-                        theme.editor_foreground,
-                        font.font_size * 0.9,
-                    ));
+                        crate::push_finite_text(
+                            scene,
+                            GlyphRun::new(
+                                label.clone(),
+                                Point::new(left_x + 12.0, cur_y + 4.0),
+                                Rect::from_xywh(
+                                    left_x + 12.0,
+                                    cur_y + 4.0,
+                                    (btn_w - 24.0).max(0.0),
+                                    font.line_height,
+                                ),
+                                theme.editor_foreground,
+                                font.font_size * 0.9,
+                            ),
+                        );
+                    }
 
                     cur_y += btn_h + 12.0;
                 }
                 WebviewElementKind::HorizontalRule => {
                     let hr_rect = Rect::from_xywh(left_x, cur_y + 6.0, content_w, 1.0);
-                    scene.push_quad(Quad::new(hr_rect).with_background(theme.panel_border));
+                    crate::push_finite_quad(scene, Quad::new(hr_rect).with_background(theme.panel_border));
                     cur_y += 14.0;
                 }
             }
@@ -551,15 +605,21 @@ impl View for WebviewEditorView {
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
+        if !crate::is_finite_positive_rect(bounds) {
+            return EventResult::Ignored;
+        }
         match event {
             InputEvent::MouseDown(mouse) => {
-                if !bounds.contains(mouse.position) {
+                if !mouse.position.x.is_finite()
+                    || !mouse.position.y.is_finite()
+                    || !bounds.contains(mouse.position)
+                {
                     return EventResult::Ignored;
                 }
 
                 let targets = self.button_targets.read().clone();
                 for (rect, payload) in targets {
-                    if rect.contains(mouse.position) {
+                    if crate::is_finite_positive_rect(rect) && rect.contains(mouse.position) {
                         self.send_message_to_host(payload);
                         return EventResult::Consumed;
                     }
@@ -567,12 +627,28 @@ impl View for WebviewEditorView {
                 EventResult::Ignored
             }
             InputEvent::ScrollWheel(scroll) => {
-                if bounds.contains(scroll.position) {
-                    self.scroll_top = (self.scroll_top + scroll.delta_y).max(0.0);
-                    EventResult::Consumed
-                } else {
-                    EventResult::Ignored
+                if !scroll.position.x.is_finite()
+                    || !scroll.position.y.is_finite()
+                    || !bounds.contains(scroll.position)
+                {
+                    return EventResult::Ignored;
                 }
+                let safe_scroll = if self.scroll_top.is_finite() {
+                    self.scroll_top.max(0.0)
+                } else {
+                    0.0
+                };
+                if !scroll.delta_y.is_finite() {
+                    self.scroll_top = safe_scroll;
+                    return EventResult::Ignored;
+                }
+                let next = (safe_scroll + scroll.delta_y).max(0.0);
+                self.scroll_top = if next.is_finite() {
+                    next
+                } else {
+                    safe_scroll
+                };
+                EventResult::Consumed
             }
             _ => EventResult::Ignored,
         }
@@ -687,5 +763,59 @@ mod tests {
             nodes[5].kind,
             WebviewElementKind::ListItem("Item 'Two'".to_string())
         );
+    }
+
+    #[test]
+    fn test_webview_non_finite_bounds_font_and_scroll_no_poison() {
+        use rustcode_platform::render::{ScrollEvent, Size};
+
+        let mut webview = WebviewEditorView::new(
+            "wv_guard",
+            "test",
+            "Guard Test",
+            "<h1>Hello</h1><p>Body</p><button>Go</button>",
+            WebviewOptions::default(),
+            None,
+        );
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for bad_bounds in [
+            Rect::new(Point::zero(), Size::new(800.0, f32::NAN)),
+            Rect::from_xywh(0.0, 0.0, f32::INFINITY, 600.0),
+            Rect::from_xywh(0.0, 0.0, 0.0, 600.0),
+        ] {
+            let mut scene = Scene::new();
+            webview.render(bad_bounds, &theme, &font, &mut scene);
+            assert!(scene.is_empty());
+        }
+
+        let valid_bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let extreme_font = FontMetrics {
+            font_size: f32::MAX,
+            line_height: f32::MAX,
+            char_width: f32::MAX,
+            ..font.clone()
+        };
+        let mut extreme_scene = Scene::new();
+        webview.render(valid_bounds, &theme, &extreme_font, &mut extreme_scene);
+        assert!(extreme_scene.is_empty());
+
+        webview.scroll_top = 40.0;
+        for bad_dy in [f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+            webview.handle_event(
+                &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(100.0, 100.0), 0.0, bad_dy)),
+                valid_bounds,
+            );
+            assert!(webview.scroll_top.is_finite());
+        }
+        assert_eq!(webview.scroll_top, 40.0);
+
+        let mut scene = Scene::new();
+        webview.render(valid_bounds, &theme, &font, &mut scene);
+        assert!(!scene.is_empty());
+        for q in scene.quads() {
+            assert!(crate::is_finite_rect(q.bounds));
+        }
     }
 }

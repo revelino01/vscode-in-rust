@@ -11,10 +11,13 @@ use crate::layout::WorkbenchLayout;
 use crate::problems::{ProblemsAction, ProblemsPanel};
 use crate::quickinput::{CommandPaletteView, PaletteAction};
 use crate::scm::{ScmAction, ScmView};
-use crate::search::{SearchAction, SearchView};
+use crate::search::{SearchAction, SearchInputFocus, SearchView};
+use crate::settings_ui::SettingsFocus;
 use crate::statusbar::{StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
+use crate::webview::WebviewElementKind;
 use crate::workspace::Workspace;
 use parking_lot::RwLock;
+use rustcode_platform::accessibility::{AccessibilityTree, AccessibleNode, AccessibleRole};
 use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba, Scene, View,
@@ -142,6 +145,9 @@ impl WorkbenchView {
     }
 
     pub fn open_command_palette(&mut self, palette_view: CommandPaletteView) {
+        for editor in self.editor_area.editors.values_mut() {
+            editor.minimap_dragging = false;
+        }
         self.command_palette = Some(palette_view);
         self.is_command_palette_open = true;
         self.focused_region = FocusedRegion::CommandPalette;
@@ -164,11 +170,13 @@ impl WorkbenchView {
 
     pub fn open_settings(&mut self, config: Option<ConfigurationService>) {
         self.editor_area.open_settings(config);
+        self.editor_area.sync_breadcrumbs(Some(&self.workspace));
         self.focused_region = FocusedRegion::Editor;
     }
 
     pub fn open_notebook(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
         self.editor_area.open_notebook(uri, title, content, is_preview);
+        self.editor_area.sync_breadcrumbs(Some(&self.workspace));
         self.focused_region = FocusedRegion::Editor;
     }
 
@@ -183,6 +191,7 @@ impl WorkbenchView {
         };
         let title = format!("Untitled-{}.ipynb", n);
         self.editor_area.open_notebook(&uri, &title, "", false);
+        self.editor_area.sync_breadcrumbs(Some(&self.workspace));
         self.focused_region = FocusedRegion::Editor;
     }
 
@@ -195,17 +204,41 @@ impl WorkbenchView {
     // --- Layout Region Calculations ---
 
     pub fn compute_regions(&self, bounds: Rect) -> WorkbenchRegions {
+        if !crate::is_finite_positive_rect(bounds) {
+            let zero = Rect::zero();
+            return WorkbenchRegions {
+                activity_bar: zero,
+                sidebar: zero,
+                editor_area: zero,
+                panel: zero,
+                status_bar: zero,
+                command_palette: zero,
+            };
+        }
+        let sanitize = |r: Rect| -> Rect {
+            if crate::is_finite_rect(r) {
+                r
+            } else {
+                Rect::zero()
+            }
+        };
+
         let status_bar_h = if self.layout.status_bar_visible { 22.0 } else { 0.0 };
-        let status_bar = Rect::from_xywh(
+        let status_bar = sanitize(Rect::from_xywh(
             bounds.min_x(),
             bounds.max_y() - status_bar_h,
             bounds.width(),
             status_bar_h,
-        );
+        ));
 
-        let main_h = bounds.height() - status_bar_h;
+        let main_h = (bounds.height() - status_bar_h).max(0.0);
         let act_bar_w = if self.layout.activity_bar_visible { 48.0 } else { 0.0 };
-        let activity_bar = Rect::from_xywh(bounds.min_x(), bounds.min_y(), act_bar_w, main_h);
+        let activity_bar = sanitize(Rect::from_xywh(
+            bounds.min_x(),
+            bounds.min_y(),
+            act_bar_w,
+            main_h,
+        ));
 
         let sidebar_w = if self.layout.sidebar_visible {
             self.layout
@@ -214,12 +247,12 @@ impl WorkbenchView {
         } else {
             0.0
         };
-        let sidebar = Rect::from_xywh(
+        let sidebar = sanitize(Rect::from_xywh(
             bounds.min_x() + act_bar_w,
             bounds.min_y(),
             sidebar_w,
             main_h,
-        );
+        ));
 
         let rem_w = (bounds.width() - act_bar_w - sidebar_w).max(0.0);
         let panel_h = if self.layout.panel_visible {
@@ -227,28 +260,28 @@ impl WorkbenchView {
         } else {
             0.0
         };
-        let panel = Rect::from_xywh(
+        let panel = sanitize(Rect::from_xywh(
             bounds.min_x() + act_bar_w + sidebar_w,
             bounds.min_y() + main_h - panel_h,
             rem_w,
             panel_h,
-        );
+        ));
 
-        let editor_area = Rect::from_xywh(
+        let editor_area = sanitize(Rect::from_xywh(
             bounds.min_x() + act_bar_w + sidebar_w,
             bounds.min_y(),
             rem_w,
-            main_h - panel_h,
-        );
+            (main_h - panel_h).max(0.0),
+        ));
 
-        let pal_w = (600.0f32).min(bounds.width() - 40.0);
-        let pal_h = (320.0f32).min(bounds.height() - 80.0);
-        let command_palette = Rect::from_xywh(
+        let pal_w = (600.0f32).min((bounds.width() - 40.0).max(0.0));
+        let pal_h = (320.0f32).min((bounds.height() - 80.0).max(0.0));
+        let command_palette = sanitize(Rect::from_xywh(
             bounds.min_x() + (bounds.width() - pal_w) / 2.0,
             bounds.min_y() + 40.0,
             pal_w,
             pal_h,
-        );
+        ));
 
         WorkbenchRegions {
             activity_bar,
@@ -258,6 +291,759 @@ impl WorkbenchView {
             status_bar,
             command_palette,
         }
+    }
+
+    pub fn accessibility_tree(&self, bounds: Rect, font: &FontMetrics) -> AccessibilityTree {
+        let safe_bounds = if crate::is_finite_rect(bounds) {
+            Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), bounds.height())
+        } else {
+            Rect::zero()
+        };
+        let fallback_font = FontMetrics::default_monospace();
+        let font = if crate::is_finite_font(font) {
+            font
+        } else {
+            &fallback_font
+        };
+        let regions = self.compute_regions(safe_bounds);
+        let mut root = AccessibleNode::new(
+            "workbench.window",
+            AccessibleRole::Window,
+            "RustCode Workbench",
+            safe_bounds,
+        );
+
+        // 1. Activity bar
+        if self.layout.activity_bar_visible {
+            let mut act_node = AccessibleNode::new(
+                "workbench.activityBar",
+                AccessibleRole::Toolbar,
+                "Activity Bar",
+                regions.activity_bar,
+            );
+            let slot_h = 48.0;
+            for (idx, item) in self.activity_bar.model.items.iter().enumerate() {
+                let slot_rect = Rect::from_xywh(
+                    regions.activity_bar.min_x(),
+                    regions.activity_bar.min_y() + idx as f32 * slot_h,
+                    regions.activity_bar.width(),
+                    slot_h,
+                );
+                let mut btn = AccessibleNode::new(
+                    format!("activityBar.{}", item.id),
+                    AccessibleRole::Button,
+                    item.title.clone(),
+                    slot_rect,
+                )
+                .with_selected(idx == self.activity_bar.model.active_item_index)
+                .with_action("activate");
+                if let Some(badge) = &item.badge {
+                    btn = btn.with_description(badge.to_string());
+                }
+                act_node.add_child(btn);
+            }
+            root.add_child(act_node);
+        }
+
+        // 2. Primary sidebar
+        if self.layout.sidebar_visible {
+            let sidebar_focused = self.focused_region == FocusedRegion::Sidebar;
+            let view_id = self.layout.active_sidebar_view.as_str();
+            let (sidebar_title, children, child_has_focus) =
+                if view_id == "scm" || view_id == "workbench.view.scm" {
+                    let input_focused = sidebar_focused && self.scm_view.commit_input_focused;
+                    let mut list = Vec::new();
+                    let input_rect = Rect::from_xywh(
+                        regions.sidebar.min_x() + 8.0,
+                        regions.sidebar.min_y() + 32.0,
+                        (regions.sidebar.width() - 16.0).max(0.0),
+                        24.0,
+                    );
+                    list.push(
+                        AccessibleNode::new(
+                            "workbench.sidebar.scm.commitInput",
+                            AccessibleRole::TextInput,
+                            "Commit Message",
+                            input_rect,
+                        )
+                        .with_value(self.scm_view.commit_message.clone())
+                        .with_focused(input_focused)
+                        .with_action("input"),
+                    );
+                    let btn_rect = Rect::from_xywh(
+                        regions.sidebar.min_x() + 8.0,
+                        regions.sidebar.min_y() + 62.0,
+                        (regions.sidebar.width() - 16.0).max(0.0),
+                        24.0,
+                    );
+                    list.push(
+                        AccessibleNode::new(
+                            "workbench.sidebar.scm.commitButton",
+                            AccessibleRole::Button,
+                            "Commit",
+                            btn_rect,
+                        )
+                        .with_action("press"),
+                    );
+                    let mut tree = AccessibleNode::new(
+                        "workbench.sidebar.scm.changes",
+                        AccessibleRole::Tree,
+                        "Source Control Changes",
+                        Rect::from_xywh(
+                            regions.sidebar.min_x(),
+                            regions.sidebar.min_y() + 92.0,
+                            regions.sidebar.width(),
+                            (regions.sidebar.height() - 92.0).max(0.0),
+                        ),
+                    );
+                    for (idx, entry) in self.scm_view.repo.changes.iter().enumerate() {
+                        let label = entry
+                            .path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("change");
+                        tree.add_child(AccessibleNode::new(
+                            format!("scm.change.{}", idx),
+                            AccessibleRole::TreeItem,
+                            label,
+                            Rect::from_xywh(
+                                regions.sidebar.min_x(),
+                                regions.sidebar.min_y() + 92.0 + idx as f32 * 22.0,
+                                regions.sidebar.width(),
+                                22.0,
+                            ),
+                        ));
+                    }
+                    list.push(tree);
+                    ("Source Control", list, input_focused)
+                } else if view_id == "debug" || view_id == "workbench.view.debug" {
+                    let tree = AccessibleNode::new(
+                        "workbench.sidebar.debug.tree",
+                        AccessibleRole::Tree,
+                        "Run and Debug",
+                        regions.sidebar,
+                    );
+                    ("Run and Debug", vec![tree], false)
+                } else if view_id == "search" || view_id == "workbench.view.search" {
+                    let input_focused =
+                        sidebar_focused && self.search_view.focused_input == SearchInputFocus::Query;
+                    let input_rect = Rect::from_xywh(
+                        regions.sidebar.min_x() + 8.0,
+                        regions.sidebar.min_y() + 32.0,
+                        (regions.sidebar.width() - 16.0).max(0.0),
+                        26.0,
+                    );
+                    let input_node = AccessibleNode::new(
+                        "workbench.sidebar.search.query",
+                        AccessibleRole::TextInput,
+                        "Search",
+                        input_rect,
+                    )
+                    .with_value(self.search_view.query.query.clone())
+                    .with_focused(input_focused)
+                    .with_action("input");
+                    let mut results_tree = AccessibleNode::new(
+                        "workbench.sidebar.search.results",
+                        AccessibleRole::Tree,
+                        "Search Results",
+                        Rect::from_xywh(
+                            regions.sidebar.min_x(),
+                            regions.sidebar.min_y() + 64.0,
+                            regions.sidebar.width(),
+                            (regions.sidebar.height() - 64.0).max(0.0),
+                        ),
+                    );
+                    for (idx, row) in self.search_view.visible_rows().iter().enumerate() {
+                        let label = match row {
+                            crate::search::SearchRow::FileHeader { relative_path, .. } => {
+                                relative_path.to_string_lossy().to_string()
+                            }
+                            crate::search::SearchRow::MatchLine { line_content, .. } => {
+                                line_content.trim().to_string()
+                            }
+                        };
+                        results_tree.add_child(AccessibleNode::new(
+                            format!("search.row.{}", idx),
+                            AccessibleRole::TreeItem,
+                            label,
+                            Rect::from_xywh(
+                                regions.sidebar.min_x(),
+                                regions.sidebar.min_y() + 64.0 + idx as f32 * 22.0,
+                                regions.sidebar.width(),
+                                22.0,
+                            ),
+                        ));
+                    }
+                    ("Search", vec![input_node, results_tree], input_focused)
+                } else if view_id == "extensions" || view_id == "workbench.view.extensions" {
+                    let input_focused = sidebar_focused && self.extensions_view.search_focused;
+                    let ext_layout = self.extensions_view.compute_layout(regions.sidebar);
+                    let search_node = AccessibleNode::new(
+                        "workbench.sidebar.extensions.search",
+                        AccessibleRole::TextInput,
+                        "Search Extensions",
+                        ext_layout.search_rect,
+                    )
+                    .with_value(self.extensions_view.search_query.clone())
+                    .with_focused(input_focused)
+                    .with_action("input");
+
+                    let mut installed_list = AccessibleNode::new(
+                        "workbench.sidebar.extensions.installed",
+                        AccessibleRole::List,
+                        "Installed Extensions",
+                        ext_layout.installed_list_rect,
+                    )
+                    .with_expanded(!self.extensions_view.installed_collapsed);
+                    for (ext, (_, row_rect)) in self
+                        .extensions_view
+                        .filtered_installed()
+                        .into_iter()
+                        .zip(ext_layout.installed_rows.iter())
+                    {
+                        if let Some(clipped) = row_rect.intersect(&ext_layout.body_rect) {
+                            installed_list.add_child(
+                                AccessibleNode::new(
+                                    format!("extensions.installed.{}", ext.id),
+                                    AccessibleRole::ListItem,
+                                    ext.display_name.clone(),
+                                    clipped,
+                                )
+                                .with_description(format!("v{}", ext.version))
+                                .with_selected(
+                                    self.extensions_view.selected_id.as_deref()
+                                        == Some(ext.id.as_str()),
+                                ),
+                            );
+                        }
+                    }
+
+                    let mut marketplace_list = AccessibleNode::new(
+                        "workbench.sidebar.extensions.marketplace",
+                        AccessibleRole::List,
+                        "Marketplace Extensions",
+                        ext_layout.marketplace_list_rect,
+                    )
+                    .with_expanded(!self.extensions_view.marketplace_collapsed);
+                    for (ext, (_, row_rect)) in self
+                        .extensions_view
+                        .filtered_marketplace()
+                        .into_iter()
+                        .zip(ext_layout.marketplace_rows.iter())
+                    {
+                        if let Some(clipped) = row_rect.intersect(&ext_layout.body_rect) {
+                            marketplace_list.add_child(
+                                AccessibleNode::new(
+                                    format!("extensions.marketplace.{}", ext.id),
+                                    AccessibleRole::ListItem,
+                                    ext.display_name.clone(),
+                                    clipped,
+                                )
+                                .with_description(format!("v{}", ext.version))
+                                .with_selected(
+                                    self.extensions_view.selected_id.as_deref()
+                                        == Some(ext.id.as_str()),
+                                ),
+                            );
+                        }
+                    }
+
+                    (
+                        "Extensions",
+                        vec![search_node, installed_list, marketplace_list],
+                        input_focused,
+                    )
+                } else {
+                    let header_h = 28.0;
+                    let row_h = 22.0;
+                    let mut tree = AccessibleNode::new(
+                        "workbench.sidebar.explorer.tree",
+                        AccessibleRole::Tree,
+                        "Explorer",
+                        Rect::from_xywh(
+                            regions.sidebar.min_x(),
+                            regions.sidebar.min_y() + header_h,
+                            regions.sidebar.width(),
+                            (regions.sidebar.height() - header_h).max(0.0),
+                        ),
+                    );
+                    for (idx, row) in self.explorer.flattened_rows().into_iter().enumerate() {
+                        let row_y = regions.sidebar.min_y() + header_h + idx as f32 * row_h;
+                        if row_y + row_h > regions.sidebar.max_y() {
+                            break;
+                        }
+                        let mut item = AccessibleNode::new(
+                            format!("explorer.row.{}", idx),
+                            AccessibleRole::TreeItem,
+                            row.name,
+                            Rect::from_xywh(
+                                regions.sidebar.min_x(),
+                                row_y,
+                                regions.sidebar.width(),
+                                row_h,
+                            ),
+                        )
+                        .with_selected(row.is_selected);
+                        if row.is_dir {
+                            item = item.with_expanded(row.is_expanded);
+                        }
+                        tree.add_child(item);
+                    }
+                    ("Explorer", vec![tree], false)
+                };
+
+            let sidebar_node = AccessibleNode::new(
+                "workbench.sidebar",
+                AccessibleRole::Sidebar,
+                sidebar_title,
+                regions.sidebar,
+            )
+            .with_focused(sidebar_focused && !child_has_focus)
+            .with_children(children);
+            root.add_child(sidebar_node);
+        }
+
+        // 3. Editor area
+        let mut editor_area_node = AccessibleNode::new(
+            "workbench.editorArea",
+            AccessibleRole::Panel,
+            "Editor Area",
+            regions.editor_area,
+        );
+
+        let tab_bar_h = 35.0;
+        let tab_bar_rect = Rect::from_xywh(
+            regions.editor_area.min_x(),
+            regions.editor_area.min_y(),
+            regions.editor_area.width(),
+            tab_bar_h,
+        );
+        let mut tab_list = AccessibleNode::new(
+            "workbench.editorArea.tabs",
+            AccessibleRole::TabList,
+            "Open Editors",
+            tab_bar_rect,
+        );
+        let group = self.editor_area.model.current_group_ref();
+        let mut cur_x = regions.editor_area.min_x();
+        for (idx, tab) in group.tabs.iter().enumerate() {
+            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
+            let tab_rect = Rect::from_xywh(cur_x, regions.editor_area.min_y(), tab_w, tab_bar_h);
+            if !crate::is_finite_rect(tab_rect) {
+                break;
+            }
+            tab_list.add_child(
+                AccessibleNode::new(
+                    format!("editor.tab.{}", idx),
+                    AccessibleRole::Tab,
+                    tab.title.clone(),
+                    tab_rect,
+                )
+                .with_selected(group.active_tab_index == Some(idx))
+                .with_action("select"),
+            );
+            cur_x += tab_w;
+        }
+        editor_area_node.add_child(tab_list);
+
+        if let Some(bc_rect) = self.editor_area.breadcrumbs_rect(regions.editor_area) {
+            let mut bc_node = AccessibleNode::new(
+                "workbench.editorArea.breadcrumbs",
+                AccessibleRole::Breadcrumb,
+                "Breadcrumbs",
+                bc_rect,
+            );
+            let item_rects = self.editor_area.breadcrumbs.compute_item_rects(bc_rect, font);
+            for (idx, item_rect) in item_rects {
+                if let Some(item) = self.editor_area.breadcrumbs.items.get(idx) {
+                    bc_node.add_child(
+                        AccessibleNode::new(
+                            format!("breadcrumbs.item.{}", idx),
+                            AccessibleRole::BreadcrumbItem,
+                            item.label.clone(),
+                            item_rect,
+                        )
+                        .with_selected(self.editor_area.breadcrumbs.selected_index == Some(idx))
+                        .with_action("select"),
+                    );
+                }
+            }
+            editor_area_node.add_child(bc_node);
+        }
+
+        let content_rect = self.editor_area.content_rect(regions.editor_area);
+        let editor_focused = self.focused_region == FocusedRegion::Editor;
+
+        if let Some(tab) = group.active_tab() {
+            if let Some(diff_view) = self.editor_area.diff_editors.get(&tab.uri) {
+                editor_area_node.add_child(
+                    AccessibleNode::new(
+                        format!("workbench.editor.diff.{}", tab.uri),
+                        AccessibleRole::TextEditor,
+                        diff_view.title.clone(),
+                        content_rect,
+                    )
+                    .with_read_only(true)
+                    .with_focused(editor_focused),
+                );
+            } else if let Some(webview) = self.editor_area.webviews.get(&tab.uri) {
+                let mut wv_node = AccessibleNode::new(
+                    format!("workbench.editor.webview.{}", tab.uri),
+                    AccessibleRole::Panel,
+                    webview.title.clone(),
+                    content_rect,
+                )
+                .with_focused(editor_focused);
+                for (idx, node) in webview.nodes.iter().enumerate() {
+                    match &node.kind {
+                        WebviewElementKind::Button { label, .. } => {
+                            wv_node.add_child(AccessibleNode::new(
+                                format!("webview.btn.{}", idx),
+                                AccessibleRole::Button,
+                                label.clone(),
+                                content_rect,
+                            ));
+                        }
+                        WebviewElementKind::Heading1(t)
+                        | WebviewElementKind::Heading2(t)
+                        | WebviewElementKind::Heading3(t)
+                        | WebviewElementKind::Paragraph(t) => {
+                            wv_node.add_child(AccessibleNode::new(
+                                format!("webview.text.{}", idx),
+                                AccessibleRole::StaticText,
+                                t.clone(),
+                                content_rect,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                editor_area_node.add_child(wv_node);
+            } else if let Some(settings_view) = self.editor_area.settings_views.get(&tab.uri) {
+                let search_focused =
+                    editor_focused && settings_view.focus == SettingsFocus::Search;
+                let mut settings_node = AccessibleNode::new(
+                    "workbench.editor.settings",
+                    AccessibleRole::Panel,
+                    "Settings",
+                    content_rect,
+                )
+                .with_focused(editor_focused && !search_focused);
+
+                settings_node.add_child(
+                    AccessibleNode::new(
+                        "settings.search",
+                        AccessibleRole::TextInput,
+                        "Search Settings",
+                        Rect::from_xywh(
+                            content_rect.min_x() + 16.0,
+                            content_rect.min_y() + 12.0,
+                            (content_rect.width() - 32.0).max(0.0),
+                            28.0,
+                        ),
+                    )
+                    .with_value(settings_view.state.search_query.clone())
+                    .with_focused(search_focused)
+                    .with_action("input"),
+                );
+
+                let mut list_node = AccessibleNode::new(
+                    "settings.items",
+                    AccessibleRole::List,
+                    "Settings Items",
+                    Rect::from_xywh(
+                        content_rect.min_x(),
+                        content_rect.min_y() + 48.0,
+                        content_rect.width(),
+                        (content_rect.height() - 48.0).max(0.0),
+                    ),
+                );
+                for (idx, item) in settings_view.state.get_filtered().into_iter().enumerate() {
+                    list_node.add_child(
+                        AccessibleNode::new(
+                            format!("settings.item.{}", item.key),
+                            AccessibleRole::ListItem,
+                            item.title.clone(),
+                            Rect::from_xywh(
+                                content_rect.min_x() + 160.0,
+                                content_rect.min_y() + 48.0 + idx as f32 * 56.0,
+                                (content_rect.width() - 176.0).max(0.0),
+                                52.0,
+                            ),
+                        )
+                        .with_value(item.current_value.to_string()),
+                    );
+                }
+                settings_node.add_child(list_node);
+                editor_area_node.add_child(settings_node);
+            } else if let Some(notebook) = self.editor_area.notebooks.get(&tab.uri) {
+                let mut nb_node = AccessibleNode::new(
+                    format!("workbench.editor.notebook.{}", tab.uri),
+                    AccessibleRole::Panel,
+                    tab.title.clone(),
+                    content_rect,
+                )
+                .with_focused(editor_focused);
+                nb_node.add_child(AccessibleNode::new(
+                    "notebook.toolbar",
+                    AccessibleRole::Toolbar,
+                    "Notebook Toolbar",
+                    Rect::from_xywh(content_rect.min_x(), content_rect.min_y(), content_rect.width(), 32.0),
+                ));
+                let mut cells_list = AccessibleNode::new(
+                    "notebook.cells",
+                    AccessibleRole::List,
+                    "Notebook Cells",
+                    Rect::from_xywh(
+                        content_rect.min_x(),
+                        content_rect.min_y() + 32.0,
+                        content_rect.width(),
+                        (content_rect.height() - 32.0).max(0.0),
+                    ),
+                );
+                for (idx, cell) in notebook.document.cells.iter().enumerate() {
+                    cells_list.add_child(
+                        AccessibleNode::new(
+                            format!("notebook.cell.{}", idx),
+                            AccessibleRole::ListItem,
+                            format!("Cell {} ({:?})", idx + 1, cell.kind),
+                            Rect::from_xywh(
+                                content_rect.min_x() + 12.0,
+                                content_rect.min_y() + 40.0 + idx as f32 * 64.0,
+                                (content_rect.width() - 24.0).max(0.0),
+                                60.0,
+                            ),
+                        )
+                        .with_value(cell.source.clone())
+                        .with_selected(notebook.active_cell_index == Some(idx)),
+                    );
+                }
+                nb_node.add_child(cells_list);
+                editor_area_node.add_child(nb_node);
+            } else if let Some(editor) = self.editor_area.editors.get(&tab.uri) {
+                let mut ed_node = editor.accessibility_node(
+                    &format!("workbench.editor.text.{}", tab.uri),
+                    content_rect,
+                    font,
+                );
+                ed_node.state.focused = editor_focused && editor.is_focused;
+                editor_area_node.add_child(ed_node);
+            } else {
+                editor_area_node.add_child(
+                    AccessibleNode::new(
+                        "workbench.editor.empty",
+                        AccessibleRole::StaticText,
+                        "No Active Editor",
+                        content_rect,
+                    )
+                    .with_focused(editor_focused),
+                );
+            }
+        } else {
+            editor_area_node.add_child(
+                AccessibleNode::new(
+                    "workbench.editor.empty",
+                    AccessibleRole::StaticText,
+                    "No Active Editor",
+                    content_rect,
+                )
+                .with_focused(editor_focused),
+            );
+        }
+        root.add_child(editor_area_node);
+
+        // 4. Bottom Panel
+        if self.layout.panel_visible {
+            let panel_focused = self.focused_region == FocusedRegion::Panel;
+            let debug_input_focused = panel_focused
+                && self.layout.active_panel_tab == "debug_console"
+                && self.debug_console.input_focused;
+            let mut panel_node = AccessibleNode::new(
+                "workbench.panel",
+                AccessibleRole::Panel,
+                "Panel",
+                regions.panel,
+            )
+            .with_focused(panel_focused && !debug_input_focused);
+
+            let tab_h = 26.0;
+            let mut panel_tabs = AccessibleNode::new(
+                "workbench.panel.tabs",
+                AccessibleRole::TabList,
+                "Panel Tabs",
+                Rect::from_xywh(regions.panel.min_x(), regions.panel.min_y(), regions.panel.width(), tab_h),
+            );
+            for (idx, (id, label)) in [
+                ("problems", "PROBLEMS"),
+                ("output", "OUTPUT"),
+                ("debug_console", "DEBUG CONSOLE"),
+                ("terminal", "TERMINAL"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                panel_tabs.add_child(
+                    AccessibleNode::new(
+                        format!("panel.tab.{}", id),
+                        AccessibleRole::Tab,
+                        *label,
+                        Rect::from_xywh(
+                            regions.panel.min_x() + idx as f32 * 100.0,
+                            regions.panel.min_y(),
+                            100.0,
+                            tab_h,
+                        ),
+                    )
+                    .with_selected(self.layout.active_panel_tab == *id),
+                );
+            }
+            panel_node.add_child(panel_tabs);
+
+            let panel_content_rect = Rect::from_xywh(
+                regions.panel.min_x(),
+                regions.panel.min_y() + tab_h,
+                regions.panel.width(),
+                (regions.panel.height() - tab_h).max(0.0),
+            );
+            if self.layout.active_panel_tab == "problems" {
+                let mut tree = AccessibleNode::new(
+                    "workbench.panel.problems",
+                    AccessibleRole::Tree,
+                    "Problems",
+                    panel_content_rect,
+                );
+                for (uri, diags) in &self.problems_panel.files {
+                    for (idx, diag) in diags.iter().enumerate() {
+                        tree.add_child(AccessibleNode::new(
+                            format!("problems.{}.{}", uri, idx),
+                            AccessibleRole::TreeItem,
+                            diag.message.clone(),
+                            panel_content_rect,
+                        ));
+                    }
+                }
+                panel_node.add_child(tree);
+            } else if self.layout.active_panel_tab == "debug_console" {
+                panel_node.add_child(
+                    AccessibleNode::new(
+                        "workbench.panel.debugConsole.input",
+                        AccessibleRole::TextInput,
+                        "Debug Console Input",
+                        Rect::from_xywh(
+                            panel_content_rect.min_x(),
+                            (panel_content_rect.max_y() - 28.0).max(panel_content_rect.min_y()),
+                            panel_content_rect.width(),
+                            28.0,
+                        ),
+                    )
+                    .with_value(self.debug_console.input_text.clone())
+                    .with_focused(debug_input_focused)
+                    .with_action("input"),
+                );
+            } else {
+                panel_node.add_child(AccessibleNode::new(
+                    format!("workbench.panel.{}", self.layout.active_panel_tab),
+                    AccessibleRole::StaticText,
+                    self.layout.active_panel_tab.clone(),
+                    panel_content_rect,
+                ));
+            }
+            root.add_child(panel_node);
+        }
+
+        // 5. Status bar
+        if self.layout.status_bar_visible {
+            let mut sb_node = AccessibleNode::new(
+                "workbench.statusBar",
+                AccessibleRole::StatusBar,
+                "Status Bar",
+                regions.status_bar,
+            );
+            for (item, rect) in self.status_bar.item_rects(regions.status_bar, font) {
+                let role = if item.command.is_some() {
+                    AccessibleRole::Button
+                } else {
+                    AccessibleRole::StaticText
+                };
+                let mut item_node = AccessibleNode::new(
+                    format!("statusBar.{}", item.id),
+                    role,
+                    item.text.clone(),
+                    rect,
+                );
+                if let Some(tooltip) = &item.tooltip {
+                    item_node = item_node.with_description(tooltip.clone());
+                }
+                if item.command.is_some() {
+                    item_node = item_node.with_action("press");
+                }
+                sb_node.add_child(item_node);
+            }
+            root.add_child(sb_node);
+        }
+
+        // 6. Command palette overlay (added last so hit_test reverse-order picks it first)
+        if self.is_command_palette_open {
+            if let Some(palette) = &self.command_palette {
+                let pal_focused = self.focused_region == FocusedRegion::CommandPalette;
+                let mut dialog = AccessibleNode::new(
+                    "workbench.commandPalette",
+                    AccessibleRole::Dialog,
+                    "Command Palette",
+                    regions.command_palette,
+                );
+                dialog.add_child(
+                    AccessibleNode::new(
+                        "commandPalette.input",
+                        AccessibleRole::TextInput,
+                        "Command Input",
+                        Rect::from_xywh(
+                            regions.command_palette.min_x() + 10.0,
+                            regions.command_palette.min_y() + 8.0,
+                            (regions.command_palette.width() - 20.0).max(0.0),
+                            28.0,
+                        ),
+                    )
+                    .with_value(palette.model.query.clone())
+                    .with_focused(pal_focused)
+                    .with_action("input"),
+                );
+
+                let mut results_list = AccessibleNode::new(
+                    "commandPalette.results",
+                    AccessibleRole::List,
+                    "Command Palette Results",
+                    Rect::from_xywh(
+                        regions.command_palette.min_x(),
+                        regions.command_palette.min_y() + 42.0,
+                        regions.command_palette.width(),
+                        (regions.command_palette.height() - 42.0).max(0.0),
+                    ),
+                );
+                for (vis_idx, &item_idx) in palette.model.filtered.iter().enumerate() {
+                    if let Some(item) = palette.model.items.get(item_idx) {
+                        results_list.add_child(
+                            AccessibleNode::new(
+                                format!("commandPalette.item.{}", vis_idx),
+                                AccessibleRole::ListItem,
+                                item.label.clone(),
+                                Rect::from_xywh(
+                                    regions.command_palette.min_x() + 4.0,
+                                    regions.command_palette.min_y() + 42.0 + vis_idx as f32 * 26.0,
+                                    (regions.command_palette.width() - 8.0).max(0.0),
+                                    26.0,
+                                ),
+                            )
+                            .with_selected(vis_idx == palette.model.selected_index),
+                        );
+                    }
+                }
+                dialog.add_child(results_list);
+                root.add_child(dialog);
+            }
+        }
+
+        AccessibilityTree::new(root)
     }
 }
 
@@ -278,6 +1064,9 @@ impl View for WorkbenchView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+            return;
+        }
         let regions = self.compute_regions(bounds);
 
         // 1. Overall base background
@@ -425,6 +1214,11 @@ impl View for WorkbenchView {
 
         // Modal command palette intercept
         if self.is_command_palette_open {
+            if matches!(event, InputEvent::MouseUp(_)) {
+                for editor in self.editor_area.editors.values_mut() {
+                    editor.minimap_dragging = false;
+                }
+            }
             if let Some(palette) = &mut self.command_palette {
                 let res = palette.handle_event(event, regions.command_palette);
                 if let Some(action) = &palette.last_action {
@@ -449,6 +1243,7 @@ impl View for WorkbenchView {
                                     active_editor.set_primary_position(rustcode_editor::Position::new(l.saturating_sub(1), col_val.unwrap_or(0)));
                                 }
                             }
+                            self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                             self.last_action = Some(WorkbenchAction::OpenFile(path_clone));
                             return EventResult::Consumed;
                         }
@@ -502,6 +1297,7 @@ impl View for WorkbenchView {
                             if let ScmAction::OpenDiff { path, title, original, modified } = &scm_act {
                                 let path_str = path.to_string_lossy().to_string();
                                 self.editor_area.open_diff(&path_str, title, original, modified);
+                                self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                                 self.last_action = Some(WorkbenchAction::OpenDiff {
                                     path: path.clone(),
                                     title: title.clone(),
@@ -535,6 +1331,7 @@ impl View for WorkbenchView {
                                             }
                                         }
                                     }
+                                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                                 }
                                 DebugViewAction::SelectFrame { path: None, .. } => {}
                                 DebugViewAction::JumpToBreakpoint { path, line } => {
@@ -550,6 +1347,7 @@ impl View for WorkbenchView {
                                             }
                                         }
                                     }
+                                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                                 }
                                 _ => {}
                             }
@@ -568,6 +1366,7 @@ impl View for WorkbenchView {
                                     if let Some(active_editor) = self.editor_area.active_editor_mut() {
                                         active_editor.set_primary_position(rustcode_editor::Position::new(line.saturating_sub(1), col));
                                     }
+                                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                                     self.last_action = Some(WorkbenchAction::OpenFile(path));
                                 }
                                 SearchAction::ExecuteSearch => {
@@ -593,6 +1392,7 @@ impl View for WorkbenchView {
                                     let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
                                     let content = std::fs::read_to_string(path).unwrap_or_default();
                                     self.editor_area.open_file(&path_str, title, &content, true);
+                                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                                     self.last_action = Some(WorkbenchAction::OpenFile(path.clone()));
                                 }
                                 ExplorerAction::ToggleDir(_) => {}
@@ -654,6 +1454,7 @@ impl View for WorkbenchView {
                                     active_editor.set_diagnostics(file_diags.clone());
                                 }
                             }
+                            self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                             self.focused_region = FocusedRegion::Editor;
                             self.last_action = Some(WorkbenchAction::JumpToDiagnostic {
                                 uri,
@@ -680,6 +1481,7 @@ impl View for WorkbenchView {
                 } else if regions.editor_area.contains(mouse.position) {
                     self.focused_region = FocusedRegion::Editor;
                     let res = self.editor_area.handle_event(event, regions.editor_area);
+                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                     // Sync editor gutter breakpoint clicks to debug session
                     if let Some(tab) = self.editor_area.model.current_group_ref().active_tab() {
                         let uri = tab.uri.clone();
@@ -719,7 +1521,11 @@ impl View for WorkbenchView {
                 }
 
                 match self.focused_region {
-                    FocusedRegion::Editor => self.editor_area.handle_event(event, regions.editor_area),
+                    FocusedRegion::Editor => {
+                        let res = self.editor_area.handle_event(event, regions.editor_area);
+                        self.editor_area.sync_breadcrumbs(Some(&self.workspace));
+                        res
+                    }
                     FocusedRegion::Sidebar => {
                         let view_id = self.layout.active_sidebar_view.as_str();
                         if view_id == "scm" || view_id == "workbench.view.scm" {
@@ -742,6 +1548,7 @@ impl View for WorkbenchView {
                                         if let Some(active_editor) = self.editor_area.active_editor_mut() {
                                             active_editor.set_primary_position(rustcode_editor::Position::new(line.saturating_sub(1), col));
                                         }
+                                        self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                                         self.last_action = Some(WorkbenchAction::OpenFile(path));
                                     }
                                     SearchAction::ExecuteSearch => {
@@ -796,13 +1603,40 @@ impl View for WorkbenchView {
                 }
             }
             InputEvent::MouseMove(mouse) => {
-                if regions.editor_area.contains(mouse.position) {
+                let dragging_minimap = self
+                    .editor_area
+                    .active_editor()
+                    .is_some_and(|e| e.minimap_dragging);
+                if dragging_minimap || regions.editor_area.contains(mouse.position) {
                     self.editor_area.handle_event(event, regions.editor_area)
                 } else {
                     EventResult::Ignored
                 }
             }
-            _ => EventResult::Ignored,
+            InputEvent::MouseUp(_) => {
+                let active_dragging = self
+                    .editor_area
+                    .active_editor()
+                    .is_some_and(|e| e.minimap_dragging);
+                let any_dragging = self
+                    .editor_area
+                    .editors
+                    .values()
+                    .any(|e| e.minimap_dragging);
+                let res = if active_dragging || self.focused_region == FocusedRegion::Editor {
+                    self.editor_area.handle_event(event, regions.editor_area)
+                } else {
+                    EventResult::Ignored
+                };
+                for editor in self.editor_area.editors.values_mut() {
+                    editor.minimap_dragging = false;
+                }
+                if any_dragging {
+                    EventResult::Consumed
+                } else {
+                    res
+                }
+            }
         }
     }
 }
@@ -936,8 +1770,9 @@ mod tests {
         wb.editor_area.open_file(file_path, "lib.rs", "fn foo() {\n    let a = 1;\n    let b = 2;\n}\n", false);
 
         let regions = wb.compute_regions(bounds);
-        let gutter_click_x = regions.editor_area.min_x() + 10.0;
-        let gutter_click_y = regions.editor_area.min_y() + 35.0 + font.line_height * 2.5; // Line 3
+        let content_rect = wb.editor_area.content_rect(regions.editor_area);
+        let gutter_click_x = content_rect.min_x() + 10.0;
+        let gutter_click_y = content_rect.min_y() + font.line_height * 2.5; // Line 3
         let click_gutter = InputEvent::MouseDown(rustcode_platform::render::MouseEvent::new(
             Point::new(gutter_click_x, gutter_click_y),
             rustcode_platform::render::MouseButton::Left,
@@ -1073,5 +1908,461 @@ mod tests {
         assert!(wb.extensions_view.scroll_top > 0.0);
         assert!(wb.explorer.last_action.is_none());
         let _ = regions;
+    }
+
+    #[test]
+    fn test_workbench_minimap_drag_forwarding_and_release() {
+        use rustcode_platform::render::{MouseButton, MouseEvent, MouseMoveEvent};
+
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let content: String = (0..200).map(|i| format!("let row_{} = {};\n", i, i)).collect();
+        wb.editor_area
+            .open_file("file:///workspace/big.rs", "big.rs", &content, false);
+
+        let regions = wb.compute_regions(bounds);
+        let content_rect = wb.editor_area.content_rect(regions.editor_area);
+        let mm_rect = wb
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .minimap_rect(content_rect)
+            .unwrap();
+
+        let down = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(mm_rect.min_x() + 20.0, mm_rect.max_y() - 30.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(wb.handle_event(&down, bounds), EventResult::Consumed);
+        assert!(wb.editor_area.active_editor().unwrap().minimap_dragging);
+
+        // Drag outside editor_area (into sidebar x=100) still updates scroll_top
+        let drag_out = InputEvent::MouseMove(MouseMoveEvent {
+            position: Point::new(100.0, mm_rect.min_y() + 20.0),
+        });
+        assert_eq!(wb.handle_event(&drag_out, bounds), EventResult::Consumed);
+
+        // MouseUp outside editor_area ends minimap drag cleanly
+        let up_out = InputEvent::MouseUp(MouseEvent::new(
+            Point::new(100.0, mm_rect.min_y() + 20.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(wb.handle_event(&up_out, bounds), EventResult::Consumed);
+        assert!(!wb.editor_area.active_editor().unwrap().minimap_dragging);
+    }
+
+    #[test]
+    fn test_workbench_accessibility_tree_regions_focus_extensions_and_overlay() {
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let font = FontMetrics::default_monospace();
+
+        wb.workspace = Workspace::from_folder(PathBuf::from("/workspace"));
+        wb.editor_area.open_file(
+            "file:///workspace/src/main.rs",
+            "main.rs",
+            "pub fn main() {\n    let x = 1;\n}\n",
+            false,
+        );
+        wb.editor_area.sync_breadcrumbs(Some(&wb.workspace));
+
+        let tree = wb.accessibility_tree(bounds, &font);
+        assert_eq!(tree.root.role, AccessibleRole::Window);
+        assert!(!tree.find_by_role(AccessibleRole::Toolbar).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::Sidebar).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::TabList).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::Tab).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::Breadcrumb).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::BreadcrumbItem).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::TextEditor).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::ScrollBar).is_empty());
+        assert!(!tree.find_by_role(AccessibleRole::StatusBar).is_empty());
+
+        let focused = tree.focused_node().unwrap();
+        assert_eq!(focused.role, AccessibleRole::TextEditor);
+
+        // Switching focus to Sidebar -> Extensions view shows Extensions Search & Lists
+        wb.layout.set_sidebar_view("workbench.view.extensions");
+        wb.focused_region = FocusedRegion::Sidebar;
+        wb.extensions_view.search_focused = true;
+        let ext_tree = wb.accessibility_tree(bounds, &font);
+        assert!(ext_tree.find_by_id("workbench.sidebar.extensions.search").is_some());
+        assert!(ext_tree.find_by_id("workbench.sidebar.extensions.marketplace").is_some());
+        assert_eq!(
+            ext_tree.focused_node().unwrap().id,
+            "workbench.sidebar.extensions.search"
+        );
+
+        // Opening CommandPalette -> Dialog & TextInput receive focus and win hit_test
+        let mut palette = CommandPalette::new();
+        palette.set_items(vec![PaletteItem::command("test.cmd", "Test Cmd", None, None)]);
+        wb.open_command_palette(CommandPaletteView::new(palette));
+        let pal_tree = wb.accessibility_tree(bounds, &font);
+        assert!(!pal_tree.find_by_role(AccessibleRole::Dialog).is_empty());
+        assert_eq!(pal_tree.focused_node().unwrap().id, "commandPalette.input");
+
+        let regions = wb.compute_regions(bounds);
+        let hit = pal_tree
+            .hit_test(Point::new(
+                regions.command_palette.min_x() + 20.0,
+                regions.command_palette.min_y() + 16.0,
+            ))
+            .unwrap();
+        assert_eq!(hit.id, "commandPalette.input");
+    }
+
+    #[test]
+    fn test_minimap_drag_cleared_when_command_palette_opens_mid_drag() {
+        use rustcode_platform::render::{MouseButton, MouseEvent, MouseMoveEvent};
+
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let content: String = (0..200).map(|i| format!("let row_{} = {};\n", i, i)).collect();
+        wb.editor_area
+            .open_file("file:///workspace/big.rs", "big.rs", &content, false);
+
+        let regions = wb.compute_regions(bounds);
+        let content_rect = wb.editor_area.content_rect(regions.editor_area);
+        let mm_rect = wb
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .minimap_rect(content_rect)
+            .unwrap();
+
+        let down = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(mm_rect.min_x() + 20.0, mm_rect.max_y() - 30.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(wb.handle_event(&down, bounds), EventResult::Consumed);
+        assert!(wb.editor_area.active_editor().unwrap().minimap_dragging);
+
+        // Open Command Palette mid-drag, send MouseUp, then close Command Palette
+        let mut palette = CommandPalette::new();
+        palette.set_items(vec![PaletteItem::command("test.cmd", "Test Cmd", None, None)]);
+        wb.open_command_palette(CommandPaletteView::new(palette));
+        assert!(!wb.editor_area.active_editor().unwrap().minimap_dragging);
+
+        // Even if minimap_dragging was active when palette intercepted MouseUp, MouseUp clears it
+        wb.editor_area.active_editor_mut().unwrap().minimap_dragging = true;
+        let up = InputEvent::MouseUp(MouseEvent::new(
+            Point::new(mm_rect.min_x() + 20.0, mm_rect.min_y() + 10.0),
+            MouseButton::Left,
+        ));
+        let _ = wb.handle_event(&up, bounds);
+        assert!(!wb.editor_area.active_editor().unwrap().minimap_dragging);
+
+        wb.close_command_palette();
+        let scroll_before = wb.editor_area.active_editor().unwrap().scroll_top;
+        let move_after = InputEvent::MouseMove(MouseMoveEvent {
+            position: Point::new(mm_rect.min_x() + 20.0, mm_rect.min_y() + 5.0),
+        });
+        let _ = wb.handle_event(&move_after, bounds);
+        assert_eq!(wb.editor_area.active_editor().unwrap().scroll_top, scroll_before);
+    }
+
+    #[test]
+    fn test_minimap_drag_cleared_on_mouseup_after_tab_switch() {
+        use rustcode_platform::render::{MouseButton, MouseEvent, MouseMoveEvent};
+
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let content: String = (0..200).map(|i| format!("let row_{} = {};\n", i, i)).collect();
+        wb.editor_area
+            .open_file("file:///workspace/big.rs", "big.rs", &content, false);
+        wb.editor_area
+            .open_file("file:///workspace/other.rs", "other.rs", "fn other() {}\n", false);
+        // Switch back to big.rs as active tab
+        wb.editor_area
+            .open_file("file:///workspace/big.rs", "big.rs", &content, false);
+
+        let regions = wb.compute_regions(bounds);
+        let content_rect = wb.editor_area.content_rect(regions.editor_area);
+        let mm_rect = wb
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .minimap_rect(content_rect)
+            .unwrap();
+
+        let down = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(mm_rect.min_x() + 20.0, mm_rect.max_y() - 30.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(wb.handle_event(&down, bounds), EventResult::Consumed);
+        assert!(wb.editor_area.editors["file:///workspace/big.rs"].minimap_dragging);
+
+        // Switch active tab mid-drag (e.g., via keybinding opening settings or another tab)
+        wb.open_settings(None);
+        assert_eq!(
+            wb.editor_area.model.current_group_ref().active_tab().unwrap().uri,
+            "rustcode://settings"
+        );
+        assert!(wb.editor_area.editors["file:///workspace/big.rs"].minimap_dragging);
+
+        // Release MouseUp while Settings tab is active
+        let up = InputEvent::MouseUp(MouseEvent::new(
+            Point::new(mm_rect.min_x() + 20.0, mm_rect.min_y() + 10.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(wb.handle_event(&up, bounds), EventResult::Consumed);
+        assert!(!wb.editor_area.editors["file:///workspace/big.rs"].minimap_dragging);
+
+        // Switching back to big.rs and moving mouse must NOT scroll
+        wb.editor_area.model.current_group().active_tab_index = Some(0);
+        let scroll_before = wb.editor_area.active_editor().unwrap().scroll_top;
+        let move_after = InputEvent::MouseMove(MouseMoveEvent {
+            position: Point::new(mm_rect.min_x() + 20.0, mm_rect.min_y() + 5.0),
+        });
+        let _ = wb.handle_event(&move_after, bounds);
+        assert_eq!(wb.editor_area.active_editor().unwrap().scroll_top, scroll_before);
+    }
+
+    #[test]
+    fn test_extensions_accessibility_tree_matches_shared_layout_with_many_items_and_collapse() {
+        use crate::extensions_view::InstalledExtensionItem;
+
+        let mut wb = WorkbenchView::new();
+        wb.layout.set_sidebar_view("workbench.view.extensions");
+        for i in 0..4 {
+            wb.extensions_view.installed.push(InstalledExtensionItem {
+                id: format!("pub.ext{}", i),
+                publisher: "pub".to_string(),
+                name: format!("ext{}", i),
+                version: "1.0.0".to_string(),
+                display_name: format!("Ext {}", i),
+                description: "Test extension".to_string(),
+                enabled: true,
+                root_dir: PathBuf::from(format!("/tmp/ext{}", i)),
+            });
+        }
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let regions = wb.compute_regions(bounds);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        wb.render(bounds, &theme, &font, &mut Scene::new());
+        let layout = wb.extensions_view.compute_layout(regions.sidebar);
+        let tree = wb.accessibility_tree(bounds, &font);
+
+        // Installed items >2 shift marketplace list & items cleanly in both layout and accessibility tree
+        let third_node = tree.find_by_id("extensions.installed.pub.ext3").unwrap();
+        assert_eq!(
+            third_node.bounds,
+            layout.installed_rows[3].1.intersect(&layout.body_rect).unwrap()
+        );
+        let mkt_list = tree.find_by_id("workbench.sidebar.extensions.marketplace").unwrap();
+        assert_eq!(mkt_list.bounds, layout.marketplace_list_rect);
+
+        let first_mkt = &layout.marketplace_rows[0];
+        let mkt_item_node = tree
+            .find_by_id(&format!("extensions.marketplace.{}", first_mkt.0))
+            .unwrap();
+        assert_eq!(
+            mkt_item_node.bounds,
+            first_mkt.1.intersect(&layout.body_rect).unwrap()
+        );
+
+        // Collapsing installed section hides installed rows and shifts marketplace up identically
+        wb.extensions_view.installed_collapsed = true;
+        wb.render(bounds, &theme, &font, &mut Scene::new());
+        let collapsed_layout = wb.extensions_view.compute_layout(regions.sidebar);
+        let collapsed_tree = wb.accessibility_tree(bounds, &font);
+
+        assert!(collapsed_tree.find_by_id("extensions.installed.pub.ext0").is_none());
+        let collapsed_mkt_list = collapsed_tree
+            .find_by_id("workbench.sidebar.extensions.marketplace")
+            .unwrap();
+        assert_eq!(collapsed_mkt_list.bounds, collapsed_layout.marketplace_list_rect);
+        assert!(
+            collapsed_mkt_list.bounds.min_y() < mkt_list.bounds.min_y(),
+            "collapsing installed should shift marketplace list upward"
+        );
+    }
+
+    #[test]
+    fn test_workbench_and_window_non_finite_bounds_extensions_and_palette_no_panic_no_nan() {
+        use crate::window::WorkbenchWindow;
+        use rustcode_platform::render::{SceneNode, Size};
+
+        let mut win = WorkbenchWindow::default();
+        win.view.layout.sidebar_visible = true;
+        win.view.layout.set_sidebar_view("extensions");
+        win.open_command_palette();
+
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for bad_bounds in [
+            Rect::new(Point::new(f32::NAN, f32::NAN), Size::new(1024.0, 768.0)),
+            Rect::new(Point::zero(), Size::new(f32::NAN, 768.0)),
+            Rect::new(Point::zero(), Size::new(1024.0, f32::NAN)),
+            Rect::from_xywh(0.0, 0.0, f32::INFINITY, 768.0),
+            Rect::from_xywh(f32::NEG_INFINITY, 0.0, 1024.0, 768.0),
+        ] {
+            let mut scene = Scene::new();
+            win.view.render(bad_bounds, &theme, &font, &mut scene);
+            assert!(scene.nodes().is_empty());
+
+            let tree = win.accessibility_tree(bad_bounds);
+            for node in tree.to_flat_list() {
+                assert!(
+                    crate::is_finite_rect(node.bounds),
+                    "non-finite accessibility node bounds for {}: {:?}",
+                    node.id,
+                    node.bounds
+                );
+            }
+        }
+
+        // Verify valid render produces balanced clips and finite primitives when extensions + palette active
+        let valid_bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let mut scene = Scene::new();
+        win.view.render(valid_bounds, &theme, &font, &mut scene);
+        let mut clip_depth = 0isize;
+        for node in scene.nodes() {
+            match node {
+                SceneNode::PushClip(r) => {
+                    clip_depth += 1;
+                    assert!(crate::is_finite_rect(*r));
+                }
+                SceneNode::PopClip => {
+                    clip_depth -= 1;
+                    assert!(clip_depth >= 0);
+                }
+                SceneNode::Quad(q) => assert!(crate::is_finite_rect(q.bounds)),
+                SceneNode::Shadow(s) => assert!(crate::is_finite_rect(s.bounds)),
+                SceneNode::GlyphRun(g) => {
+                    assert!(g.origin.x.is_finite() && g.origin.y.is_finite());
+                    assert!(crate::is_finite_rect(g.bounds));
+                }
+            }
+        }
+        assert_eq!(clip_depth, 0);
+    }
+
+    #[test]
+    fn test_window_dispatch_webview_non_finite_scroll_and_f32_max_font_render_safe() {
+        use crate::window::WorkbenchWindow;
+        use rustcode_ext_host::webview::WebviewOptions;
+        use rustcode_platform::render::{SceneNode, ScrollEvent};
+
+        let assert_scene_finite = |scene: &Scene, label: &str| {
+            let mut clip_depth = 0isize;
+            for node in scene.nodes() {
+                match node {
+                    SceneNode::PushClip(r) => {
+                        clip_depth += 1;
+                        assert!(crate::is_finite_rect(*r), "{}: non-finite PushClip {:?}", label, r);
+                    }
+                    SceneNode::PopClip => {
+                        clip_depth -= 1;
+                        assert!(clip_depth >= 0, "{}: clip stack underflow", label);
+                    }
+                    SceneNode::Quad(q) => {
+                        assert!(crate::is_finite_rect(q.bounds), "{}: non-finite Quad {:?}", label, q.bounds);
+                    }
+                    SceneNode::Shadow(s) => {
+                        assert!(crate::is_finite_rect(s.bounds), "{}: non-finite Shadow {:?}", label, s.bounds);
+                    }
+                    SceneNode::GlyphRun(g) => {
+                        assert!(
+                            g.origin.x.is_finite() && g.origin.y.is_finite(),
+                            "{}: non-finite GlyphRun origin {:?}",
+                            label,
+                            g.origin
+                        );
+                        assert!(
+                            crate::is_finite_rect(g.bounds),
+                            "{}: non-finite GlyphRun bounds {:?}",
+                            label,
+                            g.bounds
+                        );
+                    }
+                }
+            }
+            assert_eq!(clip_depth, 0, "{}: unbalanced clip stack", label);
+        };
+
+        // 1. WorkbenchWindow::dispatch_event with active webview tab + Inf/NaN ScrollWheel
+        let mut win = WorkbenchWindow::default();
+        win.view.editor_area.open_webview(
+            "wv_1",
+            "Preview",
+            "testPreview",
+            "<h1>Hello</h1><p>World</p><button>Action</button>",
+            WebviewOptions::default(),
+            None,
+        );
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for bad_dy in [f32::INFINITY, f32::NAN, f32::NEG_INFINITY] {
+            win.dispatch_event(
+                &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(500.0, 300.0), 0.0, bad_dy)),
+                bounds,
+            );
+            let wv = win.view.editor_area.webviews.get("wv_1").unwrap();
+            assert!(wv.scroll_top.is_finite(), "scroll_top poisoned for dy={}", bad_dy);
+        }
+
+        let mut wv_scene = Scene::new();
+        win.view.render(bounds, &theme, &font, &mut wv_scene);
+        assert_scene_finite(&wv_scene, "webview_after_bad_scroll");
+        assert!(wv_scene.contains_text("Hello"));
+
+        // ProblemsPanel inside WorkbenchWindow with NEG_INFINITY ScrollWheel
+        let mut panel_scene = Scene::new();
+        win.view.layout.panel_visible = true;
+        win.view.problems_panel.handle_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(500.0, 650.0), 0.0, f32::NEG_INFINITY)),
+            Rect::from_xywh(0.0, 550.0, 1024.0, 200.0),
+        );
+        assert!(win.view.problems_panel.scroll_top.is_finite());
+        win.view.render(bounds, &theme, &font, &mut panel_scene);
+        assert_scene_finite(&panel_scene, "problems_after_neg_inf_scroll");
+
+        // 2. f32::MAX FontMetrics rejected cleanly by is_finite_font across Layer 3 views
+        let max_font = FontMetrics {
+            font_family: "monospace".to_string(),
+            font_size: f32::MAX,
+            line_height: f32::MAX,
+            char_width: f32::MAX,
+            ascent: f32::MAX,
+            descent: 0.0,
+        };
+        assert!(!crate::is_finite_font(&max_font));
+
+        let mut ext_view = crate::extensions_view::ExtensionsSidebarView::new();
+        let mut ext_scene = Scene::new();
+        ext_view.search_query = "rust".to_string();
+        ext_view.render(bounds, &theme, &max_font, &mut ext_scene);
+        assert_scene_finite(&ext_scene, "extensions_max_font");
+
+        let settings_view = crate::settings_ui::SettingsUiView::default();
+        let mut settings_scene = Scene::new();
+        settings_view.render(bounds, &theme, &max_font, &mut settings_scene);
+        assert_scene_finite(&settings_scene, "settings_max_font");
+
+        let mut palette = crate::quickinput::CommandPalette::new();
+        palette.set_items(vec![crate::quickinput::PaletteItem::command(
+            "workbench.action.openSettings",
+            "Open Settings",
+            None,
+            None,
+        )]);
+        let palette_view = crate::quickinput::CommandPaletteView::new(palette);
+        let mut palette_scene = Scene::new();
+        palette_view.render(bounds, &theme, &max_font, &mut palette_scene);
+        assert_scene_finite(&palette_scene, "palette_max_font");
+
+        win.view.layout.sidebar_visible = true;
+        win.view.layout.set_sidebar_view("extensions");
+        win.open_command_palette();
+        let mut wb_scene = Scene::new();
+        win.view.render(bounds, &theme, &max_font, &mut wb_scene);
+        assert_scene_finite(&wb_scene, "workbench_max_font");
     }
 }

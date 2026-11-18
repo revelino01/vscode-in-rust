@@ -1,5 +1,9 @@
 //! GPUI EditorView component rendering text lines, line numbers, cursor, selections, and routing input.
 
+pub mod minimap;
+
+pub use minimap::MinimapState;
+
 use crate::completion::{AutocompleteWidget, CompletionItem, CompletionItemKind};
 use crate::cursor::{CursorState, Position, RangeEdit};
 use crate::document::TextDocument;
@@ -8,6 +12,7 @@ use crate::model::undo_redo::{TextEdit, UndoRedoStack};
 use crate::syntax::{GrammarRegistry, SyntaxHighlighter};
 use crate::viewmodel::{DiagnosticSeverity, EditorDiagnostic};
 use parking_lot::{Mutex, RwLock};
+use rustcode_platform::accessibility::{AccessibleNode, AccessibleRole, AccessibleState};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba,
@@ -42,6 +47,9 @@ pub struct EditorView {
     pub breakpoints: BTreeSet<usize>,
     pub execution_line: Option<usize>,
     pub last_gutter_action: Option<EditorGutterAction>,
+    pub minimap_enabled: bool,
+    pub minimap_width: f32,
+    pub minimap_dragging: bool,
 }
 
 impl EditorView {
@@ -63,6 +71,9 @@ impl EditorView {
             breakpoints: BTreeSet::new(),
             execution_line: None,
             last_gutter_action: None,
+            minimap_enabled: true,
+            minimap_width: minimap::DEFAULT_MINIMAP_WIDTH,
+            minimap_dragging: false,
         }
     }
 
@@ -172,6 +183,136 @@ impl EditorView {
         self
     }
 
+    pub fn with_minimap(mut self, enabled: bool) -> Self {
+        self.set_minimap_enabled(enabled);
+        self
+    }
+
+    pub fn set_minimap_enabled(&mut self, enabled: bool) {
+        self.minimap_enabled = enabled;
+        if !enabled {
+            self.minimap_dragging = false;
+        }
+    }
+
+    pub fn minimap_rect_with_gutter(&self, bounds: Rect, gutter_w: f32) -> Option<Rect> {
+        if !self.minimap_enabled
+            || !self.minimap_width.is_finite()
+            || self.minimap_width <= 0.0
+            || !gutter_w.is_finite()
+            || gutter_w < 0.0
+            || !is_finite_positive_rect(bounds)
+            || bounds.width() < gutter_w + self.minimap_width + 80.0
+        {
+            return None;
+        }
+        Some(Rect::from_xywh(
+            bounds.max_x() - self.minimap_width,
+            bounds.min_y(),
+            self.minimap_width,
+            bounds.height(),
+        ))
+    }
+
+    pub fn minimap_rect(&self, bounds: Rect) -> Option<Rect> {
+        self.minimap_rect_with_gutter(bounds, self.gutter_width(&FontMetrics::default_monospace()))
+    }
+
+    pub fn accessibility_node(&self, id: &str, bounds: Rect, font: &FontMetrics) -> AccessibleNode {
+        let safe_bounds = if is_finite_rect(bounds) {
+            Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), bounds.height())
+        } else {
+            Rect::zero()
+        };
+        let (line_count, text) = {
+            let buf = self.buffer.read();
+            let count = buf.line_count();
+            let full = buf.to_string();
+            let truncated = if full.len() > 4096 {
+                let mut end = 4096;
+                while !full.is_char_boundary(end) {
+                    end -= 1;
+                }
+                full[..end].to_string()
+            } else {
+                full
+            };
+            (count, truncated)
+        };
+
+        let (name, lang_id, is_dirty) = if let Some(doc) = &self.document {
+            let d = doc.read();
+            let file_name = d
+                .path
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "Text Editor".to_string());
+            (file_name, d.language_id.clone(), d.is_dirty)
+        } else {
+            ("Text Editor".to_string(), "plaintext".to_string(), false)
+        };
+
+        let pos = self.primary_position();
+        let dirty_suffix = if is_dirty { ", modified" } else { "" };
+        let description = format!(
+            "Ln {}, Col {}, {} lines, {}{}",
+            pos.line + 1,
+            pos.column + 1,
+            line_count,
+            lang_id,
+            dirty_suffix
+        );
+
+        let mut node = AccessibleNode::new(id, AccessibleRole::TextEditor, name, safe_bounds)
+            .with_value(text)
+            .with_description(description)
+            .with_state(AccessibleState::default().with_focused(self.is_focused))
+            .with_actions(["focus", "edit", "scroll"]);
+
+        if let Some(mm_rect) = self.minimap_rect_with_gutter(safe_bounds, self.gutter_width(font)) {
+            let max_line = line_count.max(1);
+            let safe_scroll_top = if self.scroll_top.is_finite() {
+                self.scroll_top.max(0.0)
+            } else {
+                0.0
+            };
+            let cur_top = (safe_scroll_top.floor() as usize)
+                .saturating_add(1)
+                .min(max_line);
+            node.add_child(
+                AccessibleNode::new(
+                    format!("{}-minimap", id),
+                    AccessibleRole::ScrollBar,
+                    "Minimap",
+                    mm_rect,
+                )
+                .with_value(format!("Line {} of {}", cur_top, max_line))
+                .with_description("Editor minimap scrollbar")
+                .with_action("scroll"),
+            );
+        }
+
+        if self.autocomplete.is_visible {
+            if let Some(pop_bounds) = *self.autocomplete.last_bounds.lock() {
+                if is_finite_rect(pop_bounds) {
+                    node.add_child(
+                        AccessibleNode::new(
+                            format!("{}-autocomplete", id),
+                            AccessibleRole::List,
+                            "Autocomplete Suggestions",
+                            pop_bounds,
+                        )
+                        .with_action("select"),
+                    );
+                }
+            }
+        }
+
+        node
+    }
+
     pub fn set_document(&mut self, doc: Arc<RwLock<TextDocument>>) {
         self.buffer = doc.read().buffer.clone();
         self.document = Some(doc);
@@ -242,7 +383,17 @@ impl EditorView {
     pub fn gutter_width(&self, font: &FontMetrics) -> f32 {
         let line_count = self.buffer.read().line_count();
         let digits = line_count.to_string().len();
-        ((digits + 4) as f32 * font.char_width).max(48.0)
+        let char_w = if font.char_width.is_finite() && font.char_width > 0.0 {
+            font.char_width
+        } else {
+            0.0
+        };
+        let raw = (digits + 4) as f32 * char_w;
+        if raw.is_finite() {
+            raw.max(48.0)
+        } else {
+            48.0
+        }
     }
 
     pub fn trigger_suggest(&mut self, trigger_char: Option<char>) {
@@ -716,16 +867,43 @@ impl View for EditorView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !is_finite_positive_rect(bounds)
+            || !font.line_height.is_finite()
+            || font.line_height <= 0.0
+            || !font.char_width.is_finite()
+            || font.char_width < 0.0
+            || !font.font_size.is_finite()
+            || font.font_size < 0.0
+        {
+            return;
+        }
+
         let buf = self.buffer.read();
         let line_count = buf.line_count();
+        let max_scroll_top = line_count.saturating_sub(1) as f32;
+
+        let scroll_top = if self.scroll_top.is_finite() {
+            self.scroll_top.clamp(0.0, max_scroll_top)
+        } else {
+            0.0
+        };
+        let scroll_left = if self.scroll_left.is_finite() {
+            self.scroll_left.clamp(0.0, 1_000_000.0)
+        } else {
+            0.0
+        };
 
         // 1. Editor background
-        scene.push_quad(Quad::new(bounds).with_background(theme.editor_background));
+        push_finite_quad(
+            scene,
+            Quad::new(bounds).with_background(theme.editor_background),
+        );
 
         // 2. Gutter background and border
         let gutter_w = self.gutter_width(font);
         let gutter_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y(), gutter_w, bounds.height());
-        scene.push_quad(
+        push_finite_quad(
+            scene,
             Quad::new(gutter_rect)
                 .with_background(theme.editor_gutter_background)
                 .with_border_edges(
@@ -734,35 +912,53 @@ impl View for EditorView {
                 ),
         );
 
-        // 3. Compute visible line range
-        let start_line = (self.scroll_top.floor() as usize).min(line_count.saturating_sub(1));
-        let visible_lines = (bounds.height() / font.line_height).ceil() as usize + 1;
-        let end_line = (start_line + visible_lines).min(line_count);
+        // 3. Compute visible line range and minimap / clip geometry
+        let start_line = (scroll_top.floor().clamp(0.0, usize::MAX as f32) as usize)
+            .min(line_count.saturating_sub(1));
+        let visible_lines = ((bounds.height() / font.line_height)
+            .ceil()
+            .clamp(0.0, (usize::MAX - 1) as f32) as usize)
+            .saturating_add(1);
+        let end_line = start_line.saturating_add(visible_lines).min(line_count);
 
-        let primary_pos = self.primary_position();
-
-        // 4. Current line highlight
-        if self.is_focused && primary_pos.line >= start_line && primary_pos.line < end_line {
-            let line_y = bounds.min_y() + (primary_pos.line as f32 - self.scroll_top) * font.line_height;
-            let hl_rect = Rect::from_xywh(
-                bounds.min_x() + gutter_w,
-                line_y,
-                bounds.width() - gutter_w,
-                font.line_height,
-            );
-            scene.push_quad(Quad::new(hl_rect).with_background(theme.editor_current_line));
+        let mm_rect = self.minimap_rect_with_gutter(bounds, gutter_w);
+        let code_min_x = bounds.min_x() + gutter_w;
+        if !code_min_x.is_finite() {
+            return;
+        }
+        let mut code_area_w = mm_rect.map_or(
+            (bounds.width() - gutter_w).max(0.0),
+            |mm| (mm.min_x() - code_min_x).max(0.0),
+        );
+        if !code_area_w.is_finite() {
+            return;
+        }
+        if let Some(mm) = mm_rect {
+            while code_min_x + code_area_w > mm.min_x() && code_area_w > 0.0 {
+                code_area_w = f32::from_bits(code_area_w.to_bits() - 1);
+            }
+        }
+        let code_clip_rect = Rect::from_xywh(
+            code_min_x,
+            bounds.min_y(),
+            code_area_w,
+            bounds.height(),
+        );
+        if !is_finite_rect(code_clip_rect) {
+            return;
         }
 
-        // 5. Render visible lines
+        let primary_pos = self.primary_position();
         let text_area_x = bounds.min_x() + gutter_w + 8.0;
 
-        // Warm up tokenizer cache sequentially up to start_line so multiline state is preserved
+        // Warm up tokenizer cache sequentially up to end_line so multiline state is preserved
+        // even across blank/empty lines in the visible range.
         {
             let mut highlighter_guard = self.syntax_highlighter.lock();
             if let Some(highlighter) = highlighter_guard.as_mut() {
                 let last_cached = highlighter.cache_len();
-                if last_cached < start_line {
-                    for l in last_cached..start_line {
+                if last_cached < end_line {
+                    for l in last_cached..end_line {
                         if let Some(content) = buf.get_line_content(l) {
                             highlighter.get_line_tokens(l, &content);
                         }
@@ -771,8 +967,12 @@ impl View for EditorView {
             }
         }
 
+        // 4. Gutter pass (breakpoints, execution arrow, line numbers)
         for line_idx in start_line..end_line {
-            let line_y = bounds.min_y() + (line_idx as f32 - self.scroll_top) * font.line_height;
+            let line_y = bounds.min_y() + (line_idx as f32 - scroll_top) * font.line_height;
+            if !line_y.is_finite() || !(line_y + font.line_height).is_finite() {
+                continue;
+            }
             let line_1based = line_idx + 1;
 
             // Breakpoint dot in gutter margin
@@ -780,36 +980,30 @@ impl View for EditorView {
                 let dot_size = 10.0;
                 let dot_x = bounds.min_x() + 4.0;
                 let dot_y = line_y + (font.line_height - dot_size) / 2.0;
-                scene.push_quad(
+                push_finite_quad(
+                    scene,
                     Quad::new(Rect::from_xywh(dot_x, dot_y, dot_size, dot_size))
                         .with_background(Rgba::new(0.9, 0.15, 0.15, 1.0))
                         .with_corner_radius(dot_size / 2.0),
                 );
             }
 
-            // Current execution paused line marker
+            // Execution arrow in gutter
             if self.execution_line == Some(line_1based) {
-                let hl_rect = Rect::from_xywh(
-                    bounds.min_x() + gutter_w,
-                    line_y,
-                    bounds.width() - gutter_w,
-                    font.line_height,
-                );
-                scene.push_quad(
-                    Quad::new(hl_rect).with_background(Rgba::new(0.4, 0.4, 0.1, 0.3)),
-                );
-
                 let arrow_x = bounds.min_x() + 4.0;
-                scene.push_text(GlyphRun::new(
-                    "▶".to_string(),
-                    Point::new(arrow_x, line_y),
-                    Rect::from_xywh(arrow_x, line_y, 12.0, font.line_height),
-                    Rgba::new(1.0, 0.85, 0.2, 1.0),
-                    font.font_size * 0.85,
-                ));
+                push_finite_text(
+                    scene,
+                    GlyphRun::new(
+                        "▶".to_string(),
+                        Point::new(arrow_x, line_y),
+                        Rect::from_xywh(arrow_x, line_y, 12.0, font.line_height),
+                        Rgba::new(1.0, 0.85, 0.2, 1.0),
+                        font.font_size * 0.85,
+                    ),
+                );
             }
 
-            // 5a. Gutter line number
+            // Gutter line number
             let line_num_str = line_1based.to_string();
             let num_w = font.text_width(&line_num_str);
             let num_x = bounds.min_x() + gutter_w - num_w - 6.0;
@@ -819,13 +1013,58 @@ impl View for EditorView {
                 theme.editor_line_number
             };
 
-            scene.push_text(GlyphRun::new(
-                line_num_str,
-                Point::new(num_x, line_y),
-                Rect::from_xywh(num_x, line_y, num_w, font.line_height),
-                num_color,
-                font.font_size,
-            ));
+            push_finite_text(
+                scene,
+                GlyphRun::new(
+                    line_num_str,
+                    Point::new(num_x, line_y),
+                    Rect::from_xywh(num_x, line_y, num_w, font.line_height),
+                    num_color,
+                    font.font_size,
+                ),
+            );
+        }
+
+        // 5. Clipped code area pass (current line highlight, execution highlight, selections, text, squigglies, cursors)
+        scene.push_clip(code_clip_rect);
+
+        // 5a. Current line highlight
+        if self.is_focused && primary_pos.line >= start_line && primary_pos.line < end_line {
+            let line_y = bounds.min_y() + (primary_pos.line as f32 - scroll_top) * font.line_height;
+            if line_y.is_finite() && (line_y + font.line_height).is_finite() {
+                let hl_rect = Rect::from_xywh(
+                    bounds.min_x() + gutter_w,
+                    line_y,
+                    code_area_w,
+                    font.line_height,
+                );
+                push_finite_quad(
+                    scene,
+                    Quad::new(hl_rect).with_background(theme.editor_current_line),
+                );
+            }
+        }
+
+        for line_idx in start_line..end_line {
+            let line_y = bounds.min_y() + (line_idx as f32 - scroll_top) * font.line_height;
+            if !line_y.is_finite() || !(line_y + font.line_height).is_finite() {
+                continue;
+            }
+            let line_1based = line_idx + 1;
+
+            // Current execution paused line highlight
+            if self.execution_line == Some(line_1based) {
+                let hl_rect = Rect::from_xywh(
+                    bounds.min_x() + gutter_w,
+                    line_y,
+                    code_area_w,
+                    font.line_height,
+                );
+                push_finite_quad(
+                    scene,
+                    Quad::new(hl_rect).with_background(Rgba::new(0.4, 0.4, 0.1, 0.3)),
+                );
+            }
 
             let line_content = buf.get_line_content(line_idx).unwrap_or_default();
 
@@ -857,10 +1096,13 @@ impl View for EditorView {
                                 }
                                 utf16_count += ch_utf16;
                             }
-                            let sel_x = text_area_x + (start_visual as f32 - self.scroll_left) * font.char_width;
+                            let sel_x = text_area_x + (start_visual as f32 - scroll_left) * font.char_width;
                             let sel_w = ((end_visual - start_visual) as f32 * font.char_width).max(4.0);
                             let sel_rect = Rect::from_xywh(sel_x, line_y, sel_w, font.line_height);
-                            scene.push_quad(Quad::new(sel_rect).with_background(theme.editor_selection));
+                            push_finite_quad(
+                                scene,
+                                Quad::new(sel_rect).with_background(theme.editor_selection),
+                            );
                         }
                     }
                 }
@@ -886,15 +1128,19 @@ impl View for EditorView {
                             {
                                 let gap_text = &line_content[last_byte..span_start];
                                 let gap_start_vis = line_content[..last_byte].chars().count();
-                                let gap_vis_w = gap_text.chars().count() as f32 * font.char_width;
-                                let gap_x = text_area_x + (gap_start_vis as f32 - self.scroll_left) * font.char_width;
-                                scene.push_text(GlyphRun::new(
-                                    gap_text.to_string(),
-                                    Point::new(gap_x, line_y),
-                                    Rect::from_xywh(gap_x, line_y, gap_vis_w, font.line_height),
+                                let gap_x = text_area_x + (gap_start_vis as f32 - scroll_left) * font.char_width;
+                                push_clipped_code_glyph_run(
+                                    scene,
+                                    gap_text,
+                                    gap_x,
+                                    line_y,
                                     theme.editor_foreground,
-                                    font.font_size,
-                                ));
+                                    font,
+                                    false,
+                                    false,
+                                    false,
+                                    code_clip_rect,
+                                );
                                 last_byte = span_start;
                             }
 
@@ -906,22 +1152,19 @@ impl View for EditorView {
                             {
                                 let span_text = &line_content[span_start..span_end];
                                 let span_start_vis = line_content[..span_start].chars().count();
-                                let span_vis_w = span_text.chars().count() as f32 * font.char_width;
-                                let span_x = text_area_x + (span_start_vis as f32 - self.scroll_left) * font.char_width;
+                                let span_x = text_area_x + (span_start_vis as f32 - scroll_left) * font.char_width;
                                 let span_color = span.color.unwrap_or(theme.editor_foreground);
-                                scene.push_text(
-                                    GlyphRun::new(
-                                        span_text.to_string(),
-                                        Point::new(span_x, line_y),
-                                        Rect::from_xywh(span_x, line_y, span_vis_w, font.line_height),
-                                        span_color,
-                                        font.font_size,
-                                    )
-                                    .with_style(
-                                        span.metadata.is_bold(),
-                                        span.metadata.is_italic(),
-                                        span.metadata.is_underline(),
-                                    ),
+                                push_clipped_code_glyph_run(
+                                    scene,
+                                    span_text,
+                                    span_x,
+                                    line_y,
+                                    span_color,
+                                    font,
+                                    span.metadata.is_bold(),
+                                    span.metadata.is_italic(),
+                                    span.metadata.is_underline(),
+                                    code_clip_rect,
                                 );
                                 last_byte = span_end;
                             } else {
@@ -935,30 +1178,38 @@ impl View for EditorView {
                         {
                             let tail_text = &line_content[last_byte..];
                             let tail_start_vis = line_content[..last_byte].chars().count();
-                            let tail_vis_w = tail_text.chars().count() as f32 * font.char_width;
-                            let tail_x = text_area_x + (tail_start_vis as f32 - self.scroll_left) * font.char_width;
-                            scene.push_text(GlyphRun::new(
-                                tail_text.to_string(),
-                                Point::new(tail_x, line_y),
-                                Rect::from_xywh(tail_x, line_y, tail_vis_w, font.line_height),
+                            let tail_x = text_area_x + (tail_start_vis as f32 - scroll_left) * font.char_width;
+                            push_clipped_code_glyph_run(
+                                scene,
+                                tail_text,
+                                tail_x,
+                                line_y,
                                 theme.editor_foreground,
-                                font.font_size,
-                            ));
+                                font,
+                                false,
+                                false,
+                                false,
+                                code_clip_rect,
+                            );
                         }
                     }
                 }
                 drop(highlighter_guard);
 
                 if !rendered_tokens {
-                    let text_w = font.text_width(&line_content);
-                    let text_x = text_area_x - self.scroll_left * font.char_width;
-                    scene.push_text(GlyphRun::new(
-                        line_content.clone(),
-                        Point::new(text_x, line_y),
-                        Rect::from_xywh(text_x, line_y, text_w, font.line_height),
+                    let text_x = text_area_x - scroll_left * font.char_width;
+                    push_clipped_code_glyph_run(
+                        scene,
+                        &line_content,
+                        text_x,
+                        line_y,
                         theme.editor_foreground,
-                        font.font_size,
-                    ));
+                        font,
+                        false,
+                        false,
+                        false,
+                        code_clip_rect,
+                    );
                 }
             }
 
@@ -980,7 +1231,7 @@ impl View for EditorView {
                 let start_vis = utf16_col_to_char_count(&line_content, start_col);
                 let end_vis = utf16_col_to_char_count(&line_content, end_col).max(start_vis + 1);
 
-                let sq_x = text_area_x + (start_vis as f32 - self.scroll_left) * font.char_width;
+                let sq_x = text_area_x + (start_vis as f32 - scroll_left) * font.char_width;
                 let sq_w = ((end_vis - start_vis) as f32 * font.char_width).max(4.0);
                 let sq_y = line_y + font.line_height - 2.5;
 
@@ -991,7 +1242,14 @@ impl View for EditorView {
                     DiagnosticSeverity::Hint => theme.editor_hint_foreground,
                 };
 
-                render_squiggly_wave(scene, sq_x, sq_x + sq_w, sq_y, color);
+                if sq_x.is_finite() && sq_y.is_finite() && !sq_w.is_nan() && sq_w > 0.0 {
+                    let raw_end = sq_x + sq_w;
+                    let clipped_start =
+                        sq_x.clamp(code_clip_rect.min_x(), code_clip_rect.max_x());
+                    let clipped_end =
+                        raw_end.clamp(code_clip_rect.min_x(), code_clip_rect.max_x());
+                    render_squiggly_wave(scene, clipped_start, clipped_end, sq_y, color);
+                }
             }
 
             // 5e. Cursors on this line
@@ -1000,13 +1258,39 @@ impl View for EditorView {
                     if sel.active.line == line_idx {
                         let visual_col = utf16_col_to_char_count(&line_content, sel.active.column);
                         let cursor_x = text_area_x
-                            + (visual_col as f32 - self.scroll_left) * font.char_width;
+                            + (visual_col as f32 - scroll_left) * font.char_width;
                         let cursor_rect =
                             Rect::from_xywh(cursor_x, line_y, 2.0, font.line_height);
-                        scene.push_quad(Quad::new(cursor_rect).with_background(theme.editor_cursor));
+                        push_finite_quad(
+                            scene,
+                            Quad::new(cursor_rect).with_background(theme.editor_cursor),
+                        );
                     }
                 }
             }
+        }
+
+        scene.pop_clip();
+
+        // 5f. Right-edge minimap
+        if let Some(mm_rect) = mm_rect {
+            let layout = minimap::MinimapLayout::compute(
+                mm_rect,
+                line_count,
+                scroll_top,
+                bounds.height(),
+                font.line_height,
+            );
+            minimap::render_minimap(
+                &layout,
+                &buf,
+                &self.syntax_highlighter,
+                &self.diagnostics,
+                primary_pos.line,
+                self.minimap_dragging,
+                theme,
+                scene,
+            );
         }
 
         // 6. Autocomplete Popover Overlay
@@ -1014,17 +1298,19 @@ impl View for EditorView {
             let buf = self.buffer.read();
             let line_content = buf.get_line_content(primary_pos.line).unwrap_or_default();
             let visual_col = utf16_col_to_char_count(&line_content, primary_pos.column);
-            let cursor_x = text_area_x + (visual_col as f32 - self.scroll_left) * font.char_width;
-            let cursor_y = bounds.min_y() + (primary_pos.line as f32 - self.scroll_top) * font.line_height;
+            let cursor_x = text_area_x + (visual_col as f32 - scroll_left) * font.char_width;
+            let cursor_y = bounds.min_y() + (primary_pos.line as f32 - scroll_top) * font.line_height;
             drop(buf);
 
-            self.autocomplete.render(
-                Point::new(cursor_x, cursor_y),
-                bounds,
-                theme,
-                font,
-                scene,
-            );
+            if cursor_x.is_finite() && cursor_y.is_finite() {
+                self.autocomplete.render(
+                    Point::new(cursor_x, cursor_y),
+                    bounds,
+                    theme,
+                    font,
+                    scene,
+                );
+            }
         }
 
         // 7. Error hover tooltip overlay
@@ -1035,58 +1321,69 @@ impl View for EditorView {
             let header_w = font.text_width(&header_text);
             let message_w = font.text_width(message_text);
             let card_rect = Self::hover_card_bounds(diag, mouse_pt, bounds, font);
-            let card_x = card_rect.min_x();
-            let card_y = card_rect.min_y();
-            let card_h = card_rect.height();
-            scene.push_shadow(Shadow {
-                bounds: card_rect,
-                offset: Point::new(0.0, 4.0),
-                blur: 10.0,
-                spread: 0.0,
-                color: Rgba::new(0.0, 0.0, 0.0, 0.35),
-            });
+            if is_finite_rect(card_rect) {
+                let card_x = card_rect.min_x();
+                let card_y = card_rect.min_y();
+                let card_h = card_rect.height();
+                push_finite_shadow(
+                    scene,
+                    Shadow {
+                        bounds: card_rect,
+                        offset: Point::new(0.0, 4.0),
+                        blur: 10.0,
+                        spread: 0.0,
+                        color: Rgba::new(0.0, 0.0, 0.0, 0.35),
+                    },
+                );
 
-            let sev_color = match diag.severity {
-                DiagnosticSeverity::Error => theme.editor_error_foreground,
-                DiagnosticSeverity::Warning => theme.editor_warning_foreground,
-                DiagnosticSeverity::Information => theme.editor_info_foreground,
-                DiagnosticSeverity::Hint => theme.editor_hint_foreground,
-            };
+                let sev_color = match diag.severity {
+                    DiagnosticSeverity::Error => theme.editor_error_foreground,
+                    DiagnosticSeverity::Warning => theme.editor_warning_foreground,
+                    DiagnosticSeverity::Information => theme.editor_info_foreground,
+                    DiagnosticSeverity::Hint => theme.editor_hint_foreground,
+                };
 
-            scene.push_quad(
-                Quad::new(card_rect)
-                    .with_background(theme.command_palette_bg)
-                    .with_border_edges(theme.panel_border, Edges::all(1.0))
-                    .with_corner_radius(4.0),
-            );
+                push_finite_quad(
+                    scene,
+                    Quad::new(card_rect)
+                        .with_background(theme.command_palette_bg)
+                        .with_border_edges(theme.panel_border, Edges::all(1.0))
+                        .with_corner_radius(4.0),
+                );
 
-            let bar_rect = Rect::from_xywh(card_x, card_y, 4.0, card_h);
-            scene.push_quad(
-                Quad::new(bar_rect)
-                    .with_background(sev_color)
-                    .with_corner_radius(2.0),
-            );
+                let bar_rect = Rect::from_xywh(card_x, card_y, 4.0, card_h);
+                push_finite_quad(
+                    scene,
+                    Quad::new(bar_rect)
+                        .with_background(sev_color)
+                        .with_corner_radius(2.0),
+                );
 
-            let header_pt = Point::new(card_x + 10.0, card_y + 6.0);
-            scene.push_text(
-                GlyphRun::new(
-                    header_text,
-                    header_pt,
-                    Rect::from_xywh(header_pt.x, header_pt.y, header_w, font.line_height),
-                    sev_color,
-                    font.font_size * 0.9,
-                )
-                .with_style(true, false, false),
-            );
+                let header_pt = Point::new(card_x + 10.0, card_y + 6.0);
+                push_finite_text(
+                    scene,
+                    GlyphRun::new(
+                        header_text,
+                        header_pt,
+                        Rect::from_xywh(header_pt.x, header_pt.y, header_w, font.line_height),
+                        sev_color,
+                        font.font_size * 0.9,
+                    )
+                    .with_style(true, false, false),
+                );
 
-            let msg_pt = Point::new(card_x + 10.0, card_y + 6.0 + font.line_height);
-            scene.push_text(GlyphRun::new(
-                message_text.clone(),
-                msg_pt,
-                Rect::from_xywh(msg_pt.x, msg_pt.y, message_w, font.line_height),
-                theme.editor_foreground,
-                font.font_size,
-            ));
+                let msg_pt = Point::new(card_x + 10.0, card_y + 6.0 + font.line_height);
+                push_finite_text(
+                    scene,
+                    GlyphRun::new(
+                        message_text.clone(),
+                        msg_pt,
+                        Rect::from_xywh(msg_pt.x, msg_pt.y, message_w, font.line_height),
+                        theme.editor_foreground,
+                        font.font_size,
+                    ),
+                );
+            }
         }
     }
 
@@ -1098,10 +1395,24 @@ impl View for EditorView {
             InputEvent::MouseDown(mouse) => {
                 self.hovered_diagnostic = None;
                 self.hover_position = None;
-                if !bounds.contains(mouse.position) {
+                if !is_finite_positive_rect(bounds)
+                    || !mouse.position.x.is_finite()
+                    || !mouse.position.y.is_finite()
+                    || !bounds.contains(mouse.position)
+                {
                     return EventResult::Ignored;
                 }
                 self.is_focused = true;
+                let scroll_top = if self.scroll_top.is_finite() {
+                    self.scroll_top.max(0.0)
+                } else {
+                    0.0
+                };
+                let scroll_left = if self.scroll_left.is_finite() {
+                    self.scroll_left.max(0.0)
+                } else {
+                    0.0
+                };
 
                 // Check click in autocomplete popover or documentation panel
                 if self.autocomplete.is_visible {
@@ -1126,19 +1437,35 @@ impl View for EditorView {
                     self.autocomplete.hide();
                 }
 
+                if let Some(mm_rect) = self.minimap_rect_with_gutter(bounds, gutter_w) {
+                    if mm_rect.contains(mouse.position) {
+                        self.minimap_dragging = true;
+                        let line_count = self.buffer.read().line_count();
+                        let layout = minimap::MinimapLayout::compute(
+                            mm_rect,
+                            line_count,
+                            self.scroll_top,
+                            bounds.height(),
+                            font.line_height,
+                        );
+                        self.scroll_top = layout.scroll_top_for_y(mouse.position.y);
+                        return EventResult::Consumed;
+                    }
+                }
+
                 if mouse.position.x >= bounds.min_x() + gutter_w {
                     let buf = self.buffer.read();
                     let line_count = buf.line_count();
 
                     let clicked_line = ((mouse.position.y - bounds.min_y()) / font.line_height
-                        + self.scroll_top)
+                        + scroll_top)
                         .floor()
                         .max(0.0) as usize;
                     let line_idx = clicked_line.min(line_count.saturating_sub(1));
 
                     let text_area_x = bounds.min_x() + gutter_w + 8.0;
                     let clicked_char_col = ((mouse.position.x - text_area_x
-                        + self.scroll_left * font.char_width)
+                        + scroll_left * font.char_width)
                         / font.char_width)
                         .round()
                         .max(0.0) as usize;
@@ -1161,7 +1488,7 @@ impl View for EditorView {
                         let buf = self.buffer.read();
                         let count = buf.line_count();
                         let idx = (((mouse.position.y - bounds.min_y()) / font.line_height
-                            + self.scroll_top)
+                            + scroll_top)
                             .floor()
                             .max(0.0) as usize)
                             .min(count.saturating_sub(1));
@@ -1169,7 +1496,7 @@ impl View for EditorView {
                         (count, len)
                     };
                     let clicked_line = ((mouse.position.y - bounds.min_y()) / font.line_height
-                        + self.scroll_top)
+                        + scroll_top)
                         .floor()
                         .max(0.0) as usize;
                     let line_idx = clicked_line.min(line_count.saturating_sub(1));
@@ -1186,8 +1513,22 @@ impl View for EditorView {
             }
             InputEvent::ScrollWheel(scroll) => {
                 let line_count = self.buffer.read().line_count();
-                self.scroll_top = (self.scroll_top - scroll.delta_y / font.line_height)
-                    .clamp(0.0, line_count.saturating_sub(1) as f32);
+                let safe_scroll_top = if self.scroll_top.is_finite() {
+                    self.scroll_top
+                } else {
+                    0.0
+                };
+                let delta = if scroll.delta_y.is_finite() {
+                    scroll.delta_y
+                } else {
+                    0.0
+                };
+                let raw = safe_scroll_top - delta / font.line_height;
+                self.scroll_top = if raw.is_nan() {
+                    0.0
+                } else {
+                    raw.clamp(0.0, line_count.saturating_sub(1) as f32)
+                };
                 EventResult::Consumed
             }
             InputEvent::KeyDown(key) => {
@@ -1377,6 +1718,35 @@ impl View for EditorView {
                 }
             }
             InputEvent::MouseMove(mouse) => {
+                if !is_finite_positive_rect(bounds)
+                    || !mouse.position.x.is_finite()
+                    || !mouse.position.y.is_finite()
+                {
+                    self.minimap_dragging = false;
+                    if self.hovered_diagnostic.is_some() {
+                        self.hovered_diagnostic = None;
+                        self.hover_position = None;
+                        return EventResult::Consumed;
+                    }
+                    return EventResult::Ignored;
+                }
+                if self.minimap_dragging {
+                    if let Some(mm_rect) = self.minimap_rect_with_gutter(bounds, gutter_w) {
+                        let line_count = self.buffer.read().line_count();
+                        let layout = minimap::MinimapLayout::compute(
+                            mm_rect,
+                            line_count,
+                            self.scroll_top,
+                            bounds.height(),
+                            font.line_height,
+                        );
+                        self.scroll_top = layout.scroll_top_for_y(mouse.position.y);
+                        return EventResult::Consumed;
+                    } else {
+                        self.minimap_dragging = false;
+                    }
+                }
+
                 if !bounds.contains(mouse.position) {
                     if self.hovered_diagnostic.is_some() {
                         self.hovered_diagnostic = None;
@@ -1392,6 +1762,18 @@ impl View for EditorView {
                     if card_rect.contains(mouse.position) {
                         return EventResult::Consumed;
                     }
+                }
+
+                let over_minimap = self
+                    .minimap_rect_with_gutter(bounds, gutter_w)
+                    .is_some_and(|r| r.contains(mouse.position));
+                if over_minimap {
+                    if self.hovered_diagnostic.is_some() {
+                        self.hovered_diagnostic = None;
+                        self.hover_position = None;
+                        return EventResult::Consumed;
+                    }
+                    return EventResult::Ignored;
                 }
 
                 if mouse.position.x >= bounds.min_x() + gutter_w {
@@ -1430,8 +1812,54 @@ impl View for EditorView {
                     EventResult::Ignored
                 }
             }
+            InputEvent::MouseUp(_) => {
+                if self.minimap_dragging {
+                    self.minimap_dragging = false;
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
             _ => EventResult::Ignored,
         }
+    }
+}
+
+fn is_finite_rect(rect: Rect) -> bool {
+    rect.min_x().is_finite()
+        && rect.min_y().is_finite()
+        && rect.width().is_finite()
+        && rect.height().is_finite()
+        && rect.max_x().is_finite()
+        && rect.max_y().is_finite()
+}
+
+fn is_finite_positive_rect(rect: Rect) -> bool {
+    is_finite_rect(rect) && rect.width() > 0.0 && rect.height() > 0.0
+}
+
+fn push_finite_quad(scene: &mut Scene, quad: Quad) {
+    if is_finite_rect(quad.bounds) {
+        scene.push_quad(quad);
+    }
+}
+
+fn push_finite_text(scene: &mut Scene, run: GlyphRun) {
+    if run.origin.x.is_finite()
+        && run.origin.y.is_finite()
+        && is_finite_rect(run.bounds)
+        && run.font_size.is_finite()
+    {
+        scene.push_text(run);
+    }
+}
+
+fn push_finite_shadow(scene: &mut Scene, shadow: Shadow) {
+    if is_finite_rect(shadow.bounds)
+        && shadow.offset.x.is_finite()
+        && shadow.offset.y.is_finite()
+    {
+        scene.push_shadow(shadow);
     }
 }
 
@@ -1450,22 +1878,107 @@ fn utf16_col_to_char_count(s: &str, col: usize) -> usize {
 }
 
 
-fn render_squiggly_wave(scene: &mut Scene, start_x: f32, end_x: f32, y: f32, color: Rgba) {
-    if !start_x.is_finite() || !end_x.is_finite() || start_x >= end_x {
+#[allow(clippy::too_many_arguments)]
+fn push_clipped_code_glyph_run(
+    scene: &mut Scene,
+    text: &str,
+    x: f32,
+    y: f32,
+    color: Rgba,
+    font: &FontMetrics,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    clip_rect: Rect,
+) {
+    if text.is_empty()
+        || !x.is_finite()
+        || !y.is_finite()
+        || !is_finite_positive_rect(clip_rect)
+        || !font.line_height.is_finite()
+        || font.line_height <= 0.0
+        || !font.font_size.is_finite()
+        || x >= clip_rect.max_x()
+    {
         return;
     }
+    let char_w = if font.char_width.is_finite() {
+        font.char_width.max(1.0)
+    } else {
+        1.0
+    };
+    let skip_chars = if x < clip_rect.min_x() {
+        ((clip_rect.min_x() - x) / char_w).floor().max(0.0) as usize
+    } else {
+        0
+    };
+    let clipped_x = x + skip_chars as f32 * char_w;
+    if !clipped_x.is_finite() || !clip_rect.max_x().is_finite() || clipped_x >= clip_rect.max_x() {
+        return;
+    }
+    let avail_w = (clip_rect.max_x() - clipped_x).max(0.0);
+    if !avail_w.is_finite() || avail_w <= 0.0 {
+        return;
+    }
+    let max_chars = ((avail_w / char_w).ceil() as usize).max(1);
+    let clipped_text: String = text.chars().skip(skip_chars).take(max_chars).collect();
+    if clipped_text.is_empty() {
+        return;
+    }
+    let mut clipped_w = (clipped_text.chars().count() as f32 * char_w).min(avail_w);
+    while clipped_x + clipped_w > clip_rect.max_x() && clipped_w > 0.0 {
+        clipped_w = f32::from_bits(clipped_w.to_bits() - 1);
+    }
+    let bounds = Rect::from_xywh(clipped_x, y, clipped_w, font.line_height);
+    if !is_finite_rect(bounds) {
+        return;
+    }
+    let mut run = GlyphRun::new(
+        clipped_text,
+        Point::new(clipped_x, y),
+        bounds,
+        color,
+        font.font_size,
+    );
+    if bold || italic || underline {
+        run = run.with_style(bold, italic, underline);
+    }
+    scene.push_text(run);
+}
+
+fn render_squiggly_wave(scene: &mut Scene, start_x: f32, end_x: f32, y: f32, color: Rgba) {
+    if !start_x.is_finite()
+        || !end_x.is_finite()
+        || !y.is_finite()
+        || end_x <= start_x
+        || !(y - 1.2).is_finite()
+        || !(y + 2.0).is_finite()
+    {
+        return;
+    }
+    const MAX_SQUIGGLY_SEGMENTS: usize = 4096;
     let wave_step: f32 = 3.0;
     let mut cur_x = start_x;
     let mut up = false;
-    while cur_x < end_x {
+    let mut segments = 0usize;
+    while cur_x < end_x && segments < MAX_SQUIGGLY_SEGMENTS {
         let seg_w = wave_step.min(end_x - cur_x);
-        if seg_w <= 0.0 {
+        if !seg_w.is_finite() || seg_w <= 0.0 {
             break;
         }
         let seg_y = if up { y - 1.2 } else { y + 0.8 };
-        scene.push_quad(Quad::new(Rect::from_xywh(cur_x, seg_y, seg_w, 1.2)).with_background(color));
-        cur_x += seg_w;
+        let quad_rect = Rect::from_xywh(cur_x, seg_y, seg_w, 1.2);
+        if !is_finite_rect(quad_rect) {
+            break;
+        }
+        scene.push_quad(Quad::new(quad_rect).with_background(color));
+        let next_x = cur_x + seg_w;
+        if !next_x.is_finite() || next_x <= cur_x {
+            break;
+        }
+        cur_x = next_x;
         up = !up;
+        segments += 1;
     }
 }
 
@@ -2669,6 +3182,672 @@ mod tests {
 
         assert!(view.undo());
         assert_eq!(view.text(), initial);
+    }
+
+    #[test]
+    fn test_minimap_rect_and_toggle() {
+        let mut view = EditorView::from_str("fn main() {}\nlet x = 1;");
+        let wide = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let narrow = Rect::from_xywh(0.0, 0.0, 150.0, 600.0);
+
+        assert!(view.minimap_enabled);
+        let mm = view.minimap_rect(wide).unwrap();
+        assert_eq!(mm.min_x(), 716.0);
+        assert_eq!(mm.max_x(), 800.0);
+        assert_eq!(mm.width(), 84.0);
+        assert!(view.minimap_rect(narrow).is_none());
+
+        view.minimap_dragging = true;
+        view.set_minimap_enabled(false);
+        assert!(!view.minimap_enabled);
+        assert!(!view.minimap_dragging);
+        assert!(view.minimap_rect(wide).is_none());
+    }
+
+    #[test]
+    fn test_minimap_render_clip_and_diagnostics() {
+        use rustcode_platform::render::SceneNode;
+
+        let content = "pub fn hello_world() -> usize { 42 }\n".repeat(120);
+        let mut view = EditorView::from_str(&content);
+        let registry = GrammarRegistry::default();
+        let theme_svc = rustcode_platform::theme::ThemeService::default_dark_theme();
+        view.set_language("rust", theme_svc, &registry);
+        view.set_diagnostics(vec![EditorDiagnostic::new(
+            Range::new(Position::new(10, 0), Position::new(10, 5)),
+            DiagnosticSeverity::Error,
+            "Sample error",
+        )]);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 300.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+
+        let mm_rect = view.minimap_rect_with_gutter(bounds, view.gutter_width(&font)).unwrap();
+        let has_code_clip = scene.nodes().iter().any(|n| match n {
+            SceneNode::PushClip(r) => (r.max_x() - mm_rect.min_x()).abs() < 0.01 && r.min_x() > 0.0,
+            _ => false,
+        });
+        assert!(has_code_clip, "Expected PushClip excluding minimap_rect");
+
+        let minimap_quads: Vec<_> = scene
+            .quads()
+            .into_iter()
+            .filter(|q| q.bounds.min_x() >= mm_rect.min_x() - 0.1)
+            .collect();
+        assert!(
+            minimap_quads.len() > 5,
+            "Expected background, slider, code blocks, diagnostic tick, and cursor indicator in minimap"
+        );
+
+        let has_error_tick = minimap_quads
+            .iter()
+            .any(|q| q.background == Some(theme.editor_error_foreground));
+        assert!(has_error_tick, "Expected diagnostic error tick in minimap");
+
+        // Disabling minimap removes minimap quads and code clip expands to full width
+        view.set_minimap_enabled(false);
+        let mut disabled_scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut disabled_scene);
+        let disabled_mm_quads = disabled_scene
+            .quads()
+            .into_iter()
+            .filter(|q| q.bounds.min_x() >= mm_rect.min_x() - 0.1)
+            .count();
+        assert_eq!(disabled_mm_quads, 0);
+    }
+
+    #[test]
+    fn test_minimap_mouse_click_drag_wheel_do_not_move_cursor() {
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{MouseButton, MouseEvent, MouseMoveEvent, ScrollEvent};
+
+        let content: String = (0..200).map(|i| format!("let line_{} = {};\n", i, i)).collect();
+        let mut view = EditorView::from_str(&content);
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 300.0);
+        let mm = view.minimap_rect(bounds).unwrap();
+        let initial_pos = view.primary_position();
+        assert_eq!(initial_pos, Position::new(0, 0));
+
+        // MouseDown near bottom of minimap
+        let down = InputEvent::MouseDown(MouseEvent {
+            position: Point::new(mm.min_x() + 20.0, mm.max_y() - 20.0),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        assert_eq!(view.handle_event(&down, bounds), EventResult::Consumed);
+        assert!(view.minimap_dragging);
+        assert!(view.scroll_top > 50.0);
+        assert_eq!(view.primary_position(), initial_pos);
+
+        // Drag upward
+        let prev_scroll = view.scroll_top;
+        let drag = InputEvent::MouseMove(MouseMoveEvent {
+            position: Point::new(mm.min_x() - 10.0, mm.min_y() + 20.0),
+        });
+        assert_eq!(view.handle_event(&drag, bounds), EventResult::Consumed);
+        assert!(view.scroll_top < prev_scroll);
+        assert_eq!(view.primary_position(), initial_pos);
+
+        // MouseUp ends drag
+        let up = InputEvent::MouseUp(MouseEvent {
+            position: Point::new(mm.min_x() - 10.0, mm.min_y() + 20.0),
+            button: MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        assert_eq!(view.handle_event(&up, bounds), EventResult::Consumed);
+        assert!(!view.minimap_dragging);
+
+        // ScrollWheel inside minimap scrolls without moving cursor
+        let scroll_before = view.scroll_top;
+        let wheel = InputEvent::ScrollWheel(ScrollEvent {
+            position: Point::new(mm.min_x() + 10.0, mm.min_y() + 50.0),
+            delta_x: 0.0,
+            delta_y: -100.0,
+            modifiers: Modifiers::default(),
+        });
+        assert_eq!(view.handle_event(&wheel, bounds), EventResult::Consumed);
+        assert!(view.scroll_top > scroll_before);
+        assert_eq!(view.primary_position(), initial_pos);
+    }
+
+    #[test]
+    fn test_editor_accessibility_node_with_and_without_minimap() {
+        let mut doc = TextDocument::new(
+            "fn main() {}\nlet a = 1;",
+            Some(std::path::PathBuf::from("/workspace/src/main.rs")),
+            Some("rust"),
+        );
+        doc.is_dirty = true;
+
+        let mut view = EditorView::from_str("").with_document(Arc::new(RwLock::new(doc)));
+        view.set_primary_position(Position::new(1, 4));
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 400.0);
+        let font = FontMetrics::default_monospace();
+
+        let node = view.accessibility_node("ed.1", bounds, &font);
+        assert_eq!(node.role, AccessibleRole::TextEditor);
+        assert_eq!(node.name, "main.rs");
+        assert!(node.state.focused);
+        let desc = node.description.as_deref().unwrap();
+        assert!(desc.contains("Ln 2, Col 5"));
+        assert!(desc.contains("rust"));
+        assert!(desc.contains("modified"));
+        assert_eq!(node.children.len(), 1);
+        assert_eq!(node.children[0].role, AccessibleRole::ScrollBar);
+        assert_eq!(node.children[0].name, "Minimap");
+
+        view.set_minimap_enabled(false);
+        let node_no_mm = view.accessibility_node("ed.1", bounds, &font);
+        assert!(node_no_mm.children.is_empty());
+    }
+
+    #[test]
+    fn test_minimap_render_does_not_poison_multiline_comment_cache_on_scroll() {
+        let mut lines = Vec::new();
+        for i in 0..5 {
+            lines.push(format!("let before_{} = {};", i, i));
+        }
+        lines.push("/* start multiline block comment".to_string());
+        for i in 6..220 {
+            if i % 5 == 0 {
+                lines.push(String::new());
+            } else if i % 7 == 0 {
+                lines.push("   ".to_string());
+            } else {
+                lines.push(format!("comment body line {}", i));
+            }
+        }
+        lines.push("end multiline block comment */".to_string());
+        lines.push("let after_comment = 42;".to_string());
+        let content = lines.join("\n");
+
+        let mut view = EditorView::from_str(&content);
+        let registry = GrammarRegistry::default();
+        let theme_svc = rustcode_platform::theme::ThemeService::default_dark_theme();
+        view.set_language("rust", theme_svc.clone(), &registry);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 300.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        // Render at scroll_top = 0.0 with minimap enabled (sample_step > 1 and blank lines present)
+        let mut scene1 = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene1);
+
+        // Scroll down into the middle of the block comment (past initial viewport and blank lines)
+        view.scroll_top = 150.0;
+        let mut scene2 = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene2);
+
+        let comment_color =
+            SyntaxHighlighter::resolve_color(&theme_svc, crate::SyntaxScope::CommentBlock);
+        let gutter_w = view.gutter_width(&font);
+        let target_y = bounds.min_y() + (151.0 - view.scroll_top) * font.line_height;
+        let line_151_runs: Vec<_> = scene2
+            .glyph_runs()
+            .into_iter()
+            .filter(|g| (g.origin.y - target_y).abs() < 0.5 && g.origin.x >= bounds.min_x() + gutter_w)
+            .collect();
+        assert!(!line_151_runs.is_empty(), "expected rendered glyph runs for line 151");
+        assert!(
+            line_151_runs.iter().all(|g| g.color == comment_color),
+            "expected CommentBlock color on scrolled multiline comment, got {:?}",
+            line_151_runs.iter().map(|g| (&g.text, g.color)).collect::<Vec<_>>()
+        );
+
+        let guard = view.syntax_highlighter.lock();
+        let hl = guard.as_ref().unwrap();
+        assert_eq!(hl.cache_len(), lines.len());
+    }
+
+    #[test]
+    fn test_code_glyph_runs_horizontally_culled_before_minimap_rect() {
+        use rustcode_platform::render::SceneNode;
+
+        let long_rust = format!("let very_long_variable_name = \"{}\"; // trailing comment", "x".repeat(180));
+        let long_plain = "a".repeat(220);
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 400.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for (lang, text) in [("rust", long_rust), ("plaintext", long_plain)] {
+            let mut view = EditorView::from_str(&text);
+            let registry = GrammarRegistry::default();
+            let theme_svc = rustcode_platform::theme::ThemeService::default_dark_theme();
+            view.set_language(lang, theme_svc, &registry);
+
+            let mut scene = Scene::new();
+            view.render(bounds, &theme, &font, &mut scene);
+
+            let mm_rect = view
+                .minimap_rect_with_gutter(bounds, view.gutter_width(&font))
+                .unwrap();
+
+            let mut push_clips = 0usize;
+            let mut pop_clips = 0usize;
+            for node in scene.nodes() {
+                match node {
+                    SceneNode::PushClip(_) => push_clips += 1,
+                    SceneNode::PopClip => pop_clips += 1,
+                    SceneNode::GlyphRun(run) => {
+                        assert!(
+                            run.origin.x < mm_rect.min_x(),
+                            "lang={} emitted GlyphRun origin inside minimap: {:?}",
+                            lang,
+                            run
+                        );
+                        assert!(
+                            run.bounds.max_x() <= mm_rect.min_x(),
+                            "lang={} emitted GlyphRun overlapping minimap: {:?} (mm_rect.min_x={})",
+                            lang,
+                            run,
+                            mm_rect.min_x()
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(push_clips, pop_clips, "unbalanced clip stack for {}", lang);
+
+            let mm_hits = scene.hit_test(Point::new(mm_rect.min_x() + 20.0, 5.0));
+            assert!(
+                !mm_hits.iter().any(|n| matches!(n, SceneNode::GlyphRun(_))),
+                "scene.hit_test inside minimap_rect returned GlyphRun for {}",
+                lang
+            );
+        }
+
+        // Strict <= mm_rect.min_x() (0 ULP slack) under fractional origins, widths, and scroll_left
+        let mut view = EditorView::from_str(&"let x = \"🦀αβγ\".repeat(50);".repeat(2));
+        let registry = GrammarRegistry::default();
+        let theme_svc = rustcode_platform::theme::ThemeService::default_dark_theme();
+        view.set_language("rust", theme_svc, &registry);
+        for origin_x in [0.0_f32, 10.3, 217.7] {
+            for width in [300.0_f32, 513.7, 799.3] {
+                for scroll_left in [0.0_f32, 0.5, 23.3] {
+                    view.scroll_left = scroll_left;
+                    let frac_bounds = Rect::from_xywh(origin_x, 0.0, width, 200.0);
+                    let mut scene = Scene::new();
+                    view.render(frac_bounds, &theme, &font, &mut scene);
+                    let mm_rect = view
+                        .minimap_rect_with_gutter(frac_bounds, view.gutter_width(&font))
+                        .unwrap();
+                    for node in scene.nodes() {
+                        if let SceneNode::GlyphRun(run) = node {
+                            assert!(
+                                run.origin.x < mm_rect.min_x(),
+                                "origin.x >= mm_rect.min_x() at origin_x={}, width={}, scroll_left={}",
+                                origin_x,
+                                width,
+                                scroll_left
+                            );
+                            assert!(
+                                run.bounds.max_x() <= mm_rect.min_x(),
+                                "bounds.max_x()={} > mm_rect.min_x()={} at origin_x={}, width={}, scroll_left={}",
+                                run.bounds.max_x(),
+                                mm_rect.min_x(),
+                                origin_x,
+                                width,
+                                scroll_left
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_editor_render_short_height_minimap_no_panic() {
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        let single_line = "fn main() { println!(\"short height\"); }";
+        let compressed_lines: String = (0..300).map(|i| format!("let line_{} = {};\n", i, i)).collect();
+
+        for (label, content) in [("single_line", single_line), ("compressed_300", compressed_lines.as_str())] {
+            let view = EditorView::from_str(content);
+            for height in [0.0_f32, 0.5, 10.0, 14.0, 15.9] {
+                let bounds = Rect::from_xywh(0.0, 0.0, 800.0, height);
+                let mut scene = Scene::new();
+                view.render(bounds, &theme, &font, &mut scene);
+                assert!(
+                    !scene.quads().is_empty() || height <= 0.0,
+                    "expected rendered quads for {} at height={}",
+                    label,
+                    height
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_editor_render_and_helpers_non_finite_bounds_no_panic_no_nan() {
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{MouseButton, MouseEvent, SceneNode, Size};
+
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let compressed_lines: String = (0..300).map(|i| format!("let line_{} = {};\n", i, i)).collect();
+
+        let bad_bounds = [
+            Rect::from_xywh(0.0, 0.0, 800.0, f32::INFINITY),
+            Rect::new(Point::zero(), Size::new(800.0, f32::NAN)),
+            Rect::from_xywh(0.0, 0.0, f32::INFINITY, 600.0),
+            Rect::new(Point::zero(), Size::new(f32::NAN, 600.0)),
+            Rect::from_xywh(f32::NAN, 0.0, 800.0, 600.0),
+            Rect::from_xywh(0.0, f32::NEG_INFINITY, 800.0, 600.0),
+            Rect::new(Point::new(f32::MAX, f32::MAX), Size::new(f32::MAX, f32::MAX)),
+        ];
+
+        for content in ["", "fn main() {}", compressed_lines.as_str()] {
+            for scroll_top in [0.0_f32, 5.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+                let mut view = EditorView::from_str(content);
+                view.scroll_top = scroll_top;
+                view.scroll_left = f32::NAN;
+
+                for &bounds in &bad_bounds {
+                    let mut scene = Scene::new();
+                    view.render(bounds, &theme, &font, &mut scene);
+
+                    let mut clip_depth = 0isize;
+                    for node in scene.nodes() {
+                        match node {
+                            SceneNode::PushClip(r) => {
+                                clip_depth += 1;
+                                assert!(is_finite_rect(*r), "non-finite clip: {:?}", r);
+                            }
+                            SceneNode::PopClip => {
+                                clip_depth -= 1;
+                                assert!(clip_depth >= 0, "clip underflow");
+                            }
+                            SceneNode::Quad(q) => {
+                                assert!(is_finite_rect(q.bounds), "non-finite quad: {:?}", q.bounds);
+                            }
+                            SceneNode::GlyphRun(g) => {
+                                assert!(g.origin.x.is_finite() && g.origin.y.is_finite());
+                                assert!(is_finite_rect(g.bounds), "non-finite glyph: {:?}", g.bounds);
+                            }
+                            SceneNode::Shadow(s) => {
+                                assert!(is_finite_rect(s.bounds));
+                            }
+                        }
+                    }
+                    assert_eq!(clip_depth, 0, "unbalanced clip stack");
+                    assert!(scene.quads().is_empty(), "expected 0 quads for non-finite bounds {:?}", bounds);
+                    assert!(scene.glyph_runs().is_empty(), "expected 0 glyphs for non-finite bounds {:?}", bounds);
+
+                    assert!(view.minimap_rect_with_gutter(bounds, view.gutter_width(&font)).is_none());
+
+                    let acc = view.accessibility_node("ed.bad", bounds, &font);
+                    assert!(is_finite_rect(acc.bounds));
+
+                    let down = InputEvent::MouseDown(MouseEvent {
+                        position: Point::new(10.0, 10.0),
+                        button: MouseButton::Left,
+                        modifiers: Modifiers::default(),
+                        click_count: 1,
+                    });
+                    assert_eq!(view.handle_event(&down, bounds), EventResult::Ignored);
+                }
+            }
+        }
+
+        // Non-finite FontMetrics also must not emit NaN/Inf or panic
+        let view = EditorView::from_str("fn main() {}");
+        let valid_bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        for bad_font in [
+            FontMetrics {
+                line_height: 0.0,
+                ..font.clone()
+            },
+            FontMetrics {
+                line_height: f32::NAN,
+                ..font.clone()
+            },
+            FontMetrics {
+                char_width: f32::INFINITY,
+                ..font.clone()
+            },
+        ] {
+            let gw = view.gutter_width(&bad_font);
+            assert!(gw.is_finite() && gw >= 48.0);
+            let mut scene = Scene::new();
+            view.render(valid_bounds, &theme, &bad_font, &mut scene);
+            for q in scene.quads() {
+                assert!(is_finite_rect(q.bounds));
+            }
+        }
+    }
+
+    #[test]
+    fn test_editor_render_extreme_scroll_and_font_metrics_no_inf_and_squiggly_bounded() {
+        use rustcode_platform::render::SceneNode;
+
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let compressed_lines: String = (0..300).map(|i| format!("let line_{} = {};\n", i, i)).collect();
+
+        let assert_scene_valid = |scene: &Scene, label: &str| {
+            let mut clip_depth = 0isize;
+            for node in scene.nodes() {
+                match node {
+                    SceneNode::PushClip(r) => {
+                        clip_depth += 1;
+                        assert!(is_finite_rect(*r), "{}: non-finite PushClip: {:?}", label, r);
+                    }
+                    SceneNode::PopClip => {
+                        clip_depth -= 1;
+                        assert!(clip_depth >= 0, "{}: clip stack underflow", label);
+                    }
+                    SceneNode::Quad(q) => {
+                        assert!(is_finite_rect(q.bounds), "{}: non-finite Quad: {:?}", label, q.bounds);
+                    }
+                    SceneNode::GlyphRun(g) => {
+                        assert!(
+                            g.origin.x.is_finite() && g.origin.y.is_finite(),
+                            "{}: non-finite GlyphRun origin: {:?}",
+                            label,
+                            g.origin
+                        );
+                        assert!(is_finite_rect(g.bounds), "{}: non-finite GlyphRun bounds: {:?}", label, g.bounds);
+                    }
+                    SceneNode::Shadow(s) => {
+                        assert!(is_finite_rect(s.bounds), "{}: non-finite Shadow: {:?}", label, s.bounds);
+                    }
+                }
+            }
+            assert_eq!(clip_depth, 0, "{}: unbalanced clip stack", label);
+        };
+
+        // 1. Extreme finite scroll_top = 1e38, scroll_left = 1e38, font.line_height = 1e38, font.char_width = 1e38
+        for content in ["", "let x = 1;", compressed_lines.as_str()] {
+            for (scroll_top, scroll_left, test_font) in [
+                (1e38_f32, 0.0_f32, font.clone()),
+                (0.0_f32, 1e38_f32, font.clone()),
+                (1e38_f32, 1e38_f32, font.clone()),
+                (
+                    5.0_f32,
+                    0.0_f32,
+                    FontMetrics {
+                        line_height: 1e38,
+                        ..font.clone()
+                    },
+                ),
+                (
+                    0.0_f32,
+                    10.0_f32,
+                    FontMetrics {
+                        char_width: 1e38,
+                        ..font.clone()
+                    },
+                ),
+                (
+                    5.0_f32,
+                    10.0_f32,
+                    FontMetrics {
+                        line_height: 2e38,
+                        char_width: 2e38,
+                        ..font.clone()
+                    },
+                ),
+            ] {
+                let mut view = EditorView::from_str(content);
+                view.scroll_top = scroll_top;
+                view.scroll_left = scroll_left;
+                view.toggle_breakpoint(1);
+                view.set_execution_line(Some(1));
+                view.cursor_state.primary_mut().anchor = Position::new(0, 0);
+                view.cursor_state.primary_mut().active = Position::new(0, 4);
+                let diag = EditorDiagnostic::error(
+                    crate::cursor::Range::new(Position::new(0, 0), Position::new(0, 4)),
+                    "err",
+                );
+                view.set_diagnostics(vec![diag.clone()]);
+                view.hovered_diagnostic = Some(diag);
+                view.hover_position = Some(Point::new(100.0, 100.0));
+                view.autocomplete.show(
+                    vec![CompletionItem::new("println!")],
+                    Position::new(0, 0),
+                    None,
+                );
+
+                let mut scene = Scene::new();
+                view.render(bounds, &theme, &test_font, &mut scene);
+                assert_scene_valid(
+                    &scene,
+                    &format!(
+                        "len={} st={} sl={} lh={} cw={}",
+                        content.len(),
+                        scroll_top,
+                        scroll_left,
+                        test_font.line_height,
+                        test_font.char_width
+                    ),
+                );
+            }
+        }
+
+        // 2. render_squiggly_wave precision-loss hang & clipping regression
+        let mut view = EditorView::from_str("let x = 1;");
+        view.set_diagnostics(vec![EditorDiagnostic::error(
+            crate::cursor::Range::new(Position::new(0, 0), Position::new(0, 4)),
+            "squiggly precision stress",
+        )]);
+        for cw in [1e7_f32, 1e38_f32] {
+            let big_cw_font = FontMetrics {
+                char_width: cw,
+                ..font.clone()
+            };
+            let mut scene = Scene::new();
+            view.render(bounds, &theme, &big_cw_font, &mut scene);
+            assert_scene_valid(&scene, &format!("squiggly cw={}", cw));
+            assert!(scene.quads().len() < 10_000, "unbounded quads emitted for cw={}", cw);
+        }
+
+        // Direct precision-loss check:
+        // - at 3.4e7 (between 2^25 and 2^26, ULP=4), MAX_SQUIGGLY_SEGMENTS bounds output
+        // - at 7.0e7 (>= 2^26, ULP=8), cur_x + 3.0 == cur_x breaks immediately
+        let mut mid_scene = Scene::new();
+        render_squiggly_wave(
+            &mut mid_scene,
+            3.4e7,
+            3.5e7,
+            100.0,
+            theme.editor_error_foreground,
+        );
+        assert!(mid_scene.quads().len() <= 4096);
+        for q in mid_scene.quads() {
+            assert!(is_finite_rect(q.bounds));
+        }
+
+        let mut direct_scene = Scene::new();
+        render_squiggly_wave(
+            &mut direct_scene,
+            7.0e7,
+            7.1e7,
+            100.0,
+            theme.editor_error_foreground,
+        );
+        assert!(direct_scene.quads().len() <= 1);
+        for q in direct_scene.quads() {
+            assert!(is_finite_rect(q.bounds));
+        }
+    }
+
+    #[test]
+    fn test_editor_render_with_autocomplete_doc_extreme_bounds_and_line_height_finite() {
+        use rustcode_platform::render::SceneNode;
+
+        let mut view = EditorView::from_str("let x = foo.cl;");
+        view.cursor_state.set_primary(Position::new(0, 14));
+        view.autocomplete.show_documentation = true;
+        view.autocomplete.show(
+            vec![
+                CompletionItem::new("clone")
+                    .with_kind(CompletionItemKind::Method)
+                    .with_detail("fn(&self) -> Self")
+                    .with_doc("Returns a duplicate of the value.\nSecond doc line."),
+            ],
+            Position::new(0, 12),
+            Some('.'),
+        );
+
+        let theme = WorkbenchThemeStyles::dark_default();
+        let base_font = FontMetrics::default_monospace();
+
+        for (bounds, line_height) in [
+            (Rect::from_xywh(0.0, 2.5e38, 800.0, 0.9e38), 1e38_f32),
+            (Rect::from_xywh(0.0, 0.0, f32::MAX, f32::MAX), 2.5e38_f32),
+            (Rect::from_xywh(1e38, 1e38, 1e38, 1e38), 2.5e38_f32),
+        ] {
+            let font = FontMetrics {
+                line_height,
+                ..base_font.clone()
+            };
+            let mut scene = Scene::new();
+            view.render(bounds, &theme, &font, &mut scene);
+
+            let mut clip_depth = 0isize;
+            for node in scene.nodes() {
+                match node {
+                    SceneNode::PushClip(r) => {
+                        clip_depth += 1;
+                        assert!(is_finite_rect(*r), "non-finite PushClip: {:?}", r);
+                    }
+                    SceneNode::PopClip => {
+                        clip_depth -= 1;
+                        assert!(clip_depth >= 0, "clip stack underflow");
+                    }
+                    SceneNode::Quad(q) => {
+                        assert!(is_finite_rect(q.bounds), "non-finite Quad: {:?}", q.bounds);
+                    }
+                    SceneNode::Shadow(s) => {
+                        assert!(is_finite_rect(s.bounds), "non-finite Shadow: {:?}", s.bounds);
+                    }
+                    SceneNode::GlyphRun(g) => {
+                        assert!(
+                            g.origin.x.is_finite() && g.origin.y.is_finite(),
+                            "non-finite GlyphRun origin: {:?}",
+                            g.origin
+                        );
+                        assert!(
+                            is_finite_rect(g.bounds),
+                            "non-finite GlyphRun bounds: {:?}",
+                            g.bounds
+                        );
+                    }
+                }
+            }
+            assert_eq!(clip_depth, 0, "unbalanced clip stack");
+        }
     }
 }
 

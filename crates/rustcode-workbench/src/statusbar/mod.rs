@@ -91,7 +91,7 @@ impl StatusBarView {
         }
     }
 
-    fn item_rects(&self, bounds: Rect, font: &FontMetrics) -> Vec<(StatusBarItem, Rect)> {
+    pub fn item_rects(&self, bounds: Rect, font: &FontMetrics) -> Vec<(StatusBarItem, Rect)> {
         let mut result = Vec::new();
 
         // Left items

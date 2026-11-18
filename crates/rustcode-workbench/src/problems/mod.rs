@@ -198,12 +198,17 @@ impl View for ProblemsPanel {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+            return;
+        }
+
         // 1. Panel base background
-        scene.push_quad(Quad::new(bounds).with_background(theme.panel_bg));
+        crate::push_finite_quad(scene, Quad::new(bounds).with_background(theme.panel_bg));
 
         let toolbar_h = 24.0f32;
         let toolbar_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), toolbar_h);
-        scene.push_quad(
+        crate::push_finite_quad(
+            scene,
             Quad::new(toolbar_rect)
                 .with_background(theme.sidebar_bg)
                 .with_border_edges(theme.panel_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
@@ -218,25 +223,36 @@ impl View for ProblemsPanel {
             "{} Errors, {} Warnings, {} Info",
             err_count, warn_count, info_count
         );
-        scene.push_text(GlyphRun::new(
-            summary_text,
-            Point::new(bounds.min_x() + 10.0, bounds.min_y() + 4.0),
-            Rect::from_xywh(bounds.min_x() + 10.0, bounds.min_y() + 4.0, 300.0, font.line_height),
-            theme.sidebar_header_fg,
-            font.font_size * 0.85,
-        ));
+        crate::push_finite_text(
+            scene,
+            GlyphRun::new(
+                summary_text,
+                Point::new(bounds.min_x() + 10.0, bounds.min_y() + 4.0),
+                Rect::from_xywh(bounds.min_x() + 10.0, bounds.min_y() + 4.0, 300.0, font.line_height),
+                theme.sidebar_header_fg,
+                font.font_size * 0.85,
+            ),
+        );
 
         // Filter notice if filter applied
         if !self.filter.is_empty() {
             let filter_str = format!("Filter: \"{}\"", self.filter);
             let filter_w = font.text_width(&filter_str);
-            scene.push_text(GlyphRun::new(
-                filter_str,
-                Point::new(bounds.max_x() - filter_w - 12.0, bounds.min_y() + 4.0),
-                Rect::from_xywh(bounds.max_x() - filter_w - 12.0, bounds.min_y() + 4.0, filter_w, font.line_height),
-                theme.editor_info_foreground,
-                font.font_size * 0.85,
-            ));
+            crate::push_finite_text(
+                scene,
+                GlyphRun::new(
+                    filter_str,
+                    Point::new(bounds.max_x() - filter_w - 12.0, bounds.min_y() + 4.0),
+                    Rect::from_xywh(
+                        bounds.max_x() - filter_w - 12.0,
+                        bounds.min_y() + 4.0,
+                        filter_w,
+                        font.line_height,
+                    ),
+                    theme.editor_info_foreground,
+                    font.font_size * 0.85,
+                ),
+            );
         }
 
         // 2. Diagnostics list
@@ -255,8 +271,18 @@ impl View for ProblemsPanel {
             .sum();
         let visible_h = (bounds.height() - toolbar_h).max(0.0);
         let max_scroll = ((total_rows as f32 * row_h) - visible_h).max(0.0);
-        let clamped_scroll = self.scroll_top.clamp(0.0, max_scroll);
+        let max_scroll = if max_scroll.is_finite() { max_scroll } else { 0.0 };
+        let safe_scroll = if self.scroll_top.is_finite() {
+            self.scroll_top
+        } else {
+            0.0
+        };
+        let clamped_scroll = safe_scroll.clamp(0.0, max_scroll);
         let mut cur_y = content_top + 4.0 - clamped_scroll;
+        if !cur_y.is_finite() {
+            *self.row_bounds.write() = row_cache;
+            return;
+        }
 
         if filtered.is_empty() {
             let empty_text = if self.files.is_empty() {
@@ -264,20 +290,28 @@ impl View for ProblemsPanel {
             } else {
                 "No problems match the current filter."
             };
-            scene.push_text(GlyphRun::new(
-                empty_text.to_string(),
-                Point::new(bounds.min_x() + 16.0, content_top + 8.0),
-                Rect::from_xywh(bounds.min_x() + 16.0, content_top + 8.0, 400.0, font.line_height),
-                theme.editor_line_number,
-                font.font_size * 0.9,
-            ));
+            crate::push_finite_text(
+                scene,
+                GlyphRun::new(
+                    empty_text.to_string(),
+                    Point::new(bounds.min_x() + 16.0, content_top + 8.0),
+                    Rect::from_xywh(bounds.min_x() + 16.0, content_top + 8.0, 400.0, font.line_height),
+                    theme.editor_line_number,
+                    font.font_size * 0.9,
+                ),
+            );
         } else {
             for (uri, diags) in filtered {
+                if !cur_y.is_finite() || !(cur_y + row_h).is_finite() {
+                    break;
+                }
                 let is_collapsed = self.collapsed_files.contains(&uri);
                 let file_row_rect = Rect::from_xywh(bounds.min_x(), cur_y, content_w, row_h);
 
                 if cur_y + row_h >= content_top && cur_y < content_bottom {
-                    row_cache.push((uri.clone(), None, file_row_rect));
+                    if crate::is_finite_positive_rect(file_row_rect) {
+                        row_cache.push((uri.clone(), None, file_row_rect));
+                    }
 
                     // File header row
                     let arrow = if is_collapsed { "▶ " } else { "▼ " };
@@ -287,7 +321,8 @@ impl View for ProblemsPanel {
                     let file_w = font.text_width(&file_label);
                     let badge_w = font.text_width(&badge);
 
-                    scene.push_text(
+                    crate::push_finite_text(
+                        scene,
                         GlyphRun::new(
                             file_label,
                             Point::new(bounds.min_x() + 8.0, cur_y + 3.0),
@@ -298,13 +333,16 @@ impl View for ProblemsPanel {
                         .with_style(true, false, false),
                     );
 
-                    scene.push_text(GlyphRun::new(
-                        badge,
-                        Point::new(bounds.min_x() + 8.0 + file_w, cur_y + 3.0),
-                        Rect::from_xywh(bounds.min_x() + 8.0 + file_w, cur_y + 3.0, badge_w, font.line_height),
-                        theme.editor_line_number,
-                        font.font_size * 0.85,
-                    ));
+                    crate::push_finite_text(
+                        scene,
+                        GlyphRun::new(
+                            badge,
+                            Point::new(bounds.min_x() + 8.0 + file_w, cur_y + 3.0),
+                            Rect::from_xywh(bounds.min_x() + 8.0 + file_w, cur_y + 3.0, badge_w, font.line_height),
+                            theme.editor_line_number,
+                            font.font_size * 0.85,
+                        ),
+                    );
                 }
 
                 cur_y += row_h;
@@ -312,14 +350,20 @@ impl View for ProblemsPanel {
                 // Problem items under this file
                 if !is_collapsed {
                     for (orig_idx, diag) in diags {
+                        if !cur_y.is_finite() || !(cur_y + row_h).is_finite() {
+                            break;
+                        }
                         let diag_rect = Rect::from_xywh(bounds.min_x(), cur_y, content_w, row_h);
 
                         if cur_y + row_h >= content_top && cur_y < content_bottom {
-                            row_cache.push((uri.clone(), Some(orig_idx), diag_rect));
+                            if crate::is_finite_positive_rect(diag_rect) {
+                                row_cache.push((uri.clone(), Some(orig_idx), diag_rect));
+                            }
 
                             let is_selected = self.selected.as_ref().is_some_and(|(u, i)| u == &uri && *i == orig_idx);
                             if is_selected {
-                                scene.push_quad(
+                                crate::push_finite_quad(
+                                    scene,
                                     Quad::new(diag_rect)
                                         .with_background(theme.list_active_selection_bg)
                                         .with_corner_radius(2.0),
@@ -345,7 +389,8 @@ impl View for ProblemsPanel {
                             let mut item_x = bounds.min_x() + 24.0;
 
                             // 1. Severity
-                            scene.push_text(
+                            crate::push_finite_text(
+                                scene,
                                 GlyphRun::new(
                                     sev_str.to_string(),
                                     Point::new(item_x, cur_y + 3.0),
@@ -358,13 +403,16 @@ impl View for ProblemsPanel {
                             item_x += sev_w;
 
                             // 2. Position
-                            scene.push_text(GlyphRun::new(
-                                pos_str,
-                                Point::new(item_x, cur_y + 3.0),
-                                Rect::from_xywh(item_x, cur_y + 3.0, pos_w, font.line_height),
-                                theme.editor_line_number,
-                                font.font_size * 0.85,
-                            ));
+                            crate::push_finite_text(
+                                scene,
+                                GlyphRun::new(
+                                    pos_str,
+                                    Point::new(item_x, cur_y + 3.0),
+                                    Rect::from_xywh(item_x, cur_y + 3.0, pos_w, font.line_height),
+                                    theme.editor_line_number,
+                                    font.font_size * 0.85,
+                                ),
+                            );
                             item_x += pos_w;
 
                             // 3. Message
@@ -373,23 +421,29 @@ impl View for ProblemsPanel {
                             } else {
                                 theme.editor_foreground
                             };
-                            scene.push_text(GlyphRun::new(
-                                diag.message.clone(),
-                                Point::new(item_x, cur_y + 3.0),
-                                Rect::from_xywh(item_x, cur_y + 3.0, msg_w, font.line_height),
-                                msg_color,
-                                font.font_size * 0.85,
-                            ));
+                            crate::push_finite_text(
+                                scene,
+                                GlyphRun::new(
+                                    diag.message.clone(),
+                                    Point::new(item_x, cur_y + 3.0),
+                                    Rect::from_xywh(item_x, cur_y + 3.0, msg_w, font.line_height),
+                                    msg_color,
+                                    font.font_size * 0.85,
+                                ),
+                            );
                             item_x += msg_w + 8.0;
 
                             // 4. Source & Code
-                            scene.push_text(GlyphRun::new(
-                                source_str,
-                                Point::new(item_x, cur_y + 3.0),
-                                Rect::from_xywh(item_x, cur_y + 3.0, src_w, font.line_height),
-                                theme.editor_line_number,
-                                font.font_size * 0.8,
-                            ));
+                            crate::push_finite_text(
+                                scene,
+                                GlyphRun::new(
+                                    source_str,
+                                    Point::new(item_x, cur_y + 3.0),
+                                    Rect::from_xywh(item_x, cur_y + 3.0, src_w, font.line_height),
+                                    theme.editor_line_number,
+                                    font.font_size * 0.8,
+                                ),
+                            );
                         }
 
                         cur_y += row_h;
@@ -402,23 +456,45 @@ impl View for ProblemsPanel {
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
+        if !crate::is_finite_positive_rect(bounds) {
+            return EventResult::Ignored;
+        }
         match event {
             InputEvent::ScrollWheel(scroll) => {
-                if bounds.contains(scroll.position) {
-                    self.scroll_top = (self.scroll_top - scroll.delta_y).max(0.0);
-                    EventResult::Consumed
-                } else {
-                    EventResult::Ignored
+                if !scroll.position.x.is_finite()
+                    || !scroll.position.y.is_finite()
+                    || !bounds.contains(scroll.position)
+                {
+                    return EventResult::Ignored;
                 }
+                let safe_scroll = if self.scroll_top.is_finite() {
+                    self.scroll_top.max(0.0)
+                } else {
+                    0.0
+                };
+                if !scroll.delta_y.is_finite() {
+                    self.scroll_top = safe_scroll;
+                    return EventResult::Ignored;
+                }
+                let next = (safe_scroll - scroll.delta_y).max(0.0);
+                self.scroll_top = if next.is_finite() {
+                    next
+                } else {
+                    safe_scroll
+                };
+                EventResult::Consumed
             }
             InputEvent::MouseDown(mouse) => {
-                if !bounds.contains(mouse.position) {
+                if !mouse.position.x.is_finite()
+                    || !mouse.position.y.is_finite()
+                    || !bounds.contains(mouse.position)
+                {
                     return EventResult::Ignored;
                 }
 
                 let rows = self.row_bounds.read().clone();
                 for (uri, maybe_idx, row_rect) in rows {
-                    if row_rect.contains(mouse.position) {
+                    if crate::is_finite_positive_rect(row_rect) && row_rect.contains(mouse.position) {
                         match maybe_idx {
                             None => {
                                 // Clicked file group row: toggle collapsed
@@ -657,5 +733,41 @@ mod tests {
         assert_eq!(diags[0].range.end, Position::new(10, 15));
         assert_eq!(diags[0].source.as_deref(), Some("rust-analyzer"));
         assert_eq!(diags[0].code.as_deref(), Some("E0308"));
+    }
+
+    #[test]
+    fn test_problems_panel_non_finite_scroll_and_bounds_safe() {
+        use rustcode_platform::render::{ScrollEvent, Size};
+
+        let mut panel = ProblemsPanel::new();
+        panel.set_file_diagnostics(
+            "src/lib.rs",
+            vec![EditorDiagnostic::error(
+                Range::new(Position::new(1, 0), Position::new(1, 4)),
+                "err",
+            )],
+        );
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let valid_bounds = Rect::from_xywh(0.0, 0.0, 800.0, 400.0);
+
+        panel.scroll_top = 12.0;
+        for bad_dy in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            panel.handle_event(
+                &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(100.0, 100.0), 0.0, bad_dy)),
+                valid_bounds,
+            );
+            assert!(panel.scroll_top.is_finite());
+        }
+        assert_eq!(panel.scroll_top, 12.0);
+
+        for bad_bounds in [
+            Rect::new(Point::zero(), Size::new(800.0, f32::NAN)),
+            Rect::from_xywh(0.0, 0.0, f32::INFINITY, 400.0),
+        ] {
+            let mut scene = Scene::new();
+            panel.render(bad_bounds, &theme, &font, &mut scene);
+            assert!(scene.is_empty());
+        }
     }
 }

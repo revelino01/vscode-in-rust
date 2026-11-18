@@ -221,14 +221,28 @@ impl Scene {
 
 
     pub fn hit_test(&self, point: Point) -> Vec<&SceneNode> {
-        self.nodes
-            .iter()
-            .filter(|node| match node {
-                SceneNode::Quad(q) => q.bounds.contains(point),
-                SceneNode::GlyphRun(g) => g.bounds.contains(point),
-                _ => false,
-            })
-            .collect()
+        let mut clip_stack: Vec<Rect> = Vec::new();
+        let mut hits = Vec::new();
+        for node in &self.nodes {
+            match node {
+                SceneNode::PushClip(rect) => clip_stack.push(*rect),
+                SceneNode::PopClip => {
+                    clip_stack.pop();
+                }
+                SceneNode::Quad(q)
+                    if clip_stack.iter().all(|c| c.contains(point)) && q.bounds.contains(point) =>
+                {
+                    hits.push(node);
+                }
+                SceneNode::GlyphRun(g)
+                    if clip_stack.iter().all(|c| c.contains(point)) && g.bounds.contains(point) =>
+                {
+                    hits.push(node);
+                }
+                _ => {}
+            }
+        }
+        hits
     }
 }
 

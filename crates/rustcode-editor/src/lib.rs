@@ -31,7 +31,7 @@ pub use syntax::{
     PlainTextGrammar, PythonGrammar, RustGrammar, SyntaxHighlighter, SyntaxScope, TokenMetadata,
     TokenSpan, TypeScriptGrammar,
 };
-pub use view::{EditorGutterAction, EditorView};
+pub use view::{EditorGutterAction, EditorView, MinimapState};
 pub use viewmodel::{
     DecorationKind, DecorationModel, DiagnosticSeverity, EditorDiagnostic, LineDecoration,
 };

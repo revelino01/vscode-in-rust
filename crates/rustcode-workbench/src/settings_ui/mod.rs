@@ -807,6 +807,12 @@ impl View for SettingsUiView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !crate::is_finite_positive_rect(bounds)
+            || !crate::is_finite_font(font)
+            || !(bounds.min_y() + 40.0).is_finite()
+        {
+            return;
+        }
         *self.last_font.write() = font.clone();
         scene.push_quad(Quad::new(bounds).with_background(theme.editor_background));
 
@@ -948,7 +954,13 @@ impl View for SettingsUiView {
         *self.last_content_height.write() = total_h;
 
         let max_scroll = (total_h - list_rect.height()).max(0.0);
-        let clamped_scroll = self.scroll_top.clamp(0.0, max_scroll);
+        let max_scroll = if max_scroll.is_finite() { max_scroll } else { 0.0 };
+        let safe_scroll = if self.scroll_top.is_finite() {
+            self.scroll_top
+        } else {
+            0.0
+        };
+        let clamped_scroll = safe_scroll.clamp(0.0, max_scroll);
         let mut cur_y = list_rect.min_y() - clamped_scroll;
 
         if filtered.is_empty() {
@@ -1313,17 +1325,36 @@ impl View for SettingsUiView {
                 SettingsFocus::None => EventResult::Ignored,
             },
             InputEvent::ScrollWheel(scroll) => {
-                if bounds.contains(scroll.position) {
-                    let (_, list_rect) = compute_list_layout(bounds);
-                    let font = self.last_font.read().clone();
-                    let total_h = self.compute_total_content_height(bounds, &font);
-                    *self.last_content_height.write() = total_h;
-                    let max_scroll = (total_h - list_rect.height()).max(0.0);
-                    self.scroll_top = (self.scroll_top - scroll.delta_y).clamp(0.0, max_scroll);
-                    EventResult::Consumed
-                } else {
-                    EventResult::Ignored
+                if !crate::is_finite_positive_rect(bounds)
+                    || !scroll.position.x.is_finite()
+                    || !scroll.position.y.is_finite()
+                    || !bounds.contains(scroll.position)
+                {
+                    return EventResult::Ignored;
                 }
+                let (_, list_rect) = compute_list_layout(bounds);
+                let font = self.last_font.read().clone();
+                let total_h = self.compute_total_content_height(bounds, &font);
+                let safe_total_h = if total_h.is_finite() { total_h } else { 0.0 };
+                *self.last_content_height.write() = safe_total_h;
+                let max_scroll = (safe_total_h - list_rect.height()).max(0.0);
+                let max_scroll = if max_scroll.is_finite() { max_scroll } else { 0.0 };
+                let safe_scroll = if self.scroll_top.is_finite() {
+                    self.scroll_top
+                } else {
+                    0.0
+                };
+                if !scroll.delta_y.is_finite() {
+                    self.scroll_top = safe_scroll.clamp(0.0, max_scroll);
+                    return EventResult::Ignored;
+                }
+                let raw = safe_scroll - scroll.delta_y;
+                self.scroll_top = if raw.is_nan() {
+                    0.0
+                } else {
+                    raw.clamp(0.0, max_scroll)
+                };
+                EventResult::Consumed
             }
             _ => EventResult::Ignored,
         }
@@ -2206,5 +2237,40 @@ mod tests {
             bounds,
         );
         assert_eq!(view.scroll_top, 10.0 * 80.0 - 660.0);
+    }
+
+    #[test]
+    fn test_settings_ui_non_finite_bounds_and_nan_scrollwheel_no_poison() {
+        use rustcode_platform::render::{ScrollEvent, Size};
+
+        let mut view = SettingsUiView::default();
+        view.handle_action(SettingsUiAction::Open);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for bad_bounds in [
+            Rect::new(Point::zero(), Size::new(f32::NAN, 600.0)),
+            Rect::new(Point::new(f32::NAN, f32::NAN), Size::new(800.0, 600.0)),
+            Rect::from_xywh(0.0, 0.0, 800.0, f32::INFINITY),
+        ] {
+            let mut scene = Scene::new();
+            view.render(bad_bounds, &theme, &font, &mut scene);
+            assert!(scene.nodes().is_empty());
+        }
+
+        let valid_bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let mut init_scene = Scene::new();
+        view.render(valid_bounds, &theme, &font, &mut init_scene);
+        assert!(init_scene.contains_text("Font Size"));
+
+        view.handle_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(400.0, 300.0), 0.0, f32::NAN)),
+            valid_bounds,
+        );
+        assert!(view.scroll_top.is_finite());
+
+        let mut after_scene = Scene::new();
+        view.render(valid_bounds, &theme, &font, &mut after_scene);
+        assert!(after_scene.contains_text("Font Size"));
     }
 }

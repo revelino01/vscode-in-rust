@@ -72,6 +72,8 @@ impl Grammar for MarkdownGrammar {
         let bytes = line.as_bytes();
         let len = bytes.len();
         let mut i = leading_spaces;
+        let mut no_more_links = false;
+        let mut failed_bracket_until: usize = 0;
 
         // Check bullet or number list
         if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
@@ -163,41 +165,61 @@ impl Grammar for MarkdownGrammar {
             // Link [text](url)
             if b == b'[' {
                 let start = i;
-                i += 1;
-                let mut closed_bracket = false;
-                while i < len {
-                    if bytes[i] == b']' {
-                        closed_bracket = true;
-                        break;
-                    }
-                    i += 1;
-                }
-                if closed_bracket && i + 1 < len && bytes[i + 1] == b'(' {
-                    i += 2;
-                    let mut closed_paren = false;
-                    while i < len {
-                        if bytes[i] == b')' {
-                            i += 1;
-                            closed_paren = true;
+                if !no_more_links && start >= failed_bracket_until {
+                    let mut scan = start + 1;
+                    let mut close_bracket = None;
+                    while scan < len {
+                        if bytes[scan] == b']' {
+                            close_bracket = Some(scan);
                             break;
                         }
-                        i += 1;
+                        scan += 1;
                     }
-                    if closed_paren {
-                        tokens.push(TokenSpan::with_style(
-                            start,
-                            i,
-                            SyntaxScope::MarkdownLink,
-                            lang_id,
-                            false,
-                            false,
-                            true,
-                        ));
-                        continue;
+                    match close_bracket {
+                        None => {
+                            no_more_links = true;
+                        }
+                        Some(cb) => {
+                            if cb + 1 < len && bytes[cb + 1] == b'(' {
+                                let mut p = cb + 2;
+                                let mut close_paren = None;
+                                while p < len {
+                                    if bytes[p] == b')' {
+                                        close_paren = Some(p);
+                                        break;
+                                    }
+                                    p += 1;
+                                }
+                                if let Some(cp) = close_paren {
+                                    i = cp + 1;
+                                    tokens.push(TokenSpan::with_style(
+                                        start,
+                                        i,
+                                        SyntaxScope::MarkdownLink,
+                                        lang_id,
+                                        false,
+                                        false,
+                                        true,
+                                    ));
+                                    continue;
+                                } else {
+                                    no_more_links = true;
+                                }
+                            } else {
+                                failed_bracket_until = cb + 1;
+                            }
+                        }
                     }
                 }
                 tokens.push(TokenSpan::new(start, start + 1, SyntaxScope::Punctuation, lang_id));
                 i = start + 1;
+                continue;
+            }
+
+            // Standalone '*' or '_' not forming bold/italic
+            if b == b'*' || b == b'_' {
+                tokens.push(TokenSpan::new(i, i + 1, SyntaxScope::Plain, lang_id));
+                i += 1;
                 continue;
             }
 
@@ -208,6 +230,10 @@ impl Grammar for MarkdownGrammar {
                 i += ch.len_utf8();
             }
             if i > start {
+                tokens.push(TokenSpan::new(start, i, SyntaxScope::Plain, lang_id));
+            } else {
+                let ch = line[i..].chars().next().unwrap();
+                i += ch.len_utf8();
                 tokens.push(TokenSpan::new(start, i, SyntaxScope::Plain, lang_id));
             }
         }
@@ -248,6 +274,119 @@ mod tests {
             assert!(line.is_char_boundary(t.end));
             assert!(t.start < t.end);
             assert!(t.end <= line.len());
+        }
+    }
+
+    #[test]
+    fn test_markdown_standalone_star_and_underscore_no_hang() {
+        let grammar = MarkdownGrammar;
+        let cases = [
+            "a * b",
+            "hello *",
+            "a _ b",
+            "hello _",
+            "/* 块注释 🦀 */",
+            "* ** _ __",
+        ];
+
+        for line in cases {
+            let (tokens, state) = grammar.tokenize_line(line, None);
+            assert_eq!(state, None, "unexpected state for {:?}", line);
+            assert!(!tokens.is_empty(), "expected tokens for {:?}", line);
+            for t in &tokens {
+                assert!(line.is_char_boundary(t.start));
+                assert!(line.is_char_boundary(t.end));
+                assert!(t.start < t.end);
+                assert!(t.end <= line.len());
+            }
+        }
+    }
+
+    #[test]
+    fn test_markdown_link_linear_time_and_edge_cases() {
+        use std::time::Instant;
+
+        let grammar = MarkdownGrammar;
+
+        // Adversarial O(N^2) candidates must finish in O(N) time (< 200ms)
+        let unclosed_50k = "[".repeat(50_000);
+        let repeated_pair_20k = "[a]".repeat(20_000);
+        let empty_pair_25k = "[]".repeat(25_000);
+        let prefix_then_close_25k = format!("{}]", "[".repeat(25_000));
+        let prefix_then_unclosed_paren_25k = format!("{}](unclosed", "[".repeat(25_000));
+        let prefix_then_valid_link_50k = format!("{}[ok](https://example.com)", "[".repeat(50_000));
+
+        for (name, line, expect_link) in [
+            ("unclosed_50k", unclosed_50k.as_str(), false),
+            ("repeated_pair_20k", repeated_pair_20k.as_str(), false),
+            ("empty_pair_25k", empty_pair_25k.as_str(), false),
+            ("prefix_then_close_25k", prefix_then_close_25k.as_str(), false),
+            (
+                "prefix_then_unclosed_paren_25k",
+                prefix_then_unclosed_paren_25k.as_str(),
+                false,
+            ),
+            ("prefix_then_valid_link_50k", prefix_then_valid_link_50k.as_str(), true),
+        ] {
+            let t0 = Instant::now();
+            let (tokens, state) = grammar.tokenize_line(line, None);
+            let elapsed = t0.elapsed();
+            assert_eq!(state, None, "case {}", name);
+            assert!(
+                elapsed.as_millis() < 200,
+                "case {} took {:?} (expected O(N) < 200ms)",
+                name,
+                elapsed
+            );
+            let has_link = tokens.iter().any(|t| t.scope == SyntaxScope::MarkdownLink);
+            assert_eq!(has_link, expect_link, "case {}", name);
+            for t in &tokens {
+                assert!(line.is_char_boundary(t.start));
+                assert!(line.is_char_boundary(t.end));
+                assert!(t.start < t.end);
+                assert!(t.end <= line.len());
+            }
+        }
+
+        // Mixed valid & broken bracket cases
+        let mixed_cases = [
+            ("[text](url)", vec![(0, 11, SyntaxScope::MarkdownLink)]),
+            ("[unclosed [ok](https://example.com)", vec![(0, 35, SyntaxScope::MarkdownLink)]),
+            ("[a [b](url)", vec![(0, 11, SyntaxScope::MarkdownLink)]),
+            (
+                "[foo][bar](baz)",
+                vec![
+                    (0, 1, SyntaxScope::Punctuation),
+                    (1, 5, SyntaxScope::Plain),
+                    (5, 15, SyntaxScope::MarkdownLink),
+                ],
+            ),
+            (
+                "[a [b][c](d)",
+                vec![
+                    (0, 1, SyntaxScope::Punctuation),
+                    (1, 3, SyntaxScope::Plain),
+                    (3, 4, SyntaxScope::Punctuation),
+                    (4, 6, SyntaxScope::Plain),
+                    (6, 12, SyntaxScope::MarkdownLink),
+                ],
+            ),
+            (
+                "[foo](bar",
+                vec![
+                    (0, 1, SyntaxScope::Punctuation),
+                    (1, 9, SyntaxScope::Plain),
+                ],
+            ),
+            ("[🦀](https://example.com)", vec![(0, 27, SyntaxScope::MarkdownLink)]),
+        ];
+
+        for (line, expected) in mixed_cases {
+            let (tokens, state) = grammar.tokenize_line(line, None);
+            assert_eq!(state, None, "line {:?}", line);
+            let actual: Vec<(usize, usize, SyntaxScope)> =
+                tokens.iter().map(|t| (t.start, t.end, t.scope)).collect();
+            assert_eq!(actual, expected, "line {:?}", line);
         }
     }
 }

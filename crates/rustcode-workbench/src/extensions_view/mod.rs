@@ -623,6 +623,151 @@ impl ExtensionsSidebarView {
             }
         }
     }
+
+    pub fn compute_layout(&self, bounds: Rect) -> ExtensionsSidebarLayout {
+        let header_h = 28.0;
+        let input_h = 26.0;
+        let safe_bounds = if crate::is_finite_rect(bounds)
+            && (bounds.min_y() + header_h + input_h + 6.0).is_finite()
+        {
+            Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), bounds.height())
+        } else {
+            Rect::zero()
+        };
+
+        let mut cur_y = safe_bounds.min_y() + header_h;
+
+        let search_rect = Rect::from_xywh(
+            safe_bounds.min_x() + 8.0,
+            cur_y,
+            (safe_bounds.width() - 16.0).max(0.0),
+            input_h,
+        );
+        cur_y += input_h + 6.0;
+
+        let footer_h = if self.status_message.is_some() { 20.0 } else { 0.0 };
+        let body_h = (safe_bounds.max_y() - cur_y - footer_h).max(0.0);
+        let body_rect = Rect::from_xywh(safe_bounds.min_x(), cur_y, safe_bounds.width(), body_h);
+
+        let installed_items = self.filtered_installed();
+        let marketplace_items = self.filtered_marketplace();
+        let total_h = self.compute_total_content_height();
+
+        let max_scroll = (total_h - body_h).max(0.0);
+        let max_scroll = if max_scroll.is_finite() { max_scroll } else { 0.0 };
+        let safe_scroll_top = if self.scroll_top.is_finite() {
+            self.scroll_top
+        } else {
+            0.0
+        };
+        let scroll = safe_scroll_top.clamp(0.0, max_scroll);
+
+        let section_h = 24.0;
+        let row_h = 54.0;
+        let mut y = body_rect.min_y() - scroll;
+
+        let installed_header_rect =
+            Rect::from_xywh(safe_bounds.min_x(), y, safe_bounds.width(), section_h);
+        y += section_h;
+
+        let inst_body_start = y;
+        let mut installed_rows = Vec::new();
+        if !self.installed_collapsed {
+            if installed_items.is_empty() {
+                y += 24.0;
+            } else {
+                for item in &installed_items {
+                    installed_rows.push((
+                        item.id.clone(),
+                        Rect::from_xywh(safe_bounds.min_x(), y, safe_bounds.width(), row_h),
+                    ));
+                    y += row_h;
+                }
+            }
+        }
+        let clamp_body_y = |val: f32| -> f32 {
+            let min_y = body_rect.min_y();
+            let max_y = body_rect.max_y();
+            if val.is_finite() && min_y.is_finite() && max_y.is_finite() && min_y <= max_y {
+                val.clamp(min_y, max_y)
+            } else if min_y.is_finite() {
+                min_y
+            } else {
+                0.0
+            }
+        };
+        let inst_raw_rect = Rect::from_xywh(
+            safe_bounds.min_x(),
+            inst_body_start,
+            safe_bounds.width(),
+            (y - inst_body_start).max(0.0),
+        );
+        let installed_list_rect = inst_raw_rect.intersect(&body_rect).unwrap_or_else(|| {
+            Rect::from_xywh(
+                safe_bounds.min_x(),
+                clamp_body_y(inst_body_start),
+                safe_bounds.width(),
+                0.0,
+            )
+        });
+
+        let marketplace_header_rect =
+            Rect::from_xywh(safe_bounds.min_x(), y, safe_bounds.width(), section_h);
+        y += section_h;
+
+        let mkt_body_start = y;
+        let mut marketplace_rows = Vec::new();
+        if !self.marketplace_collapsed {
+            if marketplace_items.is_empty() {
+                y += 24.0;
+            } else {
+                for item in &marketplace_items {
+                    marketplace_rows.push((
+                        item.id.clone(),
+                        Rect::from_xywh(safe_bounds.min_x(), y, safe_bounds.width(), row_h),
+                    ));
+                    y += row_h;
+                }
+            }
+        }
+        let mkt_raw_rect = Rect::from_xywh(
+            safe_bounds.min_x(),
+            mkt_body_start,
+            safe_bounds.width(),
+            (y - mkt_body_start).max(0.0),
+        );
+        let marketplace_list_rect = mkt_raw_rect.intersect(&body_rect).unwrap_or_else(|| {
+            Rect::from_xywh(
+                safe_bounds.min_x(),
+                clamp_body_y(mkt_body_start),
+                safe_bounds.width(),
+                0.0,
+            )
+        });
+
+        ExtensionsSidebarLayout {
+            search_rect,
+            body_rect,
+            installed_header_rect,
+            installed_list_rect,
+            installed_rows,
+            marketplace_header_rect,
+            marketplace_list_rect,
+            marketplace_rows,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtensionsSidebarLayout {
+    pub search_rect: Rect,
+    pub body_rect: Rect,
+    pub installed_header_rect: Rect,
+    pub installed_list_rect: Rect,
+    pub installed_rows: Vec<(String, Rect)>,
+    pub marketplace_header_rect: Rect,
+    pub marketplace_list_rect: Rect,
+    pub marketplace_rows: Vec<(String, Rect)>,
 }
 
 fn block_on_future<F>(fut: F) -> F::Output
@@ -705,6 +850,13 @@ impl View for ExtensionsSidebarView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !crate::is_finite_positive_rect(bounds)
+            || !crate::is_finite_font(font)
+            || !(bounds.min_x() + 12.0).is_finite()
+            || !(bounds.min_y() + 60.0).is_finite()
+        {
+            return;
+        }
         *self.last_font.write() = font.clone();
         let mut targets = Vec::new();
 
@@ -715,6 +867,7 @@ impl View for ExtensionsSidebarView {
                 .with_border_edges(theme.sidebar_border, Edges::new(0.0, 1.0, 0.0, 0.0)),
         );
 
+        let layout = self.compute_layout(bounds);
         let mut cur_y = bounds.min_y();
 
         // 2. Header (28.0 px)
@@ -735,12 +888,7 @@ impl View for ExtensionsSidebarView {
 
         // 3. Search input box (26.0 px + 6.0 bottom padding)
         let input_h = 26.0;
-        let input_rect = Rect::from_xywh(
-            bounds.min_x() + 8.0,
-            cur_y,
-            (bounds.width() - 16.0).max(0.0),
-            input_h,
-        );
+        let input_rect = layout.search_rect;
         let input_border = if self.search_focused {
             theme.activity_bar_active_border
         } else {
@@ -824,31 +972,23 @@ impl View for ExtensionsSidebarView {
             ));
         }
 
-        cur_y += input_h + 6.0;
+        let _ = cur_y + input_h + 6.0;
 
         // 4. Status footer (optional 20.0 px)
         let footer_h = if self.status_message.is_some() { 20.0 } else { 0.0 };
-        let body_h = (bounds.max_y() - cur_y - footer_h).max(0.0);
-        let body_rect = Rect::from_xywh(bounds.min_x(), cur_y, bounds.width(), body_h);
+        let body_rect = layout.body_rect;
 
         let installed_items = self.filtered_installed();
         let marketplace_items = self.filtered_marketplace();
-        let total_h = self.compute_total_content_height();
-
-        let max_scroll = (total_h - body_h).max(0.0);
-        let scroll = self.scroll_top.clamp(0.0, max_scroll);
 
         // 5. Scrollable body clipped to `body_rect`
         scene.push_clip(body_rect);
 
-        let section_h = 24.0;
-        let row_h = 54.0;
-        let mut y = body_rect.min_y() - scroll;
-
         // --- INSTALLED SECTION ---
         let inst_arrow = if self.installed_collapsed { "▶" } else { "▼" };
         let inst_header_text = format!("{} INSTALLED ({})", inst_arrow, installed_items.len());
-        let inst_header_rect = Rect::from_xywh(bounds.min_x(), y, bounds.width(), section_h);
+        let inst_header_rect = layout.installed_header_rect;
+        let y_inst_header = inst_header_rect.min_y();
         if inst_header_rect.max_y() > body_rect.min_y()
             && inst_header_rect.min_y() < body_rect.max_y()
         {
@@ -860,7 +1000,7 @@ impl View for ExtensionsSidebarView {
             scene.push_text(
                 GlyphRun::new(
                     inst_header_text,
-                    Point::new(bounds.min_x() + 8.0, y + 4.0),
+                    Point::new(bounds.min_x() + 8.0, y_inst_header + 4.0),
                     inst_header_rect,
                     theme.sidebar_header_fg,
                     font.font_size * 0.82,
@@ -874,26 +1014,28 @@ impl View for ExtensionsSidebarView {
                 ExtensionsClickTarget::ToggleInstalledSection,
             );
         }
-        y += section_h;
 
         if !self.installed_collapsed {
             if installed_items.is_empty() {
-                let empty_rect = Rect::from_xywh(bounds.min_x(), y, bounds.width(), 24.0);
+                let empty_y = inst_header_rect.max_y();
+                let empty_rect = Rect::from_xywh(bounds.min_x(), empty_y, bounds.width(), 24.0);
                 if empty_rect.max_y() > body_rect.min_y()
                     && empty_rect.min_y() < body_rect.max_y()
                 {
                     scene.push_text(GlyphRun::new(
                         "No installed extensions".to_string(),
-                        Point::new(bounds.min_x() + 12.0, y + 4.0),
+                        Point::new(bounds.min_x() + 12.0, empty_y + 4.0),
                         empty_rect,
                         theme.tab_inactive_fg,
                         font.font_size * 0.85,
                     ));
                 }
-                y += 24.0;
             } else {
-                for item in &installed_items {
-                    let row_rect = Rect::from_xywh(bounds.min_x(), y, bounds.width(), row_h);
+                for (item, (_, row_rect_ref)) in
+                    installed_items.iter().zip(layout.installed_rows.iter())
+                {
+                    let row_rect = *row_rect_ref;
+                    let y = row_rect.min_y();
                     if row_rect.max_y() > body_rect.min_y()
                         && row_rect.min_y() < body_rect.max_y()
                     {
@@ -1027,7 +1169,6 @@ impl View for ExtensionsSidebarView {
                             ExtensionsClickTarget::UninstallBtn(item.id.clone()),
                         );
                     }
-                    y += row_h;
                 }
             }
         }
@@ -1035,7 +1176,8 @@ impl View for ExtensionsSidebarView {
         // --- MARKETPLACE SECTION ---
         let mkt_arrow = if self.marketplace_collapsed { "▶" } else { "▼" };
         let mkt_header_text = format!("{} MARKETPLACE ({})", mkt_arrow, marketplace_items.len());
-        let mkt_header_rect = Rect::from_xywh(bounds.min_x(), y, bounds.width(), section_h);
+        let mkt_header_rect = layout.marketplace_header_rect;
+        let y_mkt_header = mkt_header_rect.min_y();
         if mkt_header_rect.max_y() > body_rect.min_y()
             && mkt_header_rect.min_y() < body_rect.max_y()
         {
@@ -1047,7 +1189,7 @@ impl View for ExtensionsSidebarView {
             scene.push_text(
                 GlyphRun::new(
                     mkt_header_text,
-                    Point::new(bounds.min_x() + 8.0, y + 4.0),
+                    Point::new(bounds.min_x() + 8.0, y_mkt_header + 4.0),
                     mkt_header_rect,
                     theme.sidebar_header_fg,
                     font.font_size * 0.82,
@@ -1061,25 +1203,28 @@ impl View for ExtensionsSidebarView {
                 ExtensionsClickTarget::ToggleMarketplaceSection,
             );
         }
-        y += section_h;
 
         if !self.marketplace_collapsed {
             if marketplace_items.is_empty() {
-                let empty_rect = Rect::from_xywh(bounds.min_x(), y, bounds.width(), 24.0);
+                let empty_y = mkt_header_rect.max_y();
+                let empty_rect = Rect::from_xywh(bounds.min_x(), empty_y, bounds.width(), 24.0);
                 if empty_rect.max_y() > body_rect.min_y()
                     && empty_rect.min_y() < body_rect.max_y()
                 {
                     scene.push_text(GlyphRun::new(
                         "No matching marketplace extensions".to_string(),
-                        Point::new(bounds.min_x() + 12.0, y + 4.0),
+                        Point::new(bounds.min_x() + 12.0, empty_y + 4.0),
                         empty_rect,
                         theme.tab_inactive_fg,
                         font.font_size * 0.85,
                     ));
                 }
             } else {
-                for item in &marketplace_items {
-                    let row_rect = Rect::from_xywh(bounds.min_x(), y, bounds.width(), row_h);
+                for (item, (_, row_rect_ref)) in
+                    marketplace_items.iter().zip(layout.marketplace_rows.iter())
+                {
+                    let row_rect = *row_rect_ref;
+                    let y = row_rect.min_y();
                     if row_rect.max_y() > body_rect.min_y()
                         && row_rect.min_y() < body_rect.max_y()
                     {
@@ -1185,7 +1330,6 @@ impl View for ExtensionsSidebarView {
                             );
                         }
                     }
-                    y += row_h;
                 }
             }
         }
@@ -1222,7 +1366,12 @@ impl View for ExtensionsSidebarView {
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         match event {
             InputEvent::MouseDown(mouse) => {
-                if mouse.button != MouseButton::Left || !bounds.contains(mouse.position) {
+                if !crate::is_finite_positive_rect(bounds)
+                    || !mouse.position.x.is_finite()
+                    || !mouse.position.y.is_finite()
+                    || mouse.button != MouseButton::Left
+                    || !bounds.contains(mouse.position)
+                {
                     return EventResult::Ignored;
                 }
 
@@ -1342,14 +1491,33 @@ impl View for ExtensionsSidebarView {
                 }
             }
             InputEvent::ScrollWheel(scroll) => {
-                if !bounds.contains(scroll.position) {
+                if !crate::is_finite_positive_rect(bounds)
+                    || !scroll.position.x.is_finite()
+                    || !scroll.position.y.is_finite()
+                    || !bounds.contains(scroll.position)
+                {
                     return EventResult::Ignored;
                 }
                 let footer_h = if self.status_message.is_some() { 20.0 } else { 0.0 };
                 let viewport_h = (bounds.height() - 28.0 - 32.0 - footer_h).max(0.0);
                 let content_h = self.compute_total_content_height();
                 let max_scroll = (content_h - viewport_h).max(0.0);
-                self.scroll_top = (self.scroll_top - scroll.delta_y).clamp(0.0, max_scroll);
+                let max_scroll = if max_scroll.is_finite() { max_scroll } else { 0.0 };
+                let safe_scroll = if self.scroll_top.is_finite() {
+                    self.scroll_top
+                } else {
+                    0.0
+                };
+                if !scroll.delta_y.is_finite() {
+                    self.scroll_top = safe_scroll.clamp(0.0, max_scroll);
+                    return EventResult::Ignored;
+                }
+                let raw = safe_scroll - scroll.delta_y;
+                self.scroll_top = if raw.is_nan() {
+                    0.0
+                } else {
+                    raw.clamp(0.0, max_scroll)
+                };
                 EventResult::Consumed
             }
             _ => EventResult::Ignored,
@@ -1792,5 +1960,51 @@ mod tests {
         assert_eq!(view.last_action, None);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_extensions_view_non_finite_bounds_and_nan_scrollwheel_no_panic_no_poison() {
+        use rustcode_platform::render::{SceneNode, Size};
+
+        let mut view = ExtensionsSidebarView::new();
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        let bad_bounds = [
+            Rect::new(Point::new(f32::NAN, f32::NAN), Size::new(1024.0, 768.0)),
+            Rect::new(Point::zero(), Size::new(280.0, f32::NAN)),
+            Rect::from_xywh(f32::INFINITY, 0.0, 280.0, 600.0),
+            Rect::from_xywh(0.0, 0.0, f32::INFINITY, 600.0),
+        ];
+
+        for &b in &bad_bounds {
+            let layout = view.compute_layout(b);
+            assert!(crate::is_finite_rect(layout.search_rect));
+            assert!(crate::is_finite_rect(layout.body_rect));
+            assert!(crate::is_finite_rect(layout.installed_list_rect));
+            assert!(crate::is_finite_rect(layout.marketplace_list_rect));
+
+            let mut scene = Scene::new();
+            view.render(b, &theme, &font, &mut scene);
+            assert!(scene.nodes().is_empty());
+        }
+
+        // ScrollWheel with delta_y = f32::NAN must not poison scroll_top
+        let valid_bounds = Rect::from_xywh(0.0, 0.0, 280.0, 200.0);
+        view.scroll_top = 10.0;
+        view.handle_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(100.0, 120.0), 0.0, f32::NAN)),
+            valid_bounds,
+        );
+        assert!(view.scroll_top.is_finite());
+
+        let mut scene = Scene::new();
+        view.render(valid_bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("MARKETPLACE"));
+        for node in scene.nodes() {
+            if let SceneNode::Quad(q) = node {
+                assert!(crate::is_finite_rect(q.bounds));
+            }
+        }
     }
 }

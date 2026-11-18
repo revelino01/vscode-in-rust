@@ -16,9 +16,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use crate::breadcrumbs::{BreadcrumbItem, BreadcrumbKind, BreadcrumbsAction, BreadcrumbsBar};
 use crate::notebook::NotebookEditorView;
 use crate::settings_ui::SettingsUiView;
 use crate::webview::WebviewEditorView;
+use crate::workspace::Workspace;
 use rustcode_platform::configuration::ConfigurationService;
 
 
@@ -146,6 +148,7 @@ impl EditorArea {
 pub enum EditorAreaAction {
     TabSelected(usize),
     TabClosed(usize),
+    BreadcrumbSelected(BreadcrumbItem),
 }
 
 pub struct EditorAreaView {
@@ -157,6 +160,10 @@ pub struct EditorAreaView {
     pub notebooks: HashMap<String, NotebookEditorView>,
     pub grammar_registry: Arc<GrammarRegistry>,
     pub last_action: Option<EditorAreaAction>,
+    pub breadcrumbs_enabled: bool,
+    pub minimap_enabled: bool,
+    pub breadcrumbs: BreadcrumbsBar,
+    known_workspace: Option<Workspace>,
 }
 
 impl Default for EditorAreaView {
@@ -176,17 +183,94 @@ impl EditorAreaView {
             notebooks: HashMap::new(),
             grammar_registry: Arc::new(GrammarRegistry::new()),
             last_action: None,
+            breadcrumbs_enabled: true,
+            minimap_enabled: true,
+            breadcrumbs: BreadcrumbsBar::new(),
+            known_workspace: None,
+        }
+    }
+
+    pub fn breadcrumbs_rect(&self, bounds: Rect) -> Option<Rect> {
+        let tab_bar_h = 35.0;
+        if !crate::is_finite_positive_rect(bounds)
+            || !(bounds.min_y() + tab_bar_h).is_finite()
+            || !self.breadcrumbs_enabled
+            || self.model.current_group_ref().active_tab().is_none()
+            || bounds.height() <= tab_bar_h
+        {
+            return None;
+        }
+        let bc_h = (bounds.height() - tab_bar_h).clamp(0.0, 22.0);
+        if bc_h <= 0.0 {
+            return None;
+        }
+        let rect = Rect::from_xywh(
+            bounds.min_x(),
+            bounds.min_y() + tab_bar_h,
+            bounds.width(),
+            bc_h,
+        );
+        if crate::is_finite_positive_rect(rect) {
+            Some(rect)
+        } else {
+            None
         }
     }
 
     pub fn content_rect(&self, bounds: Rect) -> Rect {
+        if !crate::is_finite_rect(bounds) {
+            return Rect::zero();
+        }
         let tab_bar_h = 35.0;
-        Rect::from_xywh(
+        let bc_h = self.breadcrumbs_rect(bounds).map_or(0.0, |r| r.height());
+        let top_offset = tab_bar_h + bc_h;
+        let rect = Rect::from_xywh(
             bounds.min_x(),
-            bounds.min_y() + tab_bar_h,
+            bounds.min_y() + top_offset,
             bounds.width(),
-            (bounds.height() - tab_bar_h).max(0.0),
-        )
+            (bounds.height() - top_offset).max(0.0),
+        );
+        if crate::is_finite_rect(rect) {
+            rect
+        } else {
+            Rect::zero()
+        }
+    }
+
+    pub fn set_minimap_enabled(&mut self, enabled: bool) {
+        self.minimap_enabled = enabled;
+        for editor in self.editors.values_mut() {
+            editor.set_minimap_enabled(enabled);
+        }
+    }
+
+    pub fn set_breadcrumbs_enabled(&mut self, enabled: bool) {
+        self.breadcrumbs_enabled = enabled;
+    }
+
+    pub fn sync_breadcrumbs(&mut self, workspace: Option<&Workspace>) {
+        if let Some(ws) = workspace {
+            self.known_workspace = Some(ws.clone());
+        }
+        let tab_info = self
+            .model
+            .current_group_ref()
+            .active_tab()
+            .map(|t| (t.uri.clone(), t.title.clone()));
+        let Some((uri, title)) = tab_info else {
+            self.breadcrumbs.clear();
+            return;
+        };
+
+        let ws_ref = self.known_workspace.as_ref();
+        if let Some(editor) = self.editors.get(&uri) {
+            let content = editor.text();
+            let cursor_line = editor.primary_position().line;
+            self.breadcrumbs
+                .update(&uri, &title, ws_ref, Some((&content, cursor_line)));
+        } else {
+            self.breadcrumbs.update(&uri, &title, ws_ref, None);
+        }
     }
 
     pub fn is_notebook_uri(uri: &str) -> bool {
@@ -206,6 +290,7 @@ impl EditorAreaView {
                 .with_grammar_registry(self.grammar_registry.clone());
             self.notebooks.insert(uri.to_string(), nb_view);
         }
+        self.sync_breadcrumbs(None);
     }
 
     pub fn sync_dirty_states(&mut self) {
@@ -248,6 +333,7 @@ impl EditorAreaView {
         if let Some(cfg) = config {
             view.set_config(cfg);
         }
+        self.sync_breadcrumbs(None);
     }
 
     pub fn close_tab(&mut self, index: usize) -> bool {
@@ -265,6 +351,7 @@ impl EditorAreaView {
             self.settings_views.retain(|u, _| open_uris.contains(u));
             self.notebooks.retain(|u, _| open_uris.contains(u));
             self.last_action = Some(EditorAreaAction::TabClosed(index));
+            self.sync_breadcrumbs(None);
         }
         closed
     }
@@ -274,6 +361,7 @@ impl EditorAreaView {
         group.open_tab(uri, title, false);
         self.diff_editors
             .insert(uri.to_string(), DiffEditorView::new(title, original, modified));
+        self.sync_breadcrumbs(None);
     }
 
     pub fn open_webview(
@@ -291,6 +379,7 @@ impl EditorAreaView {
             id.to_string(),
             WebviewEditorView::new(id, view_type, title, html, options, ext_host_manager),
         );
+        self.sync_breadcrumbs(None);
     }
 
     pub fn open_file(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
@@ -321,12 +410,15 @@ impl EditorAreaView {
                 Some(grammar.language_id()),
             )));
 
-            let mut editor = EditorView::from_str(content).with_document(doc);
+            let mut editor = EditorView::from_str(content)
+                .with_document(doc)
+                .with_minimap(self.minimap_enabled);
             let theme = ThemeService::default_dark_theme();
             editor.set_language(grammar.language_id(), theme, &self.grammar_registry);
 
             self.editors.insert(uri.to_string(), editor);
         }
+        self.sync_breadcrumbs(None);
     }
 
     pub fn save_active_file(
@@ -399,6 +491,7 @@ impl EditorAreaView {
                         }
                     }
                 }
+                self.sync_breadcrumbs(None);
             }
             changed
         } else {
@@ -451,6 +544,12 @@ impl View for EditorAreaView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !crate::is_finite_positive_rect(bounds)
+            || !crate::is_finite_font(font)
+            || !(bounds.min_y() + 35.0).is_finite()
+        {
+            return;
+        }
         // Tab bar height: 35.0
         let tab_bar_h = 35.0;
         let tab_bar_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), tab_bar_h);
@@ -470,6 +569,9 @@ impl View for EditorAreaView {
             let is_active = group.active_tab_index == Some(idx);
             let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
             let tab_rect = Rect::from_xywh(cur_x, bounds.min_y(), tab_w, tab_bar_h);
+            if !crate::is_finite_rect(tab_rect) {
+                break;
+            }
 
             let bg_color = if is_active {
                 theme.tab_active_bg
@@ -536,7 +638,12 @@ impl View for EditorAreaView {
             cur_x += tab_w;
         }
 
-        // Editor content below tabs
+        // Breadcrumbs bar immediately below tabs when enabled and active tab exists
+        if let Some(bc_rect) = self.breadcrumbs_rect(bounds) {
+            self.breadcrumbs.render(bc_rect, theme, font, scene);
+        }
+
+        // Editor content below tabs (+ optional breadcrumbs)
         let content_rect = self.content_rect(bounds);
 
         if let Some(tab) = self.model.current_group_ref().active_tab() {
@@ -584,12 +691,44 @@ impl View for EditorAreaView {
                             } else {
                                 self.model.current_group().active_tab_index = Some(idx);
                                 self.last_action = Some(EditorAreaAction::TabSelected(idx));
+                                self.sync_breadcrumbs(None);
                             }
                             return EventResult::Consumed;
                         }
                         cur_x += tab_w;
                     }
                     EventResult::Ignored
+                } else if self
+                    .breadcrumbs_rect(bounds)
+                    .is_some_and(|bc_rect| bc_rect.contains(mouse.position))
+                {
+                    let bc_rect = self.breadcrumbs_rect(bounds).unwrap();
+                    let res = self.breadcrumbs.handle_event(event, bc_rect);
+                    if let Some(BreadcrumbsAction::SelectItem { item, .. }) =
+                        self.breadcrumbs.last_action.take()
+                    {
+                        if matches!(item.kind, BreadcrumbKind::Symbol(_)) {
+                            if let Some(line) = item.line {
+                                let col = item.column.unwrap_or(0);
+                                let content_rect = self.content_rect(bounds);
+                                let font = FontMetrics::default_monospace();
+                                let visible_lines =
+                                    (content_rect.height() / font.line_height).floor().max(1.0);
+                                if let Some(editor) = self.active_editor_mut() {
+                                    editor.set_primary_position(Position::new(line, col));
+                                    let line_f = line as f32;
+                                    if line_f < editor.scroll_top
+                                        || line_f >= editor.scroll_top + visible_lines
+                                    {
+                                        editor.scroll_top = (line_f - 2.0).max(0.0);
+                                    }
+                                }
+                                self.sync_breadcrumbs(None);
+                            }
+                        }
+                        self.last_action = Some(EditorAreaAction::BreadcrumbSelected(item));
+                    }
+                    res
                 } else {
                     // Click within active editor / diff / webview / settings / notebook
                     let content_rect = self.content_rect(bounds);
@@ -606,7 +745,9 @@ impl View for EditorAreaView {
                             self.sync_dirty_states();
                             res
                         } else if let Some(editor) = self.editors.get_mut(&uri) {
-                            editor.handle_event(event, content_rect)
+                            let res = editor.handle_event(event, content_rect);
+                            self.sync_breadcrumbs(None);
+                            res
                         } else {
                             EventResult::Ignored
                         }
@@ -630,7 +771,11 @@ impl View for EditorAreaView {
                         self.sync_dirty_states();
                         res
                     } else if let Some(editor) = self.editors.get_mut(&uri) {
-                        editor.handle_event(event, content_rect)
+                        let res = editor.handle_event(event, content_rect);
+                        if matches!(event, InputEvent::KeyDown(_)) && res == EventResult::Consumed {
+                            self.sync_breadcrumbs(None);
+                        }
+                        res
                     } else {
                         EventResult::Ignored
                     }
@@ -1014,6 +1159,139 @@ mod tests {
         assert!(!area_view.notebooks.contains_key(&nb_uri));
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_editor_area_breadcrumbs_layout_click_jump_and_minimap_propagation() {
+        use rustcode_platform::render::MouseButton;
+
+        let mut area_view = EditorAreaView::new(EditorArea::new());
+        let bounds = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+
+        // Empty editor area has no breadcrumbs rect -> content_rect starts at +35.0
+        assert!(area_view.breadcrumbs_rect(bounds).is_none());
+        assert_eq!(area_view.content_rect(bounds).min_y(), 35.0);
+
+        // Disable minimap before opening file -> newly opened editor inherits minimap_enabled = false
+        area_view.set_minimap_enabled(false);
+        let ws = Workspace::from_folder(PathBuf::from("/demo"));
+        let src = "pub struct Engine {\n    x: usize,\n}\n\nimpl Engine {\n    pub fn run(&mut self) {\n        let y = 1;\n    }\n}\n";
+        area_view.open_file("file:///demo/src/lib.rs", "lib.rs", src, false);
+        area_view.sync_breadcrumbs(Some(&ws));
+
+        assert!(!area_view.active_editor().unwrap().minimap_enabled);
+        let bc_rect = area_view.breadcrumbs_rect(bounds).unwrap();
+        assert_eq!(bc_rect.min_y(), 35.0);
+        assert_eq!(bc_rect.height(), 22.0);
+        assert_eq!(area_view.content_rect(bounds).min_y(), 57.0);
+
+        // Move cursor into `run` body (line 6) and sync breadcrumbs
+        area_view
+            .active_editor_mut()
+            .unwrap()
+            .set_primary_position(Position::new(6, 8));
+        area_view.sync_breadcrumbs(Some(&ws));
+
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let mut scene = Scene::new();
+        area_view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("demo"));
+        assert!(scene.contains_text("Engine"));
+        assert!(scene.contains_text("run"));
+
+        // Click `Engine` breadcrumb item -> jumps cursor to line 0 and emits BreadcrumbSelected
+        let item_rects = area_view.breadcrumbs.compute_item_rects(bc_rect, &font);
+        let (engine_idx, engine_rect) = item_rects
+            .into_iter()
+            .find(|(idx, _)| area_view.breadcrumbs.items[*idx].label == "Engine")
+            .unwrap();
+        assert_eq!(area_view.breadcrumbs.items[engine_idx].line, Some(0));
+
+        let click = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(engine_rect.min_x() + 4.0, engine_rect.min_y() + 10.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(area_view.handle_event(&click, bounds), EventResult::Consumed);
+        assert_eq!(
+            area_view.active_editor().unwrap().primary_position().line,
+            0
+        );
+        match area_view.last_action.as_ref().unwrap() {
+            EditorAreaAction::BreadcrumbSelected(item) => assert_eq!(item.label, "Engine"),
+            other => panic!("Unexpected action: {:?}", other),
+        }
+
+        // Disabling breadcrumbs restores content_rect to +35.0
+        area_view.set_breadcrumbs_enabled(false);
+        assert!(area_view.breadcrumbs_rect(bounds).is_none());
+        assert_eq!(area_view.content_rect(bounds).min_y(), 35.0);
+    }
+
+    #[test]
+    fn test_editor_area_breadcrumb_click_after_update_and_bounds_shift_without_render() {
+        use rustcode_platform::render::MouseButton;
+
+        let mut area_view = EditorAreaView::new(EditorArea::new());
+        let ws = Workspace::from_folder(PathBuf::from("/demo"));
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        // Render initial tab with sidebar open (x = 298.0)
+        let bounds_open = Rect::from_xywh(298.0, 0.0, 700.0, 600.0);
+        area_view.open_file("file:///demo/a.rs", "a.rs", "pub fn first() {}\n", false);
+        area_view.sync_breadcrumbs(Some(&ws));
+        area_view.render(bounds_open, &theme, &font, &mut Scene::new());
+
+        // Switch to another file with symbol at line 0 and move cursor to line 3 WITHOUT render()
+        let src_b = "pub fn target_sym() {\n    let a = 1;\n    let b = 2;\n    let c = 3;\n}\n";
+        area_view.open_file("file:///demo/sub/longer_file.rs", "longer_file.rs", src_b, false);
+        area_view
+            .active_editor_mut()
+            .unwrap()
+            .set_primary_position(Position::new(3, 4));
+        area_view.sync_breadcrumbs(Some(&ws));
+
+        // Also shift bounds (simulating sidebar closed: x = 48.0) WITHOUT render()
+        let bounds_closed = Rect::from_xywh(48.0, 0.0, 950.0, 600.0);
+        let bc_rect = area_view.breadcrumbs_rect(bounds_closed).unwrap();
+        let item_rects = area_view.breadcrumbs.compute_item_rects(bc_rect, &font);
+        let (_, sym_rect) = item_rects
+            .into_iter()
+            .find(|(idx, _)| area_view.breadcrumbs.items[*idx].label == "target_sym")
+            .unwrap();
+
+        let click = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(sym_rect.min_x() + 4.0, sym_rect.min_y() + 10.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(area_view.handle_event(&click, bounds_closed), EventResult::Consumed);
+        assert_eq!(area_view.active_editor().unwrap().primary_position().line, 0);
+        assert_eq!(
+            area_view.last_action.as_ref().map(|a| matches!(a, EditorAreaAction::BreadcrumbSelected(item) if item.label == "target_sym")),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_editor_area_render_non_finite_bounds_emits_nothing() {
+        use rustcode_platform::render::Size;
+
+        let mut area_view = EditorAreaView::new(EditorArea::new());
+        area_view.open_file("file:///demo/a.rs", "a.rs", "fn main() {}", false);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for bad_bounds in [
+            Rect::new(Point::zero(), Size::new(f32::NAN, 600.0)),
+            Rect::new(Point::zero(), Size::new(800.0, f32::NAN)),
+            Rect::from_xywh(f32::INFINITY, 0.0, 800.0, 600.0),
+        ] {
+            let mut scene = Scene::new();
+            area_view.render(bad_bounds, &theme, &font, &mut scene);
+            assert!(scene.is_empty());
+            assert!(area_view.breadcrumbs_rect(bad_bounds).is_none());
+        }
     }
 }
 

@@ -4,6 +4,7 @@
 //! keybinding resolution (`KeybindingService`), command registration (`CommandRegistry`),
 //! and theme styling (`ThemeService`).
 
+pub mod accessibility;
 pub mod commands;
 pub mod configuration;
 pub mod fs;
@@ -11,6 +12,7 @@ pub mod keybindings;
 pub mod render;
 pub mod theme;
 
+pub use accessibility::{AccessibilityTree, AccessibleNode, AccessibleRole, AccessibleState};
 pub use commands::{CommandCallback, CommandRegistry};
 pub use configuration::{ConfigurationChangeEvent, ConfigurationService, ConfigurationTarget};
 pub use fs::{

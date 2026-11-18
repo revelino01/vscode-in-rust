@@ -305,6 +305,12 @@ impl View for CommandPaletteView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !crate::is_finite_positive_rect(bounds)
+            || !crate::is_finite_font(font)
+            || !(bounds.min_y() + 37.0).is_finite()
+        {
+            return;
+        }
         // Shadow behind popup
         scene.push_shadow(Shadow {
             bounds,
@@ -376,11 +382,18 @@ impl View for CommandPaletteView {
         // Result rows
         let row_h = 28.0;
         let results = self.model.results();
-        let max_visible = ((bounds.height() - input_h - 1.0) / row_h).floor() as usize;
+        let max_visible = ((bounds.height() - input_h - 1.0) / row_h)
+            .floor()
+            .max(0.0) as usize;
 
         for (idx, item) in results.iter().take(max_visible).enumerate() {
             let row_y = bounds.min_y() + input_h + 1.0 + idx as f32 * row_h;
-            let row_rect = Rect::from_xywh(bounds.min_x() + 4.0, row_y, bounds.width() - 8.0, row_h);
+            let row_rect = Rect::from_xywh(
+                bounds.min_x() + 4.0,
+                row_y,
+                (bounds.width() - 8.0).max(0.0),
+                row_h,
+            );
 
             let is_selected = idx == self.model.selected_index;
             if is_selected {
@@ -740,5 +753,31 @@ mod tests {
                 column: None,
             })
         );
+    }
+
+    #[test]
+    fn test_command_palette_render_non_finite_bounds_emits_nothing() {
+        use rustcode_platform::render::Size;
+
+        let mut palette = CommandPalette::new();
+        palette.set_items(vec![PaletteItem::command(
+            "workbench.action.openSettings",
+            "Open Settings",
+            None,
+            None,
+        )]);
+        let view = CommandPaletteView::new(palette);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for bad_bounds in [
+            Rect::new(Point::zero(), Size::new(f32::NAN, 320.0)),
+            Rect::new(Point::new(0.0, f32::NAN), Size::new(600.0, 320.0)),
+            Rect::from_xywh(0.0, 0.0, 600.0, f32::INFINITY),
+        ] {
+            let mut scene = Scene::new();
+            view.render(bad_bounds, &theme, &font, &mut scene);
+            assert!(scene.is_empty());
+        }
     }
 }

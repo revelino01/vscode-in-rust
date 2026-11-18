@@ -1887,6 +1887,12 @@ impl View for NotebookEditorView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
+        if !crate::is_finite_positive_rect(bounds)
+            || !crate::is_finite_font(font)
+            || !(bounds.min_y() + 36.0).is_finite()
+        {
+            return;
+        }
         *self.last_font.write() = font.clone();
         let mut targets = Vec::new();
 
@@ -1981,7 +1987,13 @@ impl View for NotebookEditorView {
         *self.last_viewport_height.write() = body_rect.height();
 
         let max_scroll = (total_h - body_rect.height()).max(0.0);
-        let clamped_scroll = self.scroll_top.clamp(0.0, max_scroll);
+        let max_scroll = if max_scroll.is_finite() { max_scroll } else { 0.0 };
+        let safe_scroll = if self.scroll_top.is_finite() {
+            self.scroll_top
+        } else {
+            0.0
+        };
+        let clamped_scroll = safe_scroll.clamp(0.0, max_scroll);
 
         scene.push_clip(body_rect);
 
@@ -2305,13 +2317,39 @@ impl View for NotebookEditorView {
                 EventResult::Consumed
             }
             InputEvent::ScrollWheel(scroll) => {
-                if !bounds.contains(scroll.position) {
+                if !crate::is_finite_positive_rect(bounds)
+                    || !scroll.position.x.is_finite()
+                    || !scroll.position.y.is_finite()
+                    || !bounds.contains(scroll.position)
+                {
                     return EventResult::Ignored;
                 }
-                let total_h = *self.last_content_height.read();
-                let viewport_h = (*self.last_viewport_height.read()).max((bounds.height() - 36.0).max(0.0));
+                let raw_total_h = *self.last_content_height.read();
+                let total_h = if raw_total_h.is_finite() {
+                    raw_total_h.max(0.0)
+                } else {
+                    0.0
+                };
+                let raw_vp = *self.last_viewport_height.read();
+                let safe_vp = if raw_vp.is_finite() { raw_vp } else { 0.0 };
+                let viewport_h = safe_vp.max((bounds.height() - 36.0).max(0.0));
                 let max_scroll = (total_h - viewport_h).max(0.0);
-                self.scroll_top = (self.scroll_top - scroll.delta_y).clamp(0.0, max_scroll);
+                let max_scroll = if max_scroll.is_finite() { max_scroll } else { 0.0 };
+                let safe_scroll = if self.scroll_top.is_finite() {
+                    self.scroll_top
+                } else {
+                    0.0
+                };
+                if !scroll.delta_y.is_finite() {
+                    self.scroll_top = safe_scroll.clamp(0.0, max_scroll);
+                    return EventResult::Ignored;
+                }
+                let raw = safe_scroll - scroll.delta_y;
+                self.scroll_top = if raw.is_nan() {
+                    0.0
+                } else {
+                    raw.clamp(0.0, max_scroll)
+                };
                 EventResult::Consumed
             }
             InputEvent::KeyDown(key) => {
@@ -2858,5 +2896,41 @@ mod tests {
         );
         assert!(scene.contains_text("[RAW]"));
         assert!(scene.contains_text("Raw"));
+    }
+
+    #[test]
+    fn test_notebook_view_non_finite_bounds_and_nan_scrollwheel_no_poison() {
+        use rustcode_platform::render::{ScrollEvent, Size};
+
+        let mut doc = NotebookDocument::new("file:///tmp/test.ipynb");
+        doc.add_cell(None, CellKind::Code, "let x = 1;");
+        let mut view = NotebookEditorView::new(doc);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        for bad_bounds in [
+            Rect::new(Point::zero(), Size::new(800.0, f32::NAN)),
+            Rect::new(Point::new(f32::NAN, f32::NAN), Size::new(800.0, 600.0)),
+            Rect::from_xywh(0.0, 0.0, f32::INFINITY, 600.0),
+        ] {
+            let mut scene = Scene::new();
+            view.render(bad_bounds, &theme, &font, &mut scene);
+            assert!(scene.nodes().is_empty());
+        }
+
+        let valid_bounds = Rect::from_xywh(0.0, 0.0, 800.0, 400.0);
+        let mut init_scene = Scene::new();
+        view.render(valid_bounds, &theme, &font, &mut init_scene);
+        assert!(init_scene.contains_text("Code"));
+
+        view.handle_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(200.0, 200.0), 0.0, f32::NAN)),
+            valid_bounds,
+        );
+        assert!(view.scroll_top.is_finite());
+
+        let mut after_scene = Scene::new();
+        view.render(valid_bounds, &theme, &font, &mut after_scene);
+        assert!(after_scene.contains_text("Code"));
     }
 }

@@ -59,6 +59,14 @@ pub struct WorkbenchThemeStyles {
     pub panel_bg: Rgba,
     pub panel_border: Rgba,
     pub sash_hover: Rgba,
+
+    // Minimap & Breadcrumb styles
+    pub minimap_background: Rgba,
+    pub minimap_slider_bg: Rgba,
+    pub minimap_slider_hover_bg: Rgba,
+    pub breadcrumb_bg: Rgba,
+    pub breadcrumb_fg: Rgba,
+    pub breadcrumb_focus_fg: Rgba,
 }
 
 impl Default for WorkbenchThemeStyles {
@@ -116,6 +124,13 @@ impl WorkbenchThemeStyles {
             panel_bg: Rgba::from_hex("#1e1e1e").unwrap(),
             panel_border: Rgba::from_hex("#333333").unwrap(),
             sash_hover: Rgba::from_hex("#007acc").unwrap(),
+
+            minimap_background: Rgba::from_hex("#1e1e1e").unwrap(),
+            minimap_slider_bg: Rgba::from_hex("#79797933").unwrap(),
+            minimap_slider_hover_bg: Rgba::from_hex("#64646459").unwrap(),
+            breadcrumb_bg: Rgba::from_hex("#1e1e1e").unwrap(),
+            breadcrumb_fg: Rgba::from_hex("#a9a9a9").unwrap(),
+            breadcrumb_focus_fg: Rgba::from_hex("#e0e0e0").unwrap(),
         }
     }
 
@@ -207,6 +222,37 @@ impl WorkbenchThemeStyles {
             panel_bg: Self::resolve(theme, "panel.background", d.panel_bg),
             panel_border: Self::resolve(theme, "panel.border", d.panel_border),
             sash_hover: Self::resolve(theme, "sash.hoverBorder", d.sash_hover),
+
+            minimap_background: Self::resolve(
+                theme,
+                "minimap.background",
+                Self::resolve(theme, "editor.background", d.minimap_background),
+            ),
+            minimap_slider_bg: Self::resolve(
+                theme,
+                "minimapSlider.background",
+                d.minimap_slider_bg,
+            ),
+            minimap_slider_hover_bg: Self::resolve(
+                theme,
+                "minimapSlider.hoverBackground",
+                d.minimap_slider_hover_bg,
+            ),
+            breadcrumb_bg: Self::resolve(
+                theme,
+                "breadcrumb.background",
+                Self::resolve(theme, "editor.background", d.breadcrumb_bg),
+            ),
+            breadcrumb_fg: Self::resolve(
+                theme,
+                "breadcrumb.foreground",
+                Self::resolve(theme, "tab.inactiveForeground", d.breadcrumb_fg),
+            ),
+            breadcrumb_focus_fg: Self::resolve(
+                theme,
+                "breadcrumb.focusForeground",
+                Self::resolve(theme, "editor.foreground", d.breadcrumb_focus_fg),
+            ),
         }
     }
 }
@@ -225,5 +271,34 @@ mod tests {
         assert_eq!(styles.editor_foreground, Rgba::from_hex("#d4d4d4").unwrap());
         assert_eq!(styles.statusbar_bg, Rgba::from_hex("#007acc").unwrap());
         assert_eq!(styles.activity_bar_bg, Rgba::from_hex("#333333").unwrap());
+        assert_eq!(styles.minimap_background, styles.editor_background);
+        assert_eq!(styles.breadcrumb_bg, styles.editor_background);
+    }
+
+    #[test]
+    fn test_theme_styles_minimap_and_breadcrumb_overrides() {
+        let mut theme = ThemeService::default_dark_theme();
+        theme
+            .colors
+            .insert("minimap.background".to_string(), "#112233".to_string());
+        theme
+            .colors
+            .insert("minimapSlider.background".to_string(), "#44556677".to_string());
+        theme
+            .colors
+            .insert("breadcrumb.background".to_string(), "#223344".to_string());
+        theme
+            .colors
+            .insert("breadcrumb.foreground".to_string(), "#abcdef".to_string());
+        theme
+            .colors
+            .insert("breadcrumb.focusForeground".to_string(), "#ffffff".to_string());
+
+        let styles = WorkbenchThemeStyles::from_theme(&theme);
+        assert_eq!(styles.minimap_background, Rgba::from_hex("#112233").unwrap());
+        assert_eq!(styles.minimap_slider_bg, Rgba::from_hex("#44556677").unwrap());
+        assert_eq!(styles.breadcrumb_bg, Rgba::from_hex("#223344").unwrap());
+        assert_eq!(styles.breadcrumb_fg, Rgba::from_hex("#abcdef").unwrap());
+        assert_eq!(styles.breadcrumb_focus_fg, Rgba::from_hex("#ffffff").unwrap());
     }
 }

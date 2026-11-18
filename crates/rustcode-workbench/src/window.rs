@@ -7,6 +7,7 @@ use rustcode_base::context_key::ContextKeyService;
 use rustcode_base::disposable::DisposableStore;
 use rustcode_ext_host::marketplace::ExtensionInstaller;
 use rustcode_ext_host::provider::LanguageFeatureBridge;
+use rustcode_platform::accessibility::AccessibilityTree;
 use rustcode_platform::commands::CommandRegistry;
 use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::keybindings::KeybindingService;
@@ -19,6 +20,7 @@ use rustcode_protocols::lsp::{
     CodeAction, CodeActionContext, FormattingOptions, LspPosition, LspRange, WorkspaceEdit,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct WorkbenchWindow {
@@ -55,7 +57,7 @@ impl WorkbenchWindow {
         let font_metrics = FontMetrics::default_monospace();
         let view = WorkbenchView::new();
 
-        Self {
+        let mut win = Self {
             view,
             config: ConfigurationService::new(),
             theme,
@@ -66,26 +68,75 @@ impl WorkbenchWindow {
             language_bridge: None,
             pending_code_actions: Vec::new(),
             extension_disposables: HashMap::new(),
-        }
+        };
+        win.sync_configuration();
+        win
     }
 
     pub fn with_config(mut self, config: ConfigurationService) -> Self {
         self.config = config;
+        self.sync_configuration();
         self
     }
 
     pub fn set_config(&mut self, config: ConfigurationService) {
         self.config = config;
+        self.sync_configuration();
+    }
+
+    pub fn accessibility_tree(&self, bounds: Rect) -> AccessibilityTree {
+        self.view.accessibility_tree(bounds, &self.font_metrics)
+    }
+
+    pub fn sync_configuration(&mut self) {
+        let default_minimap = self
+            .config
+            .get::<bool>("editor.minimap.enabled")
+            .unwrap_or(true);
+        let active_path: Option<PathBuf> = self
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .and_then(|t| t.uri.strip_prefix("file://").or(Some(t.uri.as_str())))
+            .filter(|p| !p.contains("://"))
+            .map(PathBuf::from);
+        let breadcrumbs_enabled = self
+            .config
+            .get_for_resource::<bool>("breadcrumbs.enabled", active_path.as_deref())
+            .unwrap_or(true);
+
+        self.view.editor_area.set_minimap_enabled(default_minimap);
+        for editor in self.view.editor_area.editors.values_mut() {
+            let doc_path = editor
+                .document
+                .as_ref()
+                .and_then(|d| d.read().path.clone());
+            let enabled = self
+                .config
+                .get_for_resource::<bool>("editor.minimap.enabled", doc_path.as_deref())
+                .unwrap_or(default_minimap);
+            editor.set_minimap_enabled(enabled);
+        }
+        self.view
+            .editor_area
+            .set_breadcrumbs_enabled(breadcrumbs_enabled);
+        self.view
+            .editor_area
+            .sync_breadcrumbs(Some(&self.view.workspace));
     }
 
     pub fn open_settings(&mut self) {
         self.view.open_settings(Some(self.config.clone()));
         self.sync_focus_context_keys();
+        self.sync_configuration();
     }
 
     pub fn new_untitled_notebook(&mut self) {
         self.view.new_untitled_notebook();
         self.sync_focus_context_keys();
+        self.sync_configuration();
     }
 
     fn sync_focus_context_keys(&mut self) {
@@ -148,6 +199,7 @@ impl WorkbenchWindow {
                     let _ = self.commands.execute(&cmd_id, None);
                     self.handle_builtin_command_effects(&cmd_id);
                     self.sync_focus_context_keys();
+                    self.sync_configuration();
                     return EventResult::Consumed;
                 }
             }
@@ -185,6 +237,10 @@ impl WorkbenchWindow {
                     self.handle_extensions_action(&act);
                 }
             }
+        }
+
+        if !matches!(event, InputEvent::MouseMove(_)) {
+            self.sync_configuration();
         }
 
         res
@@ -418,6 +474,7 @@ impl WorkbenchWindow {
             .open_file(uri, title, content, is_preview);
         self.view.focused_region = crate::workbench_view::FocusedRegion::Editor;
         self.sync_focus_context_keys();
+        self.sync_configuration();
     }
 
     pub async fn format_active_document(&mut self) -> bool {
@@ -458,7 +515,11 @@ impl WorkbenchWindow {
                         new_text: e.new_text,
                     })
                     .collect();
-                return self.view.editor_area.apply_text_edits(&uri, &range_edits);
+                let applied = self.view.editor_area.apply_text_edits(&uri, &range_edits);
+                if applied {
+                    self.sync_configuration();
+                }
+                return applied;
             }
         }
         false
@@ -557,11 +618,18 @@ impl WorkbenchWindow {
             self.handle_builtin_command_effects(&cmd.command);
             executed = true;
         }
+        if executed {
+            self.sync_configuration();
+        }
         executed
     }
 
     pub fn apply_workspace_edit(&mut self, edit: &WorkspaceEdit) -> usize {
-        self.view.editor_area.apply_workspace_edit(edit)
+        let count = self.view.editor_area.apply_workspace_edit(edit);
+        if count > 0 {
+            self.sync_configuration();
+        }
+        count
     }
 }
 
@@ -1324,5 +1392,47 @@ mod tests {
         assert!(window.commands.execute("reinstall.ping", None).is_ok());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_window_sync_configuration_minimap_breadcrumbs_and_accessibility() {
+        use rustcode_platform::accessibility::AccessibleRole;
+        use rustcode_platform::configuration::ConfigurationTarget;
+
+        let config = ConfigurationService::new();
+        config
+            .update("editor.minimap.enabled", serde_json::json!(false), ConfigurationTarget::User)
+            .unwrap();
+        config
+            .update("breadcrumbs.enabled", serde_json::json!(false), ConfigurationTarget::User)
+            .unwrap();
+
+        let mut window = WorkbenchWindow::default().with_config(config.clone());
+        assert!(!window.view.editor_area.minimap_enabled);
+        assert!(!window.view.editor_area.breadcrumbs_enabled);
+
+        window.open_file("file:///workspace/lib.rs", "lib.rs", "pub fn demo() {}\n", false);
+        assert!(!window.view.editor_area.active_editor().unwrap().minimap_enabled);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let tree_disabled = window.accessibility_tree(bounds);
+        assert!(tree_disabled.find_by_role(AccessibleRole::Breadcrumb).is_empty());
+        assert!(tree_disabled.find_by_role(AccessibleRole::ScrollBar).is_empty());
+
+        // Re-enable both and sync
+        config
+            .update("editor.minimap.enabled", serde_json::json!(true), ConfigurationTarget::User)
+            .unwrap();
+        config
+            .update("breadcrumbs.enabled", serde_json::json!(true), ConfigurationTarget::User)
+            .unwrap();
+        window.sync_configuration();
+
+        assert!(window.view.editor_area.active_editor().unwrap().minimap_enabled);
+        assert!(window.view.editor_area.breadcrumbs_enabled);
+
+        let tree_enabled = window.accessibility_tree(bounds);
+        assert!(!tree_enabled.find_by_role(AccessibleRole::Breadcrumb).is_empty());
+        assert!(!tree_enabled.find_by_role(AccessibleRole::ScrollBar).is_empty());
     }
 }

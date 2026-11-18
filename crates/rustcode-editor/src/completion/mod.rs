@@ -433,7 +433,18 @@ impl AutocompleteWidget {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !self.is_visible || self.filtered_items.is_empty() {
+        if !self.is_visible
+            || self.filtered_items.is_empty()
+            || !cursor_anchor.x.is_finite()
+            || !cursor_anchor.y.is_finite()
+            || !is_finite_positive_rect(editor_bounds)
+            || !font.line_height.is_finite()
+            || font.line_height <= 0.0
+            || !font.char_width.is_finite()
+            || font.char_width < 0.0
+            || !font.font_size.is_finite()
+            || font.font_size < 0.0
+        {
             return;
         }
 
@@ -441,28 +452,38 @@ impl AutocompleteWidget {
         let list_w = 280.0f32;
         let visible_count = self.filtered_items.len().min(self.max_visible);
         let list_h = visible_count as f32 * item_h + 4.0;
+        if !list_h.is_finite() || list_h <= 0.0 {
+            return;
+        }
 
         // Determine list position anchored at cursor
         let mut list_x = cursor_anchor.x;
         let mut list_y = cursor_anchor.y + font.line_height + 2.0;
 
-        // Flip above if overflowing bottom
-        if list_y + list_h > editor_bounds.max_y() - 10.0 {
+        // Flip above if overflowing bottom (or if cursor_anchor.y + line_height overflows)
+        if !list_y.is_finite()
+            || !(list_y + list_h).is_finite()
+            || list_y + list_h > editor_bounds.max_y() - 10.0
+        {
             list_y = (cursor_anchor.y - list_h - 2.0).max(editor_bounds.min_y());
         }
 
         // Clamp horizontally
-        if list_x + list_w > editor_bounds.max_x() - 10.0 {
+        if !(list_x + list_w).is_finite() || list_x + list_w > editor_bounds.max_x() - 10.0 {
             list_x = (editor_bounds.max_x() - list_w - 10.0).max(editor_bounds.min_x());
         }
 
         let list_rect = Rect::from_xywh(list_x, list_y, list_w, list_h);
+        if !is_finite_positive_rect(list_rect) {
+            return;
+        }
         *self.last_bounds.lock() = Some(list_rect);
 
         // 1. Popover background & border
         let bg_color = theme.command_palette_bg;
         let border_color = theme.command_palette_border;
-        scene.push_quad(
+        push_finite_quad(
+            scene,
             Quad::new(list_rect)
                 .with_background(bg_color)
                 .with_border_edges(border_color, Edges::all(1.0)),
@@ -477,10 +498,20 @@ impl AutocompleteWidget {
             let is_selected = idx == self.selected_index;
             let item_y = list_y + 2.0 + i as f32 * item_h;
             let item_rect = Rect::from_xywh(list_x + 2.0, item_y, list_w - 4.0, item_h);
+            let badge_y = item_y + (item_h - font.line_height) / 2.0;
+
+            if !item_y.is_finite()
+                || !is_finite_rect(item_rect)
+                || !badge_y.is_finite()
+                || !(badge_y + font.line_height).is_finite()
+            {
+                break;
+            }
 
             // Item highlight
             if is_selected {
-                scene.push_quad(
+                push_finite_quad(
+                    scene,
                     Quad::new(item_rect)
                         .with_background(theme.command_palette_selected_bg)
                         .with_border_edges(theme.activity_bar_active_border, Edges::new(0.0, 0.0, 0.0, 2.0)),
@@ -492,9 +523,9 @@ impl AutocompleteWidget {
             let badge_sym = kind.badge_symbol();
             let badge_color = kind.badge_color();
             let badge_x = list_x + 8.0;
-            let badge_y = item_y + (item_h - font.line_height) / 2.0;
 
-            scene.push_text(
+            push_finite_text(
+                scene,
                 GlyphRun::new(
                     badge_sym.to_string(),
                     Point::new(badge_x, badge_y),
@@ -514,20 +545,29 @@ impl AutocompleteWidget {
             };
 
             let label_text = item.label.clone();
-            scene.push_text(GlyphRun::new(
-                label_text,
-                Point::new(label_x, badge_y),
-                Rect::from_xywh(label_x, badge_y, 140.0, font.line_height),
-                label_fg,
-                font.font_size,
-            ));
+            push_finite_text(
+                scene,
+                GlyphRun::new(
+                    label_text,
+                    Point::new(label_x, badge_y),
+                    Rect::from_xywh(label_x, badge_y, 140.0, font.line_height),
+                    label_fg,
+                    font.font_size,
+                ),
+            );
 
             // Item detail (type/signature preview)
             if let Some(detail) = &item.detail {
                 let detail_fg = Rgba::new(0.60, 0.60, 0.60, 0.85);
-                let detail_w = font.text_width(detail).min(90.0);
+                let raw_detail_w = font.text_width(detail);
+                let detail_w = if raw_detail_w.is_finite() {
+                    raw_detail_w.clamp(0.0, 90.0)
+                } else {
+                    90.0
+                };
                 let detail_x = list_x + list_w - detail_w - 8.0;
-                scene.push_text(
+                push_finite_text(
+                    scene,
                     GlyphRun::new(
                         detail.clone(),
                         Point::new(detail_x, badge_y),
@@ -549,7 +589,7 @@ impl AutocompleteWidget {
 
                     // Position to right of list by default, or left if no space
                     let mut doc_x = list_x + list_w + 4.0;
-                    if doc_x + doc_w > editor_bounds.max_x() - 10.0 {
+                    if !(doc_x + doc_w).is_finite() || doc_x + doc_w > editor_bounds.max_x() - 10.0 {
                         if list_x - doc_w - 4.0 >= editor_bounds.min_x() {
                             doc_x = list_x - doc_w - 4.0;
                         } else {
@@ -559,64 +599,113 @@ impl AutocompleteWidget {
 
                     // Clamp vertically so documentation does not overflow bottom
                     let mut doc_y = list_y;
-                    if doc_y + doc_h > editor_bounds.max_y() - 10.0 {
+                    if !(doc_y + doc_h).is_finite() || doc_y + doc_h > editor_bounds.max_y() - 10.0 {
                         doc_y = (editor_bounds.max_y() - doc_h - 10.0).max(editor_bounds.min_y());
                     }
 
                     let doc_rect = Rect::from_xywh(doc_x, doc_y, doc_w, doc_h);
+                    if !is_finite_positive_rect(doc_rect) {
+                        return;
+                    }
                     *self.last_doc_bounds.lock() = Some(doc_rect);
 
                     // Background & border
-                    scene.push_quad(
+                    push_finite_quad(
+                        scene,
                         Quad::new(doc_rect)
                             .with_background(theme.sidebar_bg)
                             .with_border_edges(border_color, Edges::all(1.0)),
                     );
 
                     let mut cur_y = doc_y + 8.0;
+                    if !cur_y.is_finite() {
+                        return;
+                    }
 
                     // Header: Detail (type signature)
                     if let Some(detail) = &selected.detail {
-                        scene.push_text(
-                            GlyphRun::new(
-                                detail.clone(),
-                                Point::new(doc_x + 8.0, cur_y),
-                                Rect::from_xywh(doc_x + 8.0, cur_y, doc_w - 16.0, font.line_height),
-                                theme.editor_foreground,
-                                font.font_size * 0.9,
-                            )
-                            .with_style(true, false, false),
-                        );
-                        cur_y += font.line_height + 4.0;
+                        if cur_y.is_finite() && (cur_y + font.line_height).is_finite() {
+                            push_finite_text(
+                                scene,
+                                GlyphRun::new(
+                                    detail.clone(),
+                                    Point::new(doc_x + 8.0, cur_y),
+                                    Rect::from_xywh(doc_x + 8.0, cur_y, doc_w - 16.0, font.line_height),
+                                    theme.editor_foreground,
+                                    font.font_size * 0.9,
+                                )
+                                .with_style(true, false, false),
+                            );
+                            cur_y += font.line_height + 4.0;
 
-                        // Separator line
-                        scene.push_quad(
-                            Quad::new(Rect::from_xywh(doc_x + 8.0, cur_y, doc_w - 16.0, 1.0))
-                                .with_background(border_color),
-                        );
-                        cur_y += 6.0;
+                            // Separator line
+                            if cur_y.is_finite() && (cur_y + 1.0).is_finite() {
+                                push_finite_quad(
+                                    scene,
+                                    Quad::new(Rect::from_xywh(doc_x + 8.0, cur_y, doc_w - 16.0, 1.0))
+                                        .with_background(border_color),
+                                );
+                                cur_y += 6.0;
+                            }
+                        }
                     }
 
                     // Body: Documentation text
                     if let Some(doc) = &selected.documentation {
                         let doc_fg = Rgba::new(0.80, 0.80, 0.80, 1.0);
                         for line in doc.lines() {
-                            if cur_y + font.line_height > doc_y + doc_h - 4.0 {
+                            if !cur_y.is_finite()
+                                || !(cur_y + font.line_height).is_finite()
+                                || cur_y + font.line_height > doc_y + doc_h - 4.0
+                            {
                                 break;
                             }
-                            scene.push_text(GlyphRun::new(
-                                line.to_string(),
-                                Point::new(doc_x + 8.0, cur_y),
-                                Rect::from_xywh(doc_x + 8.0, cur_y, doc_w - 16.0, font.line_height),
-                                doc_fg,
-                                font.font_size * 0.85,
-                            ));
+                            push_finite_text(
+                                scene,
+                                GlyphRun::new(
+                                    line.to_string(),
+                                    Point::new(doc_x + 8.0, cur_y),
+                                    Rect::from_xywh(doc_x + 8.0, cur_y, doc_w - 16.0, font.line_height),
+                                    doc_fg,
+                                    font.font_size * 0.85,
+                                ),
+                            );
                             cur_y += font.line_height;
                         }
                     }
                 }
             }
         }
+    }
+}
+
+fn is_finite_rect(rect: Rect) -> bool {
+    rect.min_x().is_finite()
+        && rect.min_y().is_finite()
+        && rect.width().is_finite()
+        && rect.height().is_finite()
+        && rect.max_x().is_finite()
+        && rect.max_y().is_finite()
+}
+
+fn is_finite_positive_rect(rect: Rect) -> bool {
+    is_finite_rect(rect) && rect.width() > 0.0 && rect.height() > 0.0
+}
+
+fn push_finite_quad(scene: &mut Scene, quad: Quad) {
+    if is_finite_rect(quad.bounds) {
+        scene.push_quad(quad);
+    }
+}
+
+fn push_finite_text(scene: &mut Scene, run: GlyphRun) {
+    if run.origin.x.is_finite()
+        && run.origin.y.is_finite()
+        && is_finite_rect(run.bounds)
+        && run.font_size.is_finite()
+        && run.font_size >= 0.0
+    {
+        scene.push_text(run);
     }
 }
 
@@ -728,5 +817,101 @@ mod tests {
         widget.update_filter("zzz");
         assert!(!widget.is_visible);
         assert!(widget.filtered_items.is_empty());
+    }
+
+    #[test]
+    fn test_autocomplete_render_extreme_bounds_and_invalid_font_no_non_finite() {
+        use rustcode_platform::render::SceneNode;
+
+        let mut widget = AutocompleteWidget::new();
+        widget.show_documentation = true;
+        widget.show(
+            vec![
+                CompletionItem::new("println!")
+                    .with_kind(CompletionItemKind::Snippet)
+                    .with_detail("macro_rules! println")
+                    .with_doc("Line 1 documentation.\nLine 2 documentation."),
+                CompletionItem::new("clone")
+                    .with_kind(CompletionItemKind::Method)
+                    .with_detail("fn(&self) -> Self"),
+            ],
+            Position::new(0, 0),
+            None,
+        );
+
+        let theme = WorkbenchThemeStyles::dark_default();
+        let base_font = FontMetrics::default_monospace();
+
+        // Invalid font metrics (negative/NaN/Inf char_width or font_size) must emit nothing
+        for bad_font in [
+            FontMetrics {
+                char_width: f32::NAN,
+                ..base_font.clone()
+            },
+            FontMetrics {
+                char_width: -1.0,
+                ..base_font.clone()
+            },
+            FontMetrics {
+                char_width: f32::INFINITY,
+                ..base_font.clone()
+            },
+            FontMetrics {
+                font_size: -2.0,
+                ..base_font.clone()
+            },
+            FontMetrics {
+                line_height: 0.0,
+                ..base_font.clone()
+            },
+        ] {
+            let mut scene = Scene::new();
+            widget.render(
+                Point::new(100.0, 100.0),
+                Rect::from_xywh(0.0, 0.0, 800.0, 600.0),
+                &theme,
+                &bad_font,
+                &mut scene,
+            );
+            assert!(scene.is_empty());
+        }
+
+        // Extreme bounds & extreme line_height combinations must emit zero non-finite nodes
+        for (anchor, bounds, lh) in [
+            (
+                Point::new(100.0, 2.5e38),
+                Rect::from_xywh(0.0, 2.5e38, 800.0, 0.9e38),
+                1e38_f32,
+            ),
+            (
+                Point::new(100.0, 0.0),
+                Rect::from_xywh(0.0, 0.0, f32::MAX, f32::MAX),
+                2.5e38_f32,
+            ),
+            (
+                Point::new(1e38, 1e38),
+                Rect::from_xywh(1e38, 1e38, 1e38, 1e38),
+                2.5e38_f32,
+            ),
+        ] {
+            let extreme_font = FontMetrics {
+                line_height: lh,
+                ..base_font.clone()
+            };
+            let mut scene = Scene::new();
+            widget.render(anchor, bounds, &theme, &extreme_font, &mut scene);
+            for node in scene.nodes() {
+                match node {
+                    SceneNode::PushClip(r) => assert!(is_finite_rect(*r)),
+                    SceneNode::PopClip => {}
+                    SceneNode::Quad(q) => assert!(is_finite_rect(q.bounds)),
+                    SceneNode::Shadow(s) => assert!(is_finite_rect(s.bounds)),
+                    SceneNode::GlyphRun(g) => {
+                        assert!(g.origin.x.is_finite() && g.origin.y.is_finite());
+                        assert!(is_finite_rect(g.bounds));
+                    }
+                }
+            }
+        }
     }
 }

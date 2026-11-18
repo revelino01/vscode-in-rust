@@ -208,6 +208,7 @@ fn test_end_to_end_gpui_presentation_layer() {
     // 6. Input Routing: Mouse click and text editing in EditorView
     let regions = window.view.compute_regions(bounds);
     let editor_rect = regions.editor_area;
+    let content_rect = window.view.editor_area.content_rect(editor_rect);
 
     // Mouse click at line 1, column 4 inside editor
     let font = FontMetrics::default_monospace();
@@ -217,8 +218,8 @@ fn test_end_to_end_gpui_presentation_layer() {
         .active_editor()
         .unwrap()
         .gutter_width(&font);
-    let click_x = editor_rect.min_x() + gutter_w + 8.0 + 8.0 * font.char_width;
-    let click_y = editor_rect.min_y() + 35.0 + 1.0 * font.line_height + 5.0; // 35px tab bar offset
+    let click_x = content_rect.min_x() + gutter_w + 8.0 + 8.0 * font.char_width;
+    let click_y = content_rect.min_y() + 1.0 * font.line_height + 5.0;
 
     let click_ev = InputEvent::MouseDown(MouseEvent::new(
         Point::new(click_x, click_y),
@@ -553,8 +554,9 @@ async fn test_end_to_end_diagnostics_and_problems_panel() {
     let font = FontMetrics::default_monospace();
     let gutter_w = window.view.editor_area.active_editor().unwrap().gutter_width(&font);
     let editor_regions = window.view.compute_regions(bounds);
-    let target_x = editor_regions.editor_area.min_x() + gutter_w + 8.0 + 25.0 * font.char_width;
-    let target_y = editor_regions.editor_area.min_y() + 35.0 + 1.5 * font.line_height;
+    let content_rect = window.view.editor_area.content_rect(editor_regions.editor_area);
+    let target_x = content_rect.min_x() + gutter_w + 8.0 + 25.0 * font.char_width;
+    let target_y = content_rect.min_y() + 1.5 * font.line_height;
 
     let hover_ev = InputEvent::MouseMove(rustcode_platform::render::MouseMoveEvent {
         position: Point::new(target_x, target_y),
@@ -1804,6 +1806,457 @@ async fn test_end_to_end_extensions_marketplace_sidebar_ui() {
     assert!(!window.commands.has_command("e2eExt.hello"));
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_end_to_end_breadcrumbs_minimap_and_settings_live_toggles() {
+    use rustcode_editor::Position;
+    use rustcode_platform::render::MouseMoveEvent;
+    use rustcode_workbench::{SettingsHitTarget, Workspace};
+
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    window.view.workspace = Workspace::from_folder(PathBuf::from("/workspace"));
+
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let font = FontMetrics::default_monospace();
+
+    let mut src = String::from(
+        "pub struct Engine {\n    pub state: usize,\n}\n\nimpl Engine {\n    pub fn tick(&mut self) {\n        let v = 1;\n    }\n}\n",
+    );
+    for i in 0..160 {
+        src.push_str(&format!("// extra line {}\n", i));
+    }
+
+    window.open_file("file:///workspace/src/lib.rs", "lib.rs", &src, false);
+    window
+        .view
+        .editor_area
+        .active_editor_mut()
+        .unwrap()
+        .set_primary_position(Position::new(6, 12));
+    window.sync_configuration();
+
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("workspace"));
+    assert!(scene.contains_text("src"));
+    assert!(scene.contains_text("lib.rs"));
+    assert!(scene.contains_text("Engine"));
+    assert!(scene.contains_text("tick"));
+
+    let regions = window.view.compute_regions(bounds);
+    let bc_rect = window
+        .view
+        .editor_area
+        .breadcrumbs_rect(regions.editor_area)
+        .unwrap();
+    let content_rect = window
+        .view
+        .editor_area
+        .content_rect(regions.editor_area);
+    let mm_rect = window
+        .view
+        .editor_area
+        .active_editor()
+        .unwrap()
+        .minimap_rect(content_rect)
+        .unwrap();
+    assert!(
+        scene.quads().iter().any(|q| q.bounds.min_x() >= mm_rect.min_x() - 0.1),
+        "Expected minimap quads in rendered scene"
+    );
+
+    // Click `Engine` symbol breadcrumb -> jumps cursor to line 0
+    let item_rects = window
+        .view
+        .editor_area
+        .breadcrumbs
+        .compute_item_rects(bc_rect, &font);
+    let (_, engine_rect) = item_rects
+        .into_iter()
+        .find(|(idx, _)| window.view.editor_area.breadcrumbs.items[*idx].label == "Engine")
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(engine_rect.min_x() + 4.0, engine_rect.min_y() + 10.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .primary_position()
+            .line,
+        0
+    );
+
+    // Click & drag minimap, then release outside editor_area
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(mm_rect.min_x() + 20.0, mm_rect.max_y() - 30.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert!(
+        window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .minimap_dragging
+    );
+    assert!(
+        window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .scroll_top
+            > 20.0
+    );
+    window.dispatch_event(
+        &InputEvent::MouseMove(MouseMoveEvent {
+            position: Point::new(mm_rect.min_x() + 20.0, mm_rect.min_y() + 40.0),
+        }),
+        bounds,
+    );
+    window.dispatch_event(
+        &InputEvent::MouseUp(MouseEvent::new(
+            Point::new(50.0, 50.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert!(
+        !window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .minimap_dragging
+    );
+
+    // Press Ctrl+, to open Settings UI and toggle editor.minimap.enabled and breadcrumbs.enabled
+    let ctrl_comma = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char(','),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(window.dispatch_event(&ctrl_comma, bounds), EventResult::Consumed);
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .unwrap()
+            .uri,
+        "rustcode://settings"
+    );
+
+    window.render(&mut surface);
+    let search_rect = window
+        .view
+        .editor_area
+        .settings_views
+        .get("rustcode://settings")
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|t| match t {
+            SettingsHitTarget::SearchBar(r) => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(search_rect.min_x() + 6.0, search_rect.min_y() + 6.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    for ch in "minimap".chars() {
+        window.dispatch_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char(ch), Modifiers::none())),
+            bounds,
+        );
+    }
+    window.render(&mut surface);
+    let minimap_toggle = window
+        .view
+        .editor_area
+        .settings_views
+        .get("rustcode://settings")
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|t| match t {
+            SettingsHitTarget::ToggleBool { key, rect } if key == "editor.minimap.enabled" => {
+                Some(*rect)
+            }
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(minimap_toggle.min_x() + 5.0, minimap_toggle.min_y() + 5.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(
+        app.config.get::<bool>("editor.minimap.enabled"),
+        Some(false)
+    );
+    assert!(!window.view.editor_area.minimap_enabled);
+
+    // Search for "breadcrumbs" and toggle breadcrumbs.enabled -> false
+    {
+        let settings_view = window
+            .view
+            .editor_area
+            .settings_views
+            .get_mut("rustcode://settings")
+            .unwrap();
+        settings_view.state.apply_search("breadcrumbs");
+        settings_view.scroll_top = 0.0;
+    }
+    window.render(&mut surface);
+    let bc_toggle = window
+        .view
+        .editor_area
+        .settings_views
+        .get("rustcode://settings")
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|t| match t {
+            SettingsHitTarget::ToggleBool { key, rect } if key == "breadcrumbs.enabled" => {
+                Some(*rect)
+            }
+            _ => None,
+        })
+        .unwrap();
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(bc_toggle.min_x() + 5.0, bc_toggle.min_y() + 5.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(app.config.get::<bool>("breadcrumbs.enabled"), Some(false));
+    assert!(!window.view.editor_area.breadcrumbs_enabled);
+
+    // Switch back to lib.rs tab and verify content_rect & minimap_rect reflect disabled toggles
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(regions.editor_area.min_x() + 20.0, regions.editor_area.min_y() + 15.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .content_rect(regions.editor_area)
+            .min_y(),
+        regions.editor_area.min_y() + 35.0
+    );
+    assert!(
+        window
+            .view
+            .editor_area
+            .active_editor()
+            .unwrap()
+            .minimap_rect(window.view.editor_area.content_rect(regions.editor_area))
+            .is_none()
+    );
+    let scene_after = window.render(&mut surface);
+    assert!(!scene_after.contains_text("Engine > tick"));
+}
+
+#[test]
+fn test_end_to_end_accessibility_tree_workbench_and_overlays() {
+    use rustcode_platform::accessibility::AccessibleRole;
+    use rustcode_workbench::Workspace;
+
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    window.view.workspace = Workspace::from_folder(PathBuf::from("/workspace"));
+    window.open_file(
+        "file:///workspace/src/main.rs",
+        "main.rs",
+        "pub fn main() {\n    let x = 1;\n}\n",
+        false,
+    );
+
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let tree = window.accessibility_tree(bounds);
+    assert_eq!(tree.root.role, AccessibleRole::Window);
+    assert!(!tree.find_by_role(AccessibleRole::Toolbar).is_empty());
+    assert!(!tree.find_by_role(AccessibleRole::Sidebar).is_empty());
+    assert!(!tree.find_by_role(AccessibleRole::Tree).is_empty());
+    assert!(!tree.find_by_role(AccessibleRole::TabList).is_empty());
+    assert!(
+        tree.find_by_role(AccessibleRole::Tab)
+            .iter()
+            .any(|n| n.state.selected && n.name == "main.rs")
+    );
+    assert!(!tree.find_by_role(AccessibleRole::Breadcrumb).is_empty());
+    assert!(!tree.find_by_role(AccessibleRole::BreadcrumbItem).is_empty());
+    assert!(!tree.find_by_role(AccessibleRole::TextEditor).is_empty());
+    assert!(!tree.find_by_role(AccessibleRole::ScrollBar).is_empty());
+    assert!(!tree.find_by_role(AccessibleRole::StatusBar).is_empty());
+    assert_eq!(tree.focused_node().unwrap().role, AccessibleRole::TextEditor);
+
+    // Hit-test inside breadcrumbs & editor
+    let regions = window.view.compute_regions(bounds);
+    let bc_hit = tree
+        .hit_test(Point::new(
+            regions.editor_area.min_x() + 18.0,
+            regions.editor_area.min_y() + 45.0,
+        ))
+        .unwrap();
+    assert!(matches!(
+        bc_hit.role,
+        AccessibleRole::Breadcrumb | AccessibleRole::BreadcrumbItem
+    ));
+
+    let content_rect = window.view.editor_area.content_rect(regions.editor_area);
+    let ed_hit = tree
+        .hit_test(Point::new(
+            content_rect.min_x() + 100.0,
+            content_rect.min_y() + 20.0,
+        ))
+        .unwrap();
+    assert_eq!(ed_hit.role, AccessibleRole::TextEditor);
+
+    // Open Command Palette via Ctrl+Shift+P -> Dialog + TextInput + List/ListItem present and focused
+    let ctrl_shift_p = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('p'),
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_shift_p, bounds),
+        EventResult::Consumed
+    );
+    let pal_tree = window.accessibility_tree(bounds);
+    assert!(!pal_tree.find_by_role(AccessibleRole::Dialog).is_empty());
+    assert!(!pal_tree.find_by_role(AccessibleRole::List).is_empty());
+    assert!(!pal_tree.find_by_role(AccessibleRole::ListItem).is_empty());
+    assert_eq!(
+        pal_tree.focused_node().unwrap().id,
+        "commandPalette.input"
+    );
+}
+
+#[test]
+fn test_end_to_end_notebook_breadcrumbs_and_accessibility() {
+    use rustcode_platform::accessibility::AccessibleRole;
+    use rustcode_workbench::Workspace;
+
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    window.view.workspace = Workspace::from_folder(PathBuf::from("/workspace"));
+
+    let ipynb_json = r#"{
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "metadata": {},
+        "cells": [
+            {
+                "cell_type": "code",
+                "metadata": {},
+                "execution_count": null,
+                "source": ["x = 10 + 5"],
+                "outputs": []
+            }
+        ]
+    }"#;
+    window.open_file(
+        "file:///workspace/notebooks/demo.ipynb",
+        "demo.ipynb",
+        ipynb_json,
+        false,
+    );
+
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("notebooks"));
+    assert!(scene.contains_text("demo.ipynb"));
+
+    let tree = window.accessibility_tree(Rect::from_xywh(0.0, 0.0, 1024.0, 768.0));
+    assert!(
+        tree.find_by_role(AccessibleRole::Tab)
+            .iter()
+            .any(|n| n.state.selected && n.name == "demo.ipynb")
+    );
+    let bc_labels: Vec<&str> = tree
+        .find_by_role(AccessibleRole::BreadcrumbItem)
+        .iter()
+        .map(|n| n.name.as_str())
+        .collect();
+    assert_eq!(bc_labels, vec!["workspace", "notebooks", "demo.ipynb"]);
+    assert!(tree.find_by_id("notebook.cells").is_some());
+    assert!(!tree.find_by_role(AccessibleRole::StatusBar).is_empty());
+}
+
+#[test]
+fn test_end_to_end_extensions_sidebar_in_accessibility_tree() {
+    use rustcode_platform::accessibility::AccessibleRole;
+
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+
+    let ctrl_shift_x = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('x'),
+        Modifiers {
+            ctrl: true,
+            shift: true,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_shift_x, bounds),
+        EventResult::Consumed
+    );
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("EXTENSIONS"));
+
+    let tree = window.accessibility_tree(bounds);
+    let sidebar = tree
+        .find_by_role(AccessibleRole::Sidebar)
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(sidebar.name, "Extensions");
+    assert!(sidebar.state.focused);
+    assert!(tree.find_by_id("workbench.sidebar.extensions.search").is_some());
+    assert!(tree.find_by_id("workbench.sidebar.extensions.marketplace").is_some());
+    assert_eq!(tree.focused_node().unwrap().id, "workbench.sidebar");
 }
 
 

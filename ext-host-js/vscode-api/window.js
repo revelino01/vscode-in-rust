@@ -256,40 +256,48 @@ const window = {
   // Webview
   createWebviewPanel(viewType, title, showOptions = {}, options = {}) {
     const id = `webview_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    let _html = '';
-    const messageEvent = rpc.createEvent(`webview.onDidReceiveMessage.${id}`);
-    const disposeEvent = rpc.createEvent(`webview.onDidDispose.${id}`);
-
     rpc.call('window.createWebviewPanel', { id, viewType, title, showOptions, options });
+    return rpc.createWebviewPanelProxy(id, viewType, title, options);
+  },
 
-    const webview = {
-      get html() {
-        return _html;
-      },
-      set html(value) {
-        _html = value;
-        rpc.call('window.setWebviewHtml', { id, html: value });
-      },
-      postMessage(message) {
-        return rpc.call('window.postMessageToWebview', { id, message });
-      },
-      onDidReceiveMessage: messageEvent,
-      options,
+  // Custom Editors
+  registerCustomEditorProvider(viewType, provider, options = {}) {
+    if (typeof viewType !== 'string' || !viewType.trim()) {
+      throw new Error('registerCustomEditorProvider requires a non-empty viewType string');
+    }
+    if (!provider || typeof provider !== 'object' || Array.isArray(provider)) {
+      throw new Error('registerCustomEditorProvider requires a provider object');
+    }
+    const normalizedOptions = {
+      webviewOptions: (options && options.webviewOptions) || {},
+      supportsMultipleEditorsPerDocument: Boolean(options && options.supportsMultipleEditorsPerDocument),
     };
-
-    return {
+    const proxyDisposable = rpc.registerObjectProxy(
+      'CustomEditor',
       viewType,
-      title,
-      webview,
-      reveal(viewColumn) {
-        rpc.call('window.revealWebviewPanel', { id, viewColumn });
-      },
-      dispose() {
-        rpc.call('window.disposeWebviewPanel', { id });
-        rpc.dispatchNotification(`webview.onDidDispose.${id}`, {});
-      },
-      onDidDispose: disposeEvent,
-    };
+      provider,
+      [
+        'resolveCustomTextEditor',
+        'resolveCustomEditor',
+        'openCustomDocument',
+        'saveCustomDocument',
+        'saveCustomDocumentAs',
+        'revertCustomDocument',
+        'backupCustomDocument',
+      ],
+      {
+        selector: viewType,
+        ...normalizedOptions,
+      }
+    );
+    rpc.call('window.registerCustomEditorProvider', {
+      viewType,
+      options: normalizedOptions,
+    });
+    return new Disposable(() => {
+      proxyDisposable.dispose();
+      rpc.call('window.unregisterCustomEditorProvider', { viewType });
+    });
   },
 
   // Events

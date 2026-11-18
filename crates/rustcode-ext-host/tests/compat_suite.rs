@@ -2297,3 +2297,324 @@ fn test_compat_m2_js_api_export_surface() {
         assert_js_delimiters_balanced(name, src);
     }
 }
+
+#[tokio::test]
+async fn test_compat_custom_editor_and_webview_rpc_lifecycle() {
+    let manifest_json = r#"{
+        "name": "cat-scratch-custom-editor",
+        "publisher": "rustcode",
+        "version": "1.0.0",
+        "contributes": {
+            "customEditors": [
+                {
+                    "viewType": "catEdit.catScratch",
+                    "displayName": "Cat Scratch",
+                    "selector": [
+                        { "filenamePattern": "*.cscratch" }
+                    ],
+                    "priority": "default"
+                }
+            ]
+        }
+    }"#;
+    let manifest = ExtensionLoader::parse_manifest(manifest_json).unwrap();
+    let ce_contrib = &manifest.contributes.unwrap().custom_editors[0];
+    assert_eq!(ce_contrib.view_type, "catEdit.catScratch");
+    assert!(ce_contrib.matches_path("file:///workspace/demo.cscratch"));
+    assert!(!ce_contrib.matches_path("file:///workspace/main.rs"));
+
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(registry.clone(), rpc, lsp);
+
+    let reg_res = bridge
+        .handle_rpc_message(
+            "extHost.registerProvider",
+            &serde_json::json!({
+                "type": "CustomEditor",
+                "id": "catEdit.catScratch",
+                "selector": "catEdit.catScratch"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reg_res["registered"], true);
+    assert_eq!(
+        registry
+            .get_providers_for_language(
+                rustcode_ext_host::ProviderType::CustomEditor,
+                "catEdit.catScratch"
+            )
+            .len(),
+        1
+    );
+
+    let provider_res = bridge
+        .handle_rpc_message(
+            "window.registerCustomEditorProvider",
+            &serde_json::json!({
+                "viewType": "catEdit.catScratch",
+                "options": {
+                    "webviewOptions": { "enableScripts": true },
+                    "supportsMultipleEditorsPerDocument": true
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(provider_res["viewType"], "catEdit.catScratch");
+    assert_eq!(bridge.custom_editor_manager.list_providers().len(), 1);
+
+    let session_res = bridge
+        .handle_rpc_message(
+            "window.openCustomEditor",
+            &serde_json::json!({
+                "id": "ce_panel_1",
+                "viewType": "catEdit.catScratch",
+                "uri": "file:///workspace/demo.cscratch",
+                "title": "demo.cscratch"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(session_res["panelId"], "ce_panel_1");
+    assert!(bridge.webview_manager.get_panel("ce_panel_1").is_some());
+
+    assert!(bridge
+        .handle_rpc_message(
+            "window.createWebviewPanel",
+            &serde_json::json!({
+                "id": "wv_direct_1",
+                "viewType": "catCoding",
+                "title": "Cat Coding",
+                "options": { "enableScripts": true }
+            })
+        )
+        .await
+        .is_some());
+
+    assert_eq!(
+        bridge
+            .handle_rpc_message(
+                "window.setWebviewHtml",
+                &serde_json::json!({ "id": "ce_panel_1", "html": "<h1>Scratch</h1>" })
+            )
+            .await
+            .unwrap(),
+        serde_json::json!(true)
+    );
+    assert_eq!(
+        bridge
+            .webview_manager
+            .get_panel("ce_panel_1")
+            .unwrap()
+            .html,
+        "<h1>Scratch</h1>"
+    );
+
+    assert_eq!(
+        bridge
+            .handle_rpc_message(
+                "window.postMessageToWebview",
+                &serde_json::json!({ "id": "ce_panel_1", "message": { "type": "sync" } })
+            )
+            .await
+            .unwrap(),
+        serde_json::json!(true)
+    );
+
+    let revealed = bridge
+        .handle_rpc_message(
+            "window.revealWebviewPanel",
+            &serde_json::json!({ "id": "ce_panel_1", "viewColumn": 2 }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(revealed["revealed"], true);
+
+    assert_eq!(
+        bridge
+            .handle_rpc_message(
+                "window.disposeWebviewPanel",
+                &serde_json::json!({ "id": "wv_direct_1" })
+            )
+            .await
+            .unwrap(),
+        serde_json::json!(true)
+    );
+    assert!(bridge
+        .webview_manager
+        .get_panel("wv_direct_1")
+        .unwrap()
+        .is_disposed);
+
+    let unreg_ce = bridge
+        .handle_rpc_message(
+            "window.unregisterCustomEditorProvider",
+            &serde_json::json!({ "viewType": "catEdit.catScratch" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unreg_ce["unregistered"], true);
+
+    let unreg_provider = bridge
+        .handle_rpc_message(
+            "extHost.unregisterProvider",
+            &serde_json::json!({ "id": "catEdit.catScratch" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unreg_provider["unregistered"], true);
+}
+
+#[tokio::test]
+async fn test_compat_custom_editor_rpc_roundtrip() {
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(registry, rpc.clone(), lsp);
+
+    bridge.webview_manager.create_panel(
+        "ce_panel_rt",
+        "catEdit.catScratch",
+        "demo.cscratch",
+        rustcode_ext_host::WebviewOptions {
+            enable_scripts: true,
+            local_resource_roots: vec![],
+        },
+    );
+
+    let rpc1 = rpc.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        rpc1.handle_incoming_response(
+            1,
+            Some(serde_json::json!({ "uri": "file:///demo.cscratch", "opened": true })),
+            None,
+        );
+    });
+    let opened = bridge
+        .request_open_custom_document("catEdit.catScratch", "file:///demo.cscratch", None)
+        .await
+        .unwrap();
+    assert_eq!(opened["opened"], true);
+
+    let rpc2 = rpc.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        rpc2.handle_incoming_response(
+            2,
+            Some(serde_json::json!({
+                "resolved": true,
+                "panelId": "ce_panel_rt",
+                "viewType": "catEdit.catScratch",
+                "html": "<div id=\"custom\">Resolved Body</div>"
+            })),
+            None,
+        );
+    });
+    let resolved = bridge
+        .request_resolve_custom_editor(
+            "catEdit.catScratch",
+            "file:///demo.cscratch",
+            "ce_panel_rt",
+            "demo.cscratch",
+            Some("raw text"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved["resolved"], true);
+    assert_eq!(
+        bridge
+            .webview_manager
+            .get_panel("ce_panel_rt")
+            .unwrap()
+            .html,
+        "<div id=\"custom\">Resolved Body</div>"
+    );
+
+    let rpc3 = rpc.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        rpc3.handle_incoming_response(3, Some(serde_json::json!({ "saved": true })), None);
+    });
+    let saved = bridge
+        .request_save_custom_document("catEdit.catScratch", "file:///demo.cscratch")
+        .await
+        .unwrap();
+    assert_eq!(saved["saved"], true);
+}
+
+#[test]
+fn test_compat_custom_editor_js_api_export_surface() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let window_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/window.js")).unwrap();
+    let index_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/index.js")).unwrap();
+    let rpc_bridge_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/rpc-bridge.js")).unwrap();
+    let test_js = std::fs::read_to_string(repo_root.join("ext-host-js/test.js")).unwrap();
+
+    for sym in [
+        "registerCustomEditorProvider(",
+        "window.registerCustomEditorProvider",
+        "window.unregisterCustomEditorProvider",
+        "Array.isArray(provider)",
+        "viewType.trim()",
+        "resolveCustomTextEditor",
+        "resolveCustomEditor",
+        "openCustomDocument",
+        "saveCustomDocument",
+        "saveCustomDocumentAs",
+        "revertCustomDocument",
+        "backupCustomDocument",
+        "createWebviewPanelProxy",
+    ] {
+        assert!(
+            window_js.contains(sym),
+            "window.js missing custom editor symbol {}",
+            sym
+        );
+    }
+
+    for handler in [
+        "createWebviewPanelProxy(",
+        "let _disposed = false;",
+        "window.openCustomDocument",
+        "window.resolveCustomEditor",
+        "CustomEditor.resolveCustomEditor",
+        "CustomEditor.resolveCustomTextEditor",
+        "window.saveCustomDocument",
+        "window.saveCustomDocumentAs",
+        "window.revertCustomDocument",
+        "window.backupCustomDocument",
+        "window.closeCustomDocument",
+        "CustomEditor.closeCustomDocument",
+    ] {
+        assert!(
+            rpc_bridge_js.contains(handler),
+            "rpc-bridge.js missing handler {}",
+            handler
+        );
+    }
+
+    assert!(test_js.contains("registerCustomEditorProvider"));
+    assert!(test_js.contains("window.resolveCustomEditor"));
+
+    for (name, src) in [
+        ("window.js", &window_js),
+        ("index.js", &index_js),
+        ("rpc-bridge.js", &rpc_bridge_js),
+        ("test.js", &test_js),
+    ] {
+        assert_js_delimiters_balanced(name, src);
+    }
+}

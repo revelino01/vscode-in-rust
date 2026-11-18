@@ -2891,6 +2891,381 @@ fn test_e2e_word_wrap_config_sync_and_scene_rendering() {
     assert!(next_run.origin.y >= content_rect.min_y() + font.line_height * 2.0);
 }
 
+#[test]
+fn test_e2e_split_editor_grid_side_by_side_stacked_focus_and_close() {
+    use rustcode_platform::keybindings::Modifiers;
+    use rustcode_platform::render::{
+        KeyCode, KeyEvent, MockRenderSurface, MouseButton, MouseEvent, Point, Rect,
+    };
+
+    let app = RustCodeContext::new();
+    let mut window = app.create_window();
+    let mut surface = MockRenderSurface::new(1200.0, 800.0);
+    let bounds = Rect::from_xywh(0.0, 0.0, 1200.0, 800.0);
+
+    window.open_file("file:///workspace/a.rs", "a.rs", "fn alpha() {}\n", false);
+    window.open_file(
+        "file:///workspace/b.rs",
+        "b.rs",
+        "fn beta_one() {}\nfn beta_two() {}\n",
+        false,
+    );
+
+    // 1. Ctrl+\ splits active editor horizontally (side-by-side)
+    let ctrl_backslash = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('\\'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_backslash, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.editor_area.model.groups.len(), 2);
+    let gid1 = window.view.editor_area.model.active_group_id();
+    assert_ne!(gid1, 0);
+
+    let regions = window.view.compute_regions(bounds);
+    let rects = window
+        .view
+        .editor_area
+        .model
+        .compute_group_rects(regions.editor_area);
+    assert_eq!(rects.len(), 2);
+    assert!(rects[1].1.min_x() > rects[0].1.max_x());
+
+    // 2. Shared TextDocument across group 0 and group 1 with isolated cursor & scroll
+    window
+        .view
+        .editor_area
+        .editor_for_group_mut(0, "file:///workspace/b.rs")
+        .unwrap()
+        .scroll_top = 1.0;
+    window
+        .view
+        .editor_area
+        .active_editor_mut()
+        .unwrap()
+        .set_primary_position(rustcode_editor::Position::new(1, 0));
+
+    let type_z = InputEvent::KeyDown(KeyEvent::new(KeyCode::Char('/'), Modifiers::none()));
+    assert_eq!(window.dispatch_event(&type_z, bounds), EventResult::Consumed);
+
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .editor_for_group(0, "file:///workspace/b.rs")
+            .unwrap()
+            .text(),
+        window
+            .view
+            .editor_area
+            .editor_for_group(gid1, "file:///workspace/b.rs")
+            .unwrap()
+            .text()
+    );
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .editor_for_group(0, "file:///workspace/b.rs")
+            .unwrap()
+            .primary_position()
+            .line,
+        0
+    );
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .editor_for_group(0, "file:///workspace/b.rs")
+            .unwrap()
+            .scroll_top,
+        1.0
+    );
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .editor_for_group(gid1, "file:///workspace/b.rs")
+            .unwrap()
+            .scroll_top,
+        0.0
+    );
+
+    // 3. Ctrl+K Ctrl+\ creates a vertical (stacked) split -> 3 groups
+    let ctrl_k = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('k'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    window.dispatch_event(&ctrl_k, bounds);
+    assert_eq!(
+        window.dispatch_event(&ctrl_backslash, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.editor_area.model.groups.len(), 3);
+    let gid2 = window.view.editor_area.model.active_group_id();
+    let rects3 = window
+        .view
+        .editor_area
+        .model
+        .compute_group_rects(regions.editor_area);
+    let r1 = rects3.iter().find(|(id, _)| *id == gid1).unwrap().1;
+    let r2 = rects3.iter().find(|(id, _)| *id == gid2).unwrap().1;
+    assert!(r2.min_y() > r1.max_y());
+
+    // Render multi-group scene cleanly
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("b.rs"));
+
+    // 4. Focus switching via Ctrl+1, Ctrl+2, Ctrl+K Ctrl+Left, Ctrl+K Ctrl+Right, and mouse click
+    let ctrl_1 = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('1'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(window.dispatch_event(&ctrl_1, bounds), EventResult::Consumed);
+    assert_eq!(window.view.editor_area.model.active_group_id(), 0);
+
+    let ctrl_2 = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('2'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(window.dispatch_event(&ctrl_2, bounds), EventResult::Consumed);
+    assert_eq!(window.view.editor_area.model.active_group_id(), gid1);
+
+    let ctrl_right = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::ArrowRight,
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    window.dispatch_event(&ctrl_k, bounds);
+    assert_eq!(
+        window.dispatch_event(&ctrl_right, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.editor_area.model.active_group_id(), gid2);
+
+    let ctrl_left = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::ArrowLeft,
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    window.dispatch_event(&ctrl_k, bounds);
+    assert_eq!(
+        window.dispatch_event(&ctrl_left, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.editor_area.model.active_group_id(), gid1);
+
+    // Click inside group 0 switches focus back to 0
+    let r0 = rects3.iter().find(|(id, _)| *id == 0).unwrap().1;
+    let click_g0 = InputEvent::MouseDown(MouseEvent::new(
+        Point::new(r0.min_x() + 50.0, r0.min_y() + 80.0),
+        MouseButton::Left,
+    ));
+    assert_eq!(window.dispatch_event(&click_g0, bounds), EventResult::Consumed);
+    assert_eq!(window.view.editor_area.model.active_group_id(), 0);
+
+    // Accessibility tree exposes all groups and only marks active group focused
+    let tree = window.accessibility_tree(bounds);
+    assert!(tree.find_by_id("workbench.editorGroup.0").is_some());
+    assert!(tree
+        .find_by_id(&format!("workbench.editorGroup.{}", gid1))
+        .is_some());
+    assert!(tree
+        .find_by_id(&format!("workbench.editorGroup.{}", gid2))
+        .is_some());
+    assert!(tree
+        .find_by_id("workbench.editorGroup.0")
+        .unwrap()
+        .children
+        .iter()
+        .any(|c| c.state.focused));
+    assert!(!tree
+        .find_by_id(&format!("workbench.editorGroup.{}", gid1))
+        .unwrap()
+        .children
+        .iter()
+        .any(|c| c.state.focused));
+
+    // 5. Focus group 2 and close via Ctrl+K W (workbench.action.closeEditorsInGroup)
+    assert_eq!(window.dispatch_event(&ctrl_2, bounds), EventResult::Consumed);
+    window.dispatch_event(&ctrl_k, bounds);
+    assert_eq!(
+        window.dispatch_event(&ctrl_right, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.editor_area.model.active_group_id(), gid2);
+
+    let plain_w = InputEvent::KeyDown(KeyEvent::new(KeyCode::Char('w'), Modifiers::none()));
+    window.dispatch_event(&ctrl_k, bounds);
+    assert_eq!(window.dispatch_event(&plain_w, bounds), EventResult::Consumed);
+    assert_eq!(window.view.editor_area.model.groups.len(), 2);
+}
+
+#[test]
+fn test_e2e_custom_editor_in_split_pane_with_phase6_features() {
+    use rustcode_ext_host::manifest::{CustomEditorContribution, CustomEditorSelector};
+    use rustcode_ext_host::provider::ProviderRegistry;
+    use rustcode_ext_host::rpc::RpcBridge;
+    use rustcode_ext_host::webview::WebviewOptions;
+    use rustcode_ext_host::LanguageFeatureBridge;
+    use rustcode_platform::configuration::ConfigurationTarget;
+    use rustcode_platform::keybindings::Modifiers;
+    use rustcode_platform::render::{
+        KeyCode, KeyEvent, MockRenderSurface, MouseButton, MouseEvent, Point, Rect,
+    };
+    use rustcode_protocols::lsp::LspClientManager;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let app = RustCodeContext::new();
+    app.config
+        .update("editor.wordWrap", json!("on"), ConfigurationTarget::User)
+        .unwrap();
+
+    let registry = Arc::new(ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp));
+    bridge.custom_editor_manager.register_provider(
+        "custom.hexViewer",
+        WebviewOptions {
+            enable_scripts: true,
+            local_resource_roots: vec![],
+        },
+        true,
+    );
+
+    let mut window = app.create_window().with_language_bridge(bridge.clone());
+    window.register_custom_editor_contribution(CustomEditorContribution {
+        view_type: "custom.hexViewer".to_string(),
+        display_name: "Hex Viewer".to_string(),
+        selector: vec![CustomEditorSelector {
+            filename_pattern: "*.bin".to_string(),
+        }],
+        priority: Some("default".to_string()),
+    });
+
+    let mut surface = MockRenderSurface::new(1200.0, 800.0);
+    let bounds = Rect::from_xywh(0.0, 0.0, 1200.0, 800.0);
+
+    // Group 0: regular .rs file with M3 folding & word-wrap
+    window.open_file(
+        "file:///workspace/main.rs",
+        "main.rs",
+        "fn folded_fn() {\n    let inside = 42;\n}\n",
+        false,
+    );
+    window
+        .view
+        .editor_area
+        .active_editor_mut()
+        .unwrap()
+        .fold_at_cursor();
+
+    // Split editor horizontally -> Group 1
+    let ctrl_backslash = InputEvent::KeyDown(KeyEvent::new(
+        KeyCode::Char('\\'),
+        Modifiers {
+            ctrl: true,
+            shift: false,
+            alt: false,
+            meta: false,
+        },
+    ));
+    assert_eq!(
+        window.dispatch_event(&ctrl_backslash, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(window.view.editor_area.model.groups.len(), 2);
+
+    // Open .bin custom editor in Group 1
+    let bin_uri = "file:///workspace/firmware.bin";
+    window.open_file(bin_uri, "firmware.bin", "\x00\x01", false);
+    let session = bridge
+        .custom_editor_manager
+        .find_session_by_uri(bin_uri, Some("custom.hexViewer"))
+        .unwrap();
+
+    let clicks_received = Arc::new(AtomicUsize::new(0));
+    let clicks_clone = clicks_received.clone();
+    bridge
+        .webview_manager
+        .on_did_receive_message(&session.panel_id, move |msg| {
+            if msg["command"] == "click" && msg["text"] == "Inspect Hex" {
+                clicks_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+    bridge.webview_manager.set_html(
+        &session.panel_id,
+        "<h1>Hex Dump</h1><p>0000: 7f 45 4c 46</p><button>Inspect Hex</button>",
+    );
+    window.sync_webviews();
+
+    // Render concurrently in split grid
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("folded_fn"));
+    assert!(scene.contains_text("Hex Dump"));
+    assert!(scene.contains_text("0000: 7f 45 4c 46"));
+    assert!(scene.contains_text("Inspect Hex"));
+
+    // Click button inside split custom editor pane -> delivers outbound message to ExtHostWebviewManager
+    let btn_rect = window
+        .view
+        .editor_area
+        .webviews
+        .get(bin_uri)
+        .unwrap()
+        .button_targets
+        .read()[0]
+        .0;
+    let click_btn = InputEvent::MouseDown(MouseEvent::new(
+        Point::new(btn_rect.min_x() + 6.0, btn_rect.min_y() + 6.0),
+        MouseButton::Left,
+    ));
+    assert_eq!(
+        window.dispatch_event(&click_btn, bounds),
+        EventResult::Consumed
+    );
+    assert_eq!(clicks_received.load(Ordering::SeqCst), 1);
+
+    let tree = window.accessibility_tree(bounds);
+    assert!(tree.find_by_id("workbench.editor.text.file:///workspace/main.rs").is_some());
+    assert!(tree
+        .find_by_id("workbench.editor.webview.file:///workspace/firmware.bin")
+        .is_some());
+}
+
 
 
 

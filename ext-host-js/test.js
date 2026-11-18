@@ -322,6 +322,96 @@ exec.end(true, 200);
   assert(crossTypeFailed, 'invokeProvider must not collide across provider types');
   authDisp.dispose();
 
+  console.log('[Test] Testing vscode.window Webview & Custom Editors...');
+  assert(typeof vscode.window.createWebviewPanel === 'function', 'createWebviewPanel missing');
+  assert(typeof vscode.window.registerCustomEditorProvider === 'function', 'registerCustomEditorProvider missing');
+  const wvPanel = vscode.window.createWebviewPanel('catCoding', 'Cat Coding', 1, { enableScripts: true });
+  wvPanel.webview.html = '<h1>Meow</h1>';
+  assert(wvPanel.webview.html === '<h1>Meow</h1>', 'webview html mismatch');
+  wvPanel.webview.postMessage({ type: 'ping' });
+  wvPanel.reveal(1);
+  wvPanel.dispose();
+
+  const textCustomDisp = vscode.window.registerCustomEditorProvider(
+    'catEdit.catScratch',
+    {
+      resolveCustomTextEditor(doc, webviewPanel) {
+        webviewPanel.webview.html = '<p>' + doc.getText() + '</p>';
+      },
+    },
+    { webviewOptions: { enableScripts: true } }
+  );
+  const resolvedTextCustom = await rpc.handleIncomingRequest('window.resolveCustomEditor', {
+    viewType: 'catEdit.catScratch',
+    uri: 'file:///demo.cscratch',
+    panelId: 'ce_1',
+    text: 'hello scratch',
+  });
+  assert(resolvedTextCustom && resolvedTextCustom.resolved === true, 'resolveCustomTextEditor failed');
+  assert(resolvedTextCustom.html === '<p>hello scratch</p>', 'resolveCustomTextEditor html mismatch');
+  textCustomDisp.dispose();
+
+  let customDocSaved = false;
+  let customDocSavedAs = false;
+  let customDocReverted = false;
+  let customDocBackedUp = false;
+  const binCustomDisp = vscode.window.registerCustomEditorProvider(
+    'catEdit.hexViewer',
+    {
+      openCustomDocument(docUri) {
+        return { uri: docUri, dispose() {} };
+      },
+      resolveCustomEditor(doc, webviewPanel) {
+        webviewPanel.webview.html = '<div>' + doc.uri.toString() + '</div>';
+      },
+      saveCustomDocument() {
+        customDocSaved = true;
+      },
+      saveCustomDocumentAs() {
+        customDocSavedAs = true;
+      },
+      revertCustomDocument() {
+        customDocReverted = true;
+      },
+      backupCustomDocument() {
+        customDocBackedUp = true;
+        return { id: 'backup_1', delete() {} };
+      },
+    },
+    { supportsMultipleEditorsPerDocument: true }
+  );
+  await rpc.handleIncomingRequest('window.openCustomDocument', {
+    viewType: 'catEdit.hexViewer',
+    uri: 'file:///demo.bin',
+  });
+  const resolvedBinCustom = await rpc.handleIncomingRequest('window.resolveCustomEditor', {
+    viewType: 'catEdit.hexViewer',
+    uri: 'file:///demo.bin',
+    panelId: 'ce_2',
+  });
+  assert(resolvedBinCustom && resolvedBinCustom.resolved === true, 'resolveCustomEditor failed');
+  await rpc.handleIncomingRequest('window.saveCustomDocument', {
+    viewType: 'catEdit.hexViewer',
+    uri: 'file:///demo.bin',
+  });
+  await rpc.handleIncomingRequest('window.saveCustomDocumentAs', {
+    viewType: 'catEdit.hexViewer',
+    uri: 'file:///demo.bin',
+    destination: 'file:///demo_copy.bin',
+  });
+  await rpc.handleIncomingRequest('window.revertCustomDocument', {
+    viewType: 'catEdit.hexViewer',
+    uri: 'file:///demo.bin',
+  });
+  const backupRes = await rpc.handleIncomingRequest('window.backupCustomDocument', {
+    viewType: 'catEdit.hexViewer',
+    uri: 'file:///demo.bin',
+    context: { destination: 'file:///backup.bin' },
+  });
+  assert(customDocSaved && customDocSavedAs && customDocReverted && customDocBackedUp, 'CustomEditor lifecycle hooks failed');
+  assert(backupRes && backupRes.id === 'backup_1', 'backupCustomDocument failed');
+  binCustomDisp.dispose();
+
   console.log('All JavaScript extension host tests passed successfully!');
 })();
 

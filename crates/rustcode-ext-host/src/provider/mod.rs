@@ -29,6 +29,7 @@ pub enum ProviderType {
     Task,
     TestController,
     Authentication,
+    CustomEditor,
 }
 
 impl ProviderType {
@@ -49,6 +50,7 @@ impl ProviderType {
             "Task" => Some(Self::Task),
             "TestController" => Some(Self::TestController),
             "Authentication" => Some(Self::Authentication),
+            "CustomEditor" => Some(Self::CustomEditor),
             _ => None,
         }
     }
@@ -173,6 +175,10 @@ mod tests {
         assert_eq!(
             ProviderType::from_str_name("Authentication"),
             Some(ProviderType::Authentication)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("CustomEditor"),
+            Some(ProviderType::CustomEditor)
         );
         assert_eq!(ProviderType::from_str_name("UnknownProvider"), None);
 

@@ -1,5 +1,6 @@
 //! GPUI WorkbenchWindow host managing rendering surfaces, theme updates, and input routing.
 
+use crate::editor_area::SplitDirection;
 use crate::extensions_view::ExtensionsViewAction;
 use crate::output_panel::OutputAction;
 use crate::quickinput::{CommandPalette, CommandPaletteView, PaletteItem};
@@ -7,10 +8,12 @@ use crate::workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchView};
 use rustcode_base::context_key::ContextKeyService;
 use rustcode_base::disposable::DisposableStore;
 use rustcode_editor::WordWrapMode;
+use rustcode_ext_host::manifest::CustomEditorContribution;
 use rustcode_ext_host::marketplace::ExtensionInstaller;
 use rustcode_ext_host::output::OutputChannelEvent;
 use rustcode_ext_host::provider::LanguageFeatureBridge;
 use rustcode_ext_host::terminal::ExtTerminalEvent;
+use rustcode_ext_host::webview::{CustomEditorEvent, WebviewEvent, WebviewOptions};
 use rustcode_platform::accessibility::AccessibilityTree;
 use rustcode_platform::commands::CommandRegistry;
 use rustcode_platform::configuration::ConfigurationService;
@@ -38,8 +41,11 @@ pub struct WorkbenchWindow {
     pub language_bridge: Option<Arc<LanguageFeatureBridge>>,
     pub pending_code_actions: Vec<CodeAction>,
     pub extension_disposables: HashMap<String, DisposableStore>,
+    pub custom_editor_contributions: Vec<CustomEditorContribution>,
     synced_output_revision: u64,
     synced_terminal_revision: u64,
+    synced_webview_revision: u64,
+    synced_custom_editor_revision: u64,
     ext_terminal_map: HashMap<String, String>,
 }
 
@@ -75,8 +81,11 @@ impl WorkbenchWindow {
             language_bridge: None,
             pending_code_actions: Vec::new(),
             extension_disposables: HashMap::new(),
+            custom_editor_contributions: Vec::new(),
             synced_output_revision: 0,
             synced_terminal_revision: 0,
+            synced_webview_revision: 0,
+            synced_custom_editor_revision: 0,
             ext_terminal_map: HashMap::new(),
         };
         win.sync_configuration();
@@ -131,29 +140,27 @@ impl WorkbenchWindow {
         self.view.editor_area.set_minimap_enabled(default_minimap);
         self.view.editor_area.set_word_wrap(default_word_wrap);
         self.view.editor_area.set_word_wrap_column(default_wrap_col);
-        for editor in self.view.editor_area.editors.values_mut() {
+        let config = &self.config;
+        self.view.editor_area.for_each_editor_mut(|_, editor| {
             let doc_path = editor
                 .document
                 .as_ref()
                 .and_then(|d| d.read().path.clone());
-            let enabled = self
-                .config
+            let enabled = config
                 .get_for_resource::<bool>("editor.minimap.enabled", doc_path.as_deref())
                 .unwrap_or(default_minimap);
             editor.set_minimap_enabled(enabled);
-            let wrap_mode = self
-                .config
+            let wrap_mode = config
                 .get_for_resource::<String>("editor.wordWrap", doc_path.as_deref())
                 .map(|s| WordWrapMode::from_config_str(&s))
                 .unwrap_or(default_word_wrap);
             editor.set_word_wrap(wrap_mode);
-            let wrap_col = self
-                .config
+            let wrap_col = config
                 .get_for_resource::<usize>("editor.wordWrapColumn", doc_path.as_deref())
                 .unwrap_or(default_wrap_col)
                 .max(1);
             editor.set_word_wrap_column(wrap_col);
-        }
+        });
         self.view
             .editor_area
             .set_breadcrumbs_enabled(breadcrumbs_enabled);
@@ -367,10 +374,411 @@ impl WorkbenchWindow {
         self.sync_focus_context_keys();
     }
 
+    pub fn register_custom_editor_contribution(&mut self, contrib: CustomEditorContribution) {
+        self.custom_editor_contributions
+            .retain(|c| c.view_type != contrib.view_type);
+        self.custom_editor_contributions.push(contrib);
+        self.view
+            .editor_area
+            .register_custom_editor_contributions(self.custom_editor_contributions.clone());
+    }
+
+    pub fn find_matching_custom_editor(&self, uri: &str) -> Option<CustomEditorContribution> {
+        let mut candidates: Vec<CustomEditorContribution> = self
+            .custom_editor_contributions
+            .iter()
+            .filter(|c| c.matches_path(uri))
+            .cloned()
+            .collect();
+
+        if let Some(installer) = &self.view.extensions_view.installer {
+            for ext in installer.list_installed() {
+                let ext_id =
+                    ExtensionInstaller::extension_id(&ext.manifest.publisher, &ext.manifest.name);
+                if !installer.is_enabled(&ext_id) {
+                    continue;
+                }
+                if let Some(contribs) = ext.manifest.contributes {
+                    for ce in contribs.custom_editors {
+                        if ce.matches_path(uri)
+                            && !candidates.iter().any(|c| c.view_type == ce.view_type)
+                        {
+                            candidates.push(ce);
+                        }
+                    }
+                }
+            }
+        }
+
+        let bridge = self.language_bridge.as_ref();
+        candidates.into_iter().min_by_key(|c| {
+            let is_registered = bridge
+                .and_then(|b| b.custom_editor_manager.get_provider(&c.view_type))
+                .is_some();
+            let priority_rank = match c.priority.as_deref() {
+                Some("default") | None => 0u8,
+                _ => 1u8,
+            };
+            (!is_registered, priority_rank)
+        })
+    }
+
+    fn close_webview_tab_by_key(&mut self, key: &str) {
+        let targets: Vec<(usize, usize)> = self
+            .view
+            .editor_area
+            .model
+            .groups
+            .iter()
+            .filter_map(|g| {
+                g.tabs
+                    .iter()
+                    .position(|t| t.uri == key)
+                    .map(|idx| (g.id, idx))
+            })
+            .collect();
+        for (gid, idx) in targets {
+            self.view.editor_area.close_tab_in_group(gid, idx);
+        }
+    }
+
+    fn focus_webview_tab_by_key(&mut self, key: &str) {
+        let target = self
+            .view
+            .editor_area
+            .model
+            .groups
+            .iter()
+            .find_map(|g| {
+                g.tabs
+                    .iter()
+                    .position(|t| t.uri == key)
+                    .map(|idx| (g.id, idx))
+            });
+        if let Some((gid, idx)) = target {
+            self.view.editor_area.focus_group(gid);
+            if let Some(group) = self.view.editor_area.model.group_by_id_mut(gid) {
+                group.active_tab_index = Some(idx);
+            }
+            self.view.editor_area.sync_editor_focus();
+            self.view.editor_area.sync_breadcrumbs(Some(&self.view.workspace));
+            self.view.focused_region = FocusedRegion::Editor;
+        }
+    }
+
+    fn sync_closed_webview_panels(&mut self) {
+        let closed_ids = std::mem::take(&mut self.view.editor_area.closed_webview_panels);
+        if closed_ids.is_empty() {
+            return;
+        }
+        if let Some(bridge) = self.language_bridge.clone() {
+            for panel_id in closed_ids {
+                if let Some(session) = bridge
+                    .custom_editor_manager
+                    .find_session_by_panel_id(&panel_id)
+                {
+                    bridge
+                        .custom_editor_manager
+                        .close_session(&session.id, Some(&bridge.webview_manager));
+                } else {
+                    bridge.webview_manager.dispose_panel(&panel_id);
+                }
+            }
+        }
+    }
+
+    pub fn sync_custom_editors(&mut self) {
+        self.sync_closed_webview_panels();
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let rev = bridge.custom_editor_manager.revision();
+        if rev == self.synced_custom_editor_revision {
+            return;
+        }
+
+        let events = bridge.custom_editor_manager.take_pending_events();
+        if events.is_empty() {
+            for session in bridge.custom_editor_manager.list_active_sessions() {
+                if !self
+                    .view
+                    .editor_area
+                    .custom_editor_panels
+                    .contains_key(&session.panel_id)
+                {
+                    let (html, options) = bridge
+                        .webview_manager
+                        .get_panel(&session.panel_id)
+                        .map(|p| (p.html, p.options))
+                        .unwrap_or_default();
+                    self.view.editor_area.open_custom_editor(
+                        &session.uri,
+                        &session.title,
+                        &session.view_type,
+                        &session.panel_id,
+                        &html,
+                        options,
+                        Some((*bridge.webview_manager).clone()),
+                        false,
+                    );
+                }
+            }
+        } else {
+            for ev in events {
+                match ev {
+                    CustomEditorEvent::SessionOpened {
+                        id,
+                        view_type,
+                        uri,
+                        panel_id,
+                    } => {
+                        if !self
+                            .view
+                            .editor_area
+                            .custom_editor_panels
+                            .contains_key(&panel_id)
+                        {
+                            let title = bridge
+                                .custom_editor_manager
+                                .get_session(&id)
+                                .map(|s| s.title)
+                                .unwrap_or_else(|| view_type.clone());
+                            let (html, options) = bridge
+                                .webview_manager
+                                .get_panel(&panel_id)
+                                .map(|p| (p.html, p.options))
+                                .unwrap_or_default();
+                            self.view.editor_area.open_custom_editor(
+                                &uri,
+                                &title,
+                                &view_type,
+                                &panel_id,
+                                &html,
+                                options,
+                                Some((*bridge.webview_manager).clone()),
+                                false,
+                            );
+                        }
+                    }
+                    CustomEditorEvent::SessionClosed { id } => {
+                        if let Some(uri) = self
+                            .view
+                            .editor_area
+                            .custom_editor_panels
+                            .get(&id)
+                            .cloned()
+                        {
+                            self.close_webview_tab_by_key(&uri);
+                        }
+                    }
+                    CustomEditorEvent::ProviderRegistered { .. }
+                    | CustomEditorEvent::ProviderUnregistered { .. } => {}
+                }
+            }
+        }
+
+        self.synced_custom_editor_revision = rev;
+    }
+
+    pub fn sync_webviews(&mut self) {
+        self.sync_closed_webview_panels();
+        self.sync_custom_editors();
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let rev = bridge.webview_manager.revision();
+        if rev == self.synced_webview_revision {
+            return;
+        }
+
+        let resolve_key =
+            |panels: &std::collections::HashMap<String, String>, panel_id: &str| -> String {
+                panels
+                    .get(panel_id)
+                    .cloned()
+                    .or_else(|| {
+                        bridge
+                            .custom_editor_manager
+                            .find_session_by_panel_id(panel_id)
+                            .map(|s| s.uri)
+                    })
+                    .unwrap_or_else(|| panel_id.to_string())
+            };
+
+        let events = bridge.webview_manager.take_pending_events();
+        if events.is_empty() {
+            for panel in bridge.webview_manager.list_active_panels() {
+                let key = resolve_key(&self.view.editor_area.custom_editor_panels, &panel.id);
+                if self.view.editor_area.any_webview_for_uri(&key).is_some() {
+                    if !panel.html.is_empty() {
+                        self.view
+                            .editor_area
+                            .for_each_webview_for_uri_mut(&key, |wv| wv.set_html(&panel.html));
+                    }
+                } else if bridge.custom_editor_manager.get_session(&panel.id).is_none()
+                    && bridge
+                        .custom_editor_manager
+                        .find_session_by_panel_id(&panel.id)
+                        .is_none()
+                {
+                    self.view.editor_area.open_webview(
+                        &panel.id,
+                        &panel.title,
+                        &panel.view_type,
+                        &panel.html,
+                        panel.options,
+                        Some((*bridge.webview_manager).clone()),
+                    );
+                }
+            }
+        } else {
+            for ev in events {
+                match ev {
+                    WebviewEvent::PanelCreated {
+                        id,
+                        view_type,
+                        title,
+                    } => {
+                        let is_custom = self
+                            .view
+                            .editor_area
+                            .custom_editor_panels
+                            .contains_key(&id)
+                            || bridge.custom_editor_manager.get_session(&id).is_some()
+                            || bridge
+                                .custom_editor_manager
+                                .find_session_by_panel_id(&id)
+                                .is_some();
+                        if !is_custom && self.view.editor_area.any_webview_for_uri(&id).is_none() {
+                            let (html, options) = bridge
+                                .webview_manager
+                                .get_panel(&id)
+                                .map(|p| (p.html, p.options))
+                                .unwrap_or_default();
+                            self.view.editor_area.open_webview(
+                                &id,
+                                &title,
+                                &view_type,
+                                &html,
+                                options,
+                                Some((*bridge.webview_manager).clone()),
+                            );
+                        }
+                    }
+                    WebviewEvent::HtmlUpdated { id, html } => {
+                        let key = resolve_key(&self.view.editor_area.custom_editor_panels, &id);
+                        self.view
+                            .editor_area
+                            .for_each_webview_for_uri_mut(&key, |wv| wv.set_html(&html));
+                    }
+                    WebviewEvent::MessagePosted { id, message } => {
+                        let key = resolve_key(&self.view.editor_area.custom_editor_panels, &id);
+                        self.view
+                            .editor_area
+                            .for_each_webview_for_uri_mut(&key, |wv| {
+                                wv.receive_message_from_host(message.clone());
+                            });
+                    }
+                    WebviewEvent::PanelRevealed { id, .. } => {
+                        let key = resolve_key(&self.view.editor_area.custom_editor_panels, &id);
+                        self.focus_webview_tab_by_key(&key);
+                    }
+                    WebviewEvent::PanelDisposed { id } => {
+                        let key = self
+                            .view
+                            .editor_area
+                            .custom_editor_panels
+                            .remove(&id)
+                            .or_else(|| {
+                                bridge
+                                    .custom_editor_manager
+                                    .find_session_by_panel_id(&id)
+                                    .map(|s| s.uri)
+                            })
+                            .unwrap_or_else(|| id.clone());
+                        self.close_webview_tab_by_key(&key);
+                        if let Some(session) =
+                            bridge.custom_editor_manager.find_session_by_panel_id(&id)
+                        {
+                            bridge
+                                .custom_editor_manager
+                                .close_session(&session.id, None);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.synced_webview_revision = rev;
+    }
+
+    pub async fn resolve_custom_editor(
+        &mut self,
+        uri: &str,
+        content: Option<&str>,
+    ) -> Result<String, String> {
+        let bridge = self
+            .language_bridge
+            .clone()
+            .ok_or_else(|| "LanguageFeatureBridge not attached".to_string())?;
+
+        let (view_type, title) = if let Some(wv) = self.view.editor_area.any_webview_for_uri(uri) {
+            (wv.view_type.clone(), wv.title.clone())
+        } else if let Some(contrib) = self.find_matching_custom_editor(uri) {
+            let t = uri
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&contrib.view_type)
+                .to_string();
+            (contrib.view_type.clone(), t)
+        } else {
+            return Err(format!("No custom editor contribution matches '{}'", uri));
+        };
+
+        let existing_session = bridge
+            .custom_editor_manager
+            .find_session_by_uri(uri, Some(&view_type))
+            .filter(|session| {
+                let valid = bridge
+                    .webview_manager
+                    .get_panel(&session.panel_id)
+                    .is_some_and(|p| !p.is_disposed);
+                if !valid {
+                    bridge
+                        .custom_editor_manager
+                        .close_session(&session.id, Some(&bridge.webview_manager));
+                }
+                valid
+            });
+        let session = existing_session.unwrap_or_else(|| {
+            bridge.custom_editor_manager.open_session(
+                None,
+                &view_type,
+                uri,
+                Some(&title),
+                Some(&bridge.webview_manager),
+            )
+        });
+
+        let _ = bridge
+            .request_open_custom_document(&view_type, uri, None)
+            .await;
+        bridge
+            .request_resolve_custom_editor(&view_type, uri, &session.panel_id, &title, content)
+            .await?;
+
+        self.sync_custom_editors();
+        self.sync_webviews();
+        Ok(session.panel_id)
+    }
+
     pub fn with_language_bridge(mut self, bridge: Arc<LanguageFeatureBridge>) -> Self {
         self.language_bridge = Some(bridge);
         self.sync_output_channels();
         self.sync_ext_terminals();
+        self.sync_custom_editors();
+        self.sync_webviews();
         self
     }
 
@@ -378,6 +786,8 @@ impl WorkbenchWindow {
         self.language_bridge = Some(bridge);
         self.sync_output_channels();
         self.sync_ext_terminals();
+        self.sync_custom_editors();
+        self.sync_webviews();
     }
 
     /// Renders the workbench window into the given render surface and returns the display list.
@@ -404,6 +814,8 @@ impl WorkbenchWindow {
                     self.handle_builtin_command_effects(&cmd_id);
                     self.sync_output_channels();
                     self.sync_ext_terminals();
+                    self.sync_custom_editors();
+                    self.sync_webviews();
                     self.sync_focus_context_keys();
                     self.sync_configuration();
                     return EventResult::Consumed;
@@ -461,6 +873,8 @@ impl WorkbenchWindow {
         if !matches!(event, InputEvent::MouseMove(_)) {
             self.sync_output_channels();
             self.sync_ext_terminals();
+            self.sync_custom_editors();
+            self.sync_webviews();
             self.sync_configuration();
         }
 
@@ -506,6 +920,11 @@ impl WorkbenchWindow {
             ) {
                 self.extension_disposables
                     .insert(id.to_ascii_lowercase(), store);
+            }
+            if let Some(contribs) = ext.manifest.contributes {
+                for ce in contribs.custom_editors {
+                    self.register_custom_editor_contribution(ce);
+                }
             }
         }
     }
@@ -659,7 +1078,62 @@ impl WorkbenchWindow {
             "workbench.action.closeActiveEditor" => {
                 if let Some(active_tab) = self.view.editor_area.model.current_group_ref().active_tab_index {
                     self.view.editor_area.close_tab(active_tab);
+                    self.sync_closed_webview_panels();
                 }
+            }
+            "workbench.action.splitEditor" => {
+                self.view
+                    .editor_area
+                    .split_active_group(SplitDirection::Horizontal);
+                self.view.focused_region = FocusedRegion::Editor;
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+            }
+            "workbench.action.splitEditorDown" => {
+                self.view
+                    .editor_area
+                    .split_active_group(SplitDirection::Vertical);
+                self.view.focused_region = FocusedRegion::Editor;
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+            }
+            "workbench.action.focusPreviousGroup" => {
+                self.view.editor_area.focus_previous_group();
+                self.view.focused_region = FocusedRegion::Editor;
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+            }
+            "workbench.action.focusNextGroup" => {
+                self.view.editor_area.focus_next_group();
+                self.view.focused_region = FocusedRegion::Editor;
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+            }
+            "workbench.action.focusFirstEditorGroup" => {
+                self.view.editor_area.focus_first_editor_group();
+                self.view.focused_region = FocusedRegion::Editor;
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+            }
+            "workbench.action.focusSecondEditorGroup" => {
+                self.view.editor_area.focus_second_editor_group();
+                self.view.focused_region = FocusedRegion::Editor;
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+            }
+            "workbench.action.closeEditorsInGroup" => {
+                self.view.editor_area.close_editors_in_active_group();
+                self.sync_closed_webview_panels();
+                self.view.focused_region = FocusedRegion::Editor;
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
             }
             "undo" => {
                 if let Some(editor) = self.view.editor_area.active_editor_mut() {
@@ -811,9 +1285,84 @@ impl WorkbenchWindow {
     }
 
     pub fn open_file(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
-        self.view
-            .editor_area
-            .open_file(uri, title, content, is_preview);
+        if let Some(contrib) = self.find_matching_custom_editor(uri) {
+            if let Some(bridge) = self.language_bridge.clone() {
+                let existing_session = bridge
+                    .custom_editor_manager
+                    .find_session_by_uri(uri, Some(&contrib.view_type))
+                    .filter(|session| {
+                        let valid = bridge
+                            .webview_manager
+                            .get_panel(&session.panel_id)
+                            .is_some_and(|p| !p.is_disposed);
+                        if !valid {
+                            bridge
+                                .custom_editor_manager
+                                .close_session(&session.id, Some(&bridge.webview_manager));
+                        }
+                        valid
+                    });
+                let session = existing_session.unwrap_or_else(|| {
+                    bridge.custom_editor_manager.open_session(
+                        None,
+                        &contrib.view_type,
+                        uri,
+                        Some(title),
+                        Some(&bridge.webview_manager),
+                    )
+                });
+                let (panel_html, options) = bridge
+                    .webview_manager
+                    .get_panel(&session.panel_id)
+                    .map(|p| (p.html, p.options))
+                    .unwrap_or_else(|| (String::new(), WebviewOptions::default()));
+                let html = if panel_html.is_empty() {
+                    let display = if contrib.display_name.is_empty() {
+                        contrib.view_type.as_str()
+                    } else {
+                        contrib.display_name.as_str()
+                    };
+                    format!("<h1>{}</h1><p>Custom Editor: {}</p>", title, display)
+                } else {
+                    panel_html
+                };
+                self.view.editor_area.open_custom_editor(
+                    uri,
+                    title,
+                    &contrib.view_type,
+                    &session.panel_id,
+                    &html,
+                    options,
+                    Some((*bridge.webview_manager).clone()),
+                    is_preview,
+                );
+                self.sync_custom_editors();
+                self.sync_webviews();
+            } else {
+                let panel_id = format!("custom_editor:{}", uri);
+                let display = if contrib.display_name.is_empty() {
+                    contrib.view_type.as_str()
+                } else {
+                    contrib.display_name.as_str()
+                };
+                let html = format!("<h1>{}</h1><p>Custom Editor: {}</p>", title, display);
+                self.view.editor_area.open_custom_editor(
+                    uri,
+                    title,
+                    &contrib.view_type,
+                    &panel_id,
+                    &html,
+                    WebviewOptions::default(),
+                    None,
+                    is_preview,
+                );
+            }
+        } else {
+            self.view
+                .editor_area
+                .open_file(uri, title, content, is_preview);
+            self.sync_closed_webview_panels();
+        }
         self.view.focused_region = crate::workbench_view::FocusedRegion::Editor;
         self.sync_focus_context_keys();
         self.sync_configuration();
@@ -826,8 +1375,7 @@ impl WorkbenchWindow {
                 let lang = self
                     .view
                     .editor_area
-                    .editors
-                    .get(&uri)
+                    .active_editor()
                     .and_then(|ed| ed.document.as_ref())
                     .map(|doc| doc.read().language_id.clone())
                     .unwrap_or_else(|| "*".to_string());
@@ -902,7 +1450,7 @@ impl WorkbenchWindow {
         let (uri, lang_id, range) = match self.view.editor_area.model.current_group_ref().active_tab() {
             Some(tab) => {
                 let uri = tab.uri.clone();
-                let (lang, range) = if let Some(ed) = self.view.editor_area.editors.get(&uri) {
+                let (lang, range) = if let Some(ed) = self.view.editor_area.active_editor() {
                     let lang = ed
                         .document
                         .as_ref()
@@ -1997,5 +2545,243 @@ mod tests {
         assert_eq!(ed.word_wrap_column, 40);
         assert_eq!(ed.scroll_top, 1.0);
         assert!(ed.folding_model.is_collapsed(0));
+    }
+
+    #[test]
+    fn test_window_custom_editor_open_file_and_webview_sync() {
+        use rustcode_ext_host::manifest::CustomEditorSelector;
+        use rustcode_ext_host::provider::ProviderRegistry;
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_platform::configuration::ConfigurationTarget;
+        use rustcode_protocols::lsp::LspClientManager;
+        use serde_json::json;
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let rpc = Arc::new(RpcBridge::new());
+        let lsp = Arc::new(LspClientManager::new());
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp));
+
+        bridge.custom_editor_manager.register_provider(
+            "catEdit.catScratch",
+            WebviewOptions {
+                enable_scripts: true,
+                local_resource_roots: vec![],
+            },
+            true,
+        );
+
+        let config = ConfigurationService::new();
+        let mut window = WorkbenchWindow::new(
+            ThemeService::new(),
+            KeybindingService::new(),
+            CommandRegistry::new(),
+            ContextKeyService::new(),
+        )
+        .with_config(config.clone())
+        .with_language_bridge(bridge.clone());
+
+        window.register_custom_editor_contribution(CustomEditorContribution {
+            view_type: "catEdit.catScratch".to_string(),
+            display_name: "Cat Scratch".to_string(),
+            selector: vec![CustomEditorSelector {
+                filename_pattern: "*.cscratch".to_string(),
+            }],
+            priority: Some("default".to_string()),
+        });
+
+        // Open matching custom editor file
+        window.open_file("file:///workspace/demo.cscratch", "demo.cscratch", "{}", false);
+        let uri = "file:///workspace/demo.cscratch";
+        assert!(window.view.editor_area.webviews.contains_key(uri));
+
+        let session = bridge
+            .custom_editor_manager
+            .find_session_by_uri(uri, Some("catEdit.catScratch"))
+            .unwrap();
+        bridge
+            .webview_manager
+            .set_html(&session.panel_id, "<h1>Synced Cat</h1><button>Purr</button>");
+        bridge
+            .webview_manager
+            .post_message_to_webview(&session.panel_id, json!({ "cmd": "hydrate" }))
+            .unwrap();
+
+        window.sync_webviews();
+        let wv = window.view.editor_area.webviews.get(uri).unwrap();
+        assert!(wv.html.contains("Synced Cat"));
+        assert_eq!(wv.inbound_messages.len(), 1);
+
+        // Verify sync_configuration propagates to split editor panes as well
+        window.open_file("file:///workspace/code.rs", "code.rs", "let a = 1;", false);
+        let gid1 = window
+            .view
+            .editor_area
+            .split_active_group(SplitDirection::Horizontal);
+        config
+            .update("editor.wordWrap", json!("on"), ConfigurationTarget::User)
+            .unwrap();
+        window.sync_configuration();
+
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .editor_for_group(0, "file:///workspace/code.rs")
+                .unwrap()
+                .word_wrap,
+            WordWrapMode::On
+        );
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .editor_for_group(gid1, "file:///workspace/code.rs")
+                .unwrap()
+                .word_wrap,
+            WordWrapMode::On
+        );
+    }
+
+    #[test]
+    fn test_window_dispose_panel_closes_session_reopen_fresh_and_sync_ordering() {
+        use rustcode_ext_host::manifest::CustomEditorSelector;
+        use rustcode_ext_host::provider::ProviderRegistry;
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_protocols::lsp::LspClientManager;
+        use serde_json::json;
+
+        let registry = Arc::new(ProviderRegistry::new());
+        let rpc = Arc::new(RpcBridge::new());
+        let lsp = Arc::new(LspClientManager::new());
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp));
+
+        bridge.custom_editor_manager.register_provider(
+            "catEdit.catScratch",
+            WebviewOptions {
+                enable_scripts: true,
+                local_resource_roots: vec![],
+            },
+            true,
+        );
+
+        let mut window = WorkbenchWindow::new(
+            ThemeService::new(),
+            KeybindingService::new(),
+            CommandRegistry::new(),
+            ContextKeyService::new(),
+        )
+        .with_language_bridge(bridge.clone());
+
+        window.register_custom_editor_contribution(CustomEditorContribution {
+            view_type: "catEdit.catScratch".to_string(),
+            display_name: "Cat Scratch".to_string(),
+            selector: vec![CustomEditorSelector {
+                filename_pattern: "*.cscratch".to_string(),
+            }],
+            priority: Some("default".to_string()),
+        });
+
+        let uri = "file:///workspace/lifecycle.cscratch";
+        window.open_file(uri, "lifecycle.cscratch", "{}", false);
+        let session1 = bridge
+            .custom_editor_manager
+            .find_session_by_uri(uri, Some("catEdit.catScratch"))
+            .unwrap();
+        assert!(!bridge
+            .webview_manager
+            .get_panel(&session1.panel_id)
+            .unwrap()
+            .is_disposed);
+
+        // 1. Disposing panel from ext-host + sync_webviews closes CustomEditorSessionState
+        assert!(bridge.webview_manager.dispose_panel(&session1.panel_id));
+        window.sync_webviews();
+        assert!(bridge
+            .custom_editor_manager
+            .get_session(&session1.id)
+            .unwrap()
+            .is_closed);
+        assert!(!window
+            .view
+            .editor_area
+            .custom_editor_panels
+            .contains_key(&session1.panel_id));
+        assert!(!window.view.editor_area.webviews.contains_key(uri));
+
+        // 2. Re-opening via open_file creates a fresh non-disposed session & panel
+        window.open_file(uri, "lifecycle.cscratch", "{}", false);
+        let session2 = bridge
+            .custom_editor_manager
+            .find_session_by_uri(uri, Some("catEdit.catScratch"))
+            .unwrap();
+        assert_ne!(session2.panel_id, session1.panel_id);
+        assert!(!bridge
+            .webview_manager
+            .get_panel(&session2.panel_id)
+            .unwrap()
+            .is_disposed);
+        bridge
+            .webview_manager
+            .post_message_to_webview(&session2.panel_id, json!({ "ok": true }))
+            .unwrap();
+        window.sync_webviews();
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .webviews
+                .get(uri)
+                .unwrap()
+                .inbound_messages
+                .len(),
+            1
+        );
+
+        // 3. Closing from UI closes backing panel & session when no split pane holds it
+        window.handle_builtin_command_effects("workbench.action.closeActiveEditor");
+        assert!(bridge
+            .webview_manager
+            .get_panel(&session2.panel_id)
+            .unwrap()
+            .is_disposed);
+        assert!(bridge
+            .custom_editor_manager
+            .get_session(&session2.id)
+            .unwrap()
+            .is_closed);
+
+        // 4. Out-of-band openCustomEditor RPC + sync_webviews() called BEFORE sync_custom_editors()
+        let rpc_session = bridge
+            .custom_editor_manager
+            .handle_rpc_call(
+                "window.openCustomEditor",
+                &json!({
+                    "viewType": "catEdit.catScratch",
+                    "uri": "file:///workspace/oob.cscratch",
+                    "title": "oob.cscratch"
+                }),
+                Some(&bridge.webview_manager),
+            )
+            .unwrap();
+        let oob_panel_id = rpc_session["panelId"].as_str().unwrap();
+        bridge
+            .webview_manager
+            .set_html(oob_panel_id, "<h1>Order Preserved</h1>");
+        bridge
+            .webview_manager
+            .post_message_to_webview(oob_panel_id, json!({ "hello": "world" }))
+            .unwrap();
+
+        // Call sync_webviews BEFORE sync_custom_editors
+        window.sync_webviews();
+        window.sync_custom_editors();
+        let oob_wv = window
+            .view
+            .editor_area
+            .webviews
+            .get("file:///workspace/oob.cscratch")
+            .unwrap();
+        assert!(oob_wv.html.contains("Order Preserved"));
+        assert_eq!(oob_wv.inbound_messages, vec![json!({ "hello": "world" })]);
     }
 }

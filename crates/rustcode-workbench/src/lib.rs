@@ -35,7 +35,10 @@ pub use debug::{
     DebugConsoleView, DebugOutputEntry, DebugSessionState, DebugSidebarView, DebugToolbarAction,
     DebugToolbarView, DebugViewAction,
 };
-pub use editor_area::{EditorArea, EditorAreaAction, EditorAreaView, EditorGroup, EditorTab};
+pub use editor_area::{
+    EditorArea, EditorAreaAction, EditorAreaView, EditorGridNode, EditorGroup, EditorSash,
+    EditorTab, SplitDirection,
+};
 pub use explorer::{ExplorerAction, ExplorerRow, FileExplorer, FileExplorerView, FileTreeNode};
 pub use extensions_view::{
     curated_marketplace_extensions, ExtensionsClickTarget, ExtensionsSidebarLayout,

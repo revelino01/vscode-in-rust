@@ -126,9 +126,8 @@ impl WorkbenchView {
     }
 
     pub fn update_problems(&mut self, uri: &str, diags: Vec<rustcode_editor::viewmodel::EditorDiagnostic>) {
-        if let Some(editor) = self.editor_area.editors.get_mut(uri) {
-            editor.set_diagnostics(diags.clone());
-        }
+        self.editor_area
+            .for_each_editor_for_uri_mut(uri, |editor| editor.set_diagnostics(diags.clone()));
         self.problems_panel.set_file_diagnostics(uri, diags);
         let badge_text = self.problems_panel.status_badge_text();
         let tooltip = format!(
@@ -153,9 +152,7 @@ impl WorkbenchView {
     }
 
     pub fn open_command_palette(&mut self, palette_view: CommandPaletteView) {
-        for editor in self.editor_area.editors.values_mut() {
-            editor.minimap_dragging = false;
-        }
+        self.editor_area.clear_all_drag_state();
         self.command_palette = Some(palette_view);
         self.is_command_palette_open = true;
         self.focused_region = FocusedRegion::CommandPalette;
@@ -311,6 +308,292 @@ impl WorkbenchView {
             panel,
             status_bar,
             command_palette,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn populate_accessible_editor_group(
+        &self,
+        parent: &mut AccessibleNode,
+        group_id: usize,
+        group_rect: Rect,
+        font: &FontMetrics,
+        is_active_group: bool,
+        editor_focused: bool,
+        legacy_ids: bool,
+    ) {
+        let Some(group) = self.editor_area.model.group_by_id(group_id) else {
+            return;
+        };
+        let tab_bar_h = 35.0;
+        let tab_bar_rect = Rect::from_xywh(
+            group_rect.min_x(),
+            group_rect.min_y(),
+            group_rect.width(),
+            tab_bar_h,
+        );
+        let tabs_id = if legacy_ids {
+            "workbench.editorArea.tabs".to_string()
+        } else {
+            format!("workbench.editorArea.group.{}.tabs", group_id)
+        };
+        let mut tab_list =
+            AccessibleNode::new(tabs_id, AccessibleRole::TabList, "Open Editors", tab_bar_rect);
+
+        let mut cur_x = group_rect.min_x();
+        for (idx, tab) in group.tabs.iter().enumerate() {
+            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
+            let tab_rect = Rect::from_xywh(cur_x, group_rect.min_y(), tab_w, tab_bar_h);
+            if !crate::is_finite_rect(tab_rect) {
+                break;
+            }
+            let tab_id = if legacy_ids {
+                format!("editor.tab.{}", idx)
+            } else {
+                format!("editor.group.{}.tab.{}", group_id, idx)
+            };
+            tab_list.add_child(
+                AccessibleNode::new(tab_id, AccessibleRole::Tab, tab.title.clone(), tab_rect)
+                    .with_selected(group.active_tab_index == Some(idx))
+                    .with_action("select"),
+            );
+            cur_x += tab_w;
+        }
+        parent.add_child(tab_list);
+
+        if let Some(bc_rect) = self
+            .editor_area
+            .breadcrumbs_rect_for_group(group_id, group_rect)
+        {
+            let bc_bar = self
+                .editor_area
+                .group_breadcrumbs
+                .get(&group_id)
+                .unwrap_or(&self.editor_area.breadcrumbs);
+            let bc_id = if legacy_ids {
+                "workbench.editorArea.breadcrumbs".to_string()
+            } else {
+                format!("workbench.editorArea.group.{}.breadcrumbs", group_id)
+            };
+            let mut bc_node =
+                AccessibleNode::new(bc_id, AccessibleRole::Breadcrumb, "Breadcrumbs", bc_rect);
+            let item_rects = bc_bar.compute_item_rects(bc_rect, font);
+            for (idx, item_rect) in item_rects {
+                if let Some(item) = bc_bar.items.get(idx) {
+                    let item_id = if legacy_ids {
+                        format!("breadcrumbs.item.{}", idx)
+                    } else {
+                        format!("breadcrumbs.group.{}.item.{}", group_id, idx)
+                    };
+                    bc_node.add_child(
+                        AccessibleNode::new(
+                            item_id,
+                            AccessibleRole::BreadcrumbItem,
+                            item.label.clone(),
+                            item_rect,
+                        )
+                        .with_selected(bc_bar.selected_index == Some(idx))
+                        .with_action("select"),
+                    );
+                }
+            }
+            parent.add_child(bc_node);
+        }
+
+        let content_rect = self
+            .editor_area
+            .content_rect_for_group(group_id, group_rect);
+        let pane_focused = editor_focused && is_active_group;
+
+        if let Some(tab) = group.active_tab() {
+            if let Some(diff_view) = self.editor_area.diff_editors.get(&tab.uri) {
+                parent.add_child(
+                    AccessibleNode::new(
+                        format!("workbench.editor.diff.{}", tab.uri),
+                        AccessibleRole::TextEditor,
+                        diff_view.title.clone(),
+                        content_rect,
+                    )
+                    .with_read_only(true)
+                    .with_focused(pane_focused),
+                );
+            } else if let Some(webview) = self.editor_area.webview_for_group(group_id, &tab.uri) {
+                let mut wv_node = AccessibleNode::new(
+                    format!("workbench.editor.webview.{}", tab.uri),
+                    AccessibleRole::Panel,
+                    webview.title.clone(),
+                    content_rect,
+                )
+                .with_focused(pane_focused);
+                for (idx, node) in webview.nodes.iter().enumerate() {
+                    match &node.kind {
+                        WebviewElementKind::Button { label, .. } => {
+                            wv_node.add_child(AccessibleNode::new(
+                                format!("webview.btn.{}", idx),
+                                AccessibleRole::Button,
+                                label.clone(),
+                                content_rect,
+                            ));
+                        }
+                        WebviewElementKind::Heading1(t)
+                        | WebviewElementKind::Heading2(t)
+                        | WebviewElementKind::Heading3(t)
+                        | WebviewElementKind::Paragraph(t) => {
+                            wv_node.add_child(AccessibleNode::new(
+                                format!("webview.text.{}", idx),
+                                AccessibleRole::StaticText,
+                                t.clone(),
+                                content_rect,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                parent.add_child(wv_node);
+            } else if let Some(settings_view) = self.editor_area.settings_views.get(&tab.uri) {
+                let search_focused = pane_focused && settings_view.focus == SettingsFocus::Search;
+                let mut settings_node = AccessibleNode::new(
+                    "workbench.editor.settings",
+                    AccessibleRole::Panel,
+                    "Settings",
+                    content_rect,
+                )
+                .with_focused(pane_focused && !search_focused);
+
+                settings_node.add_child(
+                    AccessibleNode::new(
+                        "settings.search",
+                        AccessibleRole::TextInput,
+                        "Search Settings",
+                        Rect::from_xywh(
+                            content_rect.min_x() + 16.0,
+                            content_rect.min_y() + 12.0,
+                            (content_rect.width() - 32.0).max(0.0),
+                            28.0,
+                        ),
+                    )
+                    .with_value(settings_view.state.search_query.clone())
+                    .with_focused(search_focused)
+                    .with_action("input"),
+                );
+
+                let mut list_node = AccessibleNode::new(
+                    "settings.items",
+                    AccessibleRole::List,
+                    "Settings Items",
+                    Rect::from_xywh(
+                        content_rect.min_x(),
+                        content_rect.min_y() + 48.0,
+                        content_rect.width(),
+                        (content_rect.height() - 48.0).max(0.0),
+                    ),
+                );
+                for (idx, item) in settings_view.state.get_filtered().into_iter().enumerate() {
+                    list_node.add_child(
+                        AccessibleNode::new(
+                            format!("settings.item.{}", item.key),
+                            AccessibleRole::ListItem,
+                            item.title.clone(),
+                            Rect::from_xywh(
+                                content_rect.min_x() + 160.0,
+                                content_rect.min_y() + 48.0 + idx as f32 * 56.0,
+                                (content_rect.width() - 176.0).max(0.0),
+                                52.0,
+                            ),
+                        )
+                        .with_value(item.current_value.to_string()),
+                    );
+                }
+                settings_node.add_child(list_node);
+                parent.add_child(settings_node);
+            } else if let Some(notebook) = self.editor_area.notebooks.get(&tab.uri) {
+                let mut nb_node = AccessibleNode::new(
+                    format!("workbench.editor.notebook.{}", tab.uri),
+                    AccessibleRole::Panel,
+                    tab.title.clone(),
+                    content_rect,
+                )
+                .with_focused(pane_focused);
+                nb_node.add_child(AccessibleNode::new(
+                    "notebook.toolbar",
+                    AccessibleRole::Toolbar,
+                    "Notebook Toolbar",
+                    Rect::from_xywh(
+                        content_rect.min_x(),
+                        content_rect.min_y(),
+                        content_rect.width(),
+                        32.0,
+                    ),
+                ));
+                let mut cells_list = AccessibleNode::new(
+                    "notebook.cells",
+                    AccessibleRole::List,
+                    "Notebook Cells",
+                    Rect::from_xywh(
+                        content_rect.min_x(),
+                        content_rect.min_y() + 32.0,
+                        content_rect.width(),
+                        (content_rect.height() - 32.0).max(0.0),
+                    ),
+                );
+                for (idx, cell) in notebook.document.cells.iter().enumerate() {
+                    cells_list.add_child(
+                        AccessibleNode::new(
+                            format!("notebook.cell.{}", idx),
+                            AccessibleRole::ListItem,
+                            format!("Cell {} ({:?})", idx + 1, cell.kind),
+                            Rect::from_xywh(
+                                content_rect.min_x() + 12.0,
+                                content_rect.min_y() + 40.0 + idx as f32 * 64.0,
+                                (content_rect.width() - 24.0).max(0.0),
+                                60.0,
+                            ),
+                        )
+                        .with_value(cell.source.clone())
+                        .with_selected(notebook.active_cell_index == Some(idx)),
+                    );
+                }
+                nb_node.add_child(cells_list);
+                parent.add_child(nb_node);
+            } else if let Some(editor) = self.editor_area.editor_for_group(group_id, &tab.uri) {
+                let mut ed_node = editor.accessibility_node(
+                    &format!("workbench.editor.text.{}", tab.uri),
+                    content_rect,
+                    font,
+                );
+                ed_node.state.focused = pane_focused && editor.is_focused;
+                parent.add_child(ed_node);
+            } else {
+                let empty_id = if legacy_ids {
+                    "workbench.editor.empty".to_string()
+                } else {
+                    format!("workbench.editor.group.{}.empty", group_id)
+                };
+                parent.add_child(
+                    AccessibleNode::new(
+                        empty_id,
+                        AccessibleRole::StaticText,
+                        "No Active Editor",
+                        content_rect,
+                    )
+                    .with_focused(pane_focused),
+                );
+            }
+        } else {
+            let empty_id = if legacy_ids {
+                "workbench.editor.empty".to_string()
+            } else {
+                format!("workbench.editor.group.{}.empty", group_id)
+            };
+            parent.add_child(
+                AccessibleNode::new(
+                    empty_id,
+                    AccessibleRole::StaticText,
+                    "No Active Editor",
+                    content_rect,
+                )
+                .with_focused(pane_focused),
+            );
         }
     }
 
@@ -631,245 +914,46 @@ impl WorkbenchView {
             "Editor Area",
             regions.editor_area,
         );
-
-        let tab_bar_h = 35.0;
-        let tab_bar_rect = Rect::from_xywh(
-            regions.editor_area.min_x(),
-            regions.editor_area.min_y(),
-            regions.editor_area.width(),
-            tab_bar_h,
-        );
-        let mut tab_list = AccessibleNode::new(
-            "workbench.editorArea.tabs",
-            AccessibleRole::TabList,
-            "Open Editors",
-            tab_bar_rect,
-        );
-        let group = self.editor_area.model.current_group_ref();
-        let mut cur_x = regions.editor_area.min_x();
-        for (idx, tab) in group.tabs.iter().enumerate() {
-            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
-            let tab_rect = Rect::from_xywh(cur_x, regions.editor_area.min_y(), tab_w, tab_bar_h);
-            if !crate::is_finite_rect(tab_rect) {
-                break;
-            }
-            tab_list.add_child(
-                AccessibleNode::new(
-                    format!("editor.tab.{}", idx),
-                    AccessibleRole::Tab,
-                    tab.title.clone(),
-                    tab_rect,
-                )
-                .with_selected(group.active_tab_index == Some(idx))
-                .with_action("select"),
-            );
-            cur_x += tab_w;
-        }
-        editor_area_node.add_child(tab_list);
-
-        if let Some(bc_rect) = self.editor_area.breadcrumbs_rect(regions.editor_area) {
-            let mut bc_node = AccessibleNode::new(
-                "workbench.editorArea.breadcrumbs",
-                AccessibleRole::Breadcrumb,
-                "Breadcrumbs",
-                bc_rect,
-            );
-            let item_rects = self.editor_area.breadcrumbs.compute_item_rects(bc_rect, font);
-            for (idx, item_rect) in item_rects {
-                if let Some(item) = self.editor_area.breadcrumbs.items.get(idx) {
-                    bc_node.add_child(
-                        AccessibleNode::new(
-                            format!("breadcrumbs.item.{}", idx),
-                            AccessibleRole::BreadcrumbItem,
-                            item.label.clone(),
-                            item_rect,
-                        )
-                        .with_selected(self.editor_area.breadcrumbs.selected_index == Some(idx))
-                        .with_action("select"),
-                    );
-                }
-            }
-            editor_area_node.add_child(bc_node);
-        }
-
-        let content_rect = self.editor_area.content_rect(regions.editor_area);
+        let group_rects = self.editor_area.model.compute_group_rects(regions.editor_area);
+        let active_gid = self.editor_area.model.active_group_id();
+        let multi_group = self.editor_area.model.groups.len() > 1;
         let editor_focused = self.focused_region == FocusedRegion::Editor;
 
-        if let Some(tab) = group.active_tab() {
-            if let Some(diff_view) = self.editor_area.diff_editors.get(&tab.uri) {
-                editor_area_node.add_child(
-                    AccessibleNode::new(
-                        format!("workbench.editor.diff.{}", tab.uri),
-                        AccessibleRole::TextEditor,
-                        diff_view.title.clone(),
-                        content_rect,
-                    )
-                    .with_read_only(true)
-                    .with_focused(editor_focused),
-                );
-            } else if let Some(webview) = self.editor_area.webviews.get(&tab.uri) {
-                let mut wv_node = AccessibleNode::new(
-                    format!("workbench.editor.webview.{}", tab.uri),
-                    AccessibleRole::Panel,
-                    webview.title.clone(),
-                    content_rect,
-                )
-                .with_focused(editor_focused);
-                for (idx, node) in webview.nodes.iter().enumerate() {
-                    match &node.kind {
-                        WebviewElementKind::Button { label, .. } => {
-                            wv_node.add_child(AccessibleNode::new(
-                                format!("webview.btn.{}", idx),
-                                AccessibleRole::Button,
-                                label.clone(),
-                                content_rect,
-                            ));
-                        }
-                        WebviewElementKind::Heading1(t)
-                        | WebviewElementKind::Heading2(t)
-                        | WebviewElementKind::Heading3(t)
-                        | WebviewElementKind::Paragraph(t) => {
-                            wv_node.add_child(AccessibleNode::new(
-                                format!("webview.text.{}", idx),
-                                AccessibleRole::StaticText,
-                                t.clone(),
-                                content_rect,
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                editor_area_node.add_child(wv_node);
-            } else if let Some(settings_view) = self.editor_area.settings_views.get(&tab.uri) {
-                let search_focused =
-                    editor_focused && settings_view.focus == SettingsFocus::Search;
-                let mut settings_node = AccessibleNode::new(
-                    "workbench.editor.settings",
-                    AccessibleRole::Panel,
-                    "Settings",
-                    content_rect,
-                )
-                .with_focused(editor_focused && !search_focused);
-
-                settings_node.add_child(
-                    AccessibleNode::new(
-                        "settings.search",
-                        AccessibleRole::TextInput,
-                        "Search Settings",
-                        Rect::from_xywh(
-                            content_rect.min_x() + 16.0,
-                            content_rect.min_y() + 12.0,
-                            (content_rect.width() - 32.0).max(0.0),
-                            28.0,
-                        ),
-                    )
-                    .with_value(settings_view.state.search_query.clone())
-                    .with_focused(search_focused)
-                    .with_action("input"),
-                );
-
-                let mut list_node = AccessibleNode::new(
-                    "settings.items",
-                    AccessibleRole::List,
-                    "Settings Items",
-                    Rect::from_xywh(
-                        content_rect.min_x(),
-                        content_rect.min_y() + 48.0,
-                        content_rect.width(),
-                        (content_rect.height() - 48.0).max(0.0),
-                    ),
-                );
-                for (idx, item) in settings_view.state.get_filtered().into_iter().enumerate() {
-                    list_node.add_child(
-                        AccessibleNode::new(
-                            format!("settings.item.{}", item.key),
-                            AccessibleRole::ListItem,
-                            item.title.clone(),
-                            Rect::from_xywh(
-                                content_rect.min_x() + 160.0,
-                                content_rect.min_y() + 48.0 + idx as f32 * 56.0,
-                                (content_rect.width() - 176.0).max(0.0),
-                                52.0,
-                            ),
-                        )
-                        .with_value(item.current_value.to_string()),
-                    );
-                }
-                settings_node.add_child(list_node);
-                editor_area_node.add_child(settings_node);
-            } else if let Some(notebook) = self.editor_area.notebooks.get(&tab.uri) {
-                let mut nb_node = AccessibleNode::new(
-                    format!("workbench.editor.notebook.{}", tab.uri),
-                    AccessibleRole::Panel,
-                    tab.title.clone(),
-                    content_rect,
-                )
-                .with_focused(editor_focused);
-                nb_node.add_child(AccessibleNode::new(
-                    "notebook.toolbar",
-                    AccessibleRole::Toolbar,
-                    "Notebook Toolbar",
-                    Rect::from_xywh(content_rect.min_x(), content_rect.min_y(), content_rect.width(), 32.0),
-                ));
-                let mut cells_list = AccessibleNode::new(
-                    "notebook.cells",
-                    AccessibleRole::List,
-                    "Notebook Cells",
-                    Rect::from_xywh(
-                        content_rect.min_x(),
-                        content_rect.min_y() + 32.0,
-                        content_rect.width(),
-                        (content_rect.height() - 32.0).max(0.0),
-                    ),
-                );
-                for (idx, cell) in notebook.document.cells.iter().enumerate() {
-                    cells_list.add_child(
-                        AccessibleNode::new(
-                            format!("notebook.cell.{}", idx),
-                            AccessibleRole::ListItem,
-                            format!("Cell {} ({:?})", idx + 1, cell.kind),
-                            Rect::from_xywh(
-                                content_rect.min_x() + 12.0,
-                                content_rect.min_y() + 40.0 + idx as f32 * 64.0,
-                                (content_rect.width() - 24.0).max(0.0),
-                                60.0,
-                            ),
-                        )
-                        .with_value(cell.source.clone())
-                        .with_selected(notebook.active_cell_index == Some(idx)),
-                    );
-                }
-                nb_node.add_child(cells_list);
-                editor_area_node.add_child(nb_node);
-            } else if let Some(editor) = self.editor_area.editors.get(&tab.uri) {
-                let mut ed_node = editor.accessibility_node(
-                    &format!("workbench.editor.text.{}", tab.uri),
-                    content_rect,
-                    font,
-                );
-                ed_node.state.focused = editor_focused && editor.is_focused;
-                editor_area_node.add_child(ed_node);
-            } else {
-                editor_area_node.add_child(
-                    AccessibleNode::new(
-                        "workbench.editor.empty",
-                        AccessibleRole::StaticText,
-                        "No Active Editor",
-                        content_rect,
-                    )
-                    .with_focused(editor_focused),
-                );
-            }
-        } else {
-            editor_area_node.add_child(
-                AccessibleNode::new(
-                    "workbench.editor.empty",
-                    AccessibleRole::StaticText,
-                    "No Active Editor",
-                    content_rect,
-                )
-                .with_focused(editor_focused),
+        if !multi_group {
+            let group_id = self.editor_area.model.active_group_id();
+            let group_rect = group_rects
+                .first()
+                .map(|(_, r)| *r)
+                .unwrap_or(regions.editor_area);
+            self.populate_accessible_editor_group(
+                &mut editor_area_node,
+                group_id,
+                group_rect,
+                font,
+                true,
+                editor_focused,
+                true,
             );
+        } else {
+            for (group_id, group_rect) in group_rects {
+                let is_active_group = group_id == active_gid;
+                let mut group_node = AccessibleNode::new(
+                    format!("workbench.editorGroup.{}", group_id),
+                    AccessibleRole::Panel,
+                    format!("Editor Group {}", group_id),
+                    group_rect,
+                );
+                self.populate_accessible_editor_group(
+                    &mut group_node,
+                    group_id,
+                    group_rect,
+                    font,
+                    is_active_group,
+                    editor_focused,
+                    false,
+                );
+                editor_area_node.add_child(group_node);
+            }
         }
         root.add_child(editor_area_node);
 
@@ -1234,9 +1318,7 @@ impl View for WorkbenchView {
         // Modal command palette intercept
         if self.is_command_palette_open {
             if matches!(event, InputEvent::MouseUp(_)) {
-                for editor in self.editor_area.editors.values_mut() {
-                    editor.minimap_dragging = false;
-                }
+                self.editor_area.clear_all_drag_state();
             }
             if let Some(palette) = &mut self.command_palette {
                 let res = palette.handle_event(event, regions.command_palette);
@@ -1532,7 +1614,7 @@ impl View for WorkbenchView {
                     // Sync editor gutter breakpoint clicks to debug session
                     if let Some(tab) = self.editor_area.model.current_group_ref().active_tab() {
                         let uri = tab.uri.clone();
-                        if let Some(editor) = self.editor_area.editors.get_mut(&uri) {
+                        if let Some(editor) = self.editor_area.active_editor_mut() {
                             if let Some(rustcode_editor::EditorGutterAction::BreakpointToggled { line, added }) = editor.last_gutter_action.take() {
                                 if added {
                                     self.debug_sidebar.session.toggle_breakpoint(&uri, line as u32);
@@ -1682,34 +1764,21 @@ impl View for WorkbenchView {
                 }
             }
             InputEvent::MouseMove(mouse) => {
-                let dragging_minimap = self
-                    .editor_area
-                    .active_editor()
-                    .is_some_and(|e| e.minimap_dragging);
-                if dragging_minimap || regions.editor_area.contains(mouse.position) {
+                let dragging = self.editor_area.is_minimap_or_sash_dragging();
+                if dragging || regions.editor_area.contains(mouse.position) {
                     self.editor_area.handle_event(event, regions.editor_area)
                 } else {
                     EventResult::Ignored
                 }
             }
             InputEvent::MouseUp(_) => {
-                let active_dragging = self
-                    .editor_area
-                    .active_editor()
-                    .is_some_and(|e| e.minimap_dragging);
-                let any_dragging = self
-                    .editor_area
-                    .editors
-                    .values()
-                    .any(|e| e.minimap_dragging);
-                let res = if active_dragging || self.focused_region == FocusedRegion::Editor {
+                let any_dragging = self.editor_area.is_minimap_or_sash_dragging();
+                let res = if any_dragging || self.focused_region == FocusedRegion::Editor {
                     self.editor_area.handle_event(event, regions.editor_area)
                 } else {
                     EventResult::Ignored
                 };
-                for editor in self.editor_area.editors.values_mut() {
-                    editor.minimap_dragging = false;
-                }
+                self.editor_area.clear_all_minimap_dragging();
                 if any_dragging {
                     EventResult::Consumed
                 } else {
@@ -2517,5 +2586,68 @@ mod tests {
         view.toggle_panel();
         assert!(!view.layout.panel_visible);
         assert_eq!(view.focused_region, FocusedRegion::Editor);
+    }
+
+    #[test]
+    fn test_workbench_split_editor_accessibility_tree_and_gutter_breakpoint() {
+        use crate::editor_area::SplitDirection;
+        use rustcode_platform::render::{MouseButton, MouseEvent};
+
+        let mut view = WorkbenchView::new();
+        view.layout.sidebar_visible = false;
+        view.layout.panel_visible = false;
+        let bounds = Rect::from_xywh(0.0, 0.0, 1000.0, 600.0);
+        let font = FontMetrics::default_monospace();
+
+        view.editor_area
+            .open_file("file:///demo/main.rs", "main.rs", "fn main() {\n    let x = 1;\n}\n", false);
+        let gid1 = view.editor_area.split_active_group(SplitDirection::Horizontal);
+        view.editor_area
+            .open_file("file:///demo/other.rs", "other.rs", "fn other() {}\n", false);
+
+        // Diagnostic updates propagate to all split editors for the URI
+        view.update_problems(
+            "file:///demo/main.rs",
+            vec![rustcode_editor::viewmodel::EditorDiagnostic::error(
+                rustcode_editor::Range::new(
+                    rustcode_editor::Position::new(0, 0),
+                    rustcode_editor::Position::new(0, 2),
+                ),
+                "err",
+            )],
+        );
+        assert_eq!(
+            view.editor_area
+                .editor_for_group(0, "file:///demo/main.rs")
+                .unwrap()
+                .diagnostics
+                .len(),
+            1
+        );
+
+        let tree = view.accessibility_tree(bounds, &font);
+        assert!(tree.find_by_id("workbench.editorGroup.0").is_some());
+        assert!(tree
+            .find_by_id(&format!("workbench.editorGroup.{}", gid1))
+            .is_some());
+        let focused = tree.focused_node().unwrap();
+        assert_eq!(focused.id, "workbench.editor.text.file:///demo/other.rs");
+
+        // Gutter breakpoint click inside split group 1
+        let regions = view.compute_regions(bounds);
+        let rects = view.editor_area.model.compute_group_rects(regions.editor_area);
+        let r1 = rects.iter().find(|(id, _)| *id == gid1).unwrap().1;
+        let content_r1 = view.editor_area.content_rect_for_group(gid1, r1);
+        let gutter_click = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(content_r1.min_x() + 6.0, content_r1.min_y() + 6.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(view.handle_event(&gutter_click, bounds), EventResult::Consumed);
+        assert!(view
+            .debug_sidebar
+            .session
+            .breakpoints
+            .get("file:///demo/other.rs")
+            .is_some_and(|bps| !bps.is_empty()));
     }
 }

@@ -100,5 +100,33 @@
     "key": "ctrl+k ctrl+j",
     "command": "editor.unfoldAll",
     "when": "editorTextFocus"
+  },
+  {
+    "key": "ctrl+\\",
+    "command": "workbench.action.splitEditor"
+  },
+  {
+    "key": "ctrl+k ctrl+\\",
+    "command": "workbench.action.splitEditorDown"
+  },
+  {
+    "key": "ctrl+k ctrl+left",
+    "command": "workbench.action.focusPreviousGroup"
+  },
+  {
+    "key": "ctrl+k ctrl+right",
+    "command": "workbench.action.focusNextGroup"
+  },
+  {
+    "key": "ctrl+1",
+    "command": "workbench.action.focusFirstEditorGroup"
+  },
+  {
+    "key": "ctrl+2",
+    "command": "workbench.action.focusSecondEditorGroup"
+  },
+  {
+    "key": "ctrl+k w",
+    "command": "workbench.action.closeEditorsInGroup"
   }
 ]

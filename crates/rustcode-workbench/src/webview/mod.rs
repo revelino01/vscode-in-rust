@@ -438,12 +438,13 @@ impl View for WebviewEditorView {
         };
         let mut cur_y = bounds.min_y() + 20.0 - safe_scroll;
         let left_x = bounds.min_x() + 24.0;
-        let content_w = (bounds.width() - 48.0).max(100.0);
+        let content_w = (bounds.width() - 48.0).max(20.0);
         if !cur_y.is_finite() || !left_x.is_finite() || !content_w.is_finite() {
             *self.button_targets.write() = Vec::new();
             return;
         }
 
+        scene.push_clip(bounds);
         let mut targets = Vec::new();
 
         for node in &self.nodes {
@@ -601,6 +602,7 @@ impl View for WebviewEditorView {
             }
         }
 
+        scene.pop_clip();
         *self.button_targets.write() = targets;
     }
 

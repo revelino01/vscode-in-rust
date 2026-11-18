@@ -26,10 +26,10 @@ pub use debug::{
     ExtDebugEvent, ExtDebugProviderInfo, ExtDebugSessionState, ExtHostDebugManager,
 };
 pub use manifest::{
-    AuthenticationContribution, ContributedCommand, Contributions, DebuggerContribution,
-    ExtensionLoader, ExtensionManifest, GrammarContribution, KeybindingContribution,
-    LanguageContribution, LoadedExtension, TaskDefinitionContribution, ThemeContribution,
-    ViewContribution,
+    AuthenticationContribution, ContributedCommand, Contributions, CustomEditorContribution,
+    CustomEditorSelector, DebuggerContribution, ExtensionLoader, ExtensionManifest,
+    GrammarContribution, KeybindingContribution, LanguageContribution, LoadedExtension,
+    TaskDefinitionContribution, ThemeContribution, ViewContribution,
 };
 pub use marketplace::{
     curated_catalog, search_curated_catalog, CurlHttpTransport, ExtensionDownloader,
@@ -65,5 +65,7 @@ pub use testing::{
     ExtTestResultRecord, ExtTestRunProfileInfo, ExtTestRunState, TestEventListener,
 };
 pub use webview::{
-    ExtHostWebviewManager, WebviewMessageListener, WebviewOptions, WebviewPanelState,
+    CustomEditorEvent, CustomEditorEventListener, CustomEditorProviderInfo,
+    CustomEditorSessionState, ExtHostCustomEditorManager, ExtHostWebviewManager, WebviewEvent,
+    WebviewEventListener, WebviewMessageListener, WebviewOptions, WebviewPanelState,
 };

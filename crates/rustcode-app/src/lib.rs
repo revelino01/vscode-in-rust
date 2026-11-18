@@ -207,17 +207,71 @@ impl RustCodeContext {
                     Ok(json!({ "view": "extensions", "filter": "installed" }))
                 }),
         );
+
+        store.add_boxed(self.commands.register("workbench.action.splitEditor", |_| {
+            Ok(json!({ "split": "horizontal" }))
+        }));
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.splitEditorDown", |_| {
+                    Ok(json!({ "split": "vertical" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.focusPreviousGroup", |_| {
+                    Ok(json!({ "focus": "previousGroup" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.focusNextGroup", |_| {
+                    Ok(json!({ "focus": "nextGroup" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.focusFirstEditorGroup", |_| {
+                    Ok(json!({ "focus": "firstGroup" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.focusSecondEditorGroup", |_| {
+                    Ok(json!({ "focus": "secondGroup" }))
+                }),
+        );
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.closeEditorsInGroup", |_| {
+                    Ok(json!({ "closedGroupEditors": true }))
+                }),
+        );
     }
 
     /// Instantiate a GPUI WorkbenchWindow host wired to this service container.
     pub fn create_window(&self) -> WorkbenchWindow {
-        WorkbenchWindow::new(
+        let mut window = WorkbenchWindow::new(
             self.theme.clone(),
             self.keybindings.clone(),
             self.commands.clone(),
             self.context_keys.clone(),
         )
-        .with_config(self.config.clone())
+        .with_config(self.config.clone());
+        for ext in self.ext_loader.loaded_extensions() {
+            if let Some(contribs) = &ext.manifest.contributes {
+                for ce in &contribs.custom_editors {
+                    window.register_custom_editor_contribution(ce.clone());
+                }
+            }
+        }
+        window
     }
 }
 
@@ -232,6 +286,13 @@ mod tests {
         assert!(app.commands.has_command("editor.action.triggerSuggest"));
         assert!(app.commands.has_command("editor.action.formatDocument"));
         assert!(app.commands.has_command("editor.action.quickFix"));
+        assert!(app.commands.has_command("workbench.action.splitEditor"));
+        assert!(app.commands.has_command("workbench.action.splitEditorDown"));
+        assert!(app.commands.has_command("workbench.action.focusPreviousGroup"));
+        assert!(app.commands.has_command("workbench.action.focusNextGroup"));
+        assert!(app.commands.has_command("workbench.action.focusFirstEditorGroup"));
+        assert!(app.commands.has_command("workbench.action.focusSecondEditorGroup"));
+        assert!(app.commands.has_command("workbench.action.closeEditorsInGroup"));
         assert_eq!(app.config.get::<u32>("editor.fontSize"), Some(14));
 
         let window = app.create_window();

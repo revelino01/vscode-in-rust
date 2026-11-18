@@ -35,6 +35,93 @@ pub struct Contributions {
     pub task_definitions: Option<Vec<TaskDefinitionContribution>>,
     #[serde(default)]
     pub authentication: Option<Vec<AuthenticationContribution>>,
+    #[serde(rename = "customEditors", default)]
+    pub custom_editors: Vec<CustomEditorContribution>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEditorSelector {
+    #[serde(default)]
+    pub filename_pattern: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomEditorContribution {
+    pub view_type: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub selector: Vec<CustomEditorSelector>,
+    #[serde(default)]
+    pub priority: Option<String>,
+}
+
+impl CustomEditorContribution {
+    pub fn matches_path(&self, path: &str) -> bool {
+        let trimmed_path = path.trim();
+        if trimmed_path.is_empty() {
+            return false;
+        }
+        let normalized_path = trimmed_path.replace('\\', "/");
+        let file_name = normalized_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&normalized_path);
+
+        self.selector.iter().any(|sel| {
+            let pat = sel.filename_pattern.trim();
+            if pat.is_empty() {
+                return false;
+            }
+            let normalized_pat = pat.replace('\\', "/");
+            if let Some(rest) = normalized_pat.strip_prefix("**/") {
+                if rest.contains('/') {
+                    glob_match(rest, &normalized_path)
+                        || normalized_path
+                            .match_indices('/')
+                            .any(|(idx, _)| glob_match(rest, &normalized_path[idx + 1..]))
+                } else {
+                    glob_match(rest, file_name)
+                }
+            } else if normalized_pat.contains('/') {
+                glob_match(&normalized_pat, &normalized_path)
+            } else {
+                glob_match(&normalized_pat, file_name)
+            }
+        })
+    }
+}
+
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti = 0usize;
+
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,5 +394,79 @@ mod tests {
         assert_eq!(auth.len(), 1);
         assert_eq!(auth[0].id, "github");
         assert_eq!(auth[0].label, "GitHub");
+    }
+
+    #[test]
+    fn test_parse_manifest_custom_editors_and_selector_matching() {
+        let json = r#"{
+            "name": "cat-scratch",
+            "publisher": "rustcode",
+            "version": "1.0.0",
+            "contributes": {
+                "customEditors": [
+                    {
+                        "viewType": "catEdit.catScratch",
+                        "displayName": "Cat Scratch",
+                        "selector": [
+                            { "filenamePattern": "*.cscratch" },
+                            { "filenamePattern": "**/notes-*.txt" }
+                        ],
+                        "priority": "default"
+                    }
+                ]
+            }
+        }"#;
+
+        let manifest = ExtensionLoader::parse_manifest(json).unwrap();
+        let contributes = manifest.contributes.unwrap();
+        assert_eq!(contributes.custom_editors.len(), 1);
+        let ce = &contributes.custom_editors[0];
+        assert_eq!(ce.view_type, "catEdit.catScratch");
+        assert_eq!(ce.display_name, "Cat Scratch");
+        assert_eq!(ce.priority.as_deref(), Some("default"));
+        assert!(ce.matches_path("file:///workspace/demo.cscratch"));
+        assert!(ce.matches_path("/workspace/sub/notes-alpha.txt"));
+        assert!(!ce.matches_path("file:///workspace/main.rs"));
+    }
+
+    #[test]
+    fn test_custom_editor_selector_nested_paths_and_separators() {
+        let nested_ce = CustomEditorContribution {
+            view_type: "catEdit.nested".to_string(),
+            display_name: "Nested".to_string(),
+            selector: vec![CustomEditorSelector {
+                filename_pattern: "**/sub/*.cscratch".to_string(),
+            }],
+            priority: None,
+        };
+        assert!(nested_ce.matches_path("/a/sub/demo.cscratch"));
+        assert!(nested_ce.matches_path("file:///a/sub/demo.cscratch"));
+        assert!(nested_ce.matches_path("sub/demo.cscratch"));
+        assert!(nested_ce.matches_path("C:\\a\\sub\\demo.cscratch"));
+        assert!(!nested_ce.matches_path("/a/xsub/demo.cscratch"));
+        assert!(!nested_ce.matches_path("/a/demo.cscratch"));
+
+        let win_ce = CustomEditorContribution {
+            view_type: "hex.win".to_string(),
+            display_name: "Win".to_string(),
+            selector: vec![CustomEditorSelector {
+                filename_pattern: "sub\\*.bin".to_string(),
+            }],
+            priority: None,
+        };
+        assert!(win_ce.matches_path("sub\\demo.bin"));
+        assert!(win_ce.matches_path("sub/demo.bin"));
+        assert!(!win_ce.matches_path("demo.bin"));
+
+        let ext_ce = CustomEditorContribution {
+            view_type: "hex.ext".to_string(),
+            display_name: "Ext".to_string(),
+            selector: vec![CustomEditorSelector {
+                filename_pattern: "*.bin".to_string(),
+            }],
+            priority: None,
+        };
+        assert!(!ext_ce.matches_path("foo.bin.txt"));
+        assert!(ext_ce.matches_path("C:\\dir\\foo.bin"));
     }
 }

@@ -263,6 +263,8 @@ pub struct LanguageFeatureBridge {
     pub task_manager: Arc<crate::tasks::ExtHostTaskManager>,
     pub test_manager: Arc<crate::testing::ExtHostTestManager>,
     pub auth_manager: Arc<crate::auth::ExtHostAuthManager>,
+    pub webview_manager: Arc<crate::webview::ExtHostWebviewManager>,
+    pub custom_editor_manager: Arc<crate::webview::ExtHostCustomEditorManager>,
 }
 
 impl LanguageFeatureBridge {
@@ -285,6 +287,8 @@ impl LanguageFeatureBridge {
             task_manager: Arc::new(crate::tasks::ExtHostTaskManager::new()),
             test_manager: Arc::new(crate::testing::ExtHostTestManager::new()),
             auth_manager: Arc::new(crate::auth::ExtHostAuthManager::new()),
+            webview_manager: Arc::new(crate::webview::ExtHostWebviewManager::new()),
+            custom_editor_manager: Arc::new(crate::webview::ExtHostCustomEditorManager::new()),
         }
     }
 
@@ -347,6 +351,22 @@ impl LanguageFeatureBridge {
         self
     }
 
+    pub fn with_webview_manager(
+        mut self,
+        wm: Arc<crate::webview::ExtHostWebviewManager>,
+    ) -> Self {
+        self.webview_manager = wm;
+        self
+    }
+
+    pub fn with_custom_editor_manager(
+        mut self,
+        cem: Arc<crate::webview::ExtHostCustomEditorManager>,
+    ) -> Self {
+        self.custom_editor_manager = cem;
+        self
+    }
+
     pub fn scm_manager(&self) -> &Arc<crate::scm::ExtHostScmManager> {
         &self.scm_manager
     }
@@ -365,6 +385,14 @@ impl LanguageFeatureBridge {
 
     pub fn auth_manager(&self) -> &Arc<crate::auth::ExtHostAuthManager> {
         &self.auth_manager
+    }
+
+    pub fn webview_manager(&self) -> &Arc<crate::webview::ExtHostWebviewManager> {
+        &self.webview_manager
+    }
+
+    pub fn custom_editor_manager(&self) -> &Arc<crate::webview::ExtHostCustomEditorManager> {
+        &self.custom_editor_manager
     }
 
     pub fn get_diagnostics(&self, uri: &str) -> Vec<LspDiagnostic> {
@@ -819,6 +847,54 @@ impl LanguageFeatureBridge {
             .await
     }
 
+    pub async fn request_resolve_custom_editor(
+        &self,
+        view_type: &str,
+        uri: &str,
+        panel_id: &str,
+        title: &str,
+        text: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let val = self
+            .custom_editor_manager
+            .request_resolve_custom_editor(
+                &self.rpc_bridge,
+                view_type,
+                uri,
+                panel_id,
+                title,
+                text,
+            )
+            .await?;
+        if let Some(html) = val.get("html").and_then(|v| v.as_str()) {
+            if !html.is_empty() {
+                self.webview_manager.set_html(panel_id, html);
+            }
+        }
+        Ok(val)
+    }
+
+    pub async fn request_open_custom_document(
+        &self,
+        view_type: &str,
+        uri: &str,
+        backup_id: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        self.custom_editor_manager
+            .request_open_custom_document(&self.rpc_bridge, view_type, uri, backup_id)
+            .await
+    }
+
+    pub async fn request_save_custom_document(
+        &self,
+        view_type: &str,
+        uri: &str,
+    ) -> Result<serde_json::Value, String> {
+        self.custom_editor_manager
+            .request_save_custom_document(&self.rpc_bridge, view_type, uri)
+            .await
+    }
+
     /// Handle incoming RPC calls from JS runtime (e.g. provider registration, format, codeAction).
     pub async fn handle_rpc_message(
         &self,
@@ -872,6 +948,24 @@ impl LanguageFeatureBridge {
             | "window.sendTerminalText"
             | "window.disposeTerminal" => {
                 return self.terminal_manager.handle_rpc_call(method, params).ok();
+            }
+            "window.createWebviewPanel"
+            | "window.setWebviewHtml"
+            | "window.postMessageToWebview"
+            | "window.disposeWebviewPanel"
+            | "window.revealWebviewPanel" => {
+                return self
+                    .webview_manager
+                    .handle_rpc_call(method, params.clone())
+                    .ok();
+            }
+            "window.registerCustomEditorProvider"
+            | "window.unregisterCustomEditorProvider"
+            | "window.openCustomEditor" => {
+                return self
+                    .custom_editor_manager
+                    .handle_rpc_call(method, params, Some(&self.webview_manager))
+                    .ok();
             }
             _ => {}
         }

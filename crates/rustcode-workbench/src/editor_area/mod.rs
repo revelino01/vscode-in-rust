@@ -5,6 +5,7 @@ use rustcode_editor::{
     DiffEditorView, EditorView, GrammarRegistry, Position, Range, RangeEdit, TextDocument,
     WordWrapMode,
 };
+use rustcode_ext_host::manifest::CustomEditorContribution;
 use rustcode_ext_host::webview::{ExtHostWebviewManager, WebviewOptions};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
@@ -14,7 +15,7 @@ use rustcode_platform::render::{
 use rustcode_platform::theme::ThemeService;
 use rustcode_protocols::lsp::WorkspaceEdit;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use crate::breadcrumbs::{BreadcrumbItem, BreadcrumbKind, BreadcrumbsAction, BreadcrumbsBar};
@@ -48,13 +49,19 @@ impl EditorTab {
 
 #[derive(Debug, Clone, Default)]
 pub struct EditorGroup {
+    pub id: usize,
     pub tabs: Vec<EditorTab>,
     pub active_tab_index: Option<usize>,
 }
 
 impl EditorGroup {
     pub fn new() -> Self {
+        Self::with_id(0)
+    }
+
+    pub fn with_id(id: usize) -> Self {
         Self {
+            id,
             tabs: Vec::new(),
             active_tab_index: None,
         }
@@ -122,17 +129,59 @@ impl EditorGroup {
     }
 }
 
-#[derive(Default)]
+pub const SASH_THICKNESS: f32 = 4.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EditorGridNode {
+    Leaf(usize),
+    Split {
+        direction: SplitDirection,
+        ratio: f32,
+        first: Box<EditorGridNode>,
+        second: Box<EditorGridNode>,
+    },
+}
+
+impl Default for EditorGridNode {
+    fn default() -> Self {
+        Self::Leaf(0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EditorSash {
+    pub split_path: Vec<bool>,
+    pub direction: SplitDirection,
+    pub rect: Rect,
+    pub parent_bounds: Rect,
+}
+
 pub struct EditorArea {
     pub groups: Vec<EditorGroup>,
     pub active_group: usize,
+    pub grid: EditorGridNode,
+    next_group_id: usize,
+}
+
+impl Default for EditorArea {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EditorArea {
     pub fn new() -> Self {
         Self {
-            groups: vec![EditorGroup::new()],
+            groups: vec![EditorGroup::with_id(0)],
             active_group: 0,
+            grid: EditorGridNode::Leaf(0),
+            next_group_id: 1,
         }
     }
 
@@ -143,6 +192,380 @@ impl EditorArea {
     pub fn current_group_ref(&self) -> &EditorGroup {
         &self.groups[self.active_group]
     }
+
+    pub fn active_group_id(&self) -> usize {
+        self.groups.get(self.active_group).map_or(0, |g| g.id)
+    }
+
+    pub fn group_index_by_id(&self, group_id: usize) -> Option<usize> {
+        self.groups.iter().position(|g| g.id == group_id)
+    }
+
+    pub fn group_by_id(&self, group_id: usize) -> Option<&EditorGroup> {
+        self.groups.iter().find(|g| g.id == group_id)
+    }
+
+    pub fn group_by_id_mut(&mut self, group_id: usize) -> Option<&mut EditorGroup> {
+        self.groups.iter_mut().find(|g| g.id == group_id)
+    }
+
+    pub fn split_active_group(&mut self, direction: SplitDirection) -> usize {
+        let active_id = self.active_group_id();
+        let new_id = self.next_group_id;
+        self.next_group_id += 1;
+
+        let mut new_group = EditorGroup::with_id(new_id);
+        if let Some(mut cloned_tab) = self.current_group_ref().active_tab().cloned() {
+            cloned_tab.is_preview = false;
+            new_group.tabs.push(cloned_tab);
+            new_group.active_tab_index = Some(0);
+        }
+
+        Self::split_leaf(&mut self.grid, active_id, new_id, direction);
+        self.groups.push(new_group);
+        self.active_group = self.groups.len() - 1;
+        new_id
+    }
+
+    pub fn close_group(&mut self, group_id: usize) -> bool {
+        if self.groups.len() <= 1 || self.group_index_by_id(group_id).is_none() {
+            return false;
+        }
+        let (next_grid, surviving_id) = Self::remove_leaf(&self.grid, group_id);
+        self.grid = next_grid;
+        self.groups.retain(|g| g.id != group_id);
+
+        if let Some(target_id) = surviving_id {
+            if let Some(idx) = self.group_index_by_id(target_id) {
+                self.active_group = idx;
+                return true;
+            }
+        }
+        self.active_group = self.active_group.min(self.groups.len().saturating_sub(1));
+        true
+    }
+
+    pub fn focus_group(&mut self, group_id: usize) -> bool {
+        if let Some(idx) = self.group_index_by_id(group_id) {
+            self.active_group = idx;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn focus_group_index(&mut self, idx: usize) -> bool {
+        if idx < self.groups.len() {
+            self.active_group = idx;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn focus_next_group(&mut self) {
+        if !self.groups.is_empty() {
+            self.active_group = (self.active_group + 1) % self.groups.len();
+        }
+    }
+
+    pub fn focus_previous_group(&mut self) {
+        if !self.groups.is_empty() {
+            self.active_group = if self.active_group == 0 {
+                self.groups.len() - 1
+            } else {
+                self.active_group - 1
+            };
+        }
+    }
+
+    pub fn focus_first_editor_group(&mut self) -> bool {
+        self.focus_group_index(0)
+    }
+
+    pub fn focus_second_editor_group(&mut self) -> bool {
+        self.focus_group_index(1)
+    }
+
+    pub fn compute_group_rects(&self, bounds: Rect) -> Vec<(usize, Rect)> {
+        if !crate::is_finite_positive_rect(bounds) {
+            return Vec::new();
+        }
+        let mut rects = Vec::new();
+        Self::collect_group_rects(&self.grid, bounds, &mut rects);
+        rects
+    }
+
+    pub fn compute_sashes(&self, bounds: Rect) -> Vec<EditorSash> {
+        if !crate::is_finite_positive_rect(bounds) {
+            return Vec::new();
+        }
+        let mut sashes = Vec::new();
+        let mut path = Vec::new();
+        Self::collect_sashes(&self.grid, bounds, &mut path, &mut sashes);
+        sashes
+    }
+
+    pub fn update_sash_ratio(
+        &mut self,
+        split_path: &[bool],
+        pointer: Point,
+        parent_bounds: Rect,
+    ) -> bool {
+        if !pointer.x.is_finite()
+            || !pointer.y.is_finite()
+            || !crate::is_finite_positive_rect(parent_bounds)
+        {
+            return false;
+        }
+        Self::set_sash_ratio(&mut self.grid, split_path, pointer, parent_bounds)
+    }
+
+    fn split_leaf(
+        node: &mut EditorGridNode,
+        target_id: usize,
+        new_id: usize,
+        direction: SplitDirection,
+    ) -> bool {
+        match node {
+            EditorGridNode::Leaf(id) if *id == target_id => {
+                *node = EditorGridNode::Split {
+                    direction,
+                    ratio: 0.5,
+                    first: Box::new(EditorGridNode::Leaf(target_id)),
+                    second: Box::new(EditorGridNode::Leaf(new_id)),
+                };
+                true
+            }
+            EditorGridNode::Leaf(_) => false,
+            EditorGridNode::Split { first, second, .. } => {
+                Self::split_leaf(first, target_id, new_id, direction)
+                    || Self::split_leaf(second, target_id, new_id, direction)
+            }
+        }
+    }
+
+    fn first_leaf_id(node: &EditorGridNode) -> usize {
+        match node {
+            EditorGridNode::Leaf(id) => *id,
+            EditorGridNode::Split { first, .. } => Self::first_leaf_id(first),
+        }
+    }
+
+    fn contains_leaf(node: &EditorGridNode, target_id: usize) -> bool {
+        match node {
+            EditorGridNode::Leaf(id) => *id == target_id,
+            EditorGridNode::Split { first, second, .. } => {
+                Self::contains_leaf(first, target_id) || Self::contains_leaf(second, target_id)
+            }
+        }
+    }
+
+    fn remove_leaf(node: &EditorGridNode, target_id: usize) -> (EditorGridNode, Option<usize>) {
+        match node {
+            EditorGridNode::Leaf(id) => (EditorGridNode::Leaf(*id), None),
+            EditorGridNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                if matches!(first.as_ref(), EditorGridNode::Leaf(id) if *id == target_id) {
+                    let surviving = second.as_ref().clone();
+                    let next_focus = Some(Self::first_leaf_id(&surviving));
+                    return (surviving, next_focus);
+                }
+                if matches!(second.as_ref(), EditorGridNode::Leaf(id) if *id == target_id) {
+                    let surviving = first.as_ref().clone();
+                    let next_focus = Some(Self::first_leaf_id(&surviving));
+                    return (surviving, next_focus);
+                }
+                if Self::contains_leaf(first, target_id) {
+                    let (new_first, focus) = Self::remove_leaf(first, target_id);
+                    (
+                        EditorGridNode::Split {
+                            direction: *direction,
+                            ratio: *ratio,
+                            first: Box::new(new_first),
+                            second: second.clone(),
+                        },
+                        focus,
+                    )
+                } else if Self::contains_leaf(second, target_id) {
+                    let (new_second, focus) = Self::remove_leaf(second, target_id);
+                    (
+                        EditorGridNode::Split {
+                            direction: *direction,
+                            ratio: *ratio,
+                            first: first.clone(),
+                            second: Box::new(new_second),
+                        },
+                        focus,
+                    )
+                } else {
+                    (node.clone(), None)
+                }
+            }
+        }
+    }
+
+    fn split_child_rects(
+        direction: SplitDirection,
+        ratio: f32,
+        bounds: Rect,
+    ) -> (Rect, Rect, Rect) {
+        let r = if ratio.is_finite() {
+            ratio.clamp(0.15, 0.85)
+        } else {
+            0.5
+        };
+        match direction {
+            SplitDirection::Horizontal => {
+                let sash = SASH_THICKNESS.min(bounds.width());
+                let avail_w = (bounds.width() - sash).max(0.0);
+                let first_w = avail_w * r;
+                let second_w = (avail_w - first_w).max(0.0);
+                let first_rect =
+                    Rect::from_xywh(bounds.min_x(), bounds.min_y(), first_w, bounds.height());
+                let sash_rect = Rect::from_xywh(
+                    bounds.min_x() + first_w,
+                    bounds.min_y(),
+                    sash,
+                    bounds.height(),
+                );
+                let second_rect = Rect::from_xywh(
+                    bounds.min_x() + first_w + sash,
+                    bounds.min_y(),
+                    second_w,
+                    bounds.height(),
+                );
+                (first_rect, sash_rect, second_rect)
+            }
+            SplitDirection::Vertical => {
+                let sash = SASH_THICKNESS.min(bounds.height());
+                let avail_h = (bounds.height() - sash).max(0.0);
+                let first_h = avail_h * r;
+                let second_h = (avail_h - first_h).max(0.0);
+                let first_rect =
+                    Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), first_h);
+                let sash_rect = Rect::from_xywh(
+                    bounds.min_x(),
+                    bounds.min_y() + first_h,
+                    bounds.width(),
+                    sash,
+                );
+                let second_rect = Rect::from_xywh(
+                    bounds.min_x(),
+                    bounds.min_y() + first_h + sash,
+                    bounds.width(),
+                    second_h,
+                );
+                (first_rect, sash_rect, second_rect)
+            }
+        }
+    }
+
+    fn collect_group_rects(
+        node: &EditorGridNode,
+        bounds: Rect,
+        out: &mut Vec<(usize, Rect)>,
+    ) {
+        match node {
+            EditorGridNode::Leaf(id) => out.push((*id, bounds)),
+            EditorGridNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => {
+                let (first_rect, _, second_rect) =
+                    Self::split_child_rects(*direction, *ratio, bounds);
+                Self::collect_group_rects(first, first_rect, out);
+                Self::collect_group_rects(second, second_rect, out);
+            }
+        }
+    }
+
+    fn collect_sashes(
+        node: &EditorGridNode,
+        bounds: Rect,
+        path: &mut Vec<bool>,
+        out: &mut Vec<EditorSash>,
+    ) {
+        if let EditorGridNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = node
+        {
+            let (first_rect, sash_rect, second_rect) =
+                Self::split_child_rects(*direction, *ratio, bounds);
+            out.push(EditorSash {
+                split_path: path.clone(),
+                direction: *direction,
+                rect: sash_rect,
+                parent_bounds: bounds,
+            });
+            path.push(false);
+            Self::collect_sashes(first, first_rect, path, out);
+            path.pop();
+            path.push(true);
+            Self::collect_sashes(second, second_rect, path, out);
+            path.pop();
+        }
+    }
+
+    fn set_sash_ratio(
+        node: &mut EditorGridNode,
+        split_path: &[bool],
+        pointer: Point,
+        parent_bounds: Rect,
+    ) -> bool {
+        let EditorGridNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } = node
+        else {
+            return false;
+        };
+
+        if split_path.is_empty() {
+            let raw = match direction {
+                SplitDirection::Horizontal => {
+                    let sash = SASH_THICKNESS.min(parent_bounds.width());
+                    let avail_w = parent_bounds.width() - sash;
+                    if avail_w > 0.0 {
+                        (pointer.x - parent_bounds.min_x() - sash * 0.5) / avail_w
+                    } else {
+                        (pointer.x - parent_bounds.min_x()) / parent_bounds.width()
+                    }
+                }
+                SplitDirection::Vertical => {
+                    let sash = SASH_THICKNESS.min(parent_bounds.height());
+                    let avail_h = parent_bounds.height() - sash;
+                    if avail_h > 0.0 {
+                        (pointer.y - parent_bounds.min_y() - sash * 0.5) / avail_h
+                    } else {
+                        (pointer.y - parent_bounds.min_y()) / parent_bounds.height()
+                    }
+                }
+            };
+            if raw.is_finite() {
+                *ratio = raw.clamp(0.15, 0.85);
+                return true;
+            }
+            return false;
+        }
+
+        if split_path[0] {
+            Self::set_sash_ratio(second, &split_path[1..], pointer, parent_bounds)
+        } else {
+            Self::set_sash_ratio(first, &split_path[1..], pointer, parent_bounds)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,13 +573,24 @@ pub enum EditorAreaAction {
     TabSelected(usize),
     TabClosed(usize),
     BreadcrumbSelected(BreadcrumbItem),
+    GroupFocused(usize),
+    GroupSplit {
+        group_id: usize,
+        direction: SplitDirection,
+    },
+    GroupClosed(usize),
 }
 
 pub struct EditorAreaView {
     pub model: EditorArea,
     pub editors: HashMap<String, EditorView>,
+    pub split_editors: HashMap<(usize, String), EditorView>,
+    primary_editor_group: HashMap<String, usize>,
     pub diff_editors: HashMap<String, DiffEditorView>,
     pub webviews: HashMap<String, WebviewEditorView>,
+    pub split_webviews: HashMap<(usize, String), WebviewEditorView>,
+    primary_webview_group: HashMap<String, usize>,
+    pub closed_webview_panels: Vec<String>,
     pub settings_views: HashMap<String, SettingsUiView>,
     pub notebooks: HashMap<String, NotebookEditorView>,
     pub grammar_registry: Arc<GrammarRegistry>,
@@ -166,6 +600,10 @@ pub struct EditorAreaView {
     pub word_wrap_mode: WordWrapMode,
     pub word_wrap_column: usize,
     pub breadcrumbs: BreadcrumbsBar,
+    pub group_breadcrumbs: HashMap<usize, BreadcrumbsBar>,
+    pub custom_editor_panels: HashMap<String, String>,
+    pub custom_editor_contributions: Vec<CustomEditorContribution>,
+    pub active_sash_drag: Option<(Vec<bool>, Rect)>,
     known_workspace: Option<Workspace>,
 }
 
@@ -177,11 +615,20 @@ impl Default for EditorAreaView {
 
 impl EditorAreaView {
     pub fn new(model: EditorArea) -> Self {
+        let mut group_breadcrumbs = HashMap::new();
+        for g in &model.groups {
+            group_breadcrumbs.insert(g.id, BreadcrumbsBar::new());
+        }
         Self {
             model,
             editors: HashMap::new(),
+            split_editors: HashMap::new(),
+            primary_editor_group: HashMap::new(),
             diff_editors: HashMap::new(),
             webviews: HashMap::new(),
+            split_webviews: HashMap::new(),
+            primary_webview_group: HashMap::new(),
+            closed_webview_panels: Vec::new(),
             settings_views: HashMap::new(),
             notebooks: HashMap::new(),
             grammar_registry: Arc::new(GrammarRegistry::new()),
@@ -191,16 +638,172 @@ impl EditorAreaView {
             word_wrap_mode: WordWrapMode::Off,
             word_wrap_column: 80,
             breadcrumbs: BreadcrumbsBar::new(),
+            group_breadcrumbs,
+            custom_editor_panels: HashMap::new(),
+            custom_editor_contributions: Vec::new(),
+            active_sash_drag: None,
             known_workspace: None,
         }
     }
 
-    pub fn breadcrumbs_rect(&self, bounds: Rect) -> Option<Rect> {
+    pub fn editor_for_group(&self, group_id: usize, uri: &str) -> Option<&EditorView> {
+        if let Some(&primary_gid) = self.primary_editor_group.get(uri) {
+            if primary_gid == group_id {
+                self.editors.get(uri)
+            } else {
+                self.split_editors.get(&(group_id, uri.to_string()))
+            }
+        } else {
+            self.split_editors
+                .get(&(group_id, uri.to_string()))
+                .or_else(|| self.editors.get(uri))
+        }
+    }
+
+    pub fn editor_for_group_mut(&mut self, group_id: usize, uri: &str) -> Option<&mut EditorView> {
+        if let Some(&primary_gid) = self.primary_editor_group.get(uri) {
+            if primary_gid == group_id {
+                self.editors.get_mut(uri)
+            } else {
+                self.split_editors.get_mut(&(group_id, uri.to_string()))
+            }
+        } else if self.split_editors.contains_key(&(group_id, uri.to_string())) {
+            self.split_editors.get_mut(&(group_id, uri.to_string()))
+        } else {
+            self.editors.get_mut(uri)
+        }
+    }
+
+    pub fn any_editor_for_uri(&self, uri: &str) -> Option<&EditorView> {
+        self.editors.get(uri).or_else(|| {
+            self.split_editors
+                .iter()
+                .find(|((_, u), _)| u == uri)
+                .map(|(_, ed)| ed)
+        })
+    }
+
+    pub fn for_each_editor_mut(&mut self, mut f: impl FnMut(&str, &mut EditorView)) {
+        for (uri, ed) in &mut self.editors {
+            f(uri, ed);
+        }
+        for ((_, uri), ed) in &mut self.split_editors {
+            f(uri, ed);
+        }
+    }
+
+    pub fn for_each_editor_for_uri_mut(&mut self, uri: &str, mut f: impl FnMut(&mut EditorView)) {
+        if let Some(ed) = self.editors.get_mut(uri) {
+            f(ed);
+        }
+        for ((_, u), ed) in &mut self.split_editors {
+            if u == uri {
+                f(ed);
+            }
+        }
+    }
+
+    pub fn is_minimap_or_sash_dragging(&self) -> bool {
+        self.active_sash_drag.is_some()
+            || self.editors.values().any(|e| e.minimap_dragging)
+            || self.split_editors.values().any(|e| e.minimap_dragging)
+    }
+
+    pub fn clear_all_minimap_dragging(&mut self) {
+        self.active_sash_drag = None;
+        self.for_each_editor_mut(|_, ed| {
+            ed.minimap_dragging = false;
+        });
+    }
+
+    pub fn clear_all_drag_state(&mut self) {
+        self.clear_all_minimap_dragging();
+    }
+
+    pub fn webview_for_group(&self, group_id: usize, uri: &str) -> Option<&WebviewEditorView> {
+        if let Some(&primary_gid) = self.primary_webview_group.get(uri) {
+            if primary_gid == group_id {
+                self.webviews.get(uri)
+            } else {
+                self.split_webviews.get(&(group_id, uri.to_string()))
+            }
+        } else {
+            self.split_webviews
+                .get(&(group_id, uri.to_string()))
+                .or_else(|| self.webviews.get(uri))
+        }
+    }
+
+    pub fn webview_for_group_mut(
+        &mut self,
+        group_id: usize,
+        uri: &str,
+    ) -> Option<&mut WebviewEditorView> {
+        if let Some(&primary_gid) = self.primary_webview_group.get(uri) {
+            if primary_gid == group_id {
+                self.webviews.get_mut(uri)
+            } else {
+                self.split_webviews.get_mut(&(group_id, uri.to_string()))
+            }
+        } else if self.split_webviews.contains_key(&(group_id, uri.to_string())) {
+            self.split_webviews.get_mut(&(group_id, uri.to_string()))
+        } else {
+            self.webviews.get_mut(uri)
+        }
+    }
+
+    pub fn any_webview_for_uri(&self, uri: &str) -> Option<&WebviewEditorView> {
+        self.webviews.get(uri).or_else(|| {
+            self.split_webviews
+                .iter()
+                .find(|((_, u), _)| u == uri)
+                .map(|(_, wv)| wv)
+        })
+    }
+
+    pub fn for_each_webview_for_uri_mut(
+        &mut self,
+        uri: &str,
+        mut f: impl FnMut(&mut WebviewEditorView),
+    ) {
+        if let Some(wv) = self.webviews.get_mut(uri) {
+            f(wv);
+        }
+        for ((_, u), wv) in &mut self.split_webviews {
+            if u == uri {
+                f(wv);
+            }
+        }
+    }
+
+    pub fn sync_editor_focus(&mut self) {
+        let active_gid = self.model.active_group_id();
+        let active_uri = self
+            .model
+            .current_group_ref()
+            .active_tab()
+            .map(|t| t.uri.clone());
+
+        for (uri, ed) in &mut self.editors {
+            let primary_gid = self.primary_editor_group.get(uri).copied().unwrap_or(active_gid);
+            ed.is_focused = primary_gid == active_gid && active_uri.as_deref() == Some(uri.as_str());
+        }
+        for ((gid, uri), ed) in &mut self.split_editors {
+            ed.is_focused = *gid == active_gid && active_uri.as_deref() == Some(uri.as_str());
+        }
+    }
+
+    pub fn breadcrumbs_rect_for_group(&self, group_id: usize, bounds: Rect) -> Option<Rect> {
         let tab_bar_h = 35.0;
+        let has_active_tab = self
+            .model
+            .group_by_id(group_id)
+            .and_then(|g| g.active_tab())
+            .is_some();
         if !crate::is_finite_positive_rect(bounds)
             || !(bounds.min_y() + tab_bar_h).is_finite()
             || !self.breadcrumbs_enabled
-            || self.model.current_group_ref().active_tab().is_none()
+            || !has_active_tab
             || bounds.height() <= tab_bar_h
         {
             return None;
@@ -222,12 +825,14 @@ impl EditorAreaView {
         }
     }
 
-    pub fn content_rect(&self, bounds: Rect) -> Rect {
+    pub fn content_rect_for_group(&self, group_id: usize, bounds: Rect) -> Rect {
         if !crate::is_finite_rect(bounds) {
             return Rect::zero();
         }
         let tab_bar_h = 35.0;
-        let bc_h = self.breadcrumbs_rect(bounds).map_or(0.0, |r| r.height());
+        let bc_h = self
+            .breadcrumbs_rect_for_group(group_id, bounds)
+            .map_or(0.0, |r| r.height());
         let top_offset = tab_bar_h + bc_h;
         let rect = Rect::from_xywh(
             bounds.min_x(),
@@ -242,26 +847,34 @@ impl EditorAreaView {
         }
     }
 
+    pub fn breadcrumbs_rect(&self, bounds: Rect) -> Option<Rect> {
+        self.breadcrumbs_rect_for_group(self.model.active_group_id(), bounds)
+    }
+
+    pub fn content_rect(&self, bounds: Rect) -> Rect {
+        self.content_rect_for_group(self.model.active_group_id(), bounds)
+    }
+
     pub fn set_minimap_enabled(&mut self, enabled: bool) {
         self.minimap_enabled = enabled;
-        for editor in self.editors.values_mut() {
+        self.for_each_editor_mut(|_, editor| {
             editor.set_minimap_enabled(enabled);
-        }
+        });
     }
 
     pub fn set_word_wrap(&mut self, mode: WordWrapMode) {
         self.word_wrap_mode = mode;
-        for editor in self.editors.values_mut() {
+        self.for_each_editor_mut(|_, editor| {
             editor.set_word_wrap(mode);
-        }
+        });
     }
 
     pub fn set_word_wrap_column(&mut self, col: usize) {
         let clamped = col.max(1);
         self.word_wrap_column = clamped;
-        for editor in self.editors.values_mut() {
+        self.for_each_editor_mut(|_, editor| {
             editor.set_word_wrap_column(clamped);
-        }
+        });
     }
 
     pub fn set_breadcrumbs_enabled(&mut self, enabled: bool) {
@@ -272,24 +885,49 @@ impl EditorAreaView {
         if let Some(ws) = workspace {
             self.known_workspace = Some(ws.clone());
         }
-        let tab_info = self
-            .model
-            .current_group_ref()
-            .active_tab()
-            .map(|t| (t.uri.clone(), t.title.clone()));
-        let Some((uri, title)) = tab_info else {
-            self.breadcrumbs.clear();
-            return;
-        };
-
         let ws_ref = self.known_workspace.as_ref();
-        if let Some(editor) = self.editors.get(&uri) {
-            let content = editor.text();
-            let cursor_line = editor.primary_position().line;
-            self.breadcrumbs
-                .update(&uri, &title, ws_ref, Some((&content, cursor_line)));
-        } else {
-            self.breadcrumbs.update(&uri, &title, ws_ref, None);
+        let active_gid = self.model.active_group_id();
+
+        let group_snapshots: Vec<(usize, Option<(String, String)>)> = self
+            .model
+            .groups
+            .iter()
+            .map(|g| {
+                (
+                    g.id,
+                    g.active_tab().map(|t| (t.uri.clone(), t.title.clone())),
+                )
+            })
+            .collect();
+
+        for (gid, tab_info) in group_snapshots {
+            let mut bar = self
+                .group_breadcrumbs
+                .remove(&gid)
+                .unwrap_or_default();
+            if let Some((uri, title)) = tab_info {
+                let editor_ctx = self
+                    .editor_for_group(gid, &uri)
+                    .map(|ed| (ed.text(), ed.primary_position().line));
+                if let Some((ref content, cursor_line)) = editor_ctx {
+                    bar.update(&uri, &title, ws_ref, Some((content, cursor_line)));
+                    if gid == active_gid {
+                        self.breadcrumbs
+                            .update(&uri, &title, ws_ref, Some((content, cursor_line)));
+                    }
+                } else {
+                    bar.update(&uri, &title, ws_ref, None);
+                    if gid == active_gid {
+                        self.breadcrumbs.update(&uri, &title, ws_ref, None);
+                    }
+                }
+            } else {
+                bar.clear();
+                if gid == active_gid {
+                    self.breadcrumbs.clear();
+                }
+            }
+            self.group_breadcrumbs.insert(gid, bar);
         }
     }
 
@@ -310,17 +948,27 @@ impl EditorAreaView {
                 .with_grammar_registry(self.grammar_registry.clone());
             self.notebooks.insert(uri.to_string(), nb_view);
         }
+        self.retain_open_resources();
         self.sync_breadcrumbs(None);
     }
 
     pub fn sync_dirty_states(&mut self) {
+        let mut dirty_uris = HashSet::new();
+        for (uri, ed) in &self.editors {
+            if ed.is_dirty() {
+                dirty_uris.insert(uri.clone());
+            }
+        }
+        for ((_, uri), ed) in &self.split_editors {
+            if ed.is_dirty() {
+                dirty_uris.insert(uri.clone());
+            }
+        }
         for group in &mut self.model.groups {
             for tab in &mut group.tabs {
-                if let Some(editor) = self.editors.get(&tab.uri) {
-                    if editor.is_dirty() {
-                        tab.is_dirty = true;
-                        tab.is_preview = false;
-                    }
+                if dirty_uris.contains(&tab.uri) {
+                    tab.is_dirty = true;
+                    tab.is_preview = false;
                 } else if let Some(notebook) = self.notebooks.get(&tab.uri) {
                     tab.is_dirty = notebook.document.is_dirty;
                     if tab.is_dirty {
@@ -353,27 +1001,291 @@ impl EditorAreaView {
         if let Some(cfg) = config {
             view.set_config(cfg);
         }
+        self.sync_editor_focus();
         self.sync_breadcrumbs(None);
     }
 
-    pub fn close_tab(&mut self, index: usize) -> bool {
-        let closed = self.model.current_group().close_tab(index);
+    pub fn split_active_group(&mut self, direction: SplitDirection) -> usize {
+        let prev_gid = self.model.active_group_id();
+        let active_uri = self
+            .model
+            .current_group_ref()
+            .active_tab()
+            .map(|t| t.uri.clone());
+        let new_gid = self.model.split_active_group(direction);
+        self.group_breadcrumbs.entry(new_gid).or_default();
+
+        if let Some(uri) = active_uri {
+            if let Some(primary) = self.editor_for_group(prev_gid, &uri) {
+                let doc_opt = primary.document.clone();
+                let diags = primary.diagnostics.clone();
+                let mut cloned_view = if let Some(doc) = doc_opt {
+                    let (buf, lang_id) = {
+                        let d = doc.read();
+                        (d.buffer.clone(), d.language_id.clone())
+                    };
+                    let mut v = EditorView::new(buf)
+                        .with_document(doc)
+                        .with_minimap(self.minimap_enabled)
+                        .with_word_wrap(self.word_wrap_mode)
+                        .with_word_wrap_column(self.word_wrap_column);
+                    let theme = ThemeService::default_dark_theme();
+                    v.set_language(&lang_id, theme, &self.grammar_registry);
+                    v
+                } else {
+                    let content = primary.text();
+                    EditorView::from_str(&content)
+                        .with_minimap(self.minimap_enabled)
+                        .with_word_wrap(self.word_wrap_mode)
+                        .with_word_wrap_column(self.word_wrap_column)
+                };
+                if !diags.is_empty() {
+                    cloned_view.set_diagnostics(diags);
+                }
+                self.split_editors.insert((new_gid, uri), cloned_view);
+            } else if let Some(primary_wv) = self.webview_for_group(prev_gid, &uri) {
+                let mut cloned_wv = WebviewEditorView::new(
+                    &primary_wv.id,
+                    &primary_wv.view_type,
+                    &primary_wv.title,
+                    &primary_wv.html,
+                    primary_wv.options.clone(),
+                    primary_wv.ext_host_manager.clone(),
+                );
+                cloned_wv.inbound_messages = primary_wv.inbound_messages.clone();
+                cloned_wv.outbound_messages = primary_wv.outbound_messages.clone();
+                self.primary_webview_group
+                    .entry(uri.clone())
+                    .or_insert(prev_gid);
+                self.split_webviews.insert((new_gid, uri), cloned_wv);
+            }
+        }
+
+        self.sync_editor_focus();
+        self.sync_breadcrumbs(None);
+        self.last_action = Some(EditorAreaAction::GroupSplit {
+            group_id: new_gid,
+            direction,
+        });
+        new_gid
+    }
+
+    pub fn focus_group(&mut self, group_id: usize) -> bool {
+        if self.model.focus_group(group_id) {
+            self.sync_editor_focus();
+            self.sync_breadcrumbs(None);
+            self.last_action = Some(EditorAreaAction::GroupFocused(group_id));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn focus_next_group(&mut self) {
+        self.model.focus_next_group();
+        let gid = self.model.active_group_id();
+        self.sync_editor_focus();
+        self.sync_breadcrumbs(None);
+        self.last_action = Some(EditorAreaAction::GroupFocused(gid));
+    }
+
+    pub fn focus_previous_group(&mut self) {
+        self.model.focus_previous_group();
+        let gid = self.model.active_group_id();
+        self.sync_editor_focus();
+        self.sync_breadcrumbs(None);
+        self.last_action = Some(EditorAreaAction::GroupFocused(gid));
+    }
+
+    pub fn focus_first_editor_group(&mut self) -> bool {
+        if self.model.focus_first_editor_group() {
+            let gid = self.model.active_group_id();
+            self.sync_editor_focus();
+            self.sync_breadcrumbs(None);
+            self.last_action = Some(EditorAreaAction::GroupFocused(gid));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn focus_second_editor_group(&mut self) -> bool {
+        if self.model.focus_second_editor_group() {
+            let gid = self.model.active_group_id();
+            self.sync_editor_focus();
+            self.sync_breadcrumbs(None);
+            self.last_action = Some(EditorAreaAction::GroupFocused(gid));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn retain_open_resources(&mut self) {
+        let mut open_pairs: HashSet<(usize, String)> = HashSet::new();
+        let mut open_uris: HashSet<String> = HashSet::new();
+        let mut open_gids: HashSet<usize> = HashSet::new();
+        for g in &self.model.groups {
+            open_gids.insert(g.id);
+            for t in &g.tabs {
+                open_pairs.insert((g.id, t.uri.clone()));
+                open_uris.insert(t.uri.clone());
+            }
+        }
+
+        self.split_editors.retain(|k, _| open_pairs.contains(k));
+        self.group_breadcrumbs.retain(|gid, _| open_gids.contains(gid));
+
+        // If a primary group dropped its URI while a split group still has it open, promote one.
+        let uris_to_check: Vec<String> = self.editors.keys().cloned().collect();
+        for uri in uris_to_check {
+            if !open_uris.contains(&uri) {
+                self.editors.remove(&uri);
+                self.primary_editor_group.remove(&uri);
+                continue;
+            }
+            if let Some(&primary_gid) = self.primary_editor_group.get(&uri) {
+                if !open_pairs.contains(&(primary_gid, uri.clone())) {
+                    if let Some((&(_, _), _)) = self
+                        .split_editors
+                        .iter()
+                        .find(|((_, u), _)| u == &uri)
+                    {
+                        let promote_key = self
+                            .split_editors
+                            .keys()
+                            .find(|(_, u)| u == &uri)
+                            .cloned()
+                            .unwrap();
+                        if let Some(promoted) = self.split_editors.remove(&promote_key) {
+                            self.editors.insert(uri.clone(), promoted);
+                            self.primary_editor_group.insert(uri, promote_key.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut closed_panels: Vec<String> = Vec::new();
+        for (panel_id, uri) in &self.custom_editor_panels {
+            if !open_uris.contains(uri) && !closed_panels.contains(panel_id) {
+                closed_panels.push(panel_id.clone());
+            }
+        }
+
+        let wv_uris_to_check: Vec<String> = self.webviews.keys().cloned().collect();
+        for uri in wv_uris_to_check {
+            if !open_uris.contains(&uri) {
+                if let Some(wv) = self.webviews.remove(&uri) {
+                    if let Some(mgr) = &wv.ext_host_manager {
+                        mgr.dispose_panel(&wv.id);
+                    }
+                    if !closed_panels.contains(&wv.id) {
+                        closed_panels.push(wv.id);
+                    }
+                }
+                self.primary_webview_group.remove(&uri);
+                continue;
+            }
+            if let Some(&primary_gid) = self.primary_webview_group.get(&uri) {
+                if !open_pairs.contains(&(primary_gid, uri.clone())) {
+                    if let Some(promote_key) = self
+                        .split_webviews
+                        .keys()
+                        .find(|(_, u)| u == &uri)
+                        .cloned()
+                    {
+                        if let Some(promoted) = self.split_webviews.remove(&promote_key) {
+                            self.webviews.insert(uri.clone(), promoted);
+                            self.primary_webview_group.insert(uri, promote_key.0);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.split_webviews.retain(|k, wv| {
+            if open_pairs.contains(k) {
+                true
+            } else {
+                if !open_uris.contains(&k.1) {
+                    if let Some(mgr) = &wv.ext_host_manager {
+                        mgr.dispose_panel(&wv.id);
+                    }
+                    if !closed_panels.contains(&wv.id) {
+                        closed_panels.push(wv.id.clone());
+                    }
+                }
+                false
+            }
+        });
+
+        for panel_id in closed_panels {
+            if !self.closed_webview_panels.contains(&panel_id) {
+                self.closed_webview_panels.push(panel_id);
+            }
+        }
+
+        self.diff_editors.retain(|u, _| open_uris.contains(u));
+        self.settings_views.retain(|u, _| open_uris.contains(u));
+        self.notebooks.retain(|u, _| open_uris.contains(u));
+        self.custom_editor_panels
+            .retain(|_, u| open_uris.contains(u));
+    }
+
+    pub fn close_tab_in_group(&mut self, group_id: usize, index: usize) -> bool {
+        let Some(group) = self.model.group_by_id_mut(group_id) else {
+            return false;
+        };
+        let closed = group.close_tab(index);
         if closed {
-            let open_uris: std::collections::HashSet<_> = self
+            let group_empty = self
                 .model
-                .groups
-                .iter()
-                .flat_map(|g| g.tabs.iter().map(|t| t.uri.clone()))
-                .collect();
-            self.editors.retain(|u, _| open_uris.contains(u));
-            self.diff_editors.retain(|u, _| open_uris.contains(u));
-            self.webviews.retain(|u, _| open_uris.contains(u));
-            self.settings_views.retain(|u, _| open_uris.contains(u));
-            self.notebooks.retain(|u, _| open_uris.contains(u));
-            self.last_action = Some(EditorAreaAction::TabClosed(index));
+                .group_by_id(group_id)
+                .is_some_and(|g| g.tabs.is_empty());
+            if group_empty && self.model.groups.len() > 1 {
+                if self.model.close_group(group_id) {
+                    self.active_sash_drag = None;
+                }
+                self.last_action = Some(EditorAreaAction::GroupClosed(group_id));
+            } else {
+                self.last_action = Some(EditorAreaAction::TabClosed(index));
+            }
+            self.retain_open_resources();
+            self.sync_editor_focus();
             self.sync_breadcrumbs(None);
         }
         closed
+    }
+
+    pub fn close_tab(&mut self, index: usize) -> bool {
+        let gid = self.model.active_group_id();
+        self.close_tab_in_group(gid, index)
+    }
+
+    pub fn close_editors_in_active_group(&mut self) -> bool {
+        let gid = self.model.active_group_id();
+        let had_tabs = self
+            .model
+            .group_by_id(gid)
+            .is_some_and(|g| !g.tabs.is_empty());
+        if let Some(group) = self.model.group_by_id_mut(gid) {
+            group.tabs.clear();
+            group.active_tab_index = None;
+        }
+        let collapsed = if self.model.groups.len() > 1 {
+            self.model.close_group(gid)
+        } else {
+            false
+        };
+        if collapsed {
+            self.active_sash_drag = None;
+            self.last_action = Some(EditorAreaAction::GroupClosed(gid));
+        }
+        self.retain_open_resources();
+        self.sync_editor_focus();
+        self.sync_breadcrumbs(None);
+        had_tabs || collapsed
     }
 
     pub fn open_diff(&mut self, uri: &str, title: &str, original: &str, modified: &str) {
@@ -381,6 +1293,8 @@ impl EditorAreaView {
         group.open_tab(uri, title, false);
         self.diff_editors
             .insert(uri.to_string(), DiffEditorView::new(title, original, modified));
+        self.retain_open_resources();
+        self.sync_editor_focus();
         self.sync_breadcrumbs(None);
     }
 
@@ -393,12 +1307,74 @@ impl EditorAreaView {
         options: WebviewOptions,
         ext_host_manager: Option<ExtHostWebviewManager>,
     ) {
+        let gid = self.model.active_group_id();
         let group = self.model.current_group();
         group.open_tab(id, title, false);
-        self.webviews.insert(
-            id.to_string(),
-            WebviewEditorView::new(id, view_type, title, html, options, ext_host_manager),
-        );
+        let view = WebviewEditorView::new(id, view_type, title, html, options, ext_host_manager);
+        let primary_gid = self.primary_webview_group.get(id).copied();
+        if !self.webviews.contains_key(id) || primary_gid.is_none_or(|pg| pg == gid) {
+            self.webviews.insert(id.to_string(), view);
+            self.primary_webview_group.insert(id.to_string(), gid);
+        } else {
+            self.split_webviews.insert((gid, id.to_string()), view);
+        }
+        self.retain_open_resources();
+        self.sync_editor_focus();
+        self.sync_breadcrumbs(None);
+    }
+
+    pub fn register_custom_editor_contributions(
+        &mut self,
+        contributions: Vec<CustomEditorContribution>,
+    ) {
+        self.custom_editor_contributions = contributions;
+    }
+
+    pub fn find_matching_custom_editor(&self, uri: &str) -> Option<&CustomEditorContribution> {
+        self.custom_editor_contributions
+            .iter()
+            .filter(|c| c.matches_path(uri))
+            .min_by_key(|c| match c.priority.as_deref() {
+                Some("default") | None => 0u8,
+                _ => 1u8,
+            })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_custom_editor(
+        &mut self,
+        uri: &str,
+        title: &str,
+        view_type: &str,
+        panel_id: &str,
+        html: &str,
+        options: WebviewOptions,
+        ext_host_manager: Option<ExtHostWebviewManager>,
+        is_preview: bool,
+    ) {
+        let gid = self.model.active_group_id();
+        let group = self.model.current_group();
+        group.open_tab(uri, title, is_preview);
+
+        // Remove any stale text editor instances if transitioning URI to custom editor
+        self.editors.remove(uri);
+        self.primary_editor_group.remove(uri);
+        self.split_editors.retain(|(_, u), _| u != uri);
+
+        let view = WebviewEditorView::new(panel_id, view_type, title, html, options, ext_host_manager);
+        let primary_gid = self.primary_webview_group.get(uri).copied();
+        if !self.webviews.contains_key(uri) || primary_gid.is_none_or(|pg| pg == gid) {
+            self.webviews.insert(uri.to_string(), view);
+            self.primary_webview_group.insert(uri.to_string(), gid);
+        } else {
+            self.split_webviews.insert((gid, uri.to_string()), view);
+        }
+        self.custom_editor_panels
+            .retain(|pid, u| u != uri || pid == panel_id);
+        self.custom_editor_panels
+            .insert(panel_id.to_string(), uri.to_string());
+        self.retain_open_resources();
+        self.sync_editor_focus();
         self.sync_breadcrumbs(None);
     }
 
@@ -407,16 +1383,35 @@ impl EditorAreaView {
             self.open_notebook(uri, title, content, is_preview);
             return;
         }
+        if let Some(contrib) = self.find_matching_custom_editor(uri).cloned() {
+            let panel_id = format!("custom_editor:{}", uri);
+            let display = if contrib.display_name.is_empty() {
+                contrib.view_type.as_str()
+            } else {
+                contrib.display_name.as_str()
+            };
+            let html = format!("<h1>{}</h1><p>Custom Editor: {}</p>", title, display);
+            self.open_custom_editor(
+                uri,
+                title,
+                &contrib.view_type,
+                &panel_id,
+                &html,
+                WebviewOptions::default(),
+                None,
+                is_preview,
+            );
+            return;
+        }
 
-        let group = self.model.current_group();
-        group.open_tab(uri, title, is_preview);
+        let gid = self.model.active_group_id();
+        self.model.current_group().open_tab(uri, title, is_preview);
 
         if !self.editors.contains_key(uri) {
             let path_buf = uri
                 .strip_prefix("file://")
                 .map(PathBuf::from)
                 .or_else(|| Some(PathBuf::from(uri)));
-
 
             let grammar = if let Some(p) = &path_buf {
                 self.grammar_registry.get_for_path(p)
@@ -439,7 +1434,43 @@ impl EditorAreaView {
             editor.set_language(grammar.language_id(), theme, &self.grammar_registry);
 
             self.editors.insert(uri.to_string(), editor);
+            self.primary_editor_group.insert(uri.to_string(), gid);
+        } else if self.editor_for_group(gid, uri).is_none() {
+            let (doc_opt, diags, text_fallback) = {
+                let primary = &self.editors[uri];
+                (
+                    primary.document.clone(),
+                    primary.diagnostics.clone(),
+                    primary.text(),
+                )
+            };
+            let mut editor = if let Some(doc) = doc_opt {
+                let (buf, lang_id) = {
+                    let d = doc.read();
+                    (d.buffer.clone(), d.language_id.clone())
+                };
+                let mut v = EditorView::new(buf)
+                    .with_document(doc)
+                    .with_minimap(self.minimap_enabled)
+                    .with_word_wrap(self.word_wrap_mode)
+                    .with_word_wrap_column(self.word_wrap_column);
+                let theme = ThemeService::default_dark_theme();
+                v.set_language(&lang_id, theme, &self.grammar_registry);
+                v
+            } else {
+                EditorView::from_str(&text_fallback)
+                    .with_minimap(self.minimap_enabled)
+                    .with_word_wrap(self.word_wrap_mode)
+                    .with_word_wrap_column(self.word_wrap_column)
+            };
+            if !diags.is_empty() {
+                editor.set_diagnostics(diags);
+            }
+            self.split_editors.insert((gid, uri.to_string()), editor);
         }
+
+        self.retain_open_resources();
+        self.sync_editor_focus();
         self.sync_breadcrumbs(None);
     }
 
@@ -447,6 +1478,7 @@ impl EditorAreaView {
         &mut self,
         fs: &FileSystemService,
     ) -> Result<FileMetadata, FileSystemError> {
+        let active_gid = self.model.active_group_id();
         let uri = self
             .model
             .current_group()
@@ -456,10 +1488,14 @@ impl EditorAreaView {
                 FileSystemError::NotFound(PathBuf::from("no_active_tab"))
             })?;
 
-        if let Some(editor) = self.editors.get_mut(&uri) {
+        if let Some(editor) = self.editor_for_group_mut(active_gid, &uri) {
             let meta = editor.save_sync(fs)?;
-            if let Some(idx) = self.model.current_group().active_tab_index {
-                self.model.current_group().set_dirty(idx, false);
+            for group in &mut self.model.groups {
+                for tab in &mut group.tabs {
+                    if tab.uri == uri {
+                        tab.is_dirty = false;
+                    }
+                }
             }
             Ok(meta)
         } else if let Some(notebook) = self.notebooks.get_mut(&uri) {
@@ -492,33 +1528,51 @@ impl EditorAreaView {
     }
 
     pub fn active_editor_mut(&mut self) -> Option<&mut EditorView> {
-        let uri = self.model.current_group().active_tab()?.uri.clone();
-        self.editors.get_mut(&uri)
+        let gid = self.model.active_group_id();
+        let uri = self.model.current_group_ref().active_tab()?.uri.clone();
+        self.editor_for_group_mut(gid, &uri)
     }
 
     pub fn active_editor(&self) -> Option<&EditorView> {
+        let gid = self.model.active_group_id();
         let uri = self.model.current_group_ref().active_tab()?.uri.clone();
-        self.editors.get(&uri)
+        self.editor_for_group(gid, &uri)
     }
 
     pub fn apply_text_edits(&mut self, uri: &str, edits: &[RangeEdit]) -> bool {
-        if let Some(editor) = self.editors.get_mut(uri) {
-            let changed = editor.apply_text_edits(edits);
-            if changed {
-                for group in &mut self.model.groups {
-                    for tab in &mut group.tabs {
-                        if tab.uri == uri {
-                            tab.is_dirty = true;
-                            tab.is_preview = false;
-                        }
+        let active_gid = self.model.active_group_id();
+        let changed = if let Some(editor) = self.editor_for_group_mut(active_gid, uri) {
+            editor.apply_text_edits(edits)
+        } else if let Some(editor) = self.editors.get_mut(uri) {
+            editor.apply_text_edits(edits)
+        } else {
+            return false;
+        };
+
+        if changed {
+            // Recompute folding ranges on any sibling split views sharing this document.
+            if let Some(doc) = self.any_editor_for_uri(uri).and_then(|e| e.document.clone()) {
+                let (buf_arc, lang_id) = {
+                    let d = doc.read();
+                    (d.buffer.clone(), d.language_id.clone())
+                };
+                let buf = buf_arc.read();
+                self.for_each_editor_for_uri_mut(uri, |ed| {
+                    ed.folding_model.compute_from_buffer(&buf, Some(&lang_id));
+                });
+            }
+
+            for group in &mut self.model.groups {
+                for tab in &mut group.tabs {
+                    if tab.uri == uri {
+                        tab.is_dirty = true;
+                        tab.is_preview = false;
                     }
                 }
-                self.sync_breadcrumbs(None);
             }
-            changed
-        } else {
-            false
+            self.sync_breadcrumbs(None);
         }
+        changed
     }
 
     pub fn apply_workspace_edit(&mut self, edit: &WorkspaceEdit) -> usize {
@@ -555,6 +1609,68 @@ impl EditorAreaView {
         }
         total_applied
     }
+
+    fn route_event_to_group_content(
+        &mut self,
+        group_id: usize,
+        event: &InputEvent,
+        content_rect: Rect,
+    ) -> EventResult {
+        let Some(uri) = self
+            .model
+            .group_by_id(group_id)
+            .and_then(|g| g.active_tab())
+            .map(|t| t.uri.clone())
+        else {
+            return EventResult::Ignored;
+        };
+
+        if let Some(diff_view) = self.diff_editors.get_mut(&uri) {
+            diff_view.handle_event(event, content_rect)
+        } else if let Some(webview) = self.webview_for_group_mut(group_id, &uri) {
+            webview.handle_event(event, content_rect)
+        } else if let Some(settings_view) = self.settings_views.get_mut(&uri) {
+            settings_view.handle_event(event, content_rect)
+        } else if let Some(notebook) = self.notebooks.get_mut(&uri) {
+            let res = notebook.handle_event(event, content_rect);
+            self.sync_dirty_states();
+            res
+        } else if let Some(editor) = self.editor_for_group_mut(group_id, &uri) {
+            let before_state = if matches!(event, InputEvent::KeyDown(_)) {
+                Some((
+                    editor.buffer.read().len(),
+                    editor.buffer.read().line_count(),
+                    editor.document.as_ref().map(|d| d.read().version_id),
+                ))
+            } else {
+                None
+            };
+            let res = editor.handle_event(event, content_rect);
+            let after_state = if matches!(event, InputEvent::KeyDown(_)) && res == EventResult::Consumed {
+                Some((
+                    editor.buffer.read().len(),
+                    editor.buffer.read().line_count(),
+                    editor.document.as_ref().map(|d| d.read().version_id),
+                ))
+            } else {
+                None
+            };
+            if matches!(event, InputEvent::KeyDown(_)) && res == EventResult::Consumed {
+                self.sync_dirty_states();
+                if before_state != after_state {
+                    self.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.recompute_folding();
+                    });
+                }
+                self.sync_breadcrumbs(None);
+            } else if matches!(event, InputEvent::MouseDown(_)) {
+                self.sync_breadcrumbs(None);
+            }
+            res
+        } else {
+            EventResult::Ignored
+        }
+    }
 }
 
 
@@ -572,119 +1688,167 @@ impl View for EditorAreaView {
         {
             return;
         }
-        // Tab bar height: 35.0
+
         let tab_bar_h = 35.0;
-        let tab_bar_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), tab_bar_h);
+        let group_rects = self.model.compute_group_rects(bounds);
+        let sashes = self.model.compute_sashes(bounds);
+        let active_gid = self.model.active_group_id();
+        let multi_group = self.model.groups.len() > 1;
 
-        // Tab bar background
-        scene.push_quad(
-            Quad::new(tab_bar_rect)
-                .with_background(theme.tab_inactive_bg)
-                .with_border_edges(theme.tab_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
-        );
-
-        let group = self.model.current_group_ref();
-        let mut cur_x = bounds.min_x();
-
-        // Render each tab
-        for (idx, tab) in group.tabs.iter().enumerate() {
-            let is_active = group.active_tab_index == Some(idx);
-            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
-            let tab_rect = Rect::from_xywh(cur_x, bounds.min_y(), tab_w, tab_bar_h);
-            if !crate::is_finite_rect(tab_rect) {
-                break;
+        for (group_id, group_rect) in group_rects {
+            if !crate::is_finite_positive_rect(group_rect)
+                || !(group_rect.min_y() + tab_bar_h).is_finite()
+            {
+                continue;
             }
-
-            let bg_color = if is_active {
-                theme.tab_active_bg
-            } else {
-                theme.tab_inactive_bg
+            let Some(group) = self.model.group_by_id(group_id) else {
+                continue;
             };
+            let is_active_group = group_id == active_gid;
 
-            let mut tab_quad = Quad::new(tab_rect).with_background(bg_color);
-            if is_active {
-                tab_quad = tab_quad.with_border_edges(
-                    theme.activity_bar_active_border,
-                    Edges::new(2.0, 0.0, 0.0, 0.0),
-                );
-            } else {
-                tab_quad = tab_quad.with_border_edges(
-                    theme.tab_border,
-                    Edges::new(0.0, 1.0, 0.0, 0.0),
-                );
-            }
-            scene.push_quad(tab_quad);
+            scene.push_clip(group_rect);
 
-            // Title text (italic if preview)
-            let fg_color = if is_active {
-                theme.tab_active_fg
-            } else {
-                theme.tab_inactive_fg
-            };
-
-            let is_dirty = tab.is_dirty
-                || self.editors.get(&tab.uri).is_some_and(|e| e.is_dirty())
-                || self.notebooks.get(&tab.uri).is_some_and(|n| n.document.is_dirty);
-
-            let title_text = if is_dirty {
-                format!("{} \u{25cf}", tab.title)
-            } else {
-                tab.title.clone()
-            };
-
-
-            let title_y = bounds.min_y() + (tab_bar_h - font.line_height) / 2.0;
-            let title_x = cur_x + 10.0;
-            let mut run = GlyphRun::new(
-                title_text,
-                Point::new(title_x, title_y),
-                Rect::from_xywh(title_x, title_y, tab_w - 24.0, font.line_height),
-                fg_color,
-                font.font_size,
+            let tab_bar_rect =
+                Rect::from_xywh(group_rect.min_x(), group_rect.min_y(), group_rect.width(), tab_bar_h);
+            crate::push_finite_quad(
+                scene,
+                Quad::new(tab_bar_rect)
+                    .with_background(theme.tab_inactive_bg)
+                    .with_border_edges(theme.tab_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
             );
-            if tab.is_preview {
-                run = run.with_style(false, true, false);
+
+            let mut cur_x = group_rect.min_x();
+            for (idx, tab) in group.tabs.iter().enumerate() {
+                let is_active = group.active_tab_index == Some(idx);
+                let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
+                let tab_rect = Rect::from_xywh(cur_x, group_rect.min_y(), tab_w, tab_bar_h);
+                if !crate::is_finite_rect(tab_rect) {
+                    break;
+                }
+
+                let bg_color = if is_active {
+                    theme.tab_active_bg
+                } else {
+                    theme.tab_inactive_bg
+                };
+
+                let mut tab_quad = Quad::new(tab_rect).with_background(bg_color);
+                if is_active && (!multi_group || is_active_group) {
+                    tab_quad = tab_quad.with_border_edges(
+                        theme.activity_bar_active_border,
+                        Edges::new(2.0, 0.0, 0.0, 0.0),
+                    );
+                } else {
+                    tab_quad = tab_quad.with_border_edges(
+                        theme.tab_border,
+                        Edges::new(0.0, 1.0, 0.0, 0.0),
+                    );
+                }
+                scene.push_quad(tab_quad);
+
+                let fg_color = if is_active {
+                    theme.tab_active_fg
+                } else {
+                    theme.tab_inactive_fg
+                };
+
+                let is_dirty = tab.is_dirty
+                    || self
+                        .any_editor_for_uri(&tab.uri)
+                        .is_some_and(|e| e.is_dirty())
+                    || self.notebooks.get(&tab.uri).is_some_and(|n| n.document.is_dirty);
+
+                let title_text = if is_dirty {
+                    format!("{} \u{25cf}", tab.title)
+                } else {
+                    tab.title.clone()
+                };
+
+                let title_y = group_rect.min_y() + (tab_bar_h - font.line_height) / 2.0;
+                let title_x = cur_x + 10.0;
+                let mut run = GlyphRun::new(
+                    title_text,
+                    Point::new(title_x, title_y),
+                    Rect::from_xywh(title_x, title_y, tab_w - 24.0, font.line_height),
+                    fg_color,
+                    font.font_size,
+                );
+                if tab.is_preview {
+                    run = run.with_style(false, true, false);
+                }
+                scene.push_text(run);
+
+                let close_x = cur_x + tab_w - 18.0;
+                scene.push_text(GlyphRun::new(
+                    "x".to_string(),
+                    Point::new(close_x, title_y),
+                    Rect::from_xywh(close_x, title_y, 14.0, font.line_height),
+                    fg_color,
+                    font.font_size * 0.85,
+                ));
+
+                cur_x += tab_w;
             }
-            scene.push_text(run);
 
-            // Close button 'x' on right
-            let close_x = cur_x + tab_w - 18.0;
-            scene.push_text(GlyphRun::new(
-                "x".to_string(),
-                Point::new(close_x, title_y),
-                Rect::from_xywh(close_x, title_y, 14.0, font.line_height),
-                fg_color,
-                font.font_size * 0.85,
-            ));
+            if let Some(bc_rect) = self.breadcrumbs_rect_for_group(group_id, group_rect) {
+                let bc_bar = self
+                    .group_breadcrumbs
+                    .get(&group_id)
+                    .unwrap_or(&self.breadcrumbs);
+                bc_bar.render(bc_rect, theme, font, scene);
+            }
 
-            cur_x += tab_w;
-        }
-
-        // Breadcrumbs bar immediately below tabs when enabled and active tab exists
-        if let Some(bc_rect) = self.breadcrumbs_rect(bounds) {
-            self.breadcrumbs.render(bc_rect, theme, font, scene);
-        }
-
-        // Editor content below tabs (+ optional breadcrumbs)
-        let content_rect = self.content_rect(bounds);
-
-        if let Some(tab) = self.model.current_group_ref().active_tab() {
-            if let Some(diff_view) = self.diff_editors.get(&tab.uri) {
-                diff_view.render(content_rect, theme, font, scene);
-            } else if let Some(webview) = self.webviews.get(&tab.uri) {
-                webview.render(content_rect, theme, font, scene);
-            } else if let Some(settings_view) = self.settings_views.get(&tab.uri) {
-                settings_view.render(content_rect, theme, font, scene);
-            } else if let Some(notebook) = self.notebooks.get(&tab.uri) {
-                notebook.render(content_rect, theme, font, scene);
-            } else if let Some(editor) = self.editors.get(&tab.uri) {
-                editor.render(content_rect, theme, font, scene);
+            let content_rect = self.content_rect_for_group(group_id, group_rect);
+            if let Some(tab) = group.active_tab() {
+                if let Some(diff_view) = self.diff_editors.get(&tab.uri) {
+                    diff_view.render(content_rect, theme, font, scene);
+                } else if let Some(webview) = self.webview_for_group(group_id, &tab.uri) {
+                    webview.render(content_rect, theme, font, scene);
+                } else if let Some(settings_view) = self.settings_views.get(&tab.uri) {
+                    settings_view.render(content_rect, theme, font, scene);
+                } else if let Some(notebook) = self.notebooks.get(&tab.uri) {
+                    notebook.render(content_rect, theme, font, scene);
+                } else if let Some(editor) = self.editor_for_group(group_id, &tab.uri) {
+                    editor.render(content_rect, theme, font, scene);
+                } else {
+                    crate::push_finite_quad(
+                        scene,
+                        Quad::new(content_rect).with_background(theme.editor_background),
+                    );
+                }
             } else {
-                scene.push_quad(Quad::new(content_rect).with_background(theme.editor_background));
+                crate::push_finite_quad(
+                    scene,
+                    Quad::new(content_rect).with_background(theme.editor_background),
+                );
             }
-        } else {
-            // Empty editor background
-            scene.push_quad(Quad::new(content_rect).with_background(theme.editor_background));
+
+            if multi_group {
+                let border_color = if is_active_group {
+                    theme.activity_bar_active_border
+                } else {
+                    theme.tab_border
+                };
+                crate::push_finite_quad(
+                    scene,
+                    Quad::new(group_rect).with_border_edges(border_color, Edges::all(1.0)),
+                );
+            }
+
+            scene.pop_clip();
+        }
+
+        for sash in sashes {
+            let is_active = self
+                .active_sash_drag
+                .as_ref()
+                .is_some_and(|(path, _)| path == &sash.split_path);
+            let color = if is_active {
+                theme.sash_hover
+            } else {
+                theme.panel_border
+            };
+            crate::push_finite_quad(scene, Quad::new(sash.rect).with_background(color));
         }
     }
 
@@ -696,114 +1860,220 @@ impl View for EditorAreaView {
                 if !bounds.contains(mouse.position) {
                     return EventResult::Ignored;
                 }
-                if mouse.position.y < bounds.min_y() + tab_bar_h {
-                    // Click within tab bar
+
+                // 1. Check split sashes first (with 2px hit tolerance)
+                for sash in self.model.compute_sashes(bounds) {
+                    let hit_rect = Rect::from_xywh(
+                        sash.rect.min_x() - 2.0,
+                        sash.rect.min_y() - 2.0,
+                        sash.rect.width() + 4.0,
+                        sash.rect.height() + 4.0,
+                    );
+                    if hit_rect.contains(mouse.position) {
+                        self.active_sash_drag = Some((sash.split_path, sash.parent_bounds));
+                        return EventResult::Consumed;
+                    }
+                }
+
+                // 2. Hit-test target group
+                let Some((group_id, group_rect)) = self
+                    .model
+                    .compute_group_rects(bounds)
+                    .into_iter()
+                    .find(|(_, rect)| rect.contains(mouse.position))
+                else {
+                    return EventResult::Ignored;
+                };
+
+                let group_changed = group_id != self.model.active_group_id();
+                if group_changed {
+                    self.focus_group(group_id);
+                }
+
+                if mouse.position.y < group_rect.min_y() + tab_bar_h {
                     let font = FontMetrics::default_monospace();
-                    let group = self.model.current_group_ref();
-                    let mut cur_x = bounds.min_x();
+                    let tab_rects: Vec<(usize, Rect, f32)> = {
+                        let Some(group) = self.model.group_by_id(group_id) else {
+                            return EventResult::Ignored;
+                        };
+                        let mut cur_x = group_rect.min_x();
+                        let mut list = Vec::with_capacity(group.tabs.len());
+                        for (idx, tab) in group.tabs.iter().enumerate() {
+                            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
+                            let tab_rect =
+                                Rect::from_xywh(cur_x, group_rect.min_y(), tab_w, tab_bar_h);
+                            list.push((idx, tab_rect, cur_x + tab_w - 22.0));
+                            cur_x += tab_w;
+                        }
+                        list
+                    };
 
-                    for (idx, tab) in group.tabs.iter().enumerate() {
-                        let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
-                        let tab_rect = Rect::from_xywh(cur_x, bounds.min_y(), tab_w, tab_bar_h);
-
+                    for (idx, tab_rect, close_min_x) in tab_rects {
                         if tab_rect.contains(mouse.position) {
-                            // Check if close button clicked
-                            if mouse.position.x >= cur_x + tab_w - 22.0 {
-                                self.close_tab(idx);
+                            if mouse.position.x >= close_min_x {
+                                self.close_tab_in_group(group_id, idx);
                             } else {
-                                self.model.current_group().active_tab_index = Some(idx);
+                                if let Some(group) = self.model.group_by_id_mut(group_id) {
+                                    group.active_tab_index = Some(idx);
+                                }
                                 self.last_action = Some(EditorAreaAction::TabSelected(idx));
+                                self.sync_editor_focus();
                                 self.sync_breadcrumbs(None);
                             }
                             return EventResult::Consumed;
                         }
-                        cur_x += tab_w;
                     }
-                    EventResult::Ignored
-                } else if self
-                    .breadcrumbs_rect(bounds)
-                    .is_some_and(|bc_rect| bc_rect.contains(mouse.position))
-                {
-                    let bc_rect = self.breadcrumbs_rect(bounds).unwrap();
-                    let res = self.breadcrumbs.handle_event(event, bc_rect);
-                    if let Some(BreadcrumbsAction::SelectItem { item, .. }) =
-                        self.breadcrumbs.last_action.take()
-                    {
-                        if matches!(item.kind, BreadcrumbKind::Symbol(_)) {
-                            if let Some(line) = item.line {
-                                let col = item.column.unwrap_or(0);
-                                let content_rect = self.content_rect(bounds);
-                                let font = FontMetrics::default_monospace();
-                                let visible_lines =
-                                    (content_rect.height() / font.line_height).floor().max(1.0);
-                                if let Some(editor) = self.active_editor_mut() {
-                                    editor.set_primary_position(Position::new(line, col));
-                                    let line_f = line as f32;
-                                    if line_f < editor.scroll_top
-                                        || line_f >= editor.scroll_top + visible_lines
-                                    {
-                                        editor.scroll_top = (line_f - 2.0).max(0.0);
-                                    }
-                                }
-                                self.sync_breadcrumbs(None);
-                            }
-                        }
-                        self.last_action = Some(EditorAreaAction::BreadcrumbSelected(item));
-                    }
-                    res
-                } else {
-                    // Click within active editor / diff / webview / settings / notebook
-                    let content_rect = self.content_rect(bounds);
-                    if let Some(tab) = self.model.current_group_ref().active_tab() {
-                        let uri = tab.uri.clone();
-                        if let Some(diff_view) = self.diff_editors.get_mut(&uri) {
-                            diff_view.handle_event(event, content_rect)
-                        } else if let Some(webview) = self.webviews.get_mut(&uri) {
-                            webview.handle_event(event, content_rect)
-                        } else if let Some(settings_view) = self.settings_views.get_mut(&uri) {
-                            settings_view.handle_event(event, content_rect)
-                        } else if let Some(notebook) = self.notebooks.get_mut(&uri) {
-                            let res = notebook.handle_event(event, content_rect);
-                            self.sync_dirty_states();
-                            res
-                        } else if let Some(editor) = self.editors.get_mut(&uri) {
-                            let res = editor.handle_event(event, content_rect);
-                            self.sync_breadcrumbs(None);
-                            res
-                        } else {
-                            EventResult::Ignored
-                        }
+                    if group_changed {
+                        EventResult::Consumed
                     } else {
                         EventResult::Ignored
+                    }
+                } else if let Some(bc_rect) =
+                    self.breadcrumbs_rect_for_group(group_id, group_rect)
+                {
+                    if bc_rect.contains(mouse.position) {
+                        let active_gid = self.model.active_group_id();
+                        let (res, action) = {
+                            let bc_bar = self.group_breadcrumbs.entry(group_id).or_default();
+                            let r = bc_bar.handle_event(event, bc_rect);
+                            let act = bc_bar.last_action.take();
+                            if group_id == active_gid {
+                                self.breadcrumbs.items = bc_bar.items.clone();
+                                self.breadcrumbs.selected_index = bc_bar.selected_index;
+                            }
+                            (r, act)
+                        };
+                        if let Some(BreadcrumbsAction::SelectItem { item, .. }) = action {
+                            if matches!(item.kind, BreadcrumbKind::Symbol(_)) {
+                                if let Some(line) = item.line {
+                                    let col = item.column.unwrap_or(0);
+                                    let content_rect =
+                                        self.content_rect_for_group(group_id, group_rect);
+                                    let font = FontMetrics::default_monospace();
+                                    let visible_lines =
+                                        (content_rect.height() / font.line_height).floor().max(1.0);
+                                    let uri_opt = self
+                                        .model
+                                        .group_by_id(group_id)
+                                        .and_then(|g| g.active_tab())
+                                        .map(|t| t.uri.clone());
+                                    if let Some(uri) = uri_opt {
+                                        if let Some(editor) =
+                                            self.editor_for_group_mut(group_id, &uri)
+                                        {
+                                            editor.set_primary_position(Position::new(line, col));
+                                            let line_f = line as f32;
+                                            if line_f < editor.scroll_top
+                                                || line_f >= editor.scroll_top + visible_lines
+                                            {
+                                                editor.scroll_top = (line_f - 2.0).max(0.0);
+                                            }
+                                        }
+                                    }
+                                    self.sync_breadcrumbs(None);
+                                }
+                            }
+                            self.last_action = Some(EditorAreaAction::BreadcrumbSelected(item));
+                        }
+                        return res;
+                    }
+                    let content_rect = self.content_rect_for_group(group_id, group_rect);
+                    let res = self.route_event_to_group_content(group_id, event, content_rect);
+                    if group_changed && res == EventResult::Ignored {
+                        EventResult::Consumed
+                    } else {
+                        res
+                    }
+                } else {
+                    let content_rect = self.content_rect_for_group(group_id, group_rect);
+                    let res = self.route_event_to_group_content(group_id, event, content_rect);
+                    if group_changed && res == EventResult::Ignored {
+                        EventResult::Consumed
+                    } else {
+                        res
                     }
                 }
             }
-            _ => {
-                let content_rect = self.content_rect(bounds);
-                if let Some(tab) = self.model.current_group_ref().active_tab() {
-                    let uri = tab.uri.clone();
-                    if let Some(diff_view) = self.diff_editors.get_mut(&uri) {
-                        diff_view.handle_event(event, content_rect)
-                    } else if let Some(webview) = self.webviews.get_mut(&uri) {
-                        webview.handle_event(event, content_rect)
-                    } else if let Some(settings_view) = self.settings_views.get_mut(&uri) {
-                        settings_view.handle_event(event, content_rect)
-                    } else if let Some(notebook) = self.notebooks.get_mut(&uri) {
-                        let res = notebook.handle_event(event, content_rect);
-                        self.sync_dirty_states();
-                        res
-                    } else if let Some(editor) = self.editors.get_mut(&uri) {
-                        let res = editor.handle_event(event, content_rect);
-                        if matches!(event, InputEvent::KeyDown(_)) && res == EventResult::Consumed {
-                            self.sync_breadcrumbs(None);
-                        }
-                        res
-                    } else {
-                        EventResult::Ignored
-                    }
+            InputEvent::MouseMove(mouse) => {
+                if let Some((path, parent_bounds)) = self.active_sash_drag.clone() {
+                    self.model
+                        .update_sash_ratio(&path, mouse.position, parent_bounds);
+                    return EventResult::Consumed;
+                }
+
+                // Route to any editor currently dragging minimap
+                let dragging_target = self
+                    .model
+                    .groups
+                    .iter()
+                    .find_map(|g| {
+                        g.active_tab().and_then(|t| {
+                            self.editor_for_group(g.id, &t.uri)
+                                .filter(|e| e.minimap_dragging)
+                                .map(|_| g.id)
+                        })
+                    });
+
+                let target_group = if let Some(gid) = dragging_target {
+                    self.model
+                        .compute_group_rects(bounds)
+                        .into_iter()
+                        .find(|(id, _)| *id == gid)
+                } else {
+                    self.model
+                        .compute_group_rects(bounds)
+                        .into_iter()
+                        .find(|(_, rect)| rect.contains(mouse.position))
+                };
+
+                if let Some((gid, rect)) = target_group {
+                    let content_rect = self.content_rect_for_group(gid, rect);
+                    self.route_event_to_group_content(gid, event, content_rect)
                 } else {
                     EventResult::Ignored
                 }
+            }
+            InputEvent::MouseUp(_) => {
+                if self.active_sash_drag.take().is_some() {
+                    return EventResult::Consumed;
+                }
+                let gid = self.model.active_group_id();
+                let rect = self
+                    .model
+                    .compute_group_rects(bounds)
+                    .into_iter()
+                    .find(|(id, _)| *id == gid)
+                    .map(|(_, r)| r)
+                    .unwrap_or(bounds);
+                let content_rect = self.content_rect_for_group(gid, rect);
+                let res = self.route_event_to_group_content(gid, event, content_rect);
+                self.clear_all_minimap_dragging();
+                res
+            }
+            InputEvent::ScrollWheel(scroll) => {
+                if let Some((gid, rect)) = self
+                    .model
+                    .compute_group_rects(bounds)
+                    .into_iter()
+                    .find(|(_, rect)| rect.contains(scroll.position))
+                {
+                    let content_rect = self.content_rect_for_group(gid, rect);
+                    self.route_event_to_group_content(gid, event, content_rect)
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            InputEvent::KeyDown(_) | InputEvent::KeyUp(_) => {
+                let gid = self.model.active_group_id();
+                let rect = self
+                    .model
+                    .compute_group_rects(bounds)
+                    .into_iter()
+                    .find(|(id, _)| *id == gid)
+                    .map(|(_, r)| r)
+                    .unwrap_or(bounds);
+                let content_rect = self.content_rect_for_group(gid, rect);
+                self.route_event_to_group_content(gid, event, content_rect)
             }
         }
     }
@@ -1342,6 +2612,555 @@ mod tests {
             area_view.editors["file:///demo/second.rs"].word_wrap_column,
             64
         );
+    }
+
+    #[test]
+    fn test_split_editor_grid_horizontal_vertical_sash_drag_and_collapse() {
+        use rustcode_platform::render::{MouseButton, MouseMoveEvent, ScrollEvent};
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(
+            "file:///demo/shared.rs",
+            "shared.rs",
+            "fn one() {}\nfn two() {}\nfn three() {}\n",
+            false,
+        );
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1000.0, 600.0);
+
+        // 1. Horizontal split (side-by-side)
+        let gid1 = area_view.split_active_group(SplitDirection::Horizontal);
+        assert_eq!(area_view.model.groups.len(), 2);
+        assert_eq!(area_view.model.active_group_id(), gid1);
+
+        let rects = area_view.model.compute_group_rects(bounds);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].0, 0);
+        assert_eq!(rects[1].0, gid1);
+        assert!(rects[1].1.min_x() >= rects[0].1.max_x() + SASH_THICKNESS - 0.1);
+
+        // Shared TextDocument across group 0 and group 1 with isolated cursor & scroll
+        area_view
+            .editor_for_group_mut(gid1, "file:///demo/shared.rs")
+            .unwrap()
+            .set_primary_position(Position::new(2, 0));
+        area_view
+            .editor_for_group_mut(gid1, "file:///demo/shared.rs")
+            .unwrap()
+            .insert_text("// split\n");
+
+        assert_eq!(
+            area_view.editor_for_group(0, "file:///demo/shared.rs").unwrap().text(),
+            area_view.editor_for_group(gid1, "file:///demo/shared.rs").unwrap().text()
+        );
+        assert_eq!(
+            area_view.editor_for_group(0, "file:///demo/shared.rs").unwrap().primary_position().line,
+            0
+        );
+        assert_eq!(
+            area_view.editor_for_group(gid1, "file:///demo/shared.rs").unwrap().primary_position().line,
+            3
+        );
+
+        // Scroll group 0 without changing active group focus
+        let scroll_res = area_view.handle_event(
+            &InputEvent::ScrollWheel(ScrollEvent::new(Point::new(100.0, 120.0), 0.0, -30.0)),
+            bounds,
+        );
+        assert_eq!(scroll_res, EventResult::Consumed);
+        assert_eq!(area_view.model.active_group_id(), gid1);
+
+        // 2. Drag sash to resize horizontal split
+        let sashes = area_view.model.compute_sashes(bounds);
+        assert_eq!(sashes.len(), 1);
+        let sash_center = Point::new(
+            sashes[0].rect.min_x() + sashes[0].rect.width() * 0.5,
+            sashes[0].rect.min_y() + 50.0,
+        );
+        assert_eq!(
+            area_view.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(sash_center, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            area_view.handle_event(
+                &InputEvent::MouseMove(MouseMoveEvent {
+                    position: Point::new(700.0, 50.0)
+                }),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            area_view.handle_event(
+                &InputEvent::MouseUp(MouseEvent::new(Point::new(700.0, 50.0), MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        let resized = area_view.model.compute_group_rects(bounds);
+        assert!(resized[0].1.width() > resized[1].1.width());
+
+        // 3. Vertical split on active group -> 3 groups
+        let gid2 = area_view.split_active_group(SplitDirection::Vertical);
+        assert_eq!(area_view.model.groups.len(), 3);
+        let rects3 = area_view.model.compute_group_rects(bounds);
+        assert_eq!(rects3.len(), 3);
+        let r1 = rects3.iter().find(|(id, _)| *id == gid1).unwrap().1;
+        let r2 = rects3.iter().find(|(id, _)| *id == gid2).unwrap().1;
+        assert!(r2.min_y() > r1.max_y());
+
+        // 4. Close last tab in gid2 -> collapses split back to 2 groups
+        assert!(area_view.close_tab_in_group(gid2, 0));
+        assert_eq!(area_view.model.groups.len(), 2);
+        assert!(area_view.model.group_by_id(gid2).is_none());
+
+        // 5. Close primary group 0's tab -> promotes gid1 into `editors`
+        assert!(area_view.close_tab_in_group(0, 0));
+        assert_eq!(area_view.model.groups.len(), 1);
+        assert!(area_view.editors.contains_key("file:///demo/shared.rs"));
+    }
+
+    #[test]
+    fn test_custom_editor_selector_matching_and_webview_dispatch() {
+        use rustcode_ext_host::manifest::CustomEditorSelector;
+
+        let mut area_view = EditorAreaView::default();
+        area_view.register_custom_editor_contributions(vec![CustomEditorContribution {
+            view_type: "catEdit.catScratch".to_string(),
+            display_name: "Cat Scratch".to_string(),
+            selector: vec![CustomEditorSelector {
+                filename_pattern: "*.cscratch".to_string(),
+            }],
+            priority: Some("default".to_string()),
+        }]);
+
+        area_view.open_file(
+            "file:///workspace/sketch.cscratch",
+            "sketch.cscratch",
+            "ignored raw",
+            false,
+        );
+        assert!(area_view.webviews.contains_key("file:///workspace/sketch.cscratch"));
+        assert!(!area_view.editors.contains_key("file:///workspace/sketch.cscratch"));
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 500.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let mut scene = Scene::new();
+        area_view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("sketch.cscratch"));
+        assert!(scene.contains_text("Custom Editor: Cat Scratch"));
+    }
+
+    #[test]
+    fn test_nested_sash_drag_horizontal_vertical_and_deep() {
+        use rustcode_platform::render::{MouseButton, MouseMoveEvent};
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1000.0, 600.0);
+
+        // 1. 2-level Horizontal -> Horizontal nested sash drag via EditorAreaView::handle_event
+        let mut h_view = EditorAreaView::default();
+        h_view.open_file("file:///a.rs", "a.rs", "let a = 1;\n", false);
+        h_view.split_active_group(SplitDirection::Horizontal);
+        h_view.split_active_group(SplitDirection::Horizontal);
+
+        let sashes_h = h_view.model.compute_sashes(bounds);
+        let nested_h = sashes_h
+            .iter()
+            .find(|s| s.split_path == vec![true])
+            .unwrap()
+            .clone();
+        let h_start = Point::new(
+            nested_h.rect.min_x() + nested_h.rect.width() * 0.5,
+            nested_h.rect.min_y() + 50.0,
+        );
+        let h_target = Point::new(
+            nested_h.parent_bounds.min_x() + nested_h.parent_bounds.width() * 0.25,
+            100.0,
+        );
+        assert_eq!(
+            h_view.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(h_start, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            h_view.handle_event(
+                &InputEvent::MouseMove(MouseMoveEvent { position: h_target }),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            h_view.handle_event(
+                &InputEvent::MouseUp(MouseEvent::new(h_target, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        let moved_h = h_view
+            .model
+            .compute_sashes(bounds)
+            .into_iter()
+            .find(|s| s.split_path == vec![true])
+            .unwrap();
+        let moved_h_center_x = moved_h.rect.min_x() + moved_h.rect.width() * 0.5;
+        assert!(
+            (moved_h_center_x - h_target.x).abs() <= 4.0,
+            "H->H sash center {} should be within 4px of {}",
+            moved_h_center_x,
+            h_target.x
+        );
+
+        // 2. 2-level Vertical -> Vertical nested sash drag via EditorAreaView::handle_event
+        let mut v_view = EditorAreaView::default();
+        v_view.open_file("file:///b.rs", "b.rs", "let b = 2;\n", false);
+        v_view.split_active_group(SplitDirection::Vertical);
+        v_view.split_active_group(SplitDirection::Vertical);
+
+        let sashes_v = v_view.model.compute_sashes(bounds);
+        let nested_v = sashes_v
+            .iter()
+            .find(|s| s.split_path == vec![true])
+            .unwrap()
+            .clone();
+        let v_start = Point::new(
+            nested_v.rect.min_x() + 50.0,
+            nested_v.rect.min_y() + nested_v.rect.height() * 0.5,
+        );
+        let v_target = Point::new(
+            100.0,
+            nested_v.parent_bounds.min_y() + nested_v.parent_bounds.height() * 0.25,
+        );
+        assert_eq!(
+            v_view.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(v_start, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            v_view.handle_event(
+                &InputEvent::MouseMove(MouseMoveEvent { position: v_target }),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            v_view.handle_event(
+                &InputEvent::MouseUp(MouseEvent::new(v_target, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        let moved_v = v_view
+            .model
+            .compute_sashes(bounds)
+            .into_iter()
+            .find(|s| s.split_path == vec![true])
+            .unwrap();
+        let moved_v_center_y = moved_v.rect.min_y() + moved_v.rect.height() * 0.5;
+        assert!(
+            (moved_v_center_y - v_target.y).abs() <= 4.0,
+            "V->V sash center {} should be within 4px of {}",
+            moved_v_center_y,
+            v_target.y
+        );
+
+        // 3. Deeper [true, true] nested sash drag via EditorArea::update_sash_ratio & handle_event
+        h_view.split_active_group(SplitDirection::Horizontal);
+        let deep_sash = h_view
+            .model
+            .compute_sashes(bounds)
+            .into_iter()
+            .find(|s| s.split_path == vec![true, true])
+            .unwrap();
+        let deep_target = Point::new(
+            deep_sash.parent_bounds.min_x() + deep_sash.parent_bounds.width() * 0.7,
+            100.0,
+        );
+        assert!(h_view.model.update_sash_ratio(
+            &deep_sash.split_path,
+            deep_target,
+            deep_sash.parent_bounds
+        ));
+        let moved_deep = h_view
+            .model
+            .compute_sashes(bounds)
+            .into_iter()
+            .find(|s| s.split_path == vec![true, true])
+            .unwrap();
+        let moved_deep_center_x = moved_deep.rect.min_x() + moved_deep.rect.width() * 0.5;
+        assert!(
+            (moved_deep_center_x - deep_target.x).abs() <= 4.0,
+            "[true, true] sash center {} should be within 4px of {}",
+            moved_deep_center_x,
+            deep_target.x
+        );
+    }
+
+    #[test]
+    fn test_preview_keydown_edit_prevents_overwrite_and_cleans_replaced_preview() {
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{KeyCode, KeyEvent};
+
+        let mut area_view = EditorAreaView::default();
+        let bounds = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+
+        // Unedited preview p0 replaced by unedited preview p1 -> p0 cleaned up from editors
+        area_view.open_file("file:///p0.rs", "p0.rs", "let p0 = 0;\n", true);
+        assert!(area_view.editors.contains_key("file:///p0.rs"));
+        area_view.open_file("file:///p1.rs", "p1.rs", "let p1 = 1;\n", true);
+        assert!(!area_view.editors.contains_key("file:///p0.rs"));
+        assert_eq!(area_view.model.current_group_ref().tabs.len(), 1);
+        assert!(area_view.model.current_group_ref().tabs[0].is_preview);
+
+        // Edit p1 via KeyDown -> becomes dirty and non-preview
+        let res = area_view.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char('X'), Modifiers::none())),
+            bounds,
+        );
+        assert_eq!(res, EventResult::Consumed);
+        let p1_tab = &area_view.model.current_group_ref().tabs[0];
+        assert!(p1_tab.is_dirty);
+        assert!(!p1_tab.is_preview);
+
+        // Opening another preview file p2 must preserve p1
+        area_view.open_file("file:///p2.rs", "p2.rs", "let p2 = 2;\n", true);
+        assert_eq!(area_view.model.current_group_ref().tabs.len(), 2);
+        assert_eq!(
+            area_view.model.current_group_ref().tabs[0].uri,
+            "file:///p1.rs"
+        );
+        assert!(area_view.model.current_group_ref().tabs[0].is_dirty);
+        assert!(!area_view.model.current_group_ref().tabs[0].is_preview);
+        assert_eq!(
+            area_view.model.current_group_ref().tabs[1].uri,
+            "file:///p2.rs"
+        );
+    }
+
+    #[test]
+    fn test_same_file_split_keydown_syncs_dirty_tabs_and_sibling_folding() {
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{KeyCode, KeyEvent};
+
+        let mut area_view = EditorAreaView::default();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1000.0, 600.0);
+        let uri = "file:///demo/fold_sync.rs";
+        area_view.open_file(
+            uri,
+            "fold_sync.rs",
+            "fn one() {\n    let a = 1;\n}\n",
+            false,
+        );
+
+        let gid1 = area_view.split_active_group(SplitDirection::Horizontal);
+        let fold_count_before = area_view
+            .editor_for_group(0, uri)
+            .unwrap()
+            .folding_model
+            .ranges()
+            .len();
+        assert_eq!(fold_count_before, 1);
+
+        // Position cursor at end of file in group 1 and type a second foldable function via KeyDown
+        area_view
+            .editor_for_group_mut(gid1, uri)
+            .unwrap()
+            .set_primary_position(Position::new(3, 0));
+        for ch in "fn two() {\n    let b = 2;\n}\n".chars() {
+            let key = if ch == '\n' {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char(ch)
+            };
+            let res = area_view.handle_event(
+                &InputEvent::KeyDown(KeyEvent::new(key, Modifiers::none())),
+                bounds,
+            );
+            assert_eq!(res, EventResult::Consumed);
+        }
+
+        // All groups must mark tab dirty
+        for g in &area_view.model.groups {
+            let tab = g.tabs.iter().find(|t| t.uri == uri).unwrap();
+            assert!(tab.is_dirty, "group {} tab must be dirty", g.id);
+            assert!(!tab.is_preview);
+        }
+
+        // Sibling group 0 folding ranges must match group 1
+        let ranges0 = area_view
+            .editor_for_group(0, uri)
+            .unwrap()
+            .folding_model
+            .ranges()
+            .to_vec();
+        let ranges1 = area_view
+            .editor_for_group(gid1, uri)
+            .unwrap()
+            .folding_model
+            .ranges()
+            .to_vec();
+        assert_eq!(ranges1.len(), 2);
+        assert_eq!(ranges0, ranges1);
+    }
+
+    #[test]
+    fn test_closing_split_mid_sash_drag_clears_active_sash_drag() {
+        use rustcode_platform::render::{MouseButton, MouseMoveEvent};
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file("file:///drag.rs", "drag.rs", "let x = 1;\n", false);
+        let gid1 = area_view.split_active_group(SplitDirection::Horizontal);
+        let bounds = Rect::from_xywh(0.0, 0.0, 1000.0, 600.0);
+
+        let sash = area_view.model.compute_sashes(bounds).pop().unwrap();
+        let sash_pt = Point::new(
+            sash.rect.min_x() + sash.rect.width() * 0.5,
+            sash.rect.min_y() + 40.0,
+        );
+        assert_eq!(
+            area_view.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(sash_pt, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert!(area_view.active_sash_drag.is_some());
+
+        // Collapse via close_tab_in_group
+        assert!(area_view.close_tab_in_group(gid1, 0));
+        assert!(area_view.active_sash_drag.is_none());
+        assert_eq!(
+            area_view.handle_event(
+                &InputEvent::MouseMove(MouseMoveEvent {
+                    position: Point::new(300.0, 40.0)
+                }),
+                bounds
+            ),
+            EventResult::Ignored
+        );
+
+        // Repeat and collapse via close_editors_in_active_group
+        let _gid2 = area_view.split_active_group(SplitDirection::Horizontal);
+        let sash2 = area_view.model.compute_sashes(bounds).pop().unwrap();
+        let sash_pt2 = Point::new(
+            sash2.rect.min_x() + sash2.rect.width() * 0.5,
+            sash2.rect.min_y() + 40.0,
+        );
+        assert_eq!(
+            area_view.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(sash_pt2, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert!(area_view.active_sash_drag.is_some());
+        assert!(area_view.close_editors_in_active_group());
+        assert!(area_view.active_sash_drag.is_none());
+        assert_eq!(
+            area_view.handle_event(
+                &InputEvent::MouseMove(MouseMoveEvent {
+                    position: Point::new(300.0, 40.0)
+                }),
+                bounds
+            ),
+            EventResult::Ignored
+        );
+    }
+
+    #[test]
+    fn test_split_custom_editor_independent_button_hit_testing() {
+        use rustcode_platform::render::MouseButton;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let wv_mgr = ExtHostWebviewManager::new();
+        wv_mgr.create_panel(
+            "ce_split_1",
+            "catEdit.catScratch",
+            "split.cscratch",
+            WebviewOptions::default(),
+        );
+        let html = "<h1>Split Cat</h1><button id=\"feed\">Feed</button>";
+        wv_mgr.set_html("ce_split_1", html);
+
+        let msgs_received = Arc::new(AtomicUsize::new(0));
+        let msgs_clone = msgs_received.clone();
+        wv_mgr.on_did_receive_message("ce_split_1", move |msg| {
+            if msg["id"] == "feed" {
+                msgs_clone.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_custom_editor(
+            "file:///w/split.cscratch",
+            "split.cscratch",
+            "catEdit.catScratch",
+            "ce_split_1",
+            html,
+            WebviewOptions::default(),
+            Some(wv_mgr.clone()),
+            false,
+        );
+        let gid1 = area_view.split_active_group(SplitDirection::Horizontal);
+        assert!(area_view
+            .webview_for_group(0, "file:///w/split.cscratch")
+            .is_some());
+        assert!(area_view
+            .webview_for_group(gid1, "file:///w/split.cscratch")
+            .is_some());
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1000.0, 600.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let mut scene = Scene::new();
+        // Renders Group 0, then Group 1
+        area_view.render(bounds, &theme, &font, &mut scene);
+
+        let g0_btn = area_view
+            .webview_for_group(0, "file:///w/split.cscratch")
+            .unwrap()
+            .button_targets
+            .read()[0]
+            .0;
+        let g1_btn = area_view
+            .webview_for_group(gid1, "file:///w/split.cscratch")
+            .unwrap()
+            .button_targets
+            .read()[0]
+            .0;
+        assert!(g0_btn.max_x() < g1_btn.min_x());
+
+        // Clicking Group 0's button must still hit Group 0's WebviewEditorView even after Group 1 rendered
+        let click_g0 = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(g0_btn.min_x() + 5.0, g0_btn.min_y() + 5.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(area_view.handle_event(&click_g0, bounds), EventResult::Consumed);
+        assert_eq!(msgs_received.load(Ordering::SeqCst), 1);
+
+        // Clicking Group 1's button also works
+        let click_g1 = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(g1_btn.min_x() + 5.0, g1_btn.min_y() + 5.0),
+            MouseButton::Left,
+        ));
+        assert_eq!(area_view.handle_event(&click_g1, bounds), EventResult::Consumed);
+        assert_eq!(msgs_received.load(Ordering::SeqCst), 2);
+
+        // Closing Group 0 promotes Group 1's webview and keeps panel alive
+        assert!(area_view.close_tab_in_group(0, 0));
+        assert!(!wv_mgr.get_panel("ce_split_1").unwrap().is_disposed);
+        assert!(area_view.webviews.contains_key("file:///w/split.cscratch"));
+
+        // Closing the last group disposes the panel
+        assert!(area_view.close_tab_in_group(gid1, 0));
+        assert!(wv_mgr.get_panel("ce_split_1").unwrap().is_disposed);
     }
 }
 

@@ -1,11 +1,50 @@
 // MessagePack / JSON RPC bridge between the Extension Host JavaScript runtime and RustCore.
 
+const { Uri } = require('./vscode-api/types');
+
 const globalDeno = typeof Deno !== 'undefined' ? Deno : null;
 const ops = (globalDeno && globalDeno.core && globalDeno.core.ops) || {};
 
 let nextId = 1;
 const objectProxies = new Map();
 const eventSubscribers = new Map();
+const customDocuments = new Map();
+
+function findRegisteredProvider(type, id) {
+  const key = `${type}:${id}`;
+  let proxy = objectProxies.get(key);
+  if (!proxy) {
+    for (const [k, p] of objectProxies.entries()) {
+      if (k.startsWith(`${type}:`) && p.metadata && p.metadata.selector === id) {
+        proxy = p;
+        break;
+      }
+    }
+  }
+  return proxy || null;
+}
+
+function parseCustomEditorUri(uri) {
+  if (!uri) {
+    return Uri.file('');
+  }
+  if (typeof uri === 'string') {
+    return Uri.parse(uri);
+  }
+  if (uri instanceof Uri) {
+    return uri;
+  }
+  if (typeof uri === 'object' && typeof uri.scheme === 'string') {
+    return new Uri(
+      uri.scheme,
+      uri.authority || '',
+      uri.path || uri.fsPath || '',
+      uri.query || '',
+      uri.fragment || ''
+    );
+  }
+  return Uri.file(String(uri));
+}
 
 const rpc = {
   // Asynchronous RPC call to Rust Core
@@ -95,6 +134,62 @@ const rpc = {
         }
         rpc.call('extHost.unregisterProvider', { type, id });
       }
+    };
+  },
+
+  createWebviewPanelProxy(id, viewType, title, options = {}) {
+    let _html = '';
+    let _disposed = false;
+    const messageEvent = rpc.createEvent(`webview.onDidReceiveMessage.${id}`);
+    const disposeEvent = rpc.createEvent(`webview.onDidDispose.${id}`);
+
+    const webview = {
+      get html() {
+        return _html;
+      },
+      set html(value) {
+        if (_disposed) {
+          return;
+        }
+        _html = String(value ?? '');
+        rpc.call('window.setWebviewHtml', { id, html: _html });
+      },
+      postMessage(message) {
+        if (_disposed) {
+          return Promise.resolve(false);
+        }
+        return rpc.call('window.postMessageToWebview', { id, message });
+      },
+      onDidReceiveMessage: messageEvent,
+      options: options || {},
+      cspSource: 'rustcode-webview:',
+      asWebviewUri(uri) {
+        return uri;
+      },
+    };
+
+    return {
+      id,
+      viewType,
+      title,
+      webview,
+      reveal(viewColumn) {
+        if (_disposed) {
+          return;
+        }
+        rpc.call('window.revealWebviewPanel', { id, viewColumn });
+      },
+      dispose() {
+        if (_disposed) {
+          return;
+        }
+        _disposed = true;
+        rpc.call('window.disposeWebviewPanel', { id });
+        rpc.dispatchNotification(`webview.onDidDispose.${id}`, {});
+        eventSubscribers.delete(`webview.onDidReceiveMessage.${id}`);
+        eventSubscribers.delete(`webview.onDidDispose.${id}`);
+      },
+      onDidDispose: disposeEvent,
     };
   },
 
@@ -314,21 +409,173 @@ const rpc = {
         sessionId
       );
     }
+    if (method === 'window.openCustomDocument' || method === 'CustomEditor.openCustomDocument') {
+      const { providerId, viewType, uri, openContext, token } = params;
+      const id = providerId || viewType;
+      const parsedUri = parseCustomEditorUri(uri);
+      const doc = await this.invokeProvider(
+        'CustomEditor',
+        id,
+        'openCustomDocument',
+        parsedUri,
+        openContext || {},
+        token || { isCancellationRequested: false }
+      );
+      customDocuments.set(`${id}:${parsedUri.toString()}`, doc);
+      return doc || { uri: parsedUri.toString(), opened: true };
+    }
+    if (
+      method === 'window.resolveCustomEditor' ||
+      method === 'CustomEditor.resolveCustomEditor' ||
+      method === 'CustomEditor.resolveCustomTextEditor'
+    ) {
+      const {
+        providerId,
+        viewType,
+        uri,
+        panelId,
+        title,
+        options,
+        text,
+        version,
+        languageId,
+        token,
+      } = params;
+      const id = providerId || viewType;
+      const proxy = findRegisteredProvider('CustomEditor', id);
+      if (!proxy || !proxy.provider) {
+        throw new Error(`Provider not found: CustomEditor:${id}`);
+      }
+      const parsedUri = parseCustomEditorUri(uri);
+      const docKey = `${id}:${parsedUri.toString()}`;
+      let doc = customDocuments.get(docKey);
+      if (!doc) {
+        doc = {
+          uri: parsedUri,
+          fileName: parsedUri.fsPath || String(uri || ''),
+          languageId: languageId || 'plaintext',
+          version: typeof version === 'number' ? version : 1,
+          isDirty: false,
+          getText() {
+            return typeof text === 'string' ? text : '';
+          },
+        };
+      }
+      const resolvedPanelId = panelId || `custom_editor_${nextId++}`;
+      const resolvedViewType = viewType || id;
+      const resolvedTitle = title || parsedUri.fsPath || resolvedViewType;
+      const resolvedOptions =
+        options || (proxy.metadata && proxy.metadata.webviewOptions) || {};
+      const webviewPanel = this.createWebviewPanelProxy(
+        resolvedPanelId,
+        resolvedViewType,
+        resolvedTitle,
+        resolvedOptions
+      );
+
+      let methodName = 'resolveCustomEditor';
+      if (method === 'CustomEditor.resolveCustomTextEditor') {
+        methodName = 'resolveCustomTextEditor';
+      } else if (method === 'CustomEditor.resolveCustomEditor') {
+        methodName = 'resolveCustomEditor';
+      } else if (
+        customDocuments.has(docKey) &&
+        typeof proxy.provider.resolveCustomEditor === 'function'
+      ) {
+        methodName = 'resolveCustomEditor';
+      } else if (typeof proxy.provider.resolveCustomTextEditor === 'function') {
+        methodName = 'resolveCustomTextEditor';
+      }
+
+      await this.invokeProvider(
+        'CustomEditor',
+        id,
+        methodName,
+        doc,
+        webviewPanel,
+        token || { isCancellationRequested: false }
+      );
+      return {
+        resolved: true,
+        panelId: webviewPanel.id,
+        viewType: resolvedViewType,
+        html: webviewPanel.webview.html,
+      };
+    }
+    if (method === 'window.saveCustomDocument' || method === 'CustomEditor.saveCustomDocument') {
+      const { providerId, viewType, uri, token } = params;
+      const id = providerId || viewType;
+      const parsedUri = parseCustomEditorUri(uri);
+      const doc = customDocuments.get(`${id}:${parsedUri.toString()}`) || { uri: parsedUri };
+      return await this.invokeProvider(
+        'CustomEditor',
+        id,
+        'saveCustomDocument',
+        doc,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'window.saveCustomDocumentAs' || method === 'CustomEditor.saveCustomDocumentAs') {
+      const { providerId, viewType, uri, destination, targetResource, token } = params;
+      const id = providerId || viewType;
+      const parsedUri = parseCustomEditorUri(uri);
+      const destUri = parseCustomEditorUri(destination || targetResource);
+      const doc = customDocuments.get(`${id}:${parsedUri.toString()}`) || { uri: parsedUri };
+      return await this.invokeProvider(
+        'CustomEditor',
+        id,
+        'saveCustomDocumentAs',
+        doc,
+        destUri,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'window.revertCustomDocument' || method === 'CustomEditor.revertCustomDocument') {
+      const { providerId, viewType, uri, token } = params;
+      const id = providerId || viewType;
+      const parsedUri = parseCustomEditorUri(uri);
+      const doc = customDocuments.get(`${id}:${parsedUri.toString()}`) || { uri: parsedUri };
+      return await this.invokeProvider(
+        'CustomEditor',
+        id,
+        'revertCustomDocument',
+        doc,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'window.backupCustomDocument' || method === 'CustomEditor.backupCustomDocument') {
+      const { providerId, viewType, uri, context, token } = params;
+      const id = providerId || viewType;
+      const parsedUri = parseCustomEditorUri(uri);
+      const doc = customDocuments.get(`${id}:${parsedUri.toString()}`) || { uri: parsedUri };
+      return await this.invokeProvider(
+        'CustomEditor',
+        id,
+        'backupCustomDocument',
+        doc,
+        context || {},
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'window.closeCustomDocument' || method === 'CustomEditor.closeCustomDocument') {
+      const { providerId, viewType, uri } = params;
+      const id = providerId || viewType;
+      const parsedUri = parseCustomEditorUri(uri);
+      const docKey = `${id}:${parsedUri.toString()}`;
+      const doc = customDocuments.get(docKey);
+      customDocuments.delete(docKey);
+      if (doc && typeof doc.dispose === 'function') {
+        doc.dispose();
+      }
+      return { closed: true, uri: parsedUri.toString() };
+    }
     throw new Error(`Unknown incoming method: ${method}`);
   },
 
   // Invoke a method on a registered provider proxy (called from Rust Core)
   async invokeProvider(type, id, method, ...args) {
-    let key = `${type}:${id}`;
-    let proxy = objectProxies.get(key);
-    if (!proxy) {
-      for (const [k, p] of objectProxies.entries()) {
-        if (k.startsWith(`${type}:`) && p.metadata && p.metadata.selector === id) {
-          proxy = p;
-          break;
-        }
-      }
-    }
+    const key = `${type}:${id}`;
+    const proxy = findRegisteredProvider(type, id);
     if (!proxy || !proxy.provider) {
       throw new Error(`Provider not found: ${key}`);
     }

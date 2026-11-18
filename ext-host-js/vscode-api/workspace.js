@@ -50,6 +50,10 @@ const workspace = {
   onDidCloseTextDocument: rpc.createEvent('workspace.onDidCloseTextDocument'),
   onDidChangeTextDocument: rpc.createEvent('workspace.onDidChangeTextDocument'),
   onDidSaveTextDocument: rpc.createEvent('workspace.onDidSaveTextDocument'),
+  onDidOpenNotebookDocument: rpc.createEvent('notebooks.onDidOpenNotebookDocument'),
+  onDidCloseNotebookDocument: rpc.createEvent('notebooks.onDidCloseNotebookDocument'),
+  onDidChangeNotebookDocument: rpc.createEvent('notebooks.onDidChangeNotebookDocument'),
+  onDidSaveNotebookDocument: rpc.createEvent('notebooks.onDidSaveNotebookDocument'),
 };
 
 module.exports = workspace;

@@ -163,6 +163,25 @@ impl WorkbenchView {
         self.focused_region = FocusedRegion::Editor;
     }
 
+    pub fn open_notebook(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
+        self.editor_area.open_notebook(uri, title, content, is_preview);
+        self.focused_region = FocusedRegion::Editor;
+    }
+
+    pub fn new_untitled_notebook(&mut self) {
+        let mut n = 1usize;
+        let uri = loop {
+            let candidate = format!("untitled://Untitled-{}.ipynb", n);
+            if !self.editor_area.notebooks.contains_key(&candidate) {
+                break candidate;
+            }
+            n += 1;
+        };
+        let title = format!("Untitled-{}.ipynb", n);
+        self.editor_area.open_notebook(&uri, &title, "", false);
+        self.focused_region = FocusedRegion::Editor;
+    }
+
     // --- Layout Region Calculations ---
 
     pub fn compute_regions(&self, bounds: Rect) -> WorkbenchRegions {

@@ -74,8 +74,40 @@ impl WorkbenchWindow {
 
     pub fn open_settings(&mut self) {
         self.view.open_settings(Some(self.config.clone()));
-        self.context_keys.set_bool("editorTextFocus", true);
-        self.context_keys.set_bool("sideBarFocus", false);
+        self.sync_focus_context_keys();
+    }
+
+    pub fn new_untitled_notebook(&mut self) {
+        self.view.new_untitled_notebook();
+        self.sync_focus_context_keys();
+    }
+
+    fn sync_focus_context_keys(&mut self) {
+        match self.view.focused_region {
+            crate::workbench_view::FocusedRegion::Editor => {
+                self.context_keys.set_bool("editorTextFocus", true);
+                self.context_keys.set_bool("sideBarFocus", false);
+                self.context_keys.set_bool("inCommandPalette", false);
+                self.context_keys.set_bool(
+                    "notebookEditorFocused",
+                    self.view.editor_area.active_notebook().is_some(),
+                );
+            }
+            crate::workbench_view::FocusedRegion::Sidebar => {
+                self.context_keys.set_bool("editorTextFocus", false);
+                self.context_keys.set_bool("sideBarFocus", true);
+                self.context_keys.set_bool("inCommandPalette", false);
+                self.context_keys.set_bool("notebookEditorFocused", false);
+            }
+            crate::workbench_view::FocusedRegion::CommandPalette => {
+                self.context_keys.set_bool("inCommandPalette", true);
+                self.context_keys.set_bool("notebookEditorFocused", false);
+            }
+            _ => {
+                self.context_keys.set_bool("inCommandPalette", false);
+                self.context_keys.set_bool("notebookEditorFocused", false);
+            }
+        }
     }
 
     pub fn with_language_bridge(mut self, bridge: Arc<LanguageFeatureBridge>) -> Self {
@@ -109,6 +141,7 @@ impl WorkbenchWindow {
                 if let Some(cmd_id) = self.keybindings.handle_key(&combo, &self.context_keys) {
                     let _ = self.commands.execute(&cmd_id, None);
                     self.handle_builtin_command_effects(&cmd_id);
+                    self.sync_focus_context_keys();
                     return EventResult::Consumed;
                 }
             }
@@ -118,20 +151,7 @@ impl WorkbenchWindow {
         let res = self.view.handle_event(event, bounds);
 
         // 3. Update context keys from focused region
-        match self.view.focused_region {
-            crate::workbench_view::FocusedRegion::Editor => {
-                self.context_keys.set_bool("editorTextFocus", true);
-                self.context_keys.set_bool("sideBarFocus", false);
-            }
-            crate::workbench_view::FocusedRegion::Sidebar => {
-                self.context_keys.set_bool("editorTextFocus", false);
-                self.context_keys.set_bool("sideBarFocus", true);
-            }
-            crate::workbench_view::FocusedRegion::CommandPalette => {
-                self.context_keys.set_bool("inCommandPalette", true);
-            }
-            _ => {}
-        }
+        self.sync_focus_context_keys();
 
         // 4. Process any actions emitted by views
         if let Some(action) = self.view.last_action.take() {
@@ -139,12 +159,14 @@ impl WorkbenchWindow {
                 WorkbenchAction::ExecuteCommand(cmd) => {
                     let _ = self.commands.execute(&cmd, None);
                     self.handle_builtin_command_effects(&cmd);
+                    self.sync_focus_context_keys();
                 }
                 WorkbenchAction::OpenFile(path) => {
                     let path_str = path.to_string_lossy().to_string();
                     let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
                     let content = std::fs::read_to_string(&path).unwrap_or_default();
                     self.open_file(&path_str, title, &content, false);
+                    self.sync_focus_context_keys();
                 }
                 WorkbenchAction::JumpToDiagnostic { .. } => {}
                 WorkbenchAction::SidebarToggled(_) => {}
@@ -189,6 +211,21 @@ impl WorkbenchWindow {
             "workbench.action.openSettings" => {
                 self.open_settings();
             }
+            "workbench.action.files.newUntitledNotebook" => {
+                self.new_untitled_notebook();
+            }
+            "notebook.cell.execute" => {
+                if let Some(nb) = self.view.editor_area.active_notebook_mut() {
+                    nb.execute_active_cell();
+                }
+                self.view.editor_area.sync_dirty_states();
+            }
+            "notebook.execute" => {
+                if let Some(nb) = self.view.editor_area.active_notebook_mut() {
+                    nb.execute_all_cells();
+                }
+                self.view.editor_area.sync_dirty_states();
+            }
             "workbench.action.closeActiveEditor" => {
                 if let Some(active_tab) = self.view.editor_area.model.current_group_ref().active_tab_index {
                     self.view.editor_area.close_tab(active_tab);
@@ -232,7 +269,10 @@ impl WorkbenchWindow {
             let keybinding = self.keybindings.lookup_keybinding(&cmd_id);
             items.push(PaletteItem::command(
                 cmd_id.clone(),
-                cmd_id.replace("workbench.action.", "").replace("editor.action.", ""),
+                cmd_id
+                    .replace("workbench.action.files.", "")
+                    .replace("workbench.action.", "")
+                    .replace("editor.action.", ""),
                 Some("Command".to_string()),
                 keybinding,
             ));
@@ -242,6 +282,7 @@ impl WorkbenchWindow {
         palette.set_items(items);
         palette.open_mode(crate::quickinput::QuickInputMode::Command);
         self.view.open_command_palette(CommandPaletteView::new(palette));
+        self.sync_focus_context_keys();
     }
 
     pub fn open_quick_open_files(&mut self) {
@@ -260,7 +301,10 @@ impl WorkbenchWindow {
             let keybinding = self.keybindings.lookup_keybinding(&cmd_id);
             items.push(PaletteItem::command(
                 cmd_id.clone(),
-                cmd_id.replace("workbench.action.", "").replace("editor.action.", ""),
+                cmd_id
+                    .replace("workbench.action.files.", "")
+                    .replace("workbench.action.", "")
+                    .replace("editor.action.", ""),
                 Some("Command".to_string()),
                 keybinding,
             ));
@@ -270,6 +314,7 @@ impl WorkbenchWindow {
         palette.set_items(items);
         palette.open_mode(crate::quickinput::QuickInputMode::File);
         self.view.open_command_palette(CommandPaletteView::new(palette));
+        self.sync_focus_context_keys();
     }
 
     pub fn open_quick_open_symbols(&mut self) {
@@ -290,12 +335,15 @@ impl WorkbenchWindow {
         palette.set_items(items);
         palette.open_mode(crate::quickinput::QuickInputMode::WorkspaceSymbol);
         self.view.open_command_palette(CommandPaletteView::new(palette));
+        self.sync_focus_context_keys();
     }
 
     pub fn open_file(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
         self.view
             .editor_area
             .open_file(uri, title, content, is_preview);
+        self.view.focused_region = crate::workbench_view::FocusedRegion::Editor;
+        self.sync_focus_context_keys();
     }
 
     pub async fn format_active_document(&mut self) -> bool {
@@ -369,6 +417,7 @@ impl WorkbenchWindow {
         palette.set_items(items);
         palette.open_mode(crate::quickinput::QuickInputMode::Command);
         self.view.open_command_palette(CommandPaletteView::new(palette));
+        self.sync_focus_context_keys();
         true
     }
 
@@ -859,6 +908,214 @@ mod tests {
                 .unwrap()
                 .current_value,
             serde_json::Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_workbench_window_notebook_focus_context_key_on_keybinding_return() {
+        let mut window = WorkbenchWindow::default();
+        let _sub_close = window
+            .commands
+            .register("workbench.action.closeActiveEditor", |_| {
+                Ok(serde_json::json!({ "closed": true }))
+            });
+        let _sub_settings = window
+            .commands
+            .register("workbench.action.openSettings", |_| {
+                Ok(serde_json::json!({ "opened": "settings" }))
+            });
+        window
+            .keybindings
+            .load_keybindings_json(include_str!("../../../resources/default-keymaps/linux.json"))
+            .unwrap();
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+
+        window.new_untitled_notebook();
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(true))
+        );
+
+        // Ctrl+, opens Settings via keybinding early return -> notebookEditorFocused becomes false
+        let ctrl_comma = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char(','),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        assert_eq!(window.dispatch_event(&ctrl_comma, bounds), EventResult::Consumed);
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(false))
+        );
+
+        // Re-open notebook, then close via Ctrl+W keybinding early return -> false
+        window.new_untitled_notebook();
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(true))
+        );
+        let ctrl_w = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('w'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        assert_eq!(window.dispatch_event(&ctrl_w, bounds), EventResult::Consumed);
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(false))
+        );
+    }
+
+    #[test]
+    fn test_workbench_window_open_file_and_palette_syncs_context_keys() {
+        use rustcode_base::context_key::ContextKeyExpr;
+
+        let mut window = WorkbenchWindow::default();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let nb_focused_expr = ContextKeyExpr::parse("notebookEditorFocused").unwrap();
+        let in_palette_expr = ContextKeyExpr::parse("inCommandPalette").unwrap();
+
+        // Start focused on Sidebar to verify open_file focuses Editor and syncs context keys
+        window.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
+        window.context_keys.set_bool("sideBarFocus", true);
+        window.context_keys.set_bool("editorTextFocus", false);
+
+        // 1. Fresh window open_file with .ipynb sets notebookEditorFocused == true and focuses Editor
+        window.open_file("file:///probe.ipynb", "probe.ipynb", "", false);
+        assert_eq!(
+            window.view.focused_region,
+            crate::workbench_view::FocusedRegion::Editor
+        );
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            window.context_keys.get("editorTextFocus"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            window.context_keys.get("sideBarFocus"),
+            Some(serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(false))
+        );
+        assert!(nb_focused_expr.evaluate(&window.context_keys));
+
+        // 2. Switching to a regular .rs file clears notebookEditorFocused to false
+        window.open_file("file:///probe.rs", "probe.rs", "fn main() {}", false);
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(false))
+        );
+        assert!(!nb_focused_expr.evaluate(&window.context_keys));
+
+        // 3. Switch back to the notebook tab via open_file -> notebookEditorFocused == true
+        window.open_file("file:///probe.ipynb", "probe.ipynb", "", false);
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert!(nb_focused_expr.evaluate(&window.context_keys));
+
+        // 4. open_command_palette sets inCommandPalette == true and notebookEditorFocused == false;
+        //    closing via Escape restores inCommandPalette == false and notebookEditorFocused == true.
+        let esc_ev = InputEvent::KeyDown(KeyEvent::new(KeyCode::Escape, Modifiers::none()));
+
+        window.open_command_palette();
+        assert!(window.view.is_command_palette_open);
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(false))
+        );
+        assert!(in_palette_expr.evaluate(&window.context_keys));
+        assert!(!nb_focused_expr.evaluate(&window.context_keys));
+
+        window.dispatch_event(&esc_ev, bounds);
+        assert!(!window.view.is_command_palette_open);
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert!(!in_palette_expr.evaluate(&window.context_keys));
+        assert!(nb_focused_expr.evaluate(&window.context_keys));
+
+        // 5. open_quick_open_files, open_quick_open_symbols, and show_quick_fixes_palette
+        //    also sync inCommandPalette/notebookEditorFocused on open and reset on close.
+        window.open_quick_open_files();
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(false))
+        );
+        window.dispatch_event(&esc_ev, bounds);
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(false))
+        );
+
+        window.open_quick_open_symbols();
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(false))
+        );
+        window.dispatch_event(&esc_ev, bounds);
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(false))
+        );
+
+        window.pending_code_actions.push(CodeAction {
+            title: "Dummy Fix".to_string(),
+            kind: Some("quickfix".to_string()),
+            diagnostics: None,
+            is_preferred: None,
+            edit: None,
+            command: None,
+        });
+        assert!(window.show_quick_fixes_palette());
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(true))
+        );
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(false))
+        );
+        window.dispatch_event(&esc_ev, bounds);
+        assert_eq!(
+            window.context_keys.get("inCommandPalette"),
+            Some(serde_json::Value::Bool(false))
+        );
+        assert_eq!(
+            window.context_keys.get("notebookEditorFocused"),
+            Some(serde_json::Value::Bool(true))
         );
     }
 }

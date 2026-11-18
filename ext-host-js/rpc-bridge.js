@@ -120,6 +120,60 @@ const rpc = {
       const { providerId, uri, position } = params;
       return await this.invokeProvider('Definition', providerId, 'provideDefinition', uri, position);
     }
+    if (method === 'notebooks.deserializeNotebook' || method === 'NotebookSerializer.deserializeNotebook') {
+      const { providerId, notebookType, content, token } = params;
+      const id = providerId || notebookType;
+      let bytes;
+      if (content instanceof Uint8Array) {
+        bytes = content;
+      } else if (Array.isArray(content)) {
+        bytes = Uint8Array.from(content);
+      } else if (typeof content === 'string') {
+        bytes = typeof TextEncoder !== 'undefined'
+          ? new TextEncoder().encode(content)
+          : Uint8Array.from(Array.from(content).map((c) => c.charCodeAt(0) & 0xff));
+      } else {
+        bytes = new Uint8Array(0);
+      }
+      return await this.invokeProvider(
+        'NotebookSerializer',
+        id,
+        'deserializeNotebook',
+        bytes,
+        token || { isCancellationRequested: false }
+      );
+    }
+    if (method === 'notebooks.serializeNotebook' || method === 'NotebookSerializer.serializeNotebook') {
+      const { providerId, notebookType, data, token } = params;
+      const id = providerId || notebookType;
+      const res = await this.invokeProvider(
+        'NotebookSerializer',
+        id,
+        'serializeNotebook',
+        data,
+        token || { isCancellationRequested: false }
+      );
+      return res instanceof Uint8Array ? Array.from(res) : res;
+    }
+    if (method === 'notebooks.executeCells' || method === 'NotebookController.execute') {
+      const { controllerId, providerId, cells, notebook } = params;
+      return await this.invokeProvider(
+        'NotebookController',
+        controllerId || providerId,
+        'execute',
+        cells || [],
+        notebook || {}
+      );
+    }
+    if (method === 'notebooks.interruptExecution' || method === 'NotebookController.interrupt') {
+      const { controllerId, providerId, notebook } = params;
+      return await this.invokeProvider(
+        'NotebookController',
+        controllerId || providerId,
+        'interrupt',
+        notebook || {}
+      );
+    }
     throw new Error(`Unknown incoming method: ${method}`);
   },
 

@@ -91,6 +91,21 @@ impl RustCodeContext {
         store.add_boxed(self.commands.register("editor.action.quickFix", |_| {
             Ok(json!({ "quickFix": true }))
         }));
+
+        store.add_boxed(
+            self.commands
+                .register("workbench.action.files.newUntitledNotebook", |_| {
+                    Ok(json!({ "notebook": "created" }))
+                }),
+        );
+
+        store.add_boxed(self.commands.register("notebook.execute", |_| {
+            Ok(json!({ "notebookExecuted": true }))
+        }));
+
+        store.add_boxed(self.commands.register("notebook.cell.execute", |_| {
+            Ok(json!({ "cellExecuted": true }))
+        }));
     }
 
     /// Instantiate a GPUI WorkbenchWindow host wired to this service container.

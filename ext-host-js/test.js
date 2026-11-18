@@ -57,7 +57,75 @@ assert(action.title === 'Fix issue', 'CodeAction title mismatch');
 assert(action.kind === 'quickfix', 'CodeAction kind mismatch');
 action.edit = wsEdit;
 
-console.log('All JavaScript extension host tests passed successfully!');
+console.log('[Test] Testing vscode.notebooks API...');
+const rpc = require('./rpc-bridge');
+assert(vscode.NotebookCellKind.Markup === 1, 'NotebookCellKind.Markup mismatch');
+assert(vscode.NotebookCellKind.Code === 2, 'NotebookCellKind.Code mismatch');
+assert(typeof vscode.notebooks.registerNotebookSerializer === 'function');
+assert(typeof vscode.notebooks.createNotebookController === 'function');
+assert(typeof vscode.notebooks.createNotebookCellExecution === 'function');
+assert(typeof vscode.notebooks.onDidOpenNotebookDocument === 'function');
+
+const nbCell = new vscode.NotebookCellData(vscode.NotebookCellKind.Code, 'x = 1', 'python');
+const nbData = new vscode.NotebookData([nbCell]);
+assert(nbData.cells.length === 1, 'NotebookData cells length mismatch');
+
+const outItem = vscode.NotebookCellOutputItem.text('hello');
+const outItemJson = outItem.toJSON();
+assert(outItemJson.mime === 'text/plain', 'NotebookCellOutputItem mime mismatch');
+assert(Array.isArray(outItemJson.data) && outItemJson.data.length === 5, 'NotebookCellOutputItem data JSON mismatch');
+const cellOutput = new vscode.NotebookCellOutput([outItem]);
+assert(cellOutput.items.length === 1, 'NotebookCellOutput items length mismatch');
+
+const nbRange = new vscode.NotebookRange(0, 2);
+assert(!nbRange.isEmpty, 'NotebookRange should not be empty');
+const nbEdit = vscode.NotebookEdit.replaceCells(nbRange, [nbCell]);
+assert(nbEdit.newCells.length === 1, 'NotebookEdit newCells mismatch');
+
+const serDisp = vscode.notebooks.registerNotebookSerializer('jupyter-notebook', {
+  deserializeNotebook(bytes) {
+    return new vscode.NotebookData([
+      new vscode.NotebookCellData(vscode.NotebookCellKind.Code, String(bytes.length), 'python'),
+    ]);
+  },
+  serializeNotebook(data) {
+    return new Uint8Array([data.cells.length]);
+  },
+});
+
+let executedCount = 0;
+const ctrl = vscode.notebooks.createNotebookController('pure-rust', 'jupyter-notebook', 'Pure Rust', (cells) => {
+  executedCount += cells.length;
+});
+const exec = ctrl.createNotebookCellExecution({ index: 0, notebookUri: 'file:///demo.ipynb' });
+exec.start(100);
+exec.replaceOutput(cellOutput);
+exec.end(true, 200);
+
+(async () => {
+  const deser = await rpc.handleIncomingRequest('notebooks.deserializeNotebook', {
+    notebookType: 'jupyter-notebook',
+    content: 'abc',
+  });
+  assert(deser.cells.length === 1 && deser.cells[0].value === '3', 'deserializeNotebook RPC failed');
+
+  const ser = await rpc.handleIncomingRequest('notebooks.serializeNotebook', {
+    notebookType: 'jupyter-notebook',
+    data: deser,
+  });
+  assert(Array.isArray(ser) && ser[0] === 1, 'serializeNotebook RPC failed');
+
+  await rpc.handleIncomingRequest('notebooks.executeCells', {
+    controllerId: 'pure-rust',
+    cells: [nbCell],
+    notebook: { uri: 'file:///demo.ipynb' },
+  });
+  assert(executedCount === 1, 'executeCells RPC failed');
+
+  ctrl.dispose();
+  serDisp.dispose();
+  console.log('All JavaScript extension host tests passed successfully!');
+})();
 
 function assert(condition, message) {
   if (!condition) {

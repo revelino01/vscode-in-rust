@@ -21,6 +21,8 @@ pub enum ProviderType {
     DocumentFormatting,
     CodeAction,
     TreeData,
+    NotebookSerializer,
+    NotebookController,
 }
 
 impl ProviderType {
@@ -33,6 +35,8 @@ impl ProviderType {
             "DocumentFormatting" => Some(Self::DocumentFormatting),
             "CodeAction" => Some(Self::CodeAction),
             "TreeData" => Some(Self::TreeData),
+            "NotebookSerializer" => Some(Self::NotebookSerializer),
+            "NotebookController" => Some(Self::NotebookController),
             _ => None,
         }
     }
@@ -125,5 +129,14 @@ mod tests {
         registry.unregister("rust-analyzer-completion");
         let remaining = registry.get_providers_for_language(ProviderType::Completion, "rust");
         assert!(remaining.is_empty());
+
+        assert_eq!(
+            ProviderType::from_str_name("NotebookSerializer"),
+            Some(ProviderType::NotebookSerializer)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("NotebookController"),
+            Some(ProviderType::NotebookController)
+        );
     }
 }

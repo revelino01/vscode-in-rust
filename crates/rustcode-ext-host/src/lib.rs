@@ -5,6 +5,7 @@
 
 pub mod manifest;
 pub mod marketplace;
+pub mod notebook;
 pub mod provider;
 pub mod rpc;
 pub mod webview;
@@ -17,6 +18,11 @@ pub use manifest::{
 pub use marketplace::{
     CurlHttpTransport, ExtensionDownloader, ExtensionFiles, ExtensionInstaller, ExtensionMetadata,
     HttpTransport, MarketplaceClient, MarketplaceError, MockHttpTransport, SearchResponse,
+};
+pub use notebook::{
+    ExtHostNotebookManager, ExtNotebookCellData, ExtNotebookCellKind, ExtNotebookCellOutput,
+    ExtNotebookCellOutputItem, ExtNotebookData, NotebookCellExecutionState,
+    NotebookControllerInfo, NotebookEventListener, NotebookSerializerInfo,
 };
 pub use provider::{
     DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, LanguageFeatureBridge,

@@ -13,6 +13,7 @@ pub mod debug;
 pub mod editor_area;
 pub mod explorer;
 pub mod layout;
+pub mod notebook;
 pub mod problems;
 pub mod quickinput;
 pub mod scm;
@@ -32,6 +33,10 @@ pub use debug::{
 pub use editor_area::{EditorArea, EditorAreaAction, EditorAreaView, EditorGroup, EditorTab};
 pub use explorer::{ExplorerAction, ExplorerRow, FileExplorer, FileExplorerView, FileTreeNode};
 pub use layout::WorkbenchLayout;
+pub use notebook::{
+    CellKind, CellOutput, KernelValue, NotebookAction, NotebookCell, NotebookClickTarget,
+    NotebookDocument, NotebookEditorView, NotebookKernel,
+};
 pub use problems::{ProblemEntry, ProblemsAction, ProblemsPanel};
 pub use quickinput::{CommandPalette, CommandPaletteView, PaletteAction, PaletteItem};
 pub use scm::{ScmAction, ScmView};

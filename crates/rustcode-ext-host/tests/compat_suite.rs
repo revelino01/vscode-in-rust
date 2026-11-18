@@ -698,3 +698,350 @@ async fn test_compat_full_extension_end_to_end_workflow() {
     assert!(editor.undo());
     assert_eq!(editor.text(), initial_source);
 }
+
+#[tokio::test]
+async fn test_compat_notebook_provider_and_execution_lifecycle() {
+    let reg = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp_mgr = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(reg.clone(), rpc.clone(), lsp_mgr);
+
+    let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+    bridge.notebook_manager.on_notebook_event(move |name, _| {
+        events_clone.lock().push(name);
+    });
+
+    // 1. Register NotebookSerializer and NotebookController proxies
+    let ser_reg = bridge
+        .handle_rpc_message(
+            "extHost.registerProvider",
+            &json!({
+                "type": "NotebookSerializer",
+                "id": "jupyter-notebook",
+                "selector": "jupyter-notebook"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ser_reg["registered"], true);
+
+    let ctrl_reg = bridge
+        .handle_rpc_message(
+            "extHost.registerProvider",
+            &json!({
+                "type": "NotebookController",
+                "id": "rust-kernel",
+                "selector": "jupyter-notebook"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ctrl_reg["registered"], true);
+
+    assert_eq!(
+        reg.get_providers_for_language(ProviderType::NotebookSerializer, "jupyter-notebook")
+            .len(),
+        1
+    );
+    assert_eq!(
+        reg.get_providers_for_language(ProviderType::NotebookController, "jupyter-notebook")
+            .len(),
+        1
+    );
+
+    // 2. Register serializer, create controller, run execution lifecycle
+    bridge
+        .handle_rpc_message(
+            "notebooks.registerSerializer",
+            &json!({ "id": "jupyter-notebook", "notebookType": "jupyter-notebook" }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "notebooks.createController",
+            &json!({
+                "id": "rust-kernel",
+                "notebookType": "jupyter-notebook",
+                "label": "Pure Rust Kernel",
+                "supportedLanguages": ["python"],
+                "supportsExecutionOrder": true
+            }),
+        )
+        .await
+        .unwrap();
+
+    bridge
+        .handle_rpc_message(
+            "notebooks.updateExecution",
+            &json!({
+                "controllerId": "rust-kernel",
+                "notebookUri": "file:///demo.ipynb",
+                "cellIndex": 0,
+                "state": "start",
+                "executionOrder": 1
+            }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "notebooks.updateCellOutputs",
+            &json!({
+                "notebookUri": "file:///demo.ipynb",
+                "cellIndex": 0,
+                "outputs": [{ "items": [{ "mime": "text/plain", "data": [52, 50] }] }]
+            }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "notebooks.appendCellOutputs",
+            &json!({
+                "notebookUri": "file:///demo.ipynb",
+                "cellIndex": 0,
+                "outputs": [{ "items": [{ "mime": "application/vnd.code.notebook.stdout", "data": [111, 107] }] }]
+            }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "notebooks.updateExecution",
+            &json!({
+                "controllerId": "rust-kernel",
+                "notebookUri": "file:///demo.ipynb",
+                "cellIndex": 0,
+                "state": "end",
+                "success": true
+            }),
+        )
+        .await
+        .unwrap();
+
+    let exec_state = bridge
+        .notebook_manager
+        .get_execution("file:///demo.ipynb", 0)
+        .unwrap();
+    assert_eq!(exec_state.state, "succeeded");
+    assert_eq!(exec_state.outputs.len(), 2);
+
+    // 3. Cleanup controller and serializer
+    bridge
+        .handle_rpc_message("notebooks.disposeController", &json!({ "id": "rust-kernel" }))
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "notebooks.unregisterSerializer",
+            &json!({ "id": "jupyter-notebook" }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message("extHost.unregisterProvider", &json!({ "id": "rust-kernel" }))
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "extHost.unregisterProvider",
+            &json!({ "id": "jupyter-notebook" }),
+        )
+        .await
+        .unwrap();
+
+    assert!(bridge.notebook_manager.list_controllers().is_empty());
+    assert!(bridge.notebook_manager.list_serializers().is_empty());
+    assert_eq!(events.lock().len(), 8);
+}
+
+#[tokio::test]
+async fn test_compat_notebook_serializer_and_controller_rpc_roundtrip() {
+    use rustcode_ext_host::notebook::{
+        ExtNotebookCellData, ExtNotebookCellKind, ExtNotebookCellOutput,
+        ExtNotebookCellOutputItem, ExtNotebookData,
+    };
+
+    let reg = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp_mgr = Arc::new(LspClientManager::new());
+    let bridge = Arc::new(LanguageFeatureBridge::new(reg, rpc.clone(), lsp_mgr));
+
+    // 1. Deserialize RPC roundtrip (id = 1)
+    let rpc1 = rpc.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        rpc1.handle_incoming_response(
+            1,
+            Some(json!({
+                "cells": [{
+                    "kind": ExtNotebookCellKind::CODE,
+                    "value": "let x = 21\nx * 2",
+                    "languageId": "python",
+                    "outputs": []
+                }],
+                "metadata": { "nbformat": 4 }
+            })),
+            None,
+        );
+    });
+
+    let nb_data = bridge
+        .request_notebook_deserialize("jupyter-notebook", b"{\"cells\":[]}")
+        .await
+        .unwrap();
+    assert_eq!(nb_data.cells.len(), 1);
+    assert_eq!(nb_data.cells[0].kind, ExtNotebookCellKind::CODE);
+    assert_eq!(nb_data.cells[0].value, "let x = 21\nx * 2");
+
+    // 2. Serialize RPC roundtrip (id = 2)
+    let expected_bytes = b"{\"nbformat\":4}".to_vec();
+    let rpc2 = rpc.clone();
+    let resp_bytes = expected_bytes.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        rpc2.handle_incoming_response(2, Some(json!(resp_bytes)), None);
+    });
+
+    let ser_bytes = bridge
+        .request_notebook_serialize(
+            "jupyter-notebook",
+            &ExtNotebookData {
+                cells: vec![ExtNotebookCellData {
+                    kind: ExtNotebookCellKind::CODE,
+                    value: "1 + 1".to_string(),
+                    language_id: "python".to_string(),
+                    outputs: vec![ExtNotebookCellOutput {
+                        items: vec![ExtNotebookCellOutputItem::text("2", "text/plain")],
+                        metadata: None,
+                    }],
+                    metadata: None,
+                    execution_summary: None,
+                }],
+                metadata: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ser_bytes, expected_bytes);
+
+    // 3. Execute cells RPC roundtrip (id = 3)
+    let rpc3 = rpc.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        rpc3.handle_incoming_response(3, Some(json!({ "executed": 1 })), None);
+    });
+
+    let exec_res = bridge
+        .request_notebook_execute_cells(
+            "rust-kernel",
+            "file:///demo.ipynb",
+            &[0],
+            &nb_data.cells,
+        )
+        .await
+        .unwrap();
+    assert_eq!(exec_res["executed"], 1);
+}
+
+#[test]
+fn test_compat_notebook_js_api_export_surface() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let notebooks_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/notebooks.js")).unwrap();
+    let index_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/index.js")).unwrap();
+    let rpc_bridge_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/rpc-bridge.js")).unwrap();
+    let test_js = std::fs::read_to_string(repo_root.join("ext-host-js/test.js")).unwrap();
+
+    for symbol in [
+        "NotebookCellKind",
+        "NotebookCellData",
+        "NotebookData",
+        "NotebookCellOutput",
+        "NotebookCellOutputItem",
+        "NotebookRange",
+        "NotebookEdit",
+        "NotebookController",
+        "NotebookCellExecution",
+        "registerNotebookSerializer",
+        "createNotebookController",
+        "createNotebookCellExecution",
+        "onDidOpenNotebookDocument",
+        "onDidCloseNotebookDocument",
+        "onDidChangeNotebookDocument",
+        "onDidSaveNotebookDocument",
+        "onDidChangeActiveNotebookEditor",
+        "toJSON",
+    ] {
+        assert!(
+            notebooks_js.contains(symbol),
+            "notebooks.js missing symbol {}",
+            symbol
+        );
+    }
+
+    for exported in [
+        "require('./notebooks')",
+        "notebooks,",
+        "NotebookCellKind,",
+        "NotebookCellData,",
+        "NotebookData,",
+        "NotebookCellOutput,",
+        "NotebookCellOutputItem,",
+        "NotebookRange,",
+        "NotebookEdit,",
+    ] {
+        assert!(
+            index_js.contains(exported),
+            "index.js missing export {}",
+            exported
+        );
+    }
+
+    for rpc_method in [
+        "notebooks.deserializeNotebook",
+        "notebooks.serializeNotebook",
+        "notebooks.executeCells",
+        "notebooks.interruptExecution",
+    ] {
+        assert!(
+            rpc_bridge_js.contains(rpc_method),
+            "rpc-bridge.js missing handler {}",
+            rpc_method
+        );
+    }
+
+    assert!(test_js.contains("vscode.notebooks"));
+
+    // Verify balanced (), {}, [] delimiters in notebooks.js and index.js
+    for (name, src) in [("notebooks.js", &notebooks_js), ("index.js", &index_js)] {
+        let mut parens = 0i32;
+        let mut braces = 0i32;
+        let mut brackets = 0i32;
+        for ch in src.chars() {
+            match ch {
+                '(' => parens += 1,
+                ')' => parens -= 1,
+                '{' => braces += 1,
+                '}' => braces -= 1,
+                '[' => brackets += 1,
+                ']' => brackets -= 1,
+                _ => {}
+            }
+            assert!(parens >= 0 && braces >= 0 && brackets >= 0, "Unbalanced closer in {}", name);
+        }
+        assert_eq!(parens, 0, "Unbalanced () in {}", name);
+        assert_eq!(braces, 0, "Unbalanced {{}} in {}", name);
+        assert_eq!(brackets, 0, "Unbalanced [] in {}", name);
+    }
+}

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use crate::notebook::NotebookEditorView;
 use crate::settings_ui::SettingsUiView;
 use crate::webview::WebviewEditorView;
 use rustcode_platform::configuration::ConfigurationService;
@@ -153,6 +154,7 @@ pub struct EditorAreaView {
     pub diff_editors: HashMap<String, DiffEditorView>,
     pub webviews: HashMap<String, WebviewEditorView>,
     pub settings_views: HashMap<String, SettingsUiView>,
+    pub notebooks: HashMap<String, NotebookEditorView>,
     pub grammar_registry: Arc<GrammarRegistry>,
     pub last_action: Option<EditorAreaAction>,
 }
@@ -171,9 +173,67 @@ impl EditorAreaView {
             diff_editors: HashMap::new(),
             webviews: HashMap::new(),
             settings_views: HashMap::new(),
+            notebooks: HashMap::new(),
             grammar_registry: Arc::new(GrammarRegistry::new()),
             last_action: None,
         }
+    }
+
+    pub fn content_rect(&self, bounds: Rect) -> Rect {
+        let tab_bar_h = 35.0;
+        Rect::from_xywh(
+            bounds.min_x(),
+            bounds.min_y() + tab_bar_h,
+            bounds.width(),
+            (bounds.height() - tab_bar_h).max(0.0),
+        )
+    }
+
+    pub fn is_notebook_uri(uri: &str) -> bool {
+        uri.split(['?', '#'])
+            .next()
+            .unwrap_or(uri)
+            .to_ascii_lowercase()
+            .ends_with(".ipynb")
+    }
+
+    pub fn open_notebook(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
+        let group = self.model.current_group();
+        group.open_tab(uri, title, is_preview);
+
+        if !self.notebooks.contains_key(uri) {
+            let nb_view = NotebookEditorView::from_ipynb_str(uri, content)
+                .with_grammar_registry(self.grammar_registry.clone());
+            self.notebooks.insert(uri.to_string(), nb_view);
+        }
+    }
+
+    pub fn sync_dirty_states(&mut self) {
+        for group in &mut self.model.groups {
+            for tab in &mut group.tabs {
+                if let Some(editor) = self.editors.get(&tab.uri) {
+                    if editor.is_dirty() {
+                        tab.is_dirty = true;
+                        tab.is_preview = false;
+                    }
+                } else if let Some(notebook) = self.notebooks.get(&tab.uri) {
+                    tab.is_dirty = notebook.document.is_dirty;
+                    if tab.is_dirty {
+                        tab.is_preview = false;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn active_notebook(&self) -> Option<&NotebookEditorView> {
+        let uri = self.model.current_group_ref().active_tab()?.uri.clone();
+        self.notebooks.get(&uri)
+    }
+
+    pub fn active_notebook_mut(&mut self) -> Option<&mut NotebookEditorView> {
+        let uri = self.model.current_group().active_tab()?.uri.clone();
+        self.notebooks.get_mut(&uri)
     }
 
     pub fn open_settings(&mut self, config: Option<ConfigurationService>) {
@@ -203,6 +263,7 @@ impl EditorAreaView {
             self.diff_editors.retain(|u, _| open_uris.contains(u));
             self.webviews.retain(|u, _| open_uris.contains(u));
             self.settings_views.retain(|u, _| open_uris.contains(u));
+            self.notebooks.retain(|u, _| open_uris.contains(u));
             self.last_action = Some(EditorAreaAction::TabClosed(index));
         }
         closed
@@ -233,6 +294,11 @@ impl EditorAreaView {
     }
 
     pub fn open_file(&mut self, uri: &str, title: &str, content: &str, is_preview: bool) {
+        if Self::is_notebook_uri(uri) {
+            self.open_notebook(uri, title, content, is_preview);
+            return;
+        }
+
         let group = self.model.current_group();
         group.open_tab(uri, title, is_preview);
 
@@ -278,6 +344,30 @@ impl EditorAreaView {
 
         if let Some(editor) = self.editors.get_mut(&uri) {
             let meta = editor.save_sync(fs)?;
+            if let Some(idx) = self.model.current_group().active_tab_index {
+                self.model.current_group().set_dirty(idx, false);
+            }
+            Ok(meta)
+        } else if let Some(notebook) = self.notebooks.get_mut(&uri) {
+            let path = notebook
+                .document
+                .path
+                .clone()
+                .or_else(|| {
+                    if uri.starts_with("untitled:") {
+                        None
+                    } else {
+                        uri.strip_prefix("file://").map(PathBuf::from)
+                    }
+                })
+                .ok_or_else(|| FileSystemError::NotFound(PathBuf::from(&uri)))?;
+
+            let json = notebook.document.to_ipynb_json().map_err(|e| {
+                FileSystemError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+            let meta = fs.write_atomic_sync(&path, &json)?;
+            notebook.document.path = Some(path);
+            notebook.document.is_dirty = false;
             if let Some(idx) = self.model.current_group().active_tab_index {
                 self.model.current_group().set_dirty(idx, false);
             }
@@ -409,7 +499,8 @@ impl View for EditorAreaView {
             };
 
             let is_dirty = tab.is_dirty
-                || self.editors.get(&tab.uri).is_some_and(|e| e.is_dirty());
+                || self.editors.get(&tab.uri).is_some_and(|e| e.is_dirty())
+                || self.notebooks.get(&tab.uri).is_some_and(|n| n.document.is_dirty);
 
             let title_text = if is_dirty {
                 format!("{} \u{25cf}", tab.title)
@@ -446,12 +537,7 @@ impl View for EditorAreaView {
         }
 
         // Editor content below tabs
-        let content_rect = Rect::from_xywh(
-            bounds.min_x(),
-            bounds.min_y() + tab_bar_h,
-            bounds.width(),
-            (bounds.height() - tab_bar_h).max(0.0),
-        );
+        let content_rect = self.content_rect(bounds);
 
         if let Some(tab) = self.model.current_group_ref().active_tab() {
             if let Some(diff_view) = self.diff_editors.get(&tab.uri) {
@@ -460,6 +546,8 @@ impl View for EditorAreaView {
                 webview.render(content_rect, theme, font, scene);
             } else if let Some(settings_view) = self.settings_views.get(&tab.uri) {
                 settings_view.render(content_rect, theme, font, scene);
+            } else if let Some(notebook) = self.notebooks.get(&tab.uri) {
+                notebook.render(content_rect, theme, font, scene);
             } else if let Some(editor) = self.editors.get(&tab.uri) {
                 editor.render(content_rect, theme, font, scene);
             } else {
@@ -503,13 +591,8 @@ impl View for EditorAreaView {
                     }
                     EventResult::Ignored
                 } else {
-                    // Click within active editor / diff / webview / settings
-                    let content_rect = Rect::from_xywh(
-                        bounds.min_x(),
-                        bounds.min_y() + tab_bar_h,
-                        bounds.width(),
-                        (bounds.height() - tab_bar_h).max(0.0),
-                    );
+                    // Click within active editor / diff / webview / settings / notebook
+                    let content_rect = self.content_rect(bounds);
                     if let Some(tab) = self.model.current_group_ref().active_tab() {
                         let uri = tab.uri.clone();
                         if let Some(diff_view) = self.diff_editors.get_mut(&uri) {
@@ -518,6 +601,10 @@ impl View for EditorAreaView {
                             webview.handle_event(event, content_rect)
                         } else if let Some(settings_view) = self.settings_views.get_mut(&uri) {
                             settings_view.handle_event(event, content_rect)
+                        } else if let Some(notebook) = self.notebooks.get_mut(&uri) {
+                            let res = notebook.handle_event(event, content_rect);
+                            self.sync_dirty_states();
+                            res
                         } else if let Some(editor) = self.editors.get_mut(&uri) {
                             editor.handle_event(event, content_rect)
                         } else {
@@ -529,12 +616,7 @@ impl View for EditorAreaView {
                 }
             }
             _ => {
-                let content_rect = Rect::from_xywh(
-                    bounds.min_x(),
-                    bounds.min_y() + tab_bar_h,
-                    bounds.width(),
-                    (bounds.height() - tab_bar_h).max(0.0),
-                );
+                let content_rect = self.content_rect(bounds);
                 if let Some(tab) = self.model.current_group_ref().active_tab() {
                     let uri = tab.uri.clone();
                     if let Some(diff_view) = self.diff_editors.get_mut(&uri) {
@@ -543,6 +625,10 @@ impl View for EditorAreaView {
                         webview.handle_event(event, content_rect)
                     } else if let Some(settings_view) = self.settings_views.get_mut(&uri) {
                         settings_view.handle_event(event, content_rect)
+                    } else if let Some(notebook) = self.notebooks.get_mut(&uri) {
+                        let res = notebook.handle_event(event, content_rect);
+                        self.sync_dirty_states();
+                        res
                     } else if let Some(editor) = self.editors.get_mut(&uri) {
                         editor.handle_event(event, content_rect)
                     } else {
@@ -835,6 +921,99 @@ mod tests {
         assert!(area_view.close_tab(0));
         assert!(area_view.model.current_group_ref().tabs.is_empty());
         assert!(!area_view.settings_views.contains_key("rustcode://settings"));
+    }
+
+    #[test]
+    fn test_editor_area_notebook_routing_render_save_and_close() {
+        use crate::notebook::NotebookClickTarget;
+        use rustcode_platform::render::MouseButton;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "rustcode_nb_area_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let nb_path = tmp_dir.join("analysis.IPYNB");
+        let nb_uri = format!("file://{}", nb_path.display());
+
+        let initial_ipynb = r#"{
+            "cells": [
+                {
+                    "id": "c1",
+                    "cell_type": "code",
+                    "execution_count": null,
+                    "metadata": {},
+                    "outputs": [],
+                    "source": ["a = 7\n", "a * 6"]
+                }
+            ],
+            "metadata": { "language_info": { "name": "python" } },
+            "nbformat": 4,
+            "nbformat_minor": 5
+        }"#;
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(&nb_uri, "analysis.IPYNB", initial_ipynb, false);
+
+        // Routed to notebooks, NOT editors
+        assert!(area_view.notebooks.contains_key(&nb_uri));
+        assert!(!area_view.editors.contains_key(&nb_uri));
+        assert!(area_view.active_notebook().is_some());
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+        let mut scene = Scene::new();
+        area_view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("analysis.IPYNB"));
+        assert!(scene.contains_text("a = 7"));
+
+        // Click Run cell 0 -> becomes dirty and renders ● indicator
+        let run_rect = area_view
+            .active_notebook()
+            .unwrap()
+            .hit_targets
+            .read()
+            .iter()
+            .find_map(|(r, t)| match t {
+                NotebookClickTarget::RunCell(0) => Some(*r),
+                _ => None,
+            })
+            .unwrap();
+        let res = area_view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(
+                Point::new(run_rect.min_x() + 4.0, run_rect.min_y() + 4.0),
+                MouseButton::Left,
+            )),
+            bounds,
+        );
+        assert_eq!(res, EventResult::Consumed);
+        assert!(area_view.active_notebook().unwrap().document.is_dirty);
+        assert!(area_view.model.current_group_ref().tabs[0].is_dirty);
+
+        let mut dirty_scene = Scene::new();
+        area_view.render(bounds, &theme, &font, &mut dirty_scene);
+        assert!(dirty_scene.contains_text("analysis.IPYNB \u{25cf}"));
+        assert!(dirty_scene.contains_text("42"));
+
+        // Save active file writes valid .ipynb JSON and clears dirty flag
+        let fs = FileSystemService::new();
+        let meta = area_view.save_active_file(&fs).unwrap();
+        assert_eq!(meta.path, nb_path);
+        assert!(!area_view.active_notebook().unwrap().document.is_dirty);
+        assert!(!area_view.model.current_group_ref().tabs[0].is_dirty);
+
+        let saved_text = std::fs::read_to_string(&nb_path).unwrap();
+        let saved_doc =
+            crate::notebook::NotebookDocument::from_ipynb_json(&nb_uri, &saved_text).unwrap();
+        assert_eq!(saved_doc.cells[0].execution_count, Some(1));
+        assert_eq!(saved_doc.cells[0].outputs[0].plain_text(), "42");
+
+        // Closing tab removes from notebooks map
+        assert!(area_view.close_tab(0));
+        assert!(!area_view.notebooks.contains_key(&nb_uri));
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }
 

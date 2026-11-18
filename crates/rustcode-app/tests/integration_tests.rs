@@ -1387,5 +1387,156 @@ fn test_end_to_end_visual_settings_ui_and_config_sync() {
     assert_eq!(app.config.get::<bool>("editor.formatOnSave"), Some(false));
 }
 
+#[test]
+fn test_end_to_end_notebook_editor_kernel_and_save() {
+    use rustcode_platform::fs::FileSystemService;
+    use rustcode_workbench::{NotebookClickTarget, NotebookDocument};
+
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "rustcode_e2e_nb_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let nb_path = tmp_dir.join("e2e_notebook.ipynb");
+    let nb_uri = format!("file://{}", nb_path.display());
+    let nb_content = r#"{
+        "cells": [
+            {
+                "id": "cell-1",
+                "cell_type": "code",
+                "execution_count": null,
+                "metadata": {},
+                "outputs": [],
+                "source": ["let base = 20\n", "print(\"ok\")"]
+            }
+        ],
+        "metadata": { "language_info": { "name": "python" } },
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }"#;
+    std::fs::write(&nb_path, nb_content).unwrap();
+
+    // 1. Bootstrap app and window
+    let app = RustCodeContext::new();
+    assert!(app
+        .commands
+        .has_command("workbench.action.files.newUntitledNotebook"));
+    assert!(app.commands.has_command("notebook.execute"));
+    assert!(app.commands.has_command("notebook.cell.execute"));
+
+    let mut window = app.create_window();
+    let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+    let mut surface = MockRenderSurface::new(1024.0, 768.0);
+
+    // 2. Open .ipynb file via window.open_file
+    window.open_file(&nb_uri, "e2e_notebook.ipynb", nb_content, false);
+    assert!(window.view.editor_area.notebooks.contains_key(&nb_uri));
+    assert!(!window.view.editor_area.editors.contains_key(&nb_uri));
+
+    // 3. Render and click [+ Code] button to add a second code cell
+    let scene = window.render(&mut surface);
+    assert!(scene.contains_text("e2e_notebook.ipynb"));
+    assert!(scene.contains_text("let base = 20"));
+
+    let add_code_rect = window
+        .view
+        .editor_area
+        .active_notebook()
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|(r, t)| match t {
+            NotebookClickTarget::AddCode => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(add_code_rect.min_x() + 5.0, add_code_rect.min_y() + 5.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+    assert_eq!(
+        window
+            .view
+            .editor_area
+            .active_notebook()
+            .unwrap()
+            .document
+            .cells
+            .len(),
+        2
+    );
+
+    // Type `base + 22` into the newly added cell and run all via [Run All]
+    for (k, txt) in [
+        (KeyCode::Char('b'), Some("b")),
+        (KeyCode::Char('a'), Some("a")),
+        (KeyCode::Char('s'), Some("s")),
+        (KeyCode::Char('e'), Some("e")),
+        (KeyCode::Space, None),
+        (KeyCode::Char('+'), Some("+")),
+        (KeyCode::Space, None),
+        (KeyCode::Char('2'), Some("2")),
+        (KeyCode::Char('2'), Some("2")),
+    ] {
+        let mut ev = KeyEvent::new(k, Modifiers::none());
+        ev.text = txt.map(|s| s.to_string());
+        window.dispatch_event(&InputEvent::KeyDown(ev), bounds);
+    }
+
+    let run_all_rect = window
+        .view
+        .editor_area
+        .active_notebook()
+        .unwrap()
+        .hit_targets
+        .read()
+        .iter()
+        .find_map(|(r, t)| match t {
+            NotebookClickTarget::RunAll => Some(*r),
+            _ => None,
+        })
+        .unwrap();
+
+    window.dispatch_event(
+        &InputEvent::MouseDown(MouseEvent::new(
+            Point::new(run_all_rect.min_x() + 5.0, run_all_rect.min_y() + 5.0),
+            MouseButton::Left,
+        )),
+        bounds,
+    );
+
+    let scene2 = window.render(&mut surface);
+    assert!(scene2.contains_text("e2e_notebook.ipynb \u{25cf}"));
+    assert!(scene2.contains_text("ok"));
+    assert!(scene2.contains_text("42"));
+
+    // 4. Save active notebook and reload from disk to verify persistence
+    let fs = FileSystemService::new();
+    window.view.editor_area.save_active_file(&fs).unwrap();
+    assert!(
+        !window
+            .view
+            .editor_area
+            .active_notebook()
+            .unwrap()
+            .document
+            .is_dirty
+    );
+
+    let reloaded_raw = std::fs::read_to_string(&nb_path).unwrap();
+    let reloaded = NotebookDocument::from_ipynb_json(&nb_uri, &reloaded_raw).unwrap();
+    assert_eq!(reloaded.cells.len(), 2);
+    assert_eq!(reloaded.cells[0].outputs[0].plain_text(), "ok\n");
+    assert_eq!(reloaded.cells[1].execution_count, Some(2));
+    assert_eq!(reloaded.cells[1].outputs[0].plain_text(), "42");
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
 
 

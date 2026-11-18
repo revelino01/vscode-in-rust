@@ -255,6 +255,7 @@ pub struct LanguageFeatureBridge {
     pub lsp_manager: Arc<LspClientManager>,
     pub diagnostic_manager: Arc<DiagnosticCollectionManager>,
     pub status_bar_manager: Arc<ExtStatusBarManager>,
+    pub notebook_manager: Arc<crate::notebook::ExtHostNotebookManager>,
 }
 
 impl LanguageFeatureBridge {
@@ -269,6 +270,7 @@ impl LanguageFeatureBridge {
             lsp_manager,
             diagnostic_manager: Arc::new(DiagnosticCollectionManager::new()),
             status_bar_manager: Arc::new(ExtStatusBarManager::new()),
+            notebook_manager: Arc::new(crate::notebook::ExtHostNotebookManager::new()),
         }
     }
 
@@ -279,6 +281,14 @@ impl LanguageFeatureBridge {
 
     pub fn with_status_bar_manager(mut self, sbm: Arc<ExtStatusBarManager>) -> Self {
         self.status_bar_manager = sbm;
+        self
+    }
+
+    pub fn with_notebook_manager(
+        mut self,
+        nm: Arc<crate::notebook::ExtHostNotebookManager>,
+    ) -> Self {
+        self.notebook_manager = nm;
         self
     }
 
@@ -562,6 +572,44 @@ impl LanguageFeatureBridge {
         Vec::new()
     }
 
+    pub async fn request_notebook_deserialize(
+        &self,
+        notebook_type: &str,
+        content: &[u8],
+    ) -> Result<crate::notebook::ExtNotebookData, String> {
+        self.notebook_manager
+            .request_deserialize(&self.rpc_bridge, notebook_type, content)
+            .await
+    }
+
+    pub async fn request_notebook_serialize(
+        &self,
+        notebook_type: &str,
+        data: &crate::notebook::ExtNotebookData,
+    ) -> Result<Vec<u8>, String> {
+        self.notebook_manager
+            .request_serialize(&self.rpc_bridge, notebook_type, data)
+            .await
+    }
+
+    pub async fn request_notebook_execute_cells(
+        &self,
+        controller_id: &str,
+        notebook_uri: &str,
+        cell_indices: &[usize],
+        cells: &[crate::notebook::ExtNotebookCellData],
+    ) -> Result<serde_json::Value, String> {
+        self.notebook_manager
+            .request_execute_cells(
+                &self.rpc_bridge,
+                controller_id,
+                notebook_uri,
+                cell_indices,
+                cells,
+            )
+            .await
+    }
+
     /// Handle incoming RPC calls from JS runtime (e.g. provider registration, format, codeAction).
     pub async fn handle_rpc_message(
         &self,
@@ -574,6 +622,10 @@ impl LanguageFeatureBridge {
 
         if self.status_bar_manager.handle_rpc_message(method, params) {
             return Some(json!({ "success": true }));
+        }
+
+        if method.starts_with("notebooks.") {
+            return self.notebook_manager.handle_rpc_call(method, params).ok();
         }
 
         match method {

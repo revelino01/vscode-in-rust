@@ -9,7 +9,8 @@ function hasOwn(obj, key) {
 
 function hasUriScheme(str) {
   const colonIdx = str.indexOf(':');
-  if (colonIdx <= 0) {
+  // Single-letter prefixes (e.g. `C:\...` or `C:/...`) are Windows drive paths, not URI schemes.
+  if (colonIdx <= 1) {
     return false;
   }
   const scheme = str.slice(0, colonIdx);

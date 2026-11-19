@@ -158,14 +158,14 @@ pub struct ExtHostDebugManager {
 }
 
 pub fn to_dap_source(path_or_uri: &str) -> Source {
-    let stripped = path_or_uri.strip_prefix("file://").unwrap_or(path_or_uri);
-    let name = std::path::Path::new(stripped)
+    let path = rustcode_platform::file_uri_to_path(path_or_uri);
+    let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .map(|s| s.to_string());
     Source {
         name,
-        path: Some(stripped.to_string()),
+        path: Some(path.to_string_lossy().into_owned()),
         source_reference: None,
     }
 }
@@ -329,14 +329,19 @@ impl ExtHostDebugManager {
     }
 
     pub fn to_dap_source_breakpoints(&self, path_or_uri: &str) -> Vec<SourceBreakpoint> {
-        let target = path_or_uri.strip_prefix("file://").unwrap_or(path_or_uri);
+        let target = rustcode_platform::file_uri_to_path(path_or_uri);
         self.list_breakpoints()
             .into_iter()
             .filter(|bp| bp.enabled && bp.kind == "source")
             .filter(|bp| {
                 bp.uri
                     .as_deref()
-                    .map(|u| u.strip_prefix("file://").unwrap_or(u) == target)
+                    .map(|u| {
+                        rustcode_platform::paths_equivalent(
+                            &rustcode_platform::file_uri_to_path(u),
+                            &target,
+                        )
+                    })
                     .unwrap_or(false)
             })
             .filter_map(|bp| {

@@ -1408,10 +1408,7 @@ impl EditorAreaView {
         self.model.current_group().open_tab(uri, title, is_preview);
 
         if !self.editors.contains_key(uri) {
-            let path_buf = uri
-                .strip_prefix("file://")
-                .map(PathBuf::from)
-                .or_else(|| Some(PathBuf::from(uri)));
+            let path_buf = Some(rustcode_platform::file_uri_to_path(uri));
 
             let grammar = if let Some(p) = &path_buf {
                 self.grammar_registry.get_for_path(p)
@@ -1506,8 +1503,10 @@ impl EditorAreaView {
                 .or_else(|| {
                     if uri.starts_with("untitled:") {
                         None
+                    } else if rustcode_platform::is_file_uri(&uri) {
+                        Some(rustcode_platform::file_uri_to_path(&uri))
                     } else {
-                        uri.strip_prefix("file://").map(PathBuf::from)
+                        None
                     }
                 })
                 .ok_or_else(|| FileSystemError::NotFound(PathBuf::from(&uri)))?;
@@ -1593,12 +1592,13 @@ impl EditorAreaView {
                 if self.apply_text_edits(uri, &range_edits) {
                     total_applied += range_edits.len();
                 } else {
-                    let path = uri.strip_prefix("file://").unwrap_or(uri);
-                    if let Ok(content) = std::fs::read_to_string(path) {
-                        let title = std::path::Path::new(path)
+                    let path = rustcode_platform::file_uri_to_path(uri);
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let fallback_title = path.to_string_lossy().into_owned();
+                        let title = path
                             .file_name()
                             .and_then(|n| n.to_str())
-                            .unwrap_or(path);
+                            .unwrap_or(&fallback_title);
                         self.open_file(uri, title, &content, false);
                         if self.apply_text_edits(uri, &range_edits) {
                             total_applied += range_edits.len();

@@ -260,6 +260,7 @@ pub fn default_settings_schema() -> Vec<SettingsItem> {
             SettingsValueType::Number,
             Value::from(14),
         ),
+        #[cfg(not(windows))]
         SettingsItem::new(
             "terminal.integrated.shell.linux",
             "Terminal",
@@ -267,6 +268,15 @@ pub fn default_settings_schema() -> Vec<SettingsItem> {
             "The path of the shell that the terminal uses on Linux.",
             SettingsValueType::String,
             Value::from("/bin/bash"),
+        ),
+        #[cfg(windows)]
+        SettingsItem::new(
+            "terminal.integrated.shell.windows",
+            "Terminal",
+            "Shell: Windows",
+            "The path of the shell that the terminal uses on Windows.",
+            SettingsValueType::String,
+            Value::from("cmd.exe"),
         ),
         SettingsItem::new(
             "git.enableSmartCommit",

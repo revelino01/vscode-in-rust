@@ -506,6 +506,64 @@ exec.end(true, 200);
   assert(typeof nodeFs.promises.readFile === 'function' && typeof nodeFs.promises.stat === 'function', 'node-compat/fs missing methods');
   await nodeFs.promises.stat('/tmp/nonexistent');
 
+  const winUri = vscode.Uri.file('C:\\workspace\\src\\lib.rs');
+  assert(winUri.path === '/C:/workspace/src/lib.rs', 'Uri.file Windows path normalization failed: ' + winUri.path);
+  assert(winUri.toString() === 'file:///C:/workspace/src/lib.rs', 'Uri.file Windows toString failed: ' + winUri.toString());
+  assert(winUri.fsPath === 'C:\\workspace\\src\\lib.rs', 'Uri.file Windows fsPath failed: ' + winUri.fsPath);
+
+  const parsedWinUri = vscode.Uri.parse('file:///C:/workspace/src/lib.rs');
+  assert(parsedWinUri.fsPath === 'C:\\workspace\\src\\lib.rs', 'Uri.parse Windows fsPath failed: ' + parsedWinUri.fsPath);
+
+  const uncUri = vscode.Uri.file('\\\\server\\share\\dir\\app.rs');
+  assert(uncUri.toString() === 'file://server/share/dir/app.rs', 'Uri.file UNC toString failed: ' + uncUri.toString());
+  assert(uncUri.fsPath === '\\\\server\\share\\dir\\app.rs', 'Uri.file UNC fsPath failed: ' + uncUri.fsPath);
+
+  const winTreeItem = new vscode.TreeItem(winUri);
+  assert(winTreeItem.label === 'lib.rs', 'TreeItem Windows path basename extraction failed');
+
+  // rpc-bridge normalizeTreeItem with plain object resourceUri (no TreeItem constructor)
+  const winTreeDisp = vscode.window.registerTreeDataProvider('m1.winTree', {
+    getTreeItem: (el) => el,
+    getChildren: () => [{ resourceUri: { fsPath: 'C:\\workspace\\src\\main.rs' } }],
+  });
+  const winItems = await rpc.handleIncomingRequest('treeView.getChildren', { providerId: 'm1.winTree' });
+  assert(Array.isArray(winItems) && winItems.length === 1 && winItems[0].label === 'main.rs', 'rpc-bridge normalizeTreeItem Windows backslash basename failed');
+  winTreeDisp.dispose();
+
+  // workspace.openTextDocument must treat C:\... as a file path, NOT a `c:` URI scheme
+  let capturedOpenPayload = null;
+  const origRpcCall = rpc.call;
+  rpc.call = async (method, params) => {
+    if (method === 'workspace.openTextDocument') {
+      capturedOpenPayload = params;
+      return null;
+    }
+    return origRpcCall.call(rpc, method, params);
+  };
+  try {
+    await vscode.workspace.openTextDocument('C:\\workspace\\src\\main.rs');
+    assert(
+      capturedOpenPayload && capturedOpenPayload.uri === 'file:///C:/workspace/src/main.rs',
+      'workspace.openTextDocument misparsed Windows drive path: ' + JSON.stringify(capturedOpenPayload)
+    );
+    await vscode.workspace.openTextDocument('untitled:Untitled-1');
+    assert(
+      capturedOpenPayload && capturedOpenPayload.uri === 'untitled://Untitled-1' || capturedOpenPayload.uri === 'untitled:Untitled-1',
+      'workspace.openTextDocument broke untitled URI: ' + JSON.stringify(capturedOpenPayload)
+    );
+  } finally {
+    rpc.call = origRpcCall;
+  }
+
+  // node-compat/path Windows path support (while keeping POSIX behavior)
+  assert(path.basename('C:\\workspace\\src\\lib.rs') === 'lib.rs', 'path.basename Windows failed');
+  assert(path.dirname('C:\\workspace\\src\\lib.rs') === 'C:/workspace/src', 'path.dirname Windows failed');
+  assert(path.dirname('C:\\lib.rs') === 'C:/', 'path.dirname Windows root failed');
+  assert(path.extname('C:\\workspace\\src\\lib.rs') === '.rs', 'path.extname Windows failed');
+  assert(path.isAbsolute('C:\\workspace\\src\\lib.rs') === true, 'path.isAbsolute Windows failed');
+  assert(path.normalize('C:\\workspace\\src\\..\\lib.rs') === 'C:/workspace/lib.rs', 'path.normalize Windows failed');
+  assert(path.resolve('C:\\workspace\\src', '../lib.rs') === 'C:/workspace/lib.rs', 'path.resolve Windows failed');
+
   console.log('All JavaScript extension host tests passed successfully!');
 })();
 

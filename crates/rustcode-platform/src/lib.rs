@@ -18,8 +18,10 @@ pub use configuration::{
     ConfigurationChangeEvent, ConfigurationInspection, ConfigurationService, ConfigurationTarget,
 };
 pub use fs::{
-    hash_content, FileChangeEvent, FileChangeType, FileConflict, FileMetadata, FileSystemError,
-    FileSystemService, FileSystemWatcher,
+    file_uri_to_path, hash_content, is_file_uri, path_starts_with, path_strip_prefix,
+    path_to_file_uri, paths_equivalent, strip_windows_verbatim_prefix, FileChangeEvent,
+    FileChangeType, FileConflict, FileMetadata, FileSystemError, FileSystemService,
+    FileSystemWatcher,
 };
 
 pub use keybindings::{KeyChord, KeyCombo, KeybindingService, Modifiers, ResolvedKeybinding};

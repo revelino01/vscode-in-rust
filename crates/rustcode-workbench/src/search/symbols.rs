@@ -14,11 +14,7 @@ pub fn search_document_symbols(content: &str, file_path: &Path) -> Vec<SymbolInf
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let uri = if file_path.to_string_lossy().starts_with("file://") {
-        file_path.to_string_lossy().to_string()
-    } else {
-        format!("file://{}", file_path.to_string_lossy())
-    };
+    let uri = rustcode_platform::path_to_file_uri(file_path);
 
     match ext.as_str() {
         "rs" => extract_rust_symbols(content, &uri),

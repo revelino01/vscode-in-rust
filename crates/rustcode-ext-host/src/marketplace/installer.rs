@@ -104,7 +104,20 @@ impl ExtensionInstaller {
             )));
         }
         if let Ok(meta) = std::fs::symlink_metadata(&target_dir) {
-            if meta.file_type().is_symlink() {
+            let is_link = meta.file_type().is_symlink() || {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+                    (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+                        && std::fs::read_link(&target_dir).is_ok()
+                }
+                #[cfg(not(windows))]
+                {
+                    false
+                }
+            };
+            if is_link {
                 return Err(MarketplaceError::InvalidManifest(format!(
                     "Target directory '{}' cannot be a symlink",
                     folder_name
@@ -155,24 +168,40 @@ impl ExtensionInstaller {
             )));
         }
 
-        if std::fs::symlink_metadata(&resolved).is_ok() && root_dir.exists() {
+        if root_dir.exists() {
             let canon_root = std::fs::canonicalize(root_dir).map_err(|_| {
                 MarketplaceError::InvalidManifest(format!(
                     "Invalid {} contribution path '{}': failed to resolve extension root",
                     kind, contrib_path
                 ))
             })?;
-            let canon_resolved = std::fs::canonicalize(&resolved).map_err(|_| {
-                MarketplaceError::InvalidManifest(format!(
-                    "Invalid {} contribution path '{}': invalid or broken symlink target",
-                    kind, contrib_path
-                ))
-            })?;
-            if !canon_resolved.starts_with(&canon_root) {
-                return Err(MarketplaceError::InvalidManifest(format!(
-                    "Invalid {} contribution path '{}': symlink escapes extension root",
-                    kind, contrib_path
-                )));
+            // Walk up to the deepest existing component so escaping symlink/junction ancestors
+            // are caught even when the leaf file does not exist yet.
+            let mut probe = resolved.as_path();
+            while std::fs::symlink_metadata(probe).is_err() {
+                match probe.parent() {
+                    Some(parent) if parent != root_dir && parent.starts_with(root_dir) => {
+                        probe = parent;
+                    }
+                    _ => {
+                        probe = root_dir;
+                        break;
+                    }
+                }
+            }
+            if probe != root_dir {
+                let canon_probe = std::fs::canonicalize(probe).map_err(|_| {
+                    MarketplaceError::InvalidManifest(format!(
+                        "Invalid {} contribution path '{}': invalid or broken symlink target",
+                        kind, contrib_path
+                    ))
+                })?;
+                if !rustcode_platform::path_starts_with(&canon_probe, &canon_root) {
+                    return Err(MarketplaceError::InvalidManifest(format!(
+                        "Invalid {} contribution path '{}': symlink escapes extension root",
+                        kind, contrib_path
+                    )));
+                }
             }
         }
 

@@ -261,8 +261,14 @@ impl DiffEditorView {
         let added_bg = Rgba::new(0.18, 0.45, 0.25, 0.35);
         let deleted_bg = Rgba::new(0.65, 0.18, 0.18, 0.35);
 
-        for row_idx in start_row..end_row {
-            let row = &self.model.side_by_side_rows[row_idx];
+        for (row_idx, row) in self
+            .model
+            .side_by_side_rows
+            .iter()
+            .enumerate()
+            .take(end_row)
+            .skip(start_row)
+        {
             let row_y = bounds.min_y() + (row_idx as f32 - scroll_top) * font.line_height;
             if !row_y.is_finite() || !(row_y + font.line_height).is_finite() {
                 if row_y.is_nan() || row_y > 0.0 {
@@ -414,8 +420,14 @@ impl DiffEditorView {
         let added_bg = Rgba::new(0.18, 0.45, 0.25, 0.35);
         let deleted_bg = Rgba::new(0.65, 0.18, 0.18, 0.35);
 
-        for row_idx in start_row..end_row {
-            let row = &self.model.inline_rows[row_idx];
+        for (row_idx, row) in self
+            .model
+            .inline_rows
+            .iter()
+            .enumerate()
+            .take(end_row)
+            .skip(start_row)
+        {
             let row_y = bounds.min_y() + (row_idx as f32 - scroll_top) * font.line_height;
             if !row_y.is_finite() || !(row_y + font.line_height).is_finite() {
                 if row_y.is_nan() || row_y > 0.0 {

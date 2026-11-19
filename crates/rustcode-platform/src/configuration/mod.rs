@@ -90,7 +90,8 @@ impl ConfigurationService {
                 "integrated": {
                     "fontSize": 14,
                     "shell": {
-                        "linux": "/bin/bash"
+                        "linux": "/bin/bash",
+                        "windows": "cmd.exe"
                     }
                 }
             },
@@ -192,7 +193,7 @@ impl ConfigurationService {
             let folders_guard = self.folders.read();
             let mut matching: Vec<(&PathBuf, &Value)> = folders_guard
                 .iter()
-                .filter(|(folder_path, _)| res.starts_with(folder_path))
+                .filter(|(folder_path, _)| crate::fs::path_starts_with(res, folder_path))
                 .collect();
             // Sort in descending order of path length (deepest prefix first)
             matching.sort_by_key(|(folder_path, _)| std::cmp::Reverse(folder_path.as_os_str().len()));
@@ -236,7 +237,7 @@ impl ConfigurationService {
             let folders_guard = self.folders.read();
             let mut matching: Vec<(&PathBuf, &Value)> = folders_guard
                 .iter()
-                .filter(|(folder_path, _)| res.starts_with(folder_path))
+                .filter(|(folder_path, _)| crate::fs::path_starts_with(res, folder_path))
                 .collect();
             // Sort ascending by folder path length so deeper folders override shallower ones.
             matching.sort_by_key(|(folder_path, _)| folder_path.as_os_str().len());
@@ -256,7 +257,7 @@ impl ConfigurationService {
             let folders_guard = self.folders.read();
             let mut matching: Vec<(&PathBuf, &Value)> = folders_guard
                 .iter()
-                .filter(|(folder_path, _)| res.starts_with(folder_path))
+                .filter(|(folder_path, _)| crate::fs::path_starts_with(res, folder_path))
                 .collect();
             matching.sort_by_key(|(folder_path, _)| std::cmp::Reverse(folder_path.as_os_str().len()));
             for (_, folder_val) in matching {
@@ -845,6 +846,10 @@ mod tests {
         assert_eq!(
             config.get::<String>("terminal.integrated.shell.linux"),
             Some("/bin/bash".into())
+        );
+        assert_eq!(
+            config.get::<String>("terminal.integrated.shell.windows"),
+            Some("cmd.exe".into())
         );
         assert_eq!(config.get::<bool>("git.enableSmartCommit"), Some(false));
         assert_eq!(

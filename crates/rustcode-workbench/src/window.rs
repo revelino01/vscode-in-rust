@@ -129,9 +129,13 @@ impl WorkbenchWindow {
             .model
             .current_group_ref()
             .active_tab()
-            .and_then(|t| t.uri.strip_prefix("file://").or(Some(t.uri.as_str())))
-            .filter(|p| !p.contains("://"))
-            .map(PathBuf::from);
+            .and_then(|t| {
+                if rustcode_platform::is_file_uri(&t.uri) || !t.uri.contains("://") {
+                    Some(rustcode_platform::file_uri_to_path(&t.uri))
+                } else {
+                    None
+                }
+            });
         let breadcrumbs_enabled = self
             .config
             .get_for_resource::<bool>("breadcrumbs.enabled", active_path.as_deref())
@@ -168,9 +172,14 @@ impl WorkbenchWindow {
             .editor_area
             .sync_breadcrumbs(Some(&self.view.workspace));
 
+        #[cfg(windows)]
+        let shell_setting_key = "terminal.integrated.shell.windows";
+        #[cfg(not(windows))]
+        let shell_setting_key = "terminal.integrated.shell.linux";
+
         self.view.terminal_panel.default_shell = self
             .config
-            .get_for_resource::<String>("terminal.integrated.shell.linux", active_path.as_deref());
+            .get_for_resource::<String>(shell_setting_key, active_path.as_deref());
     }
 
     pub fn open_settings(&mut self) {
@@ -1267,11 +1276,11 @@ impl WorkbenchWindow {
         let mut items = Vec::new();
         let symbols = crate::search::search_workspace_symbols(self.view.workspace.folders(), "");
         for s in symbols {
-            let path_str = s.location.uri.strip_prefix("file://").unwrap_or(&s.location.uri);
+            let path = rustcode_platform::file_uri_to_path(&s.location.uri);
             items.push(PaletteItem::symbol(
                 s.name,
                 s.container_name,
-                std::path::PathBuf::from(path_str),
+                path,
                 s.location.range.start.line as usize + 1,
                 s.location.range.start.character as usize,
             ));

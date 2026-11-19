@@ -103,6 +103,19 @@ class Selection extends Range {
   }
 }
 
+function isAsciiAlpha(code) {
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+function hasWindowsDrivePrefix(str, offset) {
+  return (
+    str.length >= offset + 2 &&
+    isAsciiAlpha(str.charCodeAt(offset)) &&
+    str.charCodeAt(offset + 1) === 58 &&
+    (str.length === offset + 2 || str.charCodeAt(offset + 2) === 47)
+  );
+}
+
 class Uri {
   constructor(scheme, authority, path, query, fragment) {
     this.scheme = scheme || 'file';
@@ -113,11 +126,38 @@ class Uri {
   }
 
   get fsPath() {
+    if (this.scheme === 'file') {
+      if (
+        this.authority &&
+        this.authority.toLowerCase() !== 'localhost' &&
+        this.path.length > 1
+      ) {
+        const winTail = this.path.split('/').join('\\');
+        return `\\\\${this.authority}${winTail}`;
+      }
+      if (this.path.startsWith('/') && hasWindowsDrivePrefix(this.path, 1)) {
+        const winPath = this.path.slice(1).split('/').join('\\');
+        return winPath.length === 2 ? `${winPath}\\` : winPath;
+      }
+    }
     return this.path;
   }
 
   static file(path) {
-    return new Uri('file', '', path, '', '');
+    const raw = typeof path === 'string' ? path : String(path || '');
+    const normalized = raw.split('\\').join('/');
+    if (normalized.startsWith('//')) {
+      const idx = normalized.indexOf('/', 2);
+      if (idx === -1) {
+        return new Uri('file', normalized.slice(2), '', '', '');
+      }
+      return new Uri('file', normalized.slice(2, idx), normalized.slice(idx), '', '');
+    }
+    if (hasWindowsDrivePrefix(normalized, 0)) {
+      const withSlash = normalized.length === 2 ? `/${normalized}/` : `/${normalized}`;
+      return new Uri('file', '', withSlash, '', '');
+    }
+    return new Uri('file', '', normalized, '', '');
   }
 
   static parse(value) {
@@ -506,7 +546,8 @@ class TreeItem {
       } else if (typeof labelOrResourceUri.path === 'string' || typeof labelOrResourceUri.fsPath === 'string') {
         this.resourceUri = labelOrResourceUri;
         const rawPath = labelOrResourceUri.fsPath || labelOrResourceUri.path || '';
-        const parts = rawPath.split('/');
+        const trimmedPath = rawPath.replace(/[\\/]+$/, '');
+        const parts = trimmedPath.split(/[\\/]/);
         this.label = parts[parts.length - 1] || rawPath;
       } else {
         this.label = String(labelOrResourceUri);

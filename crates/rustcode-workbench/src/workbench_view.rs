@@ -1556,8 +1556,7 @@ impl View for WorkbenchView {
                                 if let Some(ProblemsAction::JumpToLocation { uri, position }) =
                                     self.problems_panel.last_action.take()
                                 {
-                                    let clean_path = uri.strip_prefix("file://").unwrap_or(&uri);
-                                    let path = PathBuf::from(clean_path);
+                                    let path = rustcode_platform::file_uri_to_path(&uri);
                                     let title = path
                                         .file_name()
                                         .map_or("untitled", |n| n.to_str().unwrap_or(""));

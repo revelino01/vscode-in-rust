@@ -21,7 +21,8 @@ function normalizeTreeItem(providerId, rawElement, treeItem) {
     label = item.label.label;
   } else if (item.resourceUri) {
     const rawPath = item.resourceUri.fsPath || item.resourceUri.path || String(item.resourceUri);
-    const parts = rawPath.split('/');
+    const trimmedPath = rawPath.replace(/[\\/]+$/, '');
+    const parts = trimmedPath.split(/[\\/]/);
     label = parts[parts.length - 1] || rawPath;
   }
 

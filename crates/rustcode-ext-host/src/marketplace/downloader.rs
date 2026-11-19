@@ -9,8 +9,19 @@ pub struct ExtensionDownloader;
 impl ExtensionDownloader {
     /// Resolve default user extensions directory (`~/.rustcode/extensions/`).
     pub fn default_extensions_dir() -> PathBuf {
-        if let Ok(home) = std::env::var("HOME") {
-            PathBuf::from(home).join(".rustcode").join("extensions")
+        let home = std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+            .map(PathBuf::from)
+            .or_else(|| {
+                let drive = std::env::var_os("HOMEDRIVE").filter(|v| !v.is_empty())?;
+                let path = std::env::var_os("HOMEPATH").filter(|v| !v.is_empty())?;
+                let mut combined = drive;
+                combined.push(path);
+                Some(PathBuf::from(combined))
+            });
+        if let Some(home) = home {
+            home.join(".rustcode").join("extensions")
         } else {
             PathBuf::from(".rustcode").join("extensions")
         }

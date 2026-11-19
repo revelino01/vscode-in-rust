@@ -153,10 +153,7 @@ pub fn git_status_badge(kind: GitStatusKind) -> &'static str {
 }
 
 fn strip_file_scheme(uri_or_path: &str) -> PathBuf {
-    let raw = uri_or_path
-        .strip_prefix("file://")
-        .unwrap_or(uri_or_path);
-    PathBuf::from(raw)
+    rustcode_platform::file_uri_to_path(uri_or_path)
 }
 
 impl ExtHostScmManager {

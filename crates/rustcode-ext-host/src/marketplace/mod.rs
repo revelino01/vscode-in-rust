@@ -530,6 +530,42 @@ mod tests {
             assert!(!sym_called);
         }
 
+        // Windows NTFS directory junction inside ext root pointing outside is also rejected
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let junction_dir = ext_g.root_dir.join("linked_dir");
+            let cmd_line = format!(
+                "\"mklink /J \"{}\" \"{}\"\"",
+                junction_dir.display(),
+                temp_root.display()
+            );
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/D", "/S", "/C"])
+                .raw_arg(&cmd_line)
+                .status()
+                .expect("failed to execute mklink /J");
+            assert!(status.success(), "mklink /J failed with {:?}", status);
+
+            for escape_rel in ["./linked_dir/secret_grammar.json", "./linked_dir/nonexistent.json"] {
+                let mut junc_ext = ext_g.clone();
+                junc_ext.manifest.contributes.as_mut().unwrap().grammars.as_mut().unwrap()[0].path =
+                    escape_rel.to_string();
+                let mut junc_called = false;
+                let res_junc = installer.register_contributions(&junc_ext, &commands, None, |_, _| {
+                    junc_called = true;
+                    Ok(())
+                });
+                assert!(
+                    matches!(res_junc, Err(MarketplaceError::InvalidManifest(_))),
+                    "expected InvalidManifest for junction escape path {}",
+                    escape_rel
+                );
+                assert!(!junc_called);
+            }
+            let _ = std::fs::remove_dir(&junction_dir);
+        }
+
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
@@ -670,6 +706,43 @@ mod tests {
             let res = installer.install_from_vsix(&vsix, None);
             assert!(matches!(res, Err(MarketplaceError::InvalidManifest(_))));
             assert!(!outside_dir.join("package.json").exists());
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let junction = ext_dir.join("pub.symtarget-1.0.0");
+            let cmd_line = format!(
+                "\"mklink /J \"{}\" \"{}\"\"",
+                junction.display(),
+                outside_dir.display()
+            );
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/D", "/S", "/C"])
+                .raw_arg(&cmd_line)
+                .status()
+                .expect("failed to execute mklink /J");
+            assert!(status.success(), "mklink /J failed with {:?}", status);
+
+            let transport = Arc::new(MockHttpTransport::new());
+            let client = Arc::new(MarketplaceClient::new("https://open-vsx.org/api", transport));
+            let installer = ExtensionInstaller::new(client, &ext_dir);
+
+            let vsix = create_test_vsix(
+                r#"{"name":"symtarget","publisher":"pub","version":"1.0.0"}"#,
+                None,
+            );
+            let res = installer.install_from_vsix(&vsix, None);
+            assert!(matches!(res, Err(MarketplaceError::InvalidManifest(_))));
+            assert!(!outside_dir.join("package.json").exists());
+            let _ = std::fs::remove_dir(&junction);
+        }
+
+        // Verify default_extensions_dir resolves to an absolute path when HOME or USERPROFILE is set
+        if std::env::var_os("HOME").is_some() || std::env::var_os("USERPROFILE").is_some() {
+            let def_dir = ExtensionDownloader::default_extensions_dir();
+            assert!(def_dir.is_absolute(), "expected absolute default extensions dir, got {:?}", def_dir);
+            assert!(def_dir.ends_with(std::path::Path::new(".rustcode").join("extensions")));
         }
 
         let _ = std::fs::remove_dir_all(&temp_root);

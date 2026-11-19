@@ -8,7 +8,7 @@ use rustcode_platform::render::{
     WorkbenchThemeStyles,
 };
 use rustcode_protocols::lsp::types::SymbolKind;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreadcrumbKind {
@@ -75,7 +75,9 @@ impl BreadcrumbsBar {
         self.item_bounds.write().clear();
 
         // Special non-file URIs such as rustcode://settings, untitled://..., or untitled:Untitled-1
-        if (uri.contains("://") && !uri.starts_with("file://")) || uri.starts_with("untitled:") {
+        if (uri.contains("://") && !rustcode_platform::is_file_uri(uri))
+            || uri.starts_with("untitled:")
+        {
             let label = if title.is_empty() { uri } else { title };
             self.items.push(BreadcrumbItem {
                 label: label.to_string(),
@@ -87,8 +89,9 @@ impl BreadcrumbsBar {
             return;
         }
 
-        let clean = uri.strip_prefix("file://").unwrap_or(uri);
-        let path = Path::new(clean);
+        let path_buf = rustcode_platform::file_uri_to_path(uri);
+        let path = path_buf.as_path();
+        let clean = path_buf.to_string_lossy();
 
         if let Some(folder) = workspace.and_then(|ws| ws.get_folder_for_path(path)) {
             self.items.push(BreadcrumbItem {
@@ -148,7 +151,11 @@ impl BreadcrumbsBar {
                 .collect();
 
             if comps.is_empty() {
-                let label = if title.is_empty() { clean } else { title };
+                let label = if title.is_empty() {
+                    clean.as_ref()
+                } else {
+                    title
+                };
                 self.items.push(BreadcrumbItem {
                     label: label.to_string(),
                     kind: BreadcrumbKind::File,
@@ -157,11 +164,14 @@ impl BreadcrumbsBar {
                     column: None,
                 });
             } else {
-                let mut accum = if path.is_absolute() {
-                    PathBuf::from("/")
-                } else {
-                    PathBuf::new()
-                };
+                let mut accum = PathBuf::new();
+                for comp in path.components() {
+                    match comp {
+                        Component::Prefix(p) => accum.push(p.as_os_str()),
+                        Component::RootDir => accum.push(comp.as_os_str()),
+                        _ => break,
+                    }
+                }
                 for (idx, comp) in comps.iter().enumerate() {
                     accum.push(comp);
                     let kind = if idx + 1 < comps.len() {
@@ -378,6 +388,17 @@ mod tests {
         bar.update("file:///tmp/demo/app.py", "app.py", None, Some(("class Runner:\n    def run(self):\n        pass\n", 2)));
         let labels: Vec<&str> = bar.items.iter().map(|i| i.label.as_str()).collect();
         assert_eq!(labels, vec!["tmp", "demo", "app.py", "Runner", "run"]);
+
+        #[cfg(windows)]
+        {
+            bar.update("file:///C:/Users/demo/app.py", "app.py", None, None);
+            let win_labels: Vec<&str> = bar.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(win_labels, vec!["Users", "demo", "app.py"]);
+            assert_eq!(
+                bar.items[2].path.as_deref(),
+                Some(std::path::Path::new(r"C:\Users\demo\app.py"))
+            );
+        }
     }
 
     #[test]

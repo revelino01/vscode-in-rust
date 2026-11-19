@@ -1,4 +1,4 @@
-// Node.js path shim (posix style)
+// Node.js path shim (cross-platform POSIX & Windows path support)
 
 const path = {
   sep: '/',
@@ -6,9 +6,23 @@ const path = {
 
   normalize(p) {
     if (!p || typeof p !== 'string') return '.';
-    const isAbs = p.startsWith('/');
-    const trailingSlash = p.endsWith('/') && p.length > 1;
-    const segments = p.split('/').filter(Boolean);
+    const slash = p.replace(/\\/g, '/');
+    let prefix = '';
+    let rest = slash;
+
+    const uncMatch = rest.match(/^(\/\/[^/]+\/[^/]+)(.*)$/);
+    const driveMatch = !uncMatch && rest.match(/^([A-Za-z]:)(.*)$/);
+    if (uncMatch) {
+      prefix = uncMatch[1];
+      rest = uncMatch[2] || '/';
+    } else if (driveMatch) {
+      prefix = driveMatch[1];
+      rest = driveMatch[2];
+    }
+
+    const isAbs = Boolean(uncMatch) || rest.startsWith('/');
+    const trailingSlash = rest.endsWith('/') && rest.length > 1;
+    const segments = rest.split('/').filter(Boolean);
     const resolved = [];
 
     for (const seg of segments) {
@@ -24,7 +38,7 @@ const path = {
       }
     }
 
-    let res = (isAbs ? '/' : '') + resolved.join('/');
+    let res = prefix + (isAbs ? '/' : '') + resolved.join('/');
     if (!res) res = isAbs ? '/' : '.';
     if (trailingSlash && !res.endsWith('/')) res += '/';
     return res;
@@ -42,8 +56,8 @@ const path = {
     for (let i = parts.length - 1; i >= 0 && !resolvedAbsolute; i--) {
       const part = parts[i];
       if (!part) continue;
-      resolvedPath = `${part}/${resolvedPath}`;
-      resolvedAbsolute = part.startsWith('/');
+      resolvedPath = resolvedPath ? `${part}/${resolvedPath}` : part;
+      resolvedAbsolute = this.isAbsolute(part);
     }
 
     if (!resolvedAbsolute) {
@@ -55,14 +69,25 @@ const path = {
 
   dirname(p) {
     const norm = this.normalize(p);
-    const idx = norm.lastIndexOf('/');
+    if (/^[A-Za-z]:\/?$/.test(norm)) {
+      return norm.endsWith('/') ? norm : `${norm}/`;
+    }
+    const trimmed = norm.length > 1 && norm.endsWith('/') ? norm.slice(0, -1) : norm;
+    const idx = trimmed.lastIndexOf('/');
     if (idx === -1) return '.';
     if (idx === 0) return '/';
-    return norm.slice(0, idx);
+    if (idx === 2 && /^[A-Za-z]:/.test(trimmed)) return trimmed.slice(0, 3);
+    return trimmed.slice(0, idx);
   },
 
   basename(p, ext) {
-    let base = p.split('/').filter(Boolean).pop() || '';
+    if (!p || typeof p !== 'string') return '';
+    const cleaned = p.replace(/[\\/]+$/, '');
+    const parts = cleaned.split(/[\\/]/).filter(Boolean);
+    let base = parts.pop() || '';
+    if (/^[A-Za-z]:$/.test(base)) {
+      return '';
+    }
     if (ext && base.endsWith(ext)) {
       base = base.slice(0, -ext.length);
     }
@@ -77,7 +102,10 @@ const path = {
   },
 
   isAbsolute(p) {
-    return typeof p === 'string' && p.startsWith('/');
+    return (
+      typeof p === 'string' &&
+      (p.startsWith('/') || p.startsWith('\\') || /^[A-Za-z]:[\\/]/.test(p))
+    );
   }
 };
 

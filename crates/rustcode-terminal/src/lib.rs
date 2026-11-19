@@ -21,6 +21,171 @@ fn default_command_timeout_ms() -> u64 {
     DEFAULT_COMMAND_TIMEOUT_MS
 }
 
+/// Returns the default interactive shell executable for the current operating system.
+pub fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMSPEC")
+            .ok()
+            .filter(|s| !s.trim().is_empty() && Path::new(s).is_file())
+            .unwrap_or_else(|| "cmd.exe".to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        "/bin/sh".to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    Cmd,
+    PowerShell,
+    Posix,
+}
+
+fn shell_kind(shell_prog: &str) -> ShellKind {
+    let file_name = shell_prog
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(shell_prog)
+        .to_ascii_lowercase();
+    match file_name.as_str() {
+        "cmd" | "cmd.exe" => ShellKind::Cmd,
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => ShellKind::PowerShell,
+        _ => ShellKind::Posix,
+    }
+}
+
+fn find_in_path(prog: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        let has_ext = Path::new(prog).extension().is_some();
+        let pathext_raw =
+            std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let exts: Vec<&str> = pathext_raw
+            .split(';')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .collect();
+        for dir in std::env::split_paths(&path_var) {
+            if dir.join(prog).is_file() {
+                return true;
+            }
+            if !has_ext {
+                for ext in &exts {
+                    if dir.join(format!("{}{}", prog, ext)).is_file() {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.join(prog).is_file() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(windows)]
+fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    use std::path::Prefix;
+    let mut comps = path.components();
+    let Some(Component::Prefix(prefix_comp)) = comps.next() else {
+        return path;
+    };
+    let rest: PathBuf = comps.collect();
+    match prefix_comp.kind() {
+        Prefix::VerbatimDisk(drive) => {
+            let mut out =
+                std::ffi::OsString::from(format!("{}:", (drive as char).to_ascii_uppercase()));
+            out.push(rest.as_os_str());
+            PathBuf::from(out)
+        }
+        Prefix::VerbatimUNC(server, share) => {
+            let mut out = std::ffi::OsString::from(r"\\");
+            out.push(server);
+            out.push(r"\");
+            out.push(share);
+            out.push(rest.as_os_str());
+            PathBuf::from(out)
+        }
+        _ => path,
+    }
+}
+
+#[cfg(not(windows))]
+fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    path
+}
+
+fn build_shell_command(shell_prog: &str, trimmed: &str) -> Command {
+    let mut command = Command::new(shell_prog);
+    match shell_kind(shell_prog) {
+        ShellKind::Cmd => {
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                // cmd.exe stops parsing /C at the first CR/LF, so join multiline commands with ` & `.
+                let cmd_line = if trimmed.contains('\n') || trimmed.contains('\r') {
+                    trimmed
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(" & ")
+                } else {
+                    trimmed.to_string()
+                };
+                // /D disables AutoRun registry commands; /S strips exactly the single
+                // outermost quote pair we wrap around `cmd_line`, preserving internal quotes.
+                command
+                    .arg("/D")
+                    .arg("/S")
+                    .arg("/C")
+                    .raw_arg(format!("\"{}\"", cmd_line));
+            }
+            #[cfg(not(windows))]
+            {
+                command.arg("/C").arg(trimmed);
+            }
+        }
+        ShellKind::PowerShell => {
+            command
+                .arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(trimmed);
+        }
+        ShellKind::Posix => {
+            command.arg("-c").arg(trimmed);
+        }
+    }
+    command
+}
+
+fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE").filter(|v| !v.is_empty())?;
+            let path = std::env::var_os("HOMEPATH").filter(|v| !v.is_empty())?;
+            let mut combined = drive;
+            combined.push(path);
+            Some(PathBuf::from(combined))
+        })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandExecutionResult {
     pub exit_code: Option<i32>,
@@ -358,15 +523,38 @@ impl TerminalInstance {
         }
     }
 
-    fn resolve_shell(&self) -> &str {
-        if !self.shell.is_empty() && Path::new(&self.shell).exists() {
-            &self.shell
-        } else if Path::new("/bin/sh").exists() {
-            "/bin/sh"
-        } else if Path::new("/system/bin/sh").exists() {
-            "/system/bin/sh"
-        } else {
-            "sh"
+    fn resolve_shell(&self) -> String {
+        #[cfg(windows)]
+        {
+            if !self.shell.is_empty() {
+                if self.shell.contains('/') || self.shell.contains('\\') {
+                    if Path::new(&self.shell).is_file() {
+                        return self.shell.clone();
+                    }
+                } else if find_in_path(&self.shell) {
+                    return self.shell.clone();
+                }
+            }
+            default_shell()
+        }
+        #[cfg(not(windows))]
+        {
+            if !self.shell.is_empty() {
+                if self.shell.contains('/') {
+                    if Path::new(&self.shell).is_file() {
+                        return self.shell.clone();
+                    }
+                } else if find_in_path(&self.shell) {
+                    return self.shell.clone();
+                }
+            }
+            if Path::new("/bin/sh").exists() {
+                "/bin/sh".to_string()
+            } else if Path::new("/system/bin/sh").exists() {
+                "/system/bin/sh".to_string()
+            } else {
+                "sh".to_string()
+            }
         }
     }
 
@@ -398,12 +586,10 @@ impl TerminalInstance {
             }
         }
 
-        let shell_prog = self.resolve_shell().to_string();
-        let cwd = self.effective_cwd();
-        let mut command = Command::new(&shell_prog);
+        let shell_prog = self.resolve_shell();
+        let cwd = strip_windows_verbatim_prefix(self.effective_cwd());
+        let mut command = build_shell_command(&shell_prog, trimmed);
         command
-            .arg("-c")
-            .arg(trimmed)
             .current_dir(&cwd)
             .envs(&self.env_vars)
             .stdout(Stdio::piped())
@@ -589,12 +775,13 @@ impl TerminalInstance {
             "cd" => {
                 let target_raw = strip_matching_quotes(rest);
                 let target_path = if target_raw.is_empty() || target_raw == "~" {
-                    std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| self.effective_cwd())
-                } else if let Some(sub) = target_raw.strip_prefix("~/") {
-                    std::env::var_os("HOME")
-                        .map(|h| PathBuf::from(h).join(sub))
+                    user_home_dir().unwrap_or_else(|| self.effective_cwd())
+                } else if let Some(sub) = target_raw
+                    .strip_prefix("~/")
+                    .or_else(|| target_raw.strip_prefix("~\\"))
+                {
+                    user_home_dir()
+                        .map(|h| h.join(sub))
                         .unwrap_or_else(|| PathBuf::from(target_raw))
                 } else {
                     let candidate = Path::new(target_raw);
@@ -702,7 +889,8 @@ impl TerminalManager {
         self.next_id += 1;
 
         let title = title.unwrap_or("Terminal");
-        let shell = shell.unwrap_or("/bin/sh");
+        let default_sh = default_shell();
+        let shell = shell.unwrap_or(&default_sh);
         let cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
 
         let inst = TerminalInstance::new(&id, title, shell, cwd);
@@ -860,7 +1048,7 @@ impl TerminalManager {
         let inherited_shell = self
             .active_terminal()
             .map(|t| t.shell.clone())
-            .unwrap_or_else(|| "/bin/sh".to_string());
+            .unwrap_or_else(default_shell);
         let inherited_cwd = self
             .active_terminal()
             .map(|t| t.cwd.clone())
@@ -1079,7 +1267,11 @@ mod tests {
 
     #[test]
     fn test_terminal_pure_rust_command_execution_and_timeout() {
-        let mut term = TerminalInstance::new("t1", "sh", "/bin/sh", PathBuf::from("."));
+        #[cfg(windows)]
+        let shell = default_shell();
+        #[cfg(not(windows))]
+        let shell = "/bin/sh".to_string();
+        let mut term = TerminalInstance::new("t1", "sh", &shell, PathBuf::from("."));
         term.insert_str("echo hello_rustcode");
         let res = term.submit_input();
         assert_eq!(res.exit_code, Some(0));
@@ -1087,7 +1279,11 @@ mod tests {
         assert!(term.lines.iter().any(|l| l.contains("hello_rustcode")));
 
         term.set_command_timeout(Duration::from_millis(50));
-        term.insert_str("sleep 2");
+        #[cfg(windows)]
+        let sleep_cmd = "ping -n 4 127.0.0.1 >NUL";
+        #[cfg(not(windows))]
+        let sleep_cmd = "sleep 2";
+        term.insert_str(sleep_cmd);
         let timeout_res = term.submit_input();
         assert!(timeout_res.timed_out);
         assert_eq!(timeout_res.exit_code, None);
@@ -1141,11 +1337,21 @@ mod tests {
 
     #[test]
     fn test_terminal_timeout_forked_grandchild_no_pipe_hang() {
-        let mut term = TerminalInstance::new("t1", "sh", "/bin/sh", PathBuf::from("."));
+        #[cfg(windows)]
+        let shell = default_shell();
+        #[cfg(not(windows))]
+        let shell = "/bin/sh".to_string();
+        let mut term = TerminalInstance::new("t1", "sh", &shell, PathBuf::from("."));
         term.set_command_timeout(Duration::from_millis(50));
 
+        // Do NOT redirect stdout away so the grandchild inherits both stdout & stderr pipes.
+        #[cfg(windows)]
+        let cmd = "ping -n 4 127.0.0.1 & echo after";
+        #[cfg(not(windows))]
+        let cmd = "sleep 2; echo after";
+
         let start = Instant::now();
-        let res = term.execute_command("sleep 2; echo after");
+        let res = term.execute_command(cmd);
         let elapsed = start.elapsed();
 
         assert!(res.timed_out);
@@ -1165,5 +1371,158 @@ mod tests {
         assert!(has_shell_meta("echo a\necho b"));
         assert!(!has_shell_meta("cd ~"));
         assert!(!has_shell_meta("pwd"));
+    }
+
+    #[test]
+    fn test_shell_kind_detection_and_cd_then_exec_with_env() {
+        assert_eq!(shell_kind("cmd"), ShellKind::Cmd);
+        assert_eq!(shell_kind("cmd.exe"), ShellKind::Cmd);
+        assert_eq!(shell_kind(r"C:\Windows\System32\cmd.exe"), ShellKind::Cmd);
+        assert_eq!(shell_kind("powershell.exe"), ShellKind::PowerShell);
+        assert_eq!(shell_kind("pwsh"), ShellKind::PowerShell);
+        assert_eq!(shell_kind("/bin/sh"), ShellKind::Posix);
+        assert_eq!(shell_kind(r"C:\Program Files\Git\bin\bash.exe"), ShellKind::Posix);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "rustcode_term_cwd_exec_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let marker = tmp.join("marker_ok.txt");
+        std::fs::write(&marker, "present").unwrap();
+
+        let mut term = TerminalInstance::new("t1", "shell", &default_shell(), PathBuf::from("."));
+        let cd_res = term.execute_command(&format!("cd \"{}\"", tmp.display()));
+        assert_eq!(cd_res.exit_code, Some(0));
+
+        // Verify spawned shell runs in the canonicalized cwd (even on Windows where canonicalize adds \\?\)
+        #[cfg(windows)]
+        let check_cmd = "if exist marker_ok.txt echo FOUND_MARKER";
+        #[cfg(not(windows))]
+        let check_cmd = "test -f marker_ok.txt && echo FOUND_MARKER";
+        let exec_res = term.execute_command(check_cmd);
+        assert_eq!(exec_res.exit_code, Some(0));
+        assert!(
+            exec_res.stdout.contains("FOUND_MARKER"),
+            "expected FOUND_MARKER in stdout, got stdout={:?} stderr={:?}",
+            exec_res.stdout,
+            exec_res.stderr
+        );
+
+        // Verify export env var propagates to child shell
+        assert_eq!(
+            term.execute_command("export RUSTCODE_XPLAT_TEST=hello_env").exit_code,
+            Some(0)
+        );
+        #[cfg(windows)]
+        let env_cmd = "echo %RUSTCODE_XPLAT_TEST%";
+        #[cfg(not(windows))]
+        let env_cmd = "echo $RUSTCODE_XPLAT_TEST";
+        let env_res = term.execute_command(env_cmd);
+        assert_eq!(env_res.exit_code, Some(0));
+        assert!(
+            env_res.stdout.contains("hello_env"),
+            "expected hello_env in stdout, got {:?}",
+            env_res.stdout
+        );
+
+        // Verify multiline command execution (especially cmd.exe where raw /C truncates at \n)
+        let multi = term.execute_command("echo line_one\necho line_two");
+        assert_eq!(multi.exit_code, Some(0));
+        assert!(
+            multi.stdout.contains("line_one") && multi.stdout.contains("line_two"),
+            "expected both lines in stdout, got {:?}",
+            multi.stdout
+        );
+
+        // Verify missing configured shell (including pwsh when absent) falls back cleanly
+        let mut missing_shell_term =
+            TerminalInstance::new("t2", "missing", "nonexistent_rustcode_shell_xyz", PathBuf::from("."));
+        let fallback_res = missing_shell_term.execute_command("echo fallback_ok");
+        assert_eq!(fallback_res.exit_code, Some(0));
+        assert!(fallback_res.stdout.contains("fallback_ok"));
+
+        let mut pwsh_term = TerminalInstance::new("t3", "pwsh", "pwsh", PathBuf::from("."));
+        let pwsh_fallback = pwsh_term.execute_command("echo pwsh_or_fallback_ok");
+        assert_eq!(
+            pwsh_fallback.exit_code,
+            Some(0),
+            "pwsh should execute if installed or fall back cleanly; stderr={:?}",
+            pwsh_fallback.stderr
+        );
+        assert!(pwsh_fallback.stdout.contains("pwsh_or_fallback_ok"));
+
+        // Verify non-ASCII directory cd + subprocess execution
+        let unicode_dir = tmp.join("café_λ_dir");
+        std::fs::create_dir_all(&unicode_dir).unwrap();
+        std::fs::write(unicode_dir.join("u_marker.txt"), "ok").unwrap();
+        assert_eq!(
+            term.execute_command(&format!("cd \"{}\"", unicode_dir.display()))
+                .exit_code,
+            Some(0)
+        );
+        #[cfg(windows)]
+        let u_cmd = "if exist u_marker.txt echo UNICODE_CWD_OK";
+        #[cfg(not(windows))]
+        let u_cmd = "test -f u_marker.txt && echo UNICODE_CWD_OK";
+        let u_res = term.execute_command(u_cmd);
+        assert_eq!(u_res.exit_code, Some(0));
+        assert!(u_res.stdout.contains("UNICODE_CWD_OK"));
+
+        #[cfg(windows)]
+        {
+            // Embedded quotes + pipe under cmd.exe /D /S /C
+            let mut cmd_term = TerminalInstance::new("t_cmd", "cmd", "cmd.exe", PathBuf::from("."));
+            let pipe_res = cmd_term.execute_command(r#"echo "a & b" | findstr a"#);
+            assert_eq!(pipe_res.exit_code, Some(0));
+            assert!(
+                pipe_res.stdout.contains("a & b"),
+                "expected quoted ampersand preserved across pipe, got {:?}",
+                pipe_res.stdout
+            );
+
+            // Live PowerShell end-to-end execution (env propagation, cwd, multiline)
+            if find_in_path("powershell.exe") {
+                let mut ps_term =
+                    TerminalInstance::new("t_ps", "powershell", "powershell.exe", PathBuf::from("."));
+                ps_term.set_command_timeout(Duration::from_millis(10_000));
+                assert_eq!(
+                    ps_term
+                        .execute_command(&format!("cd \"{}\"", tmp.display()))
+                        .exit_code,
+                    Some(0)
+                );
+                assert_eq!(
+                    ps_term
+                        .execute_command("export RUSTCODE_PS_TEST=ps_env_ok")
+                        .exit_code,
+                    Some(0)
+                );
+                let ps_res = ps_term.execute_command(
+                    "if (Test-Path marker_ok.txt) { Write-Output \"PS_FOUND:$env:RUSTCODE_PS_TEST\" }\nWrite-Output 'PS_LINE_2'",
+                );
+                assert_eq!(
+                    ps_res.exit_code,
+                    Some(0),
+                    "powershell failed: stdout={:?} stderr={:?}",
+                    ps_res.stdout,
+                    ps_res.stderr
+                );
+                assert!(ps_res.stdout.contains("PS_FOUND:ps_env_ok"), "stdout={:?}", ps_res.stdout);
+                assert!(ps_res.stdout.contains("PS_LINE_2"), "stdout={:?}", ps_res.stdout);
+            }
+        }
+
+        // Verify `cd ~` resolves user home directory on both Unix (HOME) and Windows (USERPROFILE)
+        if let Some(expected_home) = user_home_dir().filter(|h| h.is_dir()) {
+            let home_cd = term.execute_command("cd ~");
+            assert_eq!(home_cd.exit_code, Some(0));
+            let canon_home = std::fs::canonicalize(&expected_home)
+                .unwrap_or_else(|_| lexical_normalize_path(&expected_home));
+            assert_eq!(term.cwd, canon_home);
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

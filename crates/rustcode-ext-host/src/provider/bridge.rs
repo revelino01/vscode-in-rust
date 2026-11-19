@@ -1410,21 +1410,27 @@ impl LanguageFeatureBridge {
                         let raw = raw_uri_opt?;
                         let path = decode_file_uri(raw);
                         let path_str = path.to_string_lossy();
-                        let canonical_uri = if raw.starts_with("file://") {
+                        let normalized_uri = rustcode_platform::path_to_file_uri(&path);
+                        let canonical_uri = if rustcode_platform::is_file_uri(raw) {
                             raw.to_string()
                         } else {
-                            format!("file://{}", path_str)
+                            normalized_uri.clone()
                         };
                         let alt_uri = format!("file://{}", path_str);
 
                         let open_snap = {
                             let docs = self.open_documents.read();
                             docs.get(&canonical_uri)
+                                .or_else(|| docs.get(&normalized_uri))
                                 .or_else(|| docs.get(&alt_uri))
                                 .or_else(|| docs.get(raw))
                                 .or_else(|| {
-                                    docs.values()
-                                        .find(|snap| snap.file_name == path_str.as_ref())
+                                    docs.values().find(|snap| {
+                                        rustcode_platform::paths_equivalent(
+                                            Path::new(&snap.file_name),
+                                            &path,
+                                        )
+                                    })
                                 })
                                 .cloned()
                         };
@@ -1613,7 +1619,7 @@ impl LanguageFeatureBridge {
                         }
                         if self.fs_root.is_some()
                             && std::fs::symlink_metadata(&path)
-                                .is_ok_and(|m| m.file_type().is_symlink())
+                                .is_ok_and(|m| is_symlink_or_reparse_point(&path, &m))
                         {
                             return Err(format!(
                                 "EACCES: Refusing to write through symlink '{}'",
@@ -1684,7 +1690,7 @@ impl LanguageFeatureBridge {
                 let sym_meta = std::fs::symlink_metadata(&path).ok();
                 let is_symlink = sym_meta
                     .as_ref()
-                    .is_some_and(|m| m.file_type().is_symlink());
+                    .is_some_and(|m| is_symlink_or_reparse_point(&path, m));
                 let mtime_ms = meta
                     .modified()
                     .ok()
@@ -1733,16 +1739,29 @@ impl LanguageFeatureBridge {
         if raw_path.trim().is_empty() || raw_path.contains('\0') {
             return Err("EINVAL: Invalid empty or NUL path".to_string());
         }
-        let path = if raw_path.starts_with("file://") {
+        let path = if rustcode_platform::is_file_uri(raw_path) {
             decode_file_uri(raw_path)
         } else {
             PathBuf::from(raw_path)
         };
+        let path = rustcode_platform::strip_windows_verbatim_prefix(path);
         if path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
             return Err("EINVAL: Invalid empty or NUL path".to_string());
         }
 
         if let Some(root) = &self.fs_root {
+            #[cfg(windows)]
+            {
+                let has_prefix = path
+                    .components()
+                    .any(|c| matches!(c, Component::Prefix(_)));
+                if has_prefix && !path.has_root() {
+                    return Err(format!(
+                        "EACCES: Drive-relative path '{}' is not permitted inside fs_root",
+                        path.display()
+                    ));
+                }
+            }
             let abs_root = if root.is_absolute() {
                 root.to_path_buf()
             } else {
@@ -1787,13 +1806,37 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
+fn normalize_canonical_path(path: PathBuf) -> PathBuf {
+    rustcode_platform::strip_windows_verbatim_prefix(path)
+}
+
+fn is_symlink_or_reparse_point(path: &Path, meta: &std::fs::Metadata) -> bool {
+    if meta.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+        if (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            && std::fs::read_link(path).is_ok()
+        {
+            return true;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = path;
+    false
+}
+
 fn canonicalize_existing_prefix(path: &Path) -> PathBuf {
     let normalized = lexical_normalize(path);
     let mut suffix = Vec::new();
     let mut cur = normalized.as_path();
     loop {
         if std::fs::symlink_metadata(cur).is_ok() {
-            if let Ok(mut canon) = std::fs::canonicalize(cur) {
+            if let Ok(canon) = std::fs::canonicalize(cur) {
+                let mut canon = normalize_canonical_path(canon);
                 for seg in suffix.into_iter().rev() {
                     canon.push(seg);
                 }
@@ -1845,20 +1888,28 @@ fn resolve_sandbox_steps(
     while let Some(step) = queue.pop_front() {
         match step {
             PathStep::Prefix(p) => cur.push(p),
-            PathStep::RootDir => cur.push(Component::RootDir.as_os_str()),
+            PathStep::RootDir => {
+                cur.push(Component::RootDir.as_os_str());
+                #[cfg(windows)]
+                if let Ok(canon) = std::fs::canonicalize(&cur) {
+                    cur = normalize_canonical_path(canon);
+                }
+            }
             PathStep::ParentDir => {
                 cur.pop();
             }
             PathStep::Normal(seg) => {
                 let next = cur.join(&seg);
                 match std::fs::symlink_metadata(&next) {
-                    Ok(meta) if meta.file_type().is_symlink() => {
+                    Ok(meta) if is_symlink_or_reparse_point(&next, &meta) => {
                         *symlinks_followed += 1;
                         if *symlinks_followed > MAX_SYMLINKS {
                             return Err("ELOOP: Too many levels of symbolic links".to_string());
                         }
-                        let target = std::fs::read_link(&next).map_err(map_io_error)?;
-                        if cur.starts_with(canon_root) {
+                        let target = normalize_canonical_path(
+                            std::fs::read_link(&next).map_err(map_io_error)?,
+                        );
+                        if rustcode_platform::path_starts_with(&cur, canon_root) {
                             let candidate_target = if target.is_absolute() {
                                 target
                             } else {
@@ -1869,7 +1920,7 @@ fn resolve_sandbox_steps(
                                 canon_root,
                                 symlinks_followed,
                             )?;
-                            if !resolved_target.starts_with(canon_root) {
+                            if !rustcode_platform::path_starts_with(&resolved_target, canon_root) {
                                 return Err(format!(
                                     "EACCES: Path '{}' escapes fs_root via symlink",
                                     next.display()
@@ -1886,7 +1937,27 @@ fn resolve_sandbox_steps(
                         }
                     }
                     Ok(_) => {
-                        cur = next;
+                        #[cfg(windows)]
+                        {
+                            if let Ok(canon_next) = std::fs::canonicalize(&next) {
+                                let canon_next = normalize_canonical_path(canon_next);
+                                if rustcode_platform::path_starts_with(&cur, canon_root)
+                                    && !rustcode_platform::path_starts_with(&canon_next, canon_root)
+                                {
+                                    return Err(format!(
+                                        "EACCES: Path '{}' escapes fs_root",
+                                        next.display()
+                                    ));
+                                }
+                                cur = canon_next;
+                            } else {
+                                cur = next;
+                            }
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            cur = next;
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         cur = next;
@@ -1899,7 +1970,7 @@ fn resolve_sandbox_steps(
         }
     }
 
-    if !cur.starts_with(canon_root) {
+    if !rustcode_platform::path_starts_with(&cur, canon_root) {
         return Err(format!(
             "EACCES: Path '{}' escapes fs_root '{}'",
             cur.display(),
@@ -1909,34 +1980,8 @@ fn resolve_sandbox_steps(
     Ok(cur)
 }
 
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            let h1 = (bytes[i + 1] as char).to_digit(16);
-            let h2 = (bytes[i + 2] as char).to_digit(16);
-            if let (Some(d1), Some(d2)) = (h1, h2) {
-                out.push(((d1 << 4) | d2) as u8);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 fn decode_file_uri(uri_or_path: &str) -> PathBuf {
-    if let Some(rest) = uri_or_path.strip_prefix("file://localhost") {
-        PathBuf::from(percent_decode(rest))
-    } else if let Some(rest) = uri_or_path.strip_prefix("file://") {
-        PathBuf::from(percent_decode(rest))
-    } else {
-        PathBuf::from(uri_or_path)
-    }
+    rustcode_platform::file_uri_to_path(uri_or_path)
 }
 
 fn extract_scope_path(params: &Value) -> Option<PathBuf> {
@@ -2507,6 +2552,227 @@ mod tests {
         assert_eq!(ok["written"], json!(true));
         assert_eq!(std::fs::read(real_root.join("ok.txt")).unwrap(), b"OK");
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    fn create_windows_junction(link: &Path, target: &Path) {
+        use std::os::windows::process::CommandExt;
+        let cmd_line = format!(
+            "\"mklink /J \"{}\" \"{}\"\"",
+            link.display(),
+            target.display()
+        );
+        let status = std::process::Command::new("cmd.exe")
+            .args(["/D", "/S", "/C"])
+            .raw_arg(&cmd_line)
+            .status()
+            .expect("failed to execute cmd.exe mklink /J");
+        assert!(
+            status.success(),
+            "mklink /J {} -> {} failed with {:?}",
+            link.display(),
+            target.display(),
+            status
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn test_fs_rpc_windows_uri_verbatim_and_junction_sandbox() {
+        let base = std::env::temp_dir().join(format!(
+            "rustcode_fs_win_unit_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        let real_parent = base.join("real");
+        let root = real_parent.join("sandbox");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Junction-aliased parent to fs_root (Windows equivalent of symlinked root alias)
+        let alias_parent = base.join("alias");
+        create_windows_junction(&alias_parent, &real_parent);
+        let aliased_root = alias_parent.join("sandbox");
+
+        let reg = Arc::new(ProviderRegistry::new());
+        let rpc = Arc::new(RpcBridge::new());
+        let lsp = Arc::new(LspClientManager::new());
+        let bridge = LanguageFeatureBridge::new(reg, rpc, lsp).with_fs_root(&aliased_root);
+
+        // RFC 8089 file:///C:/..., percent-encoded drive colon file:///c%3A/..., and uppercase FILE:///
+        let target = root.join("win_file.txt");
+        let rfc_uri = rustcode_platform::path_to_file_uri(&target);
+        assert!(rfc_uri.starts_with("file:///"), "expected RFC 8089 URI, got {}", rfc_uri);
+        let wr = bridge
+            .handle_fs_rpc("fs.writeFile", &json!({ "path": rfc_uri, "data": "win-ok" }))
+            .await
+            .unwrap();
+        assert_eq!(wr["written"], json!(true));
+
+        let slash_path = target.to_string_lossy().replace('\\', "/");
+        let lower_drive_uri = format!(
+            "file:///{}",
+            slash_path.replacen(':', "%3A", 1).to_ascii_lowercase()
+        );
+        let read_back = bridge
+            .handle_fs_rpc("fs.readFile", &json!({ "path": lower_drive_uri }))
+            .await
+            .unwrap();
+        assert_eq!(read_back, json!("win-ok"));
+
+        let upper_scheme_uri = format!("FILE:///{}", slash_path);
+        let read_upper = bridge
+            .handle_fs_rpc("fs.readFile", &json!({ "path": upper_scheme_uri }))
+            .await
+            .unwrap();
+        assert_eq!(read_upper, json!("win-ok"));
+
+        // Absolute path via junction-aliased fs_root MUST succeed
+        let aliased_target = aliased_root.join("via_alias.txt");
+        let alias_wr = bridge
+            .handle_fs_rpc(
+                "fs.writeFile",
+                &json!({ "path": aliased_target.to_string_lossy(), "data": [79, 75] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(alias_wr["written"], json!(true));
+        assert_eq!(std::fs::read(root.join("via_alias.txt")).unwrap(), b"OK");
+
+        // Verbatim \\?\C:\... canonicalized path inside fs_root must also succeed
+        let verbatim_target = std::fs::canonicalize(&target).unwrap();
+        let read_verbatim = bridge
+            .handle_fs_rpc(
+                "fs.readFile",
+                &json!({ "path": verbatim_target.to_string_lossy() }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read_verbatim, json!("win-ok"));
+
+        // Drive-relative and root-relative paths MUST be rejected with EACCES
+        for bad in ["C:escape.txt", r"\outside.txt", "/outside.txt"] {
+            let err = bridge
+                .handle_fs_rpc("fs.readFile", &json!({ "path": bad }))
+                .await
+                .unwrap_err();
+            assert!(
+                err.starts_with("EACCES:"),
+                "expected EACCES for {}, got {}",
+                bad,
+                err
+            );
+        }
+
+        // NTFS directory junction inside fs_root pointing outside MUST be rejected with EACCES
+        let junction = root.join("escape_junction");
+        create_windows_junction(&junction, &outside);
+        let err = bridge
+            .handle_fs_rpc(
+                "fs.writeFile",
+                &json!({ "path": "escape_junction/pwned.txt", "data": "pwned" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("EACCES:"), "expected EACCES, got {}", err);
+        assert!(!outside.join("pwned.txt").exists());
+        let _ = std::fs::remove_dir(&junction);
+
+        // Dangling NTFS directory junction pointing to non-existent outside dir MUST fail with EACCES
+        let dangling_target = outside.join("nonexistent_dir");
+        let dangling_junction = root.join("dangling_junction");
+        create_windows_junction(&dangling_junction, &dangling_target);
+        let err_str = bridge
+            .handle_fs_rpc(
+                "fs.writeFile",
+                &json!({ "path": "dangling_junction/pwned.txt", "data": "pwned" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err_str.starts_with("EACCES:"), "expected EACCES, got {}", err_str);
+        let err_bytes = bridge
+            .handle_fs_rpc(
+                "fs.writeFile",
+                &json!({ "path": "dangling_junction/pwned.bin", "data": [1, 2, 3] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(err_bytes.starts_with("EACCES:"), "expected EACCES, got {}", err_bytes);
+        assert!(!dangling_target.exists());
+        let _ = std::fs::remove_dir(&dangling_junction);
+
+        // Cyclic NTFS junctions inside fs_root MUST fail cleanly with ELOOP
+        let cyc_a = root.join("cyc_a");
+        let cyc_b = root.join("cyc_b");
+        create_windows_junction(&cyc_a, &cyc_b);
+        create_windows_junction(&cyc_b, &cyc_a);
+        let loop_err = bridge
+            .handle_fs_rpc("fs.readFile", &json!({ "path": "cyc_a/test.txt" }))
+            .await
+            .unwrap_err();
+        assert!(loop_err.starts_with("ELOOP:"), "expected ELOOP, got {}", loop_err);
+        let _ = std::fs::remove_dir(&cyc_a);
+        let _ = std::fs::remove_dir(&cyc_b);
+
+        // Non-existent fs_root with different ASCII casing in caller path MUST succeed on Windows
+        let future_root = base.join("FutureMixedCaseRoot");
+        let future_bridge = LanguageFeatureBridge::new(
+            Arc::new(ProviderRegistry::new()),
+            Arc::new(RpcBridge::new()),
+            Arc::new(LspClientManager::new()),
+        )
+        .with_fs_root(&future_root);
+        let lower_future_file = future_root
+            .join("hello.txt")
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        let future_wr = future_bridge
+            .handle_fs_rpc(
+                "fs.writeFile",
+                &json!({ "path": lower_future_file, "data": "case-ok" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(future_wr["written"], json!(true));
+
+        // openTextDocument matches RFC 8089 did_open_document via native Windows backslash path & lowercase drive
+        let spaced = root.join("hello win.rs");
+        std::fs::write(&spaced, "disk_version").unwrap();
+        let rfc_spaced = rustcode_platform::path_to_file_uri(&spaced).replace(' ', "%20");
+        bridge
+            .did_open_document(&rfc_spaced, "rust", 1, "disk_version")
+            .await;
+        bridge
+            .did_change_document(&rfc_spaced, "rust", 2, "DIRTY_WIN_BUFFER")
+            .await;
+        let doc_by_win_path = bridge
+            .handle_rpc_message(
+                "workspace.openTextDocument",
+                &json!({ "path": spaced.to_string_lossy().to_ascii_lowercase() }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(doc_by_win_path["isDirty"], true);
+        assert_eq!(doc_by_win_path["text"], "DIRTY_WIN_BUFFER");
+
+        // Opening an uncached disk file by Windows path produces an RFC 8089 file:///C:/... URI
+        let clean_file = root.join("clean.rs");
+        std::fs::write(&clean_file, "fn clean() {}\n").unwrap();
+        let clean_doc = bridge
+            .handle_rpc_message(
+                "workspace.openTextDocument",
+                &json!({ "path": clean_file.to_string_lossy() }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            clean_doc["uri"].as_str().unwrap(),
+            rustcode_platform::path_to_file_uri(&clean_file)
+        );
+
+        let _ = std::fs::remove_dir(&alias_parent);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

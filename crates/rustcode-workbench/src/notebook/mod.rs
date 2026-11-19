@@ -320,10 +320,8 @@ pub struct NotebookDocument {
 fn resolve_path_from_uri(uri: &str) -> Option<PathBuf> {
     if uri.starts_with("untitled:") || uri.starts_with("rustcode:") {
         None
-    } else if let Some(stripped) = uri.strip_prefix("file://") {
-        Some(PathBuf::from(stripped))
     } else {
-        Some(PathBuf::from(uri))
+        Some(rustcode_platform::file_uri_to_path(uri))
     }
 }
 

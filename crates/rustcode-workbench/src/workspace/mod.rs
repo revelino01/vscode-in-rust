@@ -20,11 +20,7 @@ impl WorkspaceFolder {
                 .unwrap_or_else(|| format!("folder_{}", index))
         });
 
-        let uri = if path.to_string_lossy().starts_with("file://") {
-            path.to_string_lossy().to_string()
-        } else {
-            format!("file://{}", path.to_string_lossy())
-        };
+        let uri = rustcode_platform::path_to_file_uri(&path);
 
         Self {
             uri,
@@ -36,12 +32,12 @@ impl WorkspaceFolder {
 
     /// Check if this workspace folder contains the given file path.
     pub fn contains_path(&self, file_path: &Path) -> bool {
-        file_path.starts_with(&self.path)
+        rustcode_platform::path_starts_with(file_path, &self.path)
     }
 
     /// Returns the relative path of `file_path` with respect to this workspace folder.
     pub fn relative_path(&self, file_path: &Path) -> Option<PathBuf> {
-        file_path.strip_prefix(&self.path).ok().map(|p| p.to_path_buf())
+        rustcode_platform::path_strip_prefix(file_path, &self.path)
     }
 }
 
@@ -88,7 +84,11 @@ impl Workspace {
 
     /// Adds a folder to the workspace. If the path already exists, returns the existing folder reference.
     pub fn add_folder(&mut self, path: PathBuf, name: Option<String>) -> &WorkspaceFolder {
-        if let Some(idx) = self.folders.iter().position(|f| f.path == path) {
+        if let Some(idx) = self
+            .folders
+            .iter()
+            .position(|f| rustcode_platform::paths_equivalent(&f.path, &path))
+        {
             return &self.folders[idx];
         }
 
@@ -100,7 +100,10 @@ impl Workspace {
 
     /// Removes a folder by path, reindexing the remaining folders.
     pub fn remove_folder(&mut self, path: &Path) -> Option<WorkspaceFolder> {
-        let idx = self.folders.iter().position(|f| f.path == path)?;
+        let idx = self
+            .folders
+            .iter()
+            .position(|f| rustcode_platform::paths_equivalent(&f.path, path))?;
         let removed = self.folders.remove(idx);
         self.reindex_folders();
         Some(removed)
@@ -213,5 +216,18 @@ mod tests {
         let file = PathBuf::from("/monorepo/packages/core/src/index.ts");
         let matched = ws.get_folder_for_path(&file).expect("matched folder");
         assert_eq!(matched.name, "Core");
+
+        #[cfg(windows)]
+        {
+            let mut win_ws = Workspace::new("WinWorkspace");
+            win_ws.add_folder(PathBuf::from(r"C:\Users\Dev\Project"), Some("Project".to_string()));
+            assert_eq!(win_ws.folders()[0].uri, "file:///C:/Users/Dev/Project");
+
+            // Case-insensitive & slash-normalized matching for Windows paths decoded from URIs
+            let decoded = rustcode_platform::file_uri_to_path("file:///c:/users/dev/project/src/lib.rs");
+            let found = win_ws.get_folder_for_path(&decoded).expect("matched win folder");
+            assert_eq!(found.name, "Project");
+            assert_eq!(found.relative_path(&decoded), Some(PathBuf::from(r"src\lib.rs")));
+        }
     }
 }

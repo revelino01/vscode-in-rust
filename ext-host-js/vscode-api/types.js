@@ -490,6 +490,51 @@ class EventEmitter {
   }
 }
 
+const TreeItemCollapsibleState = {
+  None: 0,
+  Collapsed: 1,
+  Expanded: 2,
+};
+
+class TreeItem {
+  constructor(labelOrResourceUri, collapsibleState = TreeItemCollapsibleState.None) {
+    if (typeof labelOrResourceUri === 'string') {
+      this.label = labelOrResourceUri;
+    } else if (labelOrResourceUri && typeof labelOrResourceUri === 'object') {
+      if (typeof labelOrResourceUri.label === 'string') {
+        this.label = labelOrResourceUri.label;
+      } else if (typeof labelOrResourceUri.path === 'string' || typeof labelOrResourceUri.fsPath === 'string') {
+        this.resourceUri = labelOrResourceUri;
+        const rawPath = labelOrResourceUri.fsPath || labelOrResourceUri.path || '';
+        const parts = rawPath.split('/');
+        this.label = parts[parts.length - 1] || rawPath;
+      } else {
+        this.label = String(labelOrResourceUri);
+      }
+    } else {
+      this.label = '';
+    }
+    this.id = undefined;
+    this.description = undefined;
+    this.tooltip = undefined;
+    this.collapsibleState = collapsibleState;
+    this.iconPath = undefined;
+    this.contextValue = undefined;
+    this.command = undefined;
+  }
+}
+
+const ConfigurationTarget = {
+  Global: 1,
+  Workspace: 2,
+  WorkspaceFolder: 3,
+};
+
+const EndOfLine = {
+  LF: 1,
+  CRLF: 2,
+};
+
 module.exports = {
   Position,
   Range,
@@ -513,4 +558,8 @@ module.exports = {
   CodeActionKind,
   CodeActionTriggerKind,
   CodeAction,
+  TreeItemCollapsibleState,
+  TreeItem,
+  ConfigurationTarget,
+  EndOfLine,
 };

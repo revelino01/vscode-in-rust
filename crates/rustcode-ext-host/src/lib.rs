@@ -5,6 +5,7 @@
 
 pub mod auth;
 pub mod debug;
+pub mod env;
 pub mod manifest;
 pub mod marketplace;
 pub mod notebook;
@@ -16,6 +17,7 @@ pub mod tasks;
 pub mod terminal;
 pub mod testing;
 pub mod webview;
+pub mod window;
 
 pub use auth::{
     AuthEventListener, ExtAuthAccountInfo, ExtAuthEvent, ExtAuthProviderInfo, ExtAuthSessionInfo,
@@ -25,11 +27,12 @@ pub use debug::{
     DebugEventListener, ExtDebugBreakpoint, ExtDebugConsoleEntry, ExtDebugCustomEvent,
     ExtDebugEvent, ExtDebugProviderInfo, ExtDebugSessionState, ExtHostDebugManager,
 };
+pub use env::{EnvEventListener, ExtEnvEvent, ExtHostEnvManager};
 pub use manifest::{
     AuthenticationContribution, ContributedCommand, Contributions, CustomEditorContribution,
     CustomEditorSelector, DebuggerContribution, ExtensionLoader, ExtensionManifest,
-    GrammarContribution, KeybindingContribution, LanguageContribution, LoadedExtension,
-    TaskDefinitionContribution, ThemeContribution, ViewContribution,
+    ExtensionSnapshot, GrammarContribution, KeybindingContribution, LanguageContribution,
+    LoadedExtension, TaskDefinitionContribution, ThemeContribution, ViewContribution,
 };
 pub use marketplace::{
     curated_catalog, search_curated_catalog, CurlHttpTransport, ExtensionDownloader,
@@ -68,4 +71,9 @@ pub use webview::{
     CustomEditorEvent, CustomEditorEventListener, CustomEditorProviderInfo,
     CustomEditorSessionState, ExtHostCustomEditorManager, ExtHostWebviewManager, WebviewEvent,
     WebviewEventListener, WebviewMessageListener, WebviewOptions, WebviewPanelState,
+};
+pub use window::{
+    ExtHostWindowManager, ExtNotificationState, ExtPromptKind, ExtPromptState, ExtWindowEvent,
+    NotificationActionItem, NotificationResponder, NotificationSeverity, PromptResponder,
+    WindowEventListener,
 };

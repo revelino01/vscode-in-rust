@@ -210,6 +210,46 @@ pub struct LoadedExtension {
     pub is_activated: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtensionSnapshot {
+    pub id: String,
+    pub extension_path: String,
+    pub is_active: bool,
+    #[serde(rename = "packageJSON")]
+    pub package_json: Value,
+    pub extension_kind: u8,
+}
+
+impl ExtensionSnapshot {
+    pub fn from_loaded(ext: &LoadedExtension) -> Self {
+        let id = crate::marketplace::ExtensionInstaller::extension_id(
+            &ext.manifest.publisher,
+            &ext.manifest.name,
+        );
+        let package_json = serde_json::to_value(&ext.manifest).unwrap_or_else(|_| {
+            serde_json::json!({
+                "name": ext.manifest.name,
+                "publisher": ext.manifest.publisher,
+                "version": ext.manifest.version,
+            })
+        });
+        Self {
+            id,
+            extension_path: ext.root_dir.to_string_lossy().into_owned(),
+            is_active: ext.is_activated,
+            package_json,
+            extension_kind: 1,
+        }
+    }
+}
+
+impl From<&LoadedExtension> for ExtensionSnapshot {
+    fn from(ext: &LoadedExtension) -> Self {
+        Self::from_loaded(ext)
+    }
+}
+
 pub struct ExtensionLoader {
     search_paths: Vec<PathBuf>,
     extensions: Vec<LoadedExtension>,
@@ -295,6 +335,22 @@ impl ExtensionLoader {
             .iter()
             .find(|e| e.manifest.name == name)
             .is_some_and(|e| e.is_activated)
+    }
+
+    /// Return serializable snapshots of all loaded extensions.
+    pub fn snapshots(&self) -> Vec<ExtensionSnapshot> {
+        self.extensions
+            .iter()
+            .map(ExtensionSnapshot::from_loaded)
+            .collect()
+    }
+
+    /// Look up a loaded extension snapshot by canonical ID (case-insensitive).
+    pub fn snapshot_for(&self, extension_id: &str) -> Option<ExtensionSnapshot> {
+        self.extensions
+            .iter()
+            .map(ExtensionSnapshot::from_loaded)
+            .find(|snap| snap.id.eq_ignore_ascii_case(extension_id))
     }
 }
 
@@ -468,5 +524,47 @@ mod tests {
         };
         assert!(!ext_ce.matches_path("foo.bin.txt"));
         assert!(ext_ce.matches_path("C:\\dir\\foo.bin"));
+    }
+
+    #[test]
+    fn test_extension_snapshot_from_loaded_and_loader_snapshots() {
+        let dir = std::env::temp_dir().join(format!(
+            "rustcode_manifest_snap_{}",
+            std::process::id()
+        ));
+        let ext_a = dir.join("ext-a");
+        let ext_b = dir.join("ext-b");
+        std::fs::create_dir_all(&ext_a).unwrap();
+        std::fs::create_dir_all(&ext_b).unwrap();
+        std::fs::write(
+            ext_a.join("package.json"),
+            r#"{"name": "hello-world", "publisher": "RustCode", "version": "0.1.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ext_b.join("package.json"),
+            r#"{"name": "local-only", "publisher": "", "version": "0.2.0"}"#,
+        )
+        .unwrap();
+
+        let mut loader = ExtensionLoader::new();
+        loader.load_from_dir(&ext_a).unwrap();
+        loader.load_from_dir(&ext_b).unwrap();
+        assert!(loader.activate("hello-world"));
+
+        let snaps = loader.snapshots();
+        assert_eq!(snaps.len(), 2);
+        assert_eq!(snaps[0].id, "RustCode.hello-world");
+        assert!(snaps[0].is_active);
+        assert_eq!(snaps[0].package_json["name"], "hello-world");
+        assert_eq!(snaps[0].extension_kind, 1);
+        assert_eq!(snaps[1].id, "local-only");
+        assert!(!snaps[1].is_active);
+
+        let found = loader.snapshot_for("rustcode.hello-world").unwrap();
+        assert_eq!(found.id, "RustCode.hello-world");
+        assert!(loader.snapshot_for("missing.ext").is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

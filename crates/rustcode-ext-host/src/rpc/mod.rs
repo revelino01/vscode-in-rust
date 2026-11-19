@@ -87,6 +87,19 @@ impl RpcBridge {
         (msg, rx)
     }
 
+    /// Create an outbound fire-and-forget RPC notification without registering a pending response waiter.
+    pub fn create_notification(&self, channel: &str, data: Value) -> RpcMessage {
+        RpcMessage::Notification {
+            channel: channel.to_string(),
+            data,
+        }
+    }
+
+    /// Return the number of currently pending outbound RPC requests awaiting responses.
+    pub fn pending_count(&self) -> usize {
+        self.pending.lock().len()
+    }
+
     /// Dispatch an incoming response to fulfill a pending request.
     pub fn handle_incoming_response(&self, id: u64, result: Option<Value>, error: Option<String>) -> bool {
         let sender = self.pending.lock().remove(&id);

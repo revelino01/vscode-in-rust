@@ -41,7 +41,7 @@ impl ProviderType {
             "References" => Some(Self::References),
             "DocumentFormatting" => Some(Self::DocumentFormatting),
             "CodeAction" => Some(Self::CodeAction),
-            "TreeData" => Some(Self::TreeData),
+            "TreeData" | "TreeDataProvider" => Some(Self::TreeData),
             "NotebookSerializer" => Some(Self::NotebookSerializer),
             "NotebookController" => Some(Self::NotebookController),
             "SourceControl" => Some(Self::SourceControl),
@@ -82,10 +82,28 @@ impl ProviderRegistry {
 
     pub fn register(&self, registration: ProviderRegistration) {
         let mut guard = self.providers.write();
+        let list = guard.entry(registration.provider_type).or_default();
+        list.retain(|p| p.id != registration.id);
+        list.push(registration);
+    }
+
+    pub fn get_providers(&self, provider_type: ProviderType) -> Vec<ProviderRegistration> {
+        let guard = self.providers.read();
+        guard.get(&provider_type).cloned().unwrap_or_default()
+    }
+
+    pub fn has_provider(&self, provider_type: ProviderType) -> bool {
+        let guard = self.providers.read();
         guard
-            .entry(registration.provider_type)
-            .or_default()
-            .push(registration);
+            .get(&provider_type)
+            .is_some_and(|list| !list.is_empty())
+    }
+
+    pub fn has_provider_with_id(&self, provider_type: ProviderType, id: &str) -> bool {
+        let guard = self.providers.read();
+        guard
+            .get(&provider_type)
+            .is_some_and(|list| list.iter().any(|p| p.id == id))
     }
 
     pub fn get_providers_for_language(&self, provider_type: ProviderType, lang: &str) -> Vec<ProviderRegistration> {
@@ -195,5 +213,34 @@ mod tests {
         assert!(registry
             .get_providers_for_language(ProviderType::SourceControl, "git")
             .is_empty());
+
+        // TreeData & TreeDataProvider alias + deduplication + listing helpers
+        assert_eq!(
+            ProviderType::from_str_name("TreeData"),
+            Some(ProviderType::TreeData)
+        );
+        assert_eq!(
+            ProviderType::from_str_name("TreeDataProvider"),
+            Some(ProviderType::TreeData)
+        );
+        assert!(!registry.has_provider(ProviderType::TreeData));
+
+        registry.register(ProviderRegistration {
+            id: "my.treeView".to_string(),
+            provider_type: ProviderType::TreeData,
+            language_selector: Some("*".to_string()),
+        });
+        registry.register(ProviderRegistration {
+            id: "my.treeView".to_string(),
+            provider_type: ProviderType::TreeData,
+            language_selector: None,
+        });
+
+        assert!(registry.has_provider(ProviderType::TreeData));
+        assert!(registry.has_provider_with_id(ProviderType::TreeData, "my.treeView"));
+        assert!(!registry.has_provider_with_id(ProviderType::TreeData, "other.treeView"));
+        let trees = registry.get_providers(ProviderType::TreeData);
+        assert_eq!(trees.len(), 1);
+        assert!(trees[0].language_selector.is_none());
     }
 }

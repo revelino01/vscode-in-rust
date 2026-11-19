@@ -90,7 +90,7 @@ See [rustcode-implementation-plan.md](rustcode-implementation-plan.md) for the c
 - [x] **Phase 6 M5 — Documentation & Compatibility Matrix Refresh**: Refreshed `docs/extension-compat-matrix.md`, `docs/architecture.md`, `README.md`, and `rustcode-implementation-plan.md`
 
 ### Upcoming (Phase 7 — Pure-Rust Parity & Extended Ecosystem)
-- [ ] **Phase 7 M1 — 100% Extension Host RPC Bridge Parity**: Route `window.{show*Message,showQuickPick,showInputBox}`, `'TreeDataProvider'` / `"treeView.getChildren"`, `workspace.{getConfiguration,updateConfiguration,openTextDocument}`, `commands.*`, `env.*`, `extensions.all`/`getExtension`, and `node-compat/fs.js` through `LanguageFeatureBridge`
+- [x] **Phase 7 M1 — 100% Extension Host RPC Bridge Parity**: Routed `window.{show*Message,showQuickPick,showInputBox}`, `'TreeDataProvider'` / `"treeView.getChildren"`, `workspace.{getConfiguration,updateConfiguration,openTextDocument}`, `commands.*`, `env.*`, `extensions.all`/`getExtension`, and `node-compat/fs.js` through `LanguageFeatureBridge`
 - [ ] **Phase 7 M2 — In-Editor Find & Replace (`Ctrl+F` / `Ctrl+H`) & QuickInput Navigation (`Ctrl+G` / `@`)**: Floating `FindReplaceWidget` overlay with live match highlights & replace, plus Go to Line (`:line[:col]`) and Go to Symbol in Editor (`@symbol`)
 - [ ] **Phase 7 M3 — Notification Toast Overlay & Testing Sidebar (`workbench.view.testing`)**: Bottom-right notification toast stack (`Info`/`Warning`/`Error` + actions) and `TestingSidebarView` wired to `ExtHostTestManager` (`vscode.tests`)
 - [ ] **Phase 7 M4 — Interactive File Explorer CRUD & Contributed TreeViews**: Inline new file/folder, inline rename (`F2`), delete confirmation, and extension-contributed `views` (`registerTreeDataProvider`) in `FileExplorerView`
@@ -103,7 +103,7 @@ See [rustcode-implementation-plan.md](rustcode-implementation-plan.md) for the c
 
 ## 🧪 Building, Testing & Packaging
 
-Verified test & lint status: **404 workspace tests passing**, **26/26 `compat_suite` tests passing**, **0 `clippy` warnings**.
+Verified test & lint status: **424 workspace tests passing**, **34/34 `compat_suite` tests passing**, **0 `clippy` warnings**.
 
 ```bash
 # Clone the repository

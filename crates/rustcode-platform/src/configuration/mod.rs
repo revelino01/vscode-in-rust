@@ -3,6 +3,7 @@
 use parking_lot::RwLock;
 use rustcode_base::event::Emitter;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,19 @@ pub enum ConfigurationTarget {
     User,
     Workspace,
     WorkspaceFolder(PathBuf),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ConfigurationInspection {
+    pub key: String,
+    #[serde(rename = "defaultValue", skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<Value>,
+    #[serde(rename = "globalValue", skip_serializing_if = "Option::is_none")]
+    pub global_value: Option<Value>,
+    #[serde(rename = "workspaceValue", skip_serializing_if = "Option::is_none")]
+    pub workspace_value: Option<Value>,
+    #[serde(rename = "workspaceFolderValue", skip_serializing_if = "Option::is_none")]
+    pub workspace_folder_value: Option<Value>,
 }
 
 #[derive(Clone)]
@@ -184,18 +198,8 @@ impl ConfigurationService {
             matching.sort_by_key(|(folder_path, _)| std::cmp::Reverse(folder_path.as_os_str().len()));
 
             for (_, folder_val) in matching {
-                let mut cur = folder_val;
-                let mut found = true;
-                for part in path.split('.') {
-                    if let Some(next) = cur.get(part) {
-                        cur = next;
-                    } else {
-                        found = false;
-                        break;
-                    }
-                }
-                if found && !cur.is_null() {
-                    return Some(cur.clone());
+                if let Some(val) = lookup_in_layer(folder_val, path) {
+                    return Some(val);
                 }
             }
         }
@@ -218,6 +222,58 @@ impl ConfigurationService {
         }
 
         Some(cur.clone())
+    }
+
+    /// Return the complete merged configuration tree (defaults <- user <- workspace).
+    pub fn get_all(&self) -> Value {
+        self.merged.read().clone()
+    }
+
+    /// Return the merged configuration tree with any matching workspace folder overrides applied.
+    pub fn get_merged_for_resource(&self, resource: Option<&Path>) -> Value {
+        let mut merged = self.merged.read().clone();
+        if let Some(res) = resource {
+            let folders_guard = self.folders.read();
+            let mut matching: Vec<(&PathBuf, &Value)> = folders_guard
+                .iter()
+                .filter(|(folder_path, _)| res.starts_with(folder_path))
+                .collect();
+            // Sort ascending by folder path length so deeper folders override shallower ones.
+            matching.sort_by_key(|(folder_path, _)| folder_path.as_os_str().len());
+            for (_, folder_val) in matching {
+                merge_json_values(&mut merged, folder_val);
+            }
+        }
+        merged
+    }
+
+    /// Inspect a configuration key across defaults, user, workspace, and workspace folder layers.
+    pub fn inspect(&self, path: &str, resource: Option<&Path>) -> ConfigurationInspection {
+        let default_value = lookup_in_layer(&self.defaults.read(), path);
+        let global_value = lookup_in_layer(&self.user.read(), path);
+        let workspace_value = lookup_in_layer(&self.workspace.read(), path);
+        let workspace_folder_value = resource.and_then(|res| {
+            let folders_guard = self.folders.read();
+            let mut matching: Vec<(&PathBuf, &Value)> = folders_guard
+                .iter()
+                .filter(|(folder_path, _)| res.starts_with(folder_path))
+                .collect();
+            matching.sort_by_key(|(folder_path, _)| std::cmp::Reverse(folder_path.as_os_str().len()));
+            for (_, folder_val) in matching {
+                if let Some(val) = lookup_in_layer(folder_val, path) {
+                    return Some(val);
+                }
+            }
+            None
+        });
+
+        ConfigurationInspection {
+            key: path.to_string(),
+            default_value,
+            global_value,
+            workspace_value,
+            workspace_folder_value,
+        }
     }
 
     /// Update a setting at `path` for the specified `ConfigurationTarget`.
@@ -343,6 +399,33 @@ impl ConfigurationService {
         self.on_did_change
             .fire(ConfigurationChangeEvent { affected_keys });
     }
+}
+
+fn lookup_in_layer(root: &Value, path: &str) -> Option<Value> {
+    if path.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = path.split('.').collect();
+    lookup_in_layer_parts(root, &parts)
+}
+
+fn lookup_in_layer_parts(cur: &Value, parts: &[&str]) -> Option<Value> {
+    if parts.is_empty() {
+        return Some(cur.clone());
+    }
+    for i in (1..=parts.len()).rev() {
+        let key = if i == 1 {
+            parts[0].to_string()
+        } else {
+            parts[..i].join(".")
+        };
+        if let Some(next) = cur.get(&key) {
+            if let Some(found) = lookup_in_layer_parts(next, &parts[i..]) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn is_leaf_object_setting(path: &str) -> bool {
@@ -1019,5 +1102,93 @@ mod tests {
         cfg.update("editor.tabSize", json!(2), ConfigurationTarget::User)
             .unwrap();
         assert_eq!(cfg.get::<u32>("editor.tabSize"), Some(2));
+    }
+
+    #[test]
+    fn test_get_all_get_merged_for_resource_and_inspect() {
+        let cfg = ConfigurationService::new();
+        let all = cfg.get_all();
+        assert_eq!(all["editor"]["fontSize"], json!(14));
+        assert_eq!(all["workbench"]["colorTheme"], json!("Default Dark+"));
+
+        cfg.load_user_settings(r#"{"editor.fontSize": 18}"#).unwrap();
+        cfg.update("editor.tabSize", json!(2), ConfigurationTarget::Workspace)
+            .unwrap();
+
+        let folder = Path::new("/workspace/pkg");
+        let file = Path::new("/workspace/pkg/src/lib.rs");
+        cfg.update(
+            "editor.tabSize",
+            json!(6),
+            ConfigurationTarget::WorkspaceFolder(folder.to_path_buf()),
+        )
+        .unwrap();
+
+        let merged_for_file = cfg.get_merged_for_resource(Some(file));
+        assert_eq!(merged_for_file["editor"]["tabSize"], json!(6));
+        // Sibling defaults & user settings preserved when merging folder overrides
+        assert_eq!(merged_for_file["editor"]["fontSize"], json!(18));
+        assert_eq!(merged_for_file["editor"]["minimap"]["enabled"], json!(true));
+
+        let inspected = cfg.inspect("editor.fontSize", Some(file));
+        assert_eq!(inspected.key, "editor.fontSize");
+        assert_eq!(inspected.default_value, Some(json!(14)));
+        assert_eq!(inspected.global_value, Some(json!(18)));
+        assert_eq!(inspected.workspace_value, None);
+        assert_eq!(inspected.workspace_folder_value, None);
+
+        let inspected_tab = cfg.inspect("editor.tabSize", Some(file));
+        assert_eq!(inspected_tab.default_value, Some(json!(4)));
+        assert_eq!(inspected_tab.global_value, None);
+        assert_eq!(inspected_tab.workspace_value, Some(json!(2)));
+        assert_eq!(inspected_tab.workspace_folder_value, Some(json!(6)));
+    }
+
+    #[test]
+    fn test_inspect_mixed_nested_dotted_and_folder_null_consistency() {
+        let cfg = ConfigurationService::new();
+        cfg.load_user_settings(
+            r#"{
+                "myExt": {
+                    "a": { "other": 2 },
+                    "a.b": 1
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.get::<i64>("myExt.a.b"), Some(1));
+        assert_eq!(cfg.get::<i64>("myExt.a.other"), Some(2));
+
+        let inspected = cfg.inspect("myExt.a.b", None);
+        assert_eq!(inspected.global_value, Some(json!(1)));
+        let inspected_other = cfg.inspect("myExt.a.other", None);
+        assert_eq!(inspected_other.global_value, Some(json!(2)));
+
+        // WorkspaceFolder explicit Value::Null is consistent across get_value_for_resource,
+        // get_merged_for_resource, and inspect.
+        let folder = Path::new("/workspace/nullpkg");
+        let file = Path::new("/workspace/nullpkg/src/main.rs");
+        cfg.update("editor.tabSize", json!(8), ConfigurationTarget::Workspace)
+            .unwrap();
+        cfg.update(
+            "editor.tabSize",
+            Value::Null,
+            ConfigurationTarget::WorkspaceFolder(folder.to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.get_value_for_resource("editor.tabSize", Some(file)),
+            Some(Value::Null)
+        );
+        assert_eq!(
+            cfg.get_merged_for_resource(Some(file))["editor"]["tabSize"],
+            Value::Null
+        );
+        assert_eq!(
+            cfg.inspect("editor.tabSize", Some(file)).workspace_folder_value,
+            Some(Value::Null)
+        );
     }
 }

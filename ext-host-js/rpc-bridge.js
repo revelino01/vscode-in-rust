@@ -9,6 +9,94 @@ let nextId = 1;
 const objectProxies = new Map();
 const eventSubscribers = new Map();
 const customDocuments = new Map();
+const treeElements = new Map();
+const commandHandlers = new Map();
+
+function normalizeTreeItem(providerId, rawElement, treeItem) {
+  const item = treeItem && typeof treeItem === 'object' ? treeItem : { label: String(treeItem ?? '') };
+  let label = '';
+  if (typeof item.label === 'string') {
+    label = item.label;
+  } else if (item.label && typeof item.label === 'object' && typeof item.label.label === 'string') {
+    label = item.label.label;
+  } else if (item.resourceUri) {
+    const rawPath = item.resourceUri.fsPath || item.resourceUri.path || String(item.resourceUri);
+    const parts = rawPath.split('/');
+    label = parts[parts.length - 1] || rawPath;
+  }
+
+  let tooltip = null;
+  if (typeof item.tooltip === 'string') {
+    tooltip = item.tooltip;
+  } else if (item.tooltip && typeof item.tooltip === 'object' && typeof item.tooltip.value === 'string') {
+    tooltip = item.tooltip.value;
+  }
+
+  let iconPath = null;
+  if (typeof item.iconPath === 'string') {
+    iconPath = item.iconPath;
+  } else if (item.iconPath && typeof item.iconPath === 'object') {
+    if (typeof item.iconPath.id === 'string') {
+      iconPath = item.iconPath.id;
+    } else if (typeof item.iconPath.fsPath === 'string' || typeof item.iconPath.path === 'string') {
+      iconPath = item.iconPath.fsPath || item.iconPath.path;
+    } else if (item.iconPath.dark || item.iconPath.light) {
+      const picked = item.iconPath.dark || item.iconPath.light;
+      if (typeof picked === 'string') {
+        iconPath = picked;
+      } else if (picked && typeof picked === 'object') {
+        if (typeof picked.id === 'string') {
+          iconPath = picked.id;
+        } else if (typeof picked.fsPath === 'string' || typeof picked.path === 'string') {
+          iconPath = picked.fsPath || picked.path;
+        }
+      }
+    }
+  }
+
+  const itemId = typeof item.id === 'string' && item.id.length > 0 ? item.id : null;
+  if (itemId !== null && rawElement !== undefined) {
+    treeElements.set(`${providerId}:${itemId}`, rawElement);
+  }
+
+  let collapsibleState = 0;
+  if (typeof item.collapsibleState === 'number' && Number.isFinite(item.collapsibleState)) {
+    const truncated = Math.trunc(item.collapsibleState);
+    if (truncated === 0 || truncated === 1 || truncated === 2) {
+      collapsibleState = truncated;
+    } else if (truncated > 2) {
+      collapsibleState = 2;
+    }
+  } else if (typeof item.collapsibleState === 'string') {
+    const lower = item.collapsibleState.toLowerCase();
+    if (lower === 'collapsed') {
+      collapsibleState = 1;
+    } else if (lower === 'expanded') {
+      collapsibleState = 2;
+    }
+  }
+
+  let command = null;
+  if (item.command && typeof item.command === 'object' && typeof item.command.command === 'string') {
+    const c = item.command;
+    command = {
+      title: String(c.title !== undefined && c.title !== null ? c.title : ''),
+      command: c.command,
+      ...(Array.isArray(c.arguments) ? { arguments: c.arguments } : {}),
+    };
+  }
+
+  return {
+    id: itemId,
+    label,
+    description: typeof item.description === 'string' ? item.description : null,
+    tooltip,
+    collapsibleState,
+    iconPath,
+    contextValue: typeof item.contextValue === 'string' ? item.contextValue : null,
+    command,
+  };
+}
 
 function findRegisteredProvider(type, id) {
   const key = `${type}:${id}`;
@@ -129,12 +217,34 @@ const rpc = {
     return {
       dispose() {
         objectProxies.delete(key);
+        if (type === 'TreeDataProvider' || type === 'TreeData') {
+          const prefix = `${id}:`;
+          for (const elemKey of Array.from(treeElements.keys())) {
+            if (elemKey.startsWith(prefix)) {
+              treeElements.delete(elemKey);
+            }
+          }
+        }
         if (ops.op_unregister_provider) {
           ops.op_unregister_provider(type, id);
         }
         rpc.call('extHost.unregisterProvider', { type, id });
       }
     };
+  },
+
+  registerCommandHandler(command, handler) {
+    commandHandlers.set(command, handler);
+  },
+
+  unregisterCommandHandler(command, handler) {
+    if (!handler || commandHandlers.get(command) === handler) {
+      commandHandlers.delete(command);
+    }
+  },
+
+  hasCommandHandler(command) {
+    return commandHandlers.has(command);
   },
 
   createWebviewPanelProxy(id, viewType, title, options = {}) {
@@ -568,6 +678,75 @@ const rpc = {
         doc.dispose();
       }
       return { closed: true, uri: parsedUri.toString() };
+    }
+    if (
+      method === 'treeView.getChildren' ||
+      method === 'TreeDataProvider.getChildren' ||
+      method === 'TreeData.getChildren'
+    ) {
+      const id = params.providerId || params.viewId || params.id;
+      const proxy = findRegisteredProvider('TreeDataProvider', id) || findRegisteredProvider('TreeData', id);
+      if (!proxy || !proxy.provider) {
+        throw new Error(`Provider not found: TreeDataProvider:${id}`);
+      }
+      if (typeof proxy.provider.getChildren !== 'function') {
+        throw new Error(`Provider TreeDataProvider:${id} does not implement method getChildren`);
+      }
+      let element = params.element;
+      if (element === null || element === undefined) {
+        element = undefined;
+      } else if (typeof element === 'string') {
+        const cached = treeElements.get(`${id}:${element}`);
+        if (cached !== undefined) {
+          element = cached;
+        }
+      }
+      const children = await proxy.provider.getChildren(element);
+      if (!Array.isArray(children)) {
+        return [];
+      }
+      const normalized = [];
+      for (const child of children) {
+        const treeItem = typeof proxy.provider.getTreeItem === 'function'
+          ? await proxy.provider.getTreeItem(child)
+          : child;
+        normalized.push(normalizeTreeItem(id, child, treeItem));
+      }
+      return normalized;
+    }
+    if (
+      method === 'treeView.getTreeItem' ||
+      method === 'TreeDataProvider.getTreeItem' ||
+      method === 'TreeData.getTreeItem'
+    ) {
+      const id = params.providerId || params.viewId || params.id;
+      const proxy = findRegisteredProvider('TreeDataProvider', id) || findRegisteredProvider('TreeData', id);
+      if (!proxy || !proxy.provider) {
+        throw new Error(`Provider not found: TreeDataProvider:${id}`);
+      }
+      if (typeof proxy.provider.getTreeItem !== 'function') {
+        throw new Error(`Provider TreeDataProvider:${id} does not implement method getTreeItem`);
+      }
+      let element = params.element;
+      if (typeof element === 'string') {
+        const cached = treeElements.get(`${id}:${element}`);
+        if (cached !== undefined) {
+          element = cached;
+        }
+      }
+      const treeItem = await proxy.provider.getTreeItem(element);
+      return normalizeTreeItem(id, element, treeItem);
+    }
+    if (method === 'commands.executeCommand') {
+      const { command, args } = params || {};
+      if (!command || !commandHandlers.has(command)) {
+        throw new Error(`Command not found in extension host: ${command}`);
+      }
+      const handler = commandHandlers.get(command);
+      const argList = Array.isArray(args)
+        ? args
+        : (args !== undefined && args !== null ? [args] : []);
+      return await handler(...argList);
     }
     throw new Error(`Unknown incoming method: ${method}`);
   },

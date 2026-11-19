@@ -412,6 +412,100 @@ exec.end(true, 200);
   assert(backupRes && backupRes.id === 'backup_1', 'backupCustomDocument failed');
   binCustomDisp.dispose();
 
+  console.log('[Test] Testing M1 TreeDataProvider, Window, Workspace, Commands, Env, Extensions, FS...');
+  assert(vscode.TreeItemCollapsibleState.None === 0, 'TreeItemCollapsibleState.None mismatch');
+  assert(vscode.TreeItemCollapsibleState.Collapsed === 1, 'TreeItemCollapsibleState.Collapsed mismatch');
+  assert(vscode.TreeItemCollapsibleState.Expanded === 2, 'TreeItemCollapsibleState.Expanded mismatch');
+  assert(vscode.ConfigurationTarget.Global === 1, 'ConfigurationTarget.Global mismatch');
+  assert(vscode.ConfigurationTarget.Workspace === 2, 'ConfigurationTarget.Workspace mismatch');
+  assert(vscode.ConfigurationTarget.WorkspaceFolder === 3, 'ConfigurationTarget.WorkspaceFolder mismatch');
+  assert(vscode.EndOfLine.LF === 1 && vscode.EndOfLine.CRLF === 2, 'EndOfLine mismatch');
+
+  const sampleTreeItem = new vscode.TreeItem('src', vscode.TreeItemCollapsibleState.Collapsed);
+  sampleTreeItem.id = 'node_src';
+  sampleTreeItem.contextValue = 'folder';
+  assert(sampleTreeItem.label === 'src' && sampleTreeItem.collapsibleState === 1, 'TreeItem constructor mismatch');
+
+  const treeDisp = vscode.window.registerTreeDataProvider('m1.treeView', {
+    getTreeItem(el) {
+      return el;
+    },
+    getChildren(el) {
+      if (!el) {
+        return [sampleTreeItem];
+      }
+      const child = new vscode.TreeItem(vscode.Uri.file('/workspace/src/main.rs'));
+      child.id = 'node_main';
+      return [child];
+    },
+  });
+  const rootTreeItems = await rpc.handleIncomingRequest('treeView.getChildren', { providerId: 'm1.treeView' });
+  assert(Array.isArray(rootTreeItems) && rootTreeItems.length === 1 && rootTreeItems[0].label === 'src', 'treeView.getChildren root failed');
+  const childTreeItems = await rpc.handleIncomingRequest('TreeDataProvider.getChildren', {
+    providerId: 'm1.treeView',
+    element: 'node_src',
+  });
+  assert(Array.isArray(childTreeItems) && childTreeItems.length === 1 && childTreeItems[0].label === 'main.rs', 'TreeDataProvider.getChildren child failed');
+  const tvHandle = vscode.window.createTreeView('m1.treeViewHandle', {
+    treeDataProvider: { getTreeItem: (e) => e, getChildren: () => [] },
+  });
+  assert(tvHandle.viewId === 'm1.treeViewHandle', 'createTreeView viewId mismatch');
+  tvHandle.dispose();
+  treeDisp.dispose();
+
+  const cancelSrc = new vscode.CancellationTokenSource();
+  cancelSrc.cancel();
+  const qpCancelled = await vscode.window.showQuickPick(['a', 'b'], {}, cancelSrc.token);
+  assert(qpCancelled === undefined, 'showQuickPick with cancelled token must return undefined');
+  const ibCancelled = await vscode.window.showInputBox({ prompt: 'name' }, cancelSrc.token);
+  assert(ibCancelled === undefined, 'showInputBox with cancelled token must return undefined');
+  await vscode.window.showInformationMessage('M1 info', 'OK');
+
+  const wsCfg = vscode.workspace.getConfiguration('editor');
+  wsCfg._data = { fontSize: 14, minimap: { enabled: true }, 'files.exclude': { '**/.git': true } };
+  assert(wsCfg.get('minimap.enabled') === true, 'WorkspaceConfiguration nested get failed');
+  assert(wsCfg.has('minimap.enabled') === true, 'WorkspaceConfiguration nested has failed');
+  assert(wsCfg.get('missing.key', 42) === 42, 'WorkspaceConfiguration defaultValue failed');
+  assert(wsCfg.inspect('fontSize').key === 'editor.fontSize', 'WorkspaceConfiguration inspect key mismatch');
+  await vscode.workspace.openTextDocument('/workspace/main.rs');
+
+  let cmdRanWith = null;
+  const cmdDisp = vscode.commands.registerCommand('m1.greet', (who) => {
+    cmdRanWith = who;
+    return 'hello ' + who;
+  });
+  const cmdOut = await rpc.handleIncomingRequest('commands.executeCommand', {
+    command: 'm1.greet',
+    args: ['rustcode'],
+  });
+  assert(cmdRanWith === 'rustcode' && cmdOut === 'hello rustcode', 'commands.executeCommand incoming failed');
+  const cmdList = await vscode.commands.getCommands(true);
+  assert(Array.isArray(cmdList) && cmdList.includes('m1.greet'), 'commands.getCommands headless fallback failed');
+  cmdDisp.dispose();
+
+  await vscode.env.clipboard.writeText('clip-m1');
+  await vscode.env.clipboard.readText();
+  await vscode.env.openExternal(vscode.Uri.parse('https://rustcode.dev'));
+  await vscode.env.openExternal('https://rustcode.dev/docs');
+  const invalidExtOpen = await vscode.env.openExternal(null);
+  assert(invalidExtOpen === false, 'env.openExternal(null) must resolve false');
+
+  vscode.extensions._setAll([
+    {
+      id: 'RustCode.sample',
+      extensionPath: '/ext/sample',
+      isActive: false,
+      packageJSON: { name: 'sample', publisher: 'RustCode' },
+      extensionKind: 1,
+    },
+  ]);
+  const foundExt = vscode.extensions.getExtension('rustcode.sample');
+  assert(foundExt && foundExt.id === 'RustCode.sample' && foundExt.extensionUri.fsPath === '/ext/sample', 'extensions.getExtension case-insensitive failed');
+
+  const nodeFs = require('./node-compat/fs');
+  assert(typeof nodeFs.promises.readFile === 'function' && typeof nodeFs.promises.stat === 'function', 'node-compat/fs missing methods');
+  await nodeFs.promises.stat('/tmp/nonexistent');
+
   console.log('All JavaScript extension host tests passed successfully!');
 })();
 

@@ -14,7 +14,9 @@ pub mod theme;
 
 pub use accessibility::{AccessibilityTree, AccessibleNode, AccessibleRole, AccessibleState};
 pub use commands::{CommandCallback, CommandRegistry};
-pub use configuration::{ConfigurationChangeEvent, ConfigurationService, ConfigurationTarget};
+pub use configuration::{
+    ConfigurationChangeEvent, ConfigurationInspection, ConfigurationService, ConfigurationTarget,
+};
 pub use fs::{
     hash_content, FileChangeEvent, FileChangeType, FileConflict, FileMetadata, FileSystemError,
     FileSystemService, FileSystemWatcher,

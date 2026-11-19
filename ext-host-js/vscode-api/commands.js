@@ -7,14 +7,22 @@ const localCommands = new Map();
 
 const commands = {
   registerCommand(command, callback, thisArg) {
-    const handler = thisArg ? callback.bind(thisArg) : callback;
+    const handler = thisArg !== undefined ? callback.bind(thisArg) : callback;
     localCommands.set(command, handler);
+    if (typeof rpc.registerCommandHandler === 'function') {
+      rpc.registerCommandHandler(command, handler);
+    }
 
     rpc.call('commands.registerCommand', { command });
 
     return new Disposable(() => {
-      localCommands.remove ? localCommands.remove(command) : localCommands.delete(command);
-      rpc.call('commands.unregisterCommand', { command });
+      if (localCommands.get(command) === handler) {
+        localCommands.delete(command);
+        if (typeof rpc.unregisterCommandHandler === 'function') {
+          rpc.unregisterCommandHandler(command, handler);
+        }
+        rpc.call('commands.unregisterCommand', { command });
+      }
     });
   },
 
@@ -28,7 +36,14 @@ const commands = {
   },
 
   async getCommands(filterInternal = false) {
-    return await rpc.call('commands.getCommands', { filterInternal });
+    const res = await rpc.call('commands.getCommands', { filterInternal });
+    if (Array.isArray(res)) {
+      return res;
+    }
+    const keys = Array.from(localCommands.keys());
+    const filtered = filterInternal ? keys.filter(c => !c.startsWith('_')) : keys;
+    filtered.sort();
+    return filtered;
   }
 };
 

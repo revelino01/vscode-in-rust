@@ -135,11 +135,11 @@ The pure-Rust Open VSX marketplace client (`MarketplaceClient`) and VSIX unpacke
 To reach 100% end-to-end Rust <-> JS `RpcBridge` parity and broaden extension compatibility, **Phase 7** targets the remaining deltas documented above:
 
 ### M1 — Closing Remaining `LanguageFeatureBridge` & `rpc-bridge.js` Deltas
-- [ ] **`vscode.window` UI Prompts & TreeViews**: Handle `window.{showInformationMessage, showWarningMessage, showErrorMessage, showQuickPick, showInputBox}` in `LanguageFeatureBridge::handle_rpc_message` (bridged to Notification Toasts / QuickInput), normalize `'TreeDataProvider'` vs `'TreeData'` naming, and implement outbound `"treeView.getChildren"` handling in `ext-host-js/rpc-bridge.js`.
-- [ ] **`vscode.workspace` RPC Handlers**: Add `workspace.{getConfiguration, updateConfiguration, openTextDocument}` match arms backed by `ConfigurationService`, `Workspace`, and disk/editor state.
-- [ ] **`vscode.commands` RPC Routing**: Route `commands.{registerCommand, unregisterCommand, executeCommand, getCommands}` between `ext-host-js` and `CommandRegistry` in `rustcode-platform`.
-- [ ] **`vscode.env` & `vscode.extensions`**: Route `env.{clipboardRead, clipboardWrite, openExternal}` in `LanguageFeatureBridge`, and hydrate `vscode.extensions.all` / `getExtension(id)` from `ExtensionLoader`.
-- [ ] **`node-compat/fs.js` Host Routing**: Implement `fs.{readFile, writeFile, readdir, stat, mkdir, unlink}` match arms backed by `FileSystemService`.
+- [x] **`vscode.window` UI Prompts & TreeViews**: Handled `window.{showInformationMessage, showWarningMessage, showErrorMessage, showQuickPick, showInputBox}` in `LanguageFeatureBridge::handle_rpc_message`, normalized `'TreeDataProvider'` vs `'TreeData'` naming, and implemented outbound `"treeView.getChildren"` handling in `ext-host-js/rpc-bridge.js`.
+- [x] **`vscode.workspace` RPC Handlers**: Added `workspace.{getConfiguration, updateConfiguration, openTextDocument}` match arms backed by `ConfigurationService`, `Workspace`, and disk/editor state.
+- [x] **`vscode.commands` RPC Routing**: Routed `commands.{registerCommand, unregisterCommand, executeCommand, getCommands}` between `ext-host-js` and `CommandRegistry` in `rustcode-platform`.
+- [x] **`vscode.env` & `vscode.extensions`**: Routed `env.{clipboardRead, clipboardWrite, openExternal}` in `LanguageFeatureBridge`, and hydrated `vscode.extensions.all` / `getExtension(id)` from `ExtensionLoader`.
+- [x] **`node-compat/fs.js` Host Routing**: Implemented `fs.{readFile, writeFile, readdir, stat, mkdir, unlink}` match arms backed by `FileSystemService`. (`34/34` `compat_suite` tests passing, `58/58` `rustcode-ext-host` unit tests passing.)
 
 ### M5 — Additional `node-compat` Polyfills & Language Grammars
 - [ ] **`ext-host-js/node-compat/` Expansion**: Add `buffer.js`, `url.js`, `util.js`, `os.js`, `crypto.js`, and `child_process.js` polyfills + unit tests in `ext-host-js/test.js` and `compat_suite.rs`.

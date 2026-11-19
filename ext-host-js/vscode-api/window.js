@@ -187,12 +187,32 @@ const window = {
 
   // Quick Pick & Input
   async showQuickPick(items, options = {}, token) {
+    if (token && token.isCancellationRequested) {
+      return undefined;
+    }
     const rawItems = Array.isArray(items) ? items : await Promise.resolve(items);
-    const normalized = rawItems.map(i => (typeof i === 'string' ? { label: i } : i));
-    return await rpc.call('window.showQuickPick', { items: normalized, options });
+    const list = Array.isArray(rawItems) ? rawItems : [];
+    const allStrings = list.length > 0 && list.every(i => typeof i === 'string');
+    const normalized = list.map(i => (typeof i === 'string' ? { label: i } : i));
+    const res = await rpc.call('window.showQuickPick', { items: normalized, options });
+    if (res === null || res === undefined) {
+      return res;
+    }
+    if (allStrings) {
+      if (options && options.canPickMany && Array.isArray(res)) {
+        return res.map(item => (item && typeof item === 'object' && typeof item.label === 'string' ? item.label : item));
+      }
+      if (res && typeof res === 'object' && typeof res.label === 'string') {
+        return res.label;
+      }
+    }
+    return res;
   },
 
   async showInputBox(options = {}, token) {
+    if (token && token.isCancellationRequested) {
+      return undefined;
+    }
     return await rpc.call('window.showInputBox', { options });
   },
 
@@ -210,6 +230,25 @@ const window = {
       'getParent',
       'resolveTreeItem',
     ]);
+  },
+
+  createTreeView(viewId, options = {}) {
+    const providerDisposable = options && options.treeDataProvider
+      ? this.registerTreeDataProvider(viewId, options.treeDataProvider)
+      : new Disposable(() => {});
+    return {
+      viewId,
+      visible: true,
+      selection: [],
+      onDidExpandElement: rpc.createEvent(`treeView.onDidExpandElement.${viewId}`),
+      onDidCollapseElement: rpc.createEvent(`treeView.onDidCollapseElement.${viewId}`),
+      onDidChangeSelection: rpc.createEvent(`treeView.onDidChangeSelection.${viewId}`),
+      onDidChangeVisibility: rpc.createEvent(`treeView.onDidChangeVisibility.${viewId}`),
+      async reveal() {},
+      dispose() {
+        providerDisposable.dispose();
+      },
+    };
   },
 
   // Output Channel

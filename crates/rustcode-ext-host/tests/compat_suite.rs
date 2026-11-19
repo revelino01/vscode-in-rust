@@ -2618,3 +2618,836 @@ fn test_compat_custom_editor_js_api_export_surface() {
         assert_js_delimiters_balanced(name, src);
     }
 }
+
+#[tokio::test]
+async fn test_compat_m1_window_notifications_quickpick_and_inputbox() {
+    use rustcode_ext_host::{ExtPromptKind, NotificationSeverity};
+
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(registry, rpc, lsp);
+
+    // 1. Headless non-blocking default + MessageOptions normalization
+    let res = bridge
+        .handle_rpc_message(
+            "window.showInformationMessage",
+            &json!({
+                "message": "Workspace loaded",
+                "items": [{ "modal": true, "detail": "Ready" }, "Configure"]
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res, serde_json::Value::Null);
+    assert_eq!(bridge.window_manager().revision(), 1);
+    let notifs = bridge.window_manager().list_notifications();
+    assert_eq!(notifs.len(), 1);
+    assert_eq!(notifs[0].severity, NotificationSeverity::Info);
+    assert!(notifs[0].modal);
+    assert_eq!(notifs[0].items.len(), 1);
+
+    // 2. Sync responders for Warning/Error/QuickPick/InputBox
+    bridge.window_manager().set_notification_responder(|n| {
+        n.items.first().map(|item| item.raw.clone())
+    });
+    let warn_res = bridge
+        .handle_rpc_message(
+            "window.showWarningMessage",
+            &json!({ "message": "Slow task", "items": ["Retry"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warn_res, json!("Retry"));
+
+    let err_res = bridge
+        .handle_rpc_message(
+            "window.showErrorMessage",
+            &json!({ "message": "Disk full", "items": [{ "title": "Cleanup" }] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(err_res, json!({ "title": "Cleanup" }));
+
+    bridge.window_manager().set_prompt_responder(|p| match &p.kind {
+        ExtPromptKind::QuickPick { can_pick_many, .. } => {
+            if *can_pick_many {
+                Some(json!(["One", "Two"]))
+            } else {
+                Some(json!("Two"))
+            }
+        }
+        ExtPromptKind::InputBox { .. } => Some(json!("my-input")),
+    });
+
+    let qp_single = bridge
+        .handle_rpc_message(
+            "window.showQuickPick",
+            &json!({ "items": ["One", "Two"], "options": {} }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(qp_single, json!({ "label": "Two" }));
+
+    let qp_many = bridge
+        .handle_rpc_message(
+            "window.showQuickPick",
+            &json!({ "items": ["One", "Two"], "options": { "canPickMany": true } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(qp_many, json!([{ "label": "One" }, { "label": "Two" }]));
+
+    let ib = bridge
+        .handle_rpc_message(
+            "window.showInputBox",
+            &json!({ "options": { "prompt": "Enter name" } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ib, json!("my-input"));
+}
+
+#[tokio::test]
+async fn test_compat_m1_tree_data_provider_alias_and_numeric_collapsible_state() {
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = Arc::new(LanguageFeatureBridge::new(registry.clone(), rpc.clone(), lsp));
+
+    let reg_res = bridge
+        .handle_rpc_message(
+            "extHost.registerProvider",
+            &json!({
+                "type": "TreeDataProvider",
+                "id": "outlineView",
+                "selector": "*"
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reg_res["registered"], true);
+    assert!(registry.has_provider(ProviderType::TreeData));
+    assert!(registry.has_provider_with_id(ProviderType::TreeData, "outlineView"));
+    assert_eq!(registry.get_providers(ProviderType::TreeData).len(), 1);
+
+    let b = bridge.clone();
+    let task = tokio::spawn(async move { b.request_tree_children("outlineView", None).await });
+    tokio::task::yield_now().await;
+
+    rpc.handle_incoming_response(
+        1,
+        Some(json!([
+            {
+                "id": "src",
+                "label": "src",
+                "collapsibleState": 1,
+                "contextValue": "folder"
+            },
+            {
+                "id": "lib",
+                "label": "lib.rs",
+                "collapsibleState": 0,
+                "contextValue": "file"
+            }
+        ])),
+        None,
+    );
+
+    let items = task.await.unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].collapsible_state, TreeItemCollapsibleState::Collapsed);
+    assert_eq!(items[0].context_value.as_deref(), Some("folder"));
+    assert_eq!(items[1].collapsible_state, TreeItemCollapsibleState::None);
+}
+
+#[tokio::test]
+async fn test_compat_m1_workspace_configuration_and_open_text_document() {
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let config = rustcode_platform::ConfigurationService::new();
+    let folder = PathBuf::from("/workspace/subpkg");
+    let scoped_file = PathBuf::from("/workspace/subpkg/src/main.rs");
+    config
+        .update(
+            "editor.tabSize",
+            json!(2),
+            rustcode_platform::ConfigurationTarget::WorkspaceFolder(folder.clone()),
+        )
+        .unwrap();
+
+    let bridge = LanguageFeatureBridge::new(registry, rpc, lsp).with_configuration_service(config);
+
+    // 1. getConfiguration empty section returns full merged config
+    let all = bridge
+        .handle_rpc_message("workspace.getConfiguration", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(all["editor"]["fontSize"], json!(14));
+
+    // 2. Scoped getConfiguration merges folder overrides while keeping sibling defaults
+    let scoped_editor = bridge
+        .handle_rpc_message(
+            "workspace.getConfiguration",
+            &json!({
+                "section": "editor",
+                "scope": format!("file://{}", scoped_file.to_string_lossy())
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped_editor["tabSize"], json!(2));
+    assert_eq!(scoped_editor["minimap"]["enabled"], json!(true));
+
+    // 3. updateConfiguration targets 1 (User), 2 (Workspace), bool, and reset (no value)
+    bridge
+        .handle_rpc_message(
+            "workspace.updateConfiguration",
+            &json!({ "key": "editor.fontSize", "value": 18, "target": 1 }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message(
+            "workspace.updateConfiguration",
+            &json!({ "key": "editor.fontSize", "value": 22, "target": 2 }),
+        )
+        .await
+        .unwrap();
+
+    let inspected = bridge
+        .handle_rpc_message(
+            "workspace.inspectConfiguration",
+            &json!({ "key": "editor.fontSize" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspected["defaultValue"], json!(14));
+    assert_eq!(inspected["globalValue"], json!(18));
+    assert_eq!(inspected["workspaceValue"], json!(22));
+
+    // Reset workspace override (missing value) -> falls back to globalValue (18)
+    bridge
+        .handle_rpc_message(
+            "workspace.updateConfiguration",
+            &json!({ "key": "editor.fontSize", "target": 2 }),
+        )
+        .await
+        .unwrap();
+    let after_reset = bridge
+        .handle_rpc_message(
+            "workspace.getConfiguration",
+            &json!({ "section": "editor.fontSize" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_reset, json!(18));
+
+    // 4. openTextDocument with %20 URI decoding, dirty snapshot, untitled, and missing file
+    let tmp = std::env::temp_dir().join(format!(
+        "rustcode_ws_open_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let spaced_file = tmp.join("my file.rs");
+    std::fs::write(&spaced_file, "fn main() {}\n").unwrap();
+    let encoded_uri = format!(
+        "file://{}",
+        spaced_file.to_string_lossy().replace(' ', "%20")
+    );
+
+    let doc = bridge
+        .handle_rpc_message("workspace.openTextDocument", &json!({ "uri": encoded_uri }))
+        .await
+        .unwrap();
+    assert_eq!(doc["languageId"], "rust");
+    assert_eq!(doc["text"], "fn main() {}\n");
+    assert_eq!(doc["lineCount"], 2);
+    assert_eq!(doc["isDirty"], false);
+
+    // Dirty open snapshot takes precedence over disk
+    let raw_file_uri = format!("file://{}", spaced_file.to_string_lossy());
+    bridge
+        .did_change_document(&raw_file_uri, "rust", 3, "fn main() { println!(\"hi\"); }")
+        .await;
+    let dirty_doc = bridge
+        .handle_rpc_message("workspace.openTextDocument", &json!({ "uri": encoded_uri }))
+        .await
+        .unwrap();
+    assert_eq!(dirty_doc["isDirty"], true);
+    assert_eq!(dirty_doc["version"], 3);
+    assert_eq!(dirty_doc["text"], "fn main() { println!(\"hi\"); }");
+
+    // Untitled document
+    let untitled = bridge
+        .handle_rpc_message(
+            "workspace.openTextDocument",
+            &json!({ "language": "python", "content": "print(1)\nprint(2)" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(untitled["isUntitled"], true);
+    assert_eq!(untitled["languageId"], "python");
+    assert_eq!(untitled["lineCount"], 2);
+
+    // Missing file returns None
+    assert!(bridge
+        .handle_rpc_message(
+            "workspace.openTextDocument",
+            &json!({ "uri": format!("file://{}/does_not_exist.rs", tmp.to_string_lossy()) }),
+        )
+        .await
+        .is_none());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[tokio::test]
+async fn test_compat_m1_commands_rpc_lifecycle() {
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let cmd_reg = rustcode_platform::CommandRegistry::new();
+    let _rust_disp = cmd_reg.register("rust.echo", |args| {
+        Ok(json!({ "echo": args.unwrap_or(serde_json::Value::Null) }))
+    });
+    let _internal_disp = cmd_reg.register("_internal.secret", |_| Ok(json!(true)));
+
+    let bridge = Arc::new(
+        LanguageFeatureBridge::new(registry, rpc.clone(), lsp).with_command_registry(cmd_reg.clone()),
+    );
+
+    // Register & re-register JS command safely (old disposable must NOT delete new command)
+    bridge
+        .handle_rpc_message("commands.registerCommand", &json!({ "command": "ext.sayHi" }))
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message("commands.registerCommand", &json!({ "command": "ext.sayHi" }))
+        .await
+        .unwrap();
+    assert!(cmd_reg.has_command("ext.sayHi"));
+
+    // getCommands respects filterInternal and sorting
+    let filtered = bridge
+        .handle_rpc_message("commands.getCommands", &json!({ "filterInternal": true }))
+        .await
+        .unwrap();
+    assert_eq!(filtered, json!(["ext.sayHi", "rust.echo"]));
+
+    let all = bridge
+        .handle_rpc_message("commands.getCommands", &json!({ "filterInternal": false }))
+        .await
+        .unwrap();
+    assert_eq!(all, json!(["_internal.secret", "ext.sayHi", "rust.echo"]));
+
+    // Inbound executeCommand runs Rust command
+    let rust_res = bridge
+        .handle_rpc_message(
+            "commands.executeCommand",
+            &json!({ "command": "rust.echo", "args": ["abc"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rust_res, json!({ "echo": ["abc"] }));
+
+    // Inbound executeCommand recursion guard blocks bouncing JS command back to JS
+    assert!(bridge
+        .handle_rpc_message(
+            "commands.executeCommand",
+            &json!({ "command": "ext.sayHi", "args": [] }),
+        )
+        .await
+        .is_none());
+
+    // Async outbound request_execute_command dispatches to JS and receives response
+    let b = bridge.clone();
+    let exec_task =
+        tokio::spawn(async move { b.request_execute_command("ext.sayHi", vec![json!("M1")]).await });
+    tokio::task::yield_now().await;
+    rpc.handle_incoming_response(1, Some(json!("hi M1")), None);
+    let exec_res = exec_task.await.unwrap().unwrap();
+    assert_eq!(exec_res, json!("hi M1"));
+
+    // Unregister removes from both registry and js_commands
+    let unreg = bridge
+        .handle_rpc_message("commands.unregisterCommand", &json!({ "command": "ext.sayHi" }))
+        .await
+        .unwrap();
+    assert_eq!(unreg["unregistered"], true);
+    assert!(!cmd_reg.has_command("ext.sayHi"));
+}
+
+#[tokio::test]
+async fn test_compat_m1_env_and_extensions_rpc_lifecycle() {
+    let dir = fixtures_dir();
+    let mut loader = ExtensionLoader::new();
+    for ext in [
+        "theme_ext",
+        "formatter_ext",
+        "codeactions_ext",
+        "treeview_ext",
+        "statusbar_ext",
+        "linter_ext",
+    ] {
+        loader.load_from_dir(dir.join(ext)).unwrap();
+    }
+    assert!(loader.activate("git-status-ext"));
+
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(registry, rpc, lsp).with_extension_loader(&loader);
+
+    let all_exts = bridge
+        .handle_rpc_message("extensions.getAll", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(all_exts.as_array().unwrap().len(), 6);
+
+    // Case-insensitive lookup
+    let git_ext = bridge
+        .handle_rpc_message(
+            "extensions.getExtension",
+            &json!({ "id": "RUSTCODE.git-status-ext" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(git_ext["id"], "rustcode.git-status-ext");
+    assert_eq!(git_ext["isActive"], true);
+
+    // Clipboard roundtrip
+    let wr = bridge
+        .handle_rpc_message("env.clipboardWrite", &json!({ "value": "m1-clipboard" }))
+        .await
+        .unwrap();
+    assert_eq!(wr["written"], true);
+    let rd = bridge
+        .handle_rpc_message("env.clipboardRead", &json!({}))
+        .await
+        .unwrap();
+    assert_eq!(rd, json!("m1-clipboard"));
+
+    // openExternal allowlist offline validation
+    assert_eq!(
+        bridge
+            .handle_rpc_message("env.openExternal", &json!({ "uri": "https://rustcode.dev" }))
+            .await
+            .unwrap(),
+        json!(true)
+    );
+    assert_eq!(
+        bridge
+            .handle_rpc_message("env.openExternal", &json!({ "uri": "javascript:alert(1)" }))
+            .await
+            .unwrap(),
+        json!(false)
+    );
+}
+
+#[tokio::test]
+async fn test_compat_m1_node_fs_rpc_lifecycle() {
+    let tmp = std::env::temp_dir().join(format!(
+        "rustcode_compat_fs_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let fs_svc = Arc::new(rustcode_platform::FileSystemService::new());
+    let changed_paths = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let changed_clone = changed_paths.clone();
+    let _sub = fs_svc.on_did_change.event().attach(move |ev| {
+        changed_clone.lock().push(ev.path.clone());
+    });
+
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let bridge = LanguageFeatureBridge::new(registry, rpc, lsp).with_file_system_service(fs_svc);
+
+    let sub_dir = tmp.join("a/b");
+    let mk = bridge
+        .handle_rpc_message(
+            "fs.mkdir",
+            &json!({ "path": sub_dir.to_string_lossy(), "options": { "recursive": true } }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mk["created"], true);
+
+    let file_path = sub_dir.join("note.txt");
+    let wr = bridge
+        .handle_rpc_message(
+            "fs.writeFile",
+            &json!({ "path": file_path.to_string_lossy(), "data": "hello fs" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wr["written"], true);
+    assert_eq!(changed_paths.lock().len(), 1);
+
+    let content = bridge
+        .handle_rpc_message(
+            "fs.readFile",
+            &json!({ "path": file_path.to_string_lossy(), "encoding": "utf8" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(content, json!("hello fs"));
+
+    let entries = bridge
+        .handle_rpc_message("fs.readdir", &json!({ "path": sub_dir.to_string_lossy() }))
+        .await
+        .unwrap();
+    assert_eq!(entries, json!(["note.txt"]));
+
+    let st = bridge
+        .handle_rpc_message("fs.stat", &json!({ "path": file_path.to_string_lossy() }))
+        .await
+        .unwrap();
+    assert_eq!(st["isFile"], true);
+    assert_eq!(st["size"], 8);
+
+    let ul = bridge
+        .handle_rpc_message("fs.unlink", &json!({ "path": file_path.to_string_lossy() }))
+        .await
+        .unwrap();
+    assert_eq!(ul["unlinked"], true);
+
+    // Missing file returns None from handle_rpc_message and ENOENT from handle_fs_rpc
+    assert!(bridge
+        .handle_rpc_message(
+            "fs.readFile",
+            &json!({ "path": file_path.to_string_lossy() }),
+        )
+        .await
+        .is_none());
+    let err = bridge
+        .handle_fs_rpc(
+            "fs.readFile",
+            &json!({ "path": file_path.to_string_lossy() }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.starts_with("ENOENT:"), "unexpected err: {}", err);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_compat_m1_js_api_export_surface() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let types_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/types.js")).unwrap();
+    let index_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/index.js")).unwrap();
+    let window_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/window.js")).unwrap();
+    let workspace_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/workspace.js")).unwrap();
+    let commands_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/commands.js")).unwrap();
+    let env_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/vscode-api/env.js")).unwrap();
+    let fs_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/node-compat/fs.js")).unwrap();
+    let rpc_bridge_js =
+        std::fs::read_to_string(repo_root.join("ext-host-js/rpc-bridge.js")).unwrap();
+    let test_js = std::fs::read_to_string(repo_root.join("ext-host-js/test.js")).unwrap();
+
+    for sym in [
+        "TreeItemCollapsibleState",
+        "class TreeItem",
+        "ConfigurationTarget",
+        "EndOfLine",
+    ] {
+        assert!(types_js.contains(sym), "types.js missing {}", sym);
+    }
+
+    for sym in [
+        "createTreeView(",
+        "isCancellationRequested",
+        "showQuickPick(",
+        "showInputBox(",
+    ] {
+        assert!(window_js.contains(sym), "window.js missing {}", sym);
+    }
+
+    for sym in [
+        "_resolve(section)",
+        "inspect(section)",
+        "class TextDocumentProxy",
+        "workspace.inspectConfiguration",
+    ] {
+        assert!(workspace_js.contains(sym), "workspace.js missing {}", sym);
+    }
+
+    for sym in [
+        "registerCommandHandler",
+        "unregisterCommandHandler",
+        "Array.isArray(res)",
+        "if (localCommands.get(command) === handler)",
+    ] {
+        assert!(commands_js.contains(sym), "commands.js missing {}", sym);
+    }
+
+    for sym in [
+        "normalizeExtension(",
+        "onDidChange:",
+        "_setAll(",
+        "async refresh()",
+        "toLowerCase()",
+    ] {
+        assert!(env_js.contains(sym), "env.js missing {}", sym);
+    }
+
+    for sym in [
+        "unwrapResult(",
+        "isFile: () => isFileVal",
+        "isDirectory: () => isDirVal",
+        "isSymbolicLink: () => isSymVal",
+        "options === null",
+        "Uint8Array.from(res)",
+    ] {
+        assert!(fs_js.contains(sym), "node-compat/fs.js missing {}", sym);
+    }
+
+    for sym in [
+        "treeView.getChildren",
+        "TreeDataProvider.getChildren",
+        "TreeData.getChildren",
+        "treeView.getTreeItem",
+        "TreeDataProvider.getTreeItem",
+        "TreeData.getTreeItem",
+        "commands.executeCommand",
+        "normalizeTreeItem(",
+        "item.iconPath.dark || item.iconPath.light",
+        "Number.isFinite(item.collapsibleState)",
+    ] {
+        assert!(rpc_bridge_js.contains(sym), "rpc-bridge.js missing {}", sym);
+    }
+
+    assert!(workspace_js.contains("(this._section && section)"));
+
+    assert!(test_js.contains("TreeItemCollapsibleState"));
+    assert!(test_js.contains("treeView.getChildren"));
+
+    for (name, src) in [
+        ("types.js", &types_js),
+        ("index.js", &index_js),
+        ("window.js", &window_js),
+        ("workspace.js", &workspace_js),
+        ("commands.js", &commands_js),
+        ("env.js", &env_js),
+        ("node-compat/fs.js", &fs_js),
+        ("rpc-bridge.js", &rpc_bridge_js),
+        ("test.js", &test_js),
+    ] {
+        assert_js_delimiters_balanced(name, src);
+    }
+}
+
+#[tokio::test]
+async fn test_compat_m1_iteration2_regressions() {
+    let registry = Arc::new(rustcode_ext_host::ProviderRegistry::new());
+    let rpc = Arc::new(RpcBridge::new());
+    let lsp = Arc::new(LspClientManager::new());
+    let config = rustcode_platform::ConfigurationService::new();
+    let cmd_reg = rustcode_platform::CommandRegistry::new();
+
+    config
+        .load_user_settings(r#"{"myExt": {"a": {"other": 2}, "a.b": 1}}"#)
+        .unwrap();
+    config
+        .update(
+            "editor.tabSize",
+            json!(2),
+            rustcode_platform::ConfigurationTarget::WorkspaceFolder(PathBuf::from(
+                "/workspace/subpkg",
+            )),
+        )
+        .unwrap();
+
+    let tmp = std::env::temp_dir().join(format!("rustcode_compat_m1_iter2_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let sandbox = tmp.join("sandbox");
+    let outside = tmp.join("outside");
+    std::fs::create_dir_all(&sandbox).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    let bridge = Arc::new(
+        LanguageFeatureBridge::new(registry, rpc.clone(), lsp)
+            .with_configuration_service(config)
+            .with_command_registry(cmd_reg.clone())
+            .with_fs_root(&sandbox),
+    );
+
+    // 1. Mixed nested + dotted sibling keys match between getConfiguration and inspectConfiguration
+    let got = bridge
+        .handle_rpc_message(
+            "workspace.getConfiguration",
+            &json!({ "section": "myExt.a.b" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(got, json!(1));
+    let insp = bridge
+        .handle_rpc_message(
+            "workspace.inspectConfiguration",
+            &json!({ "key": "myExt.a.b" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(insp["globalValue"], json!(1));
+
+    // 2. { uri: Uri.toJSON() } scope (with `path` and no `fsPath`) resolves folder settings
+    let scoped = bridge
+        .handle_rpc_message(
+            "workspace.getConfiguration",
+            &json!({
+                "section": "editor.tabSize",
+                "scope": {
+                    "uri": {
+                        "$mid": 1,
+                        "scheme": "file",
+                        "path": "/workspace/subpkg/src/main.rs"
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(scoped, json!(2));
+
+    // 3. openTextDocument matches %20-encoded did_open_document via raw path & untitled: dirty buffers
+    let spaced = sandbox.join("hello world.rs");
+    std::fs::write(&spaced, "disk_version").unwrap();
+    let encoded_uri = format!("file://{}", spaced.to_string_lossy().replace(' ', "%20"));
+    bridge
+        .did_open_document(&encoded_uri, "rust", 1, "disk_version")
+        .await;
+    bridge
+        .did_change_document(&encoded_uri, "rust", 2, "DIRTY_BUFFER")
+        .await;
+
+    let doc_by_path = bridge
+        .handle_rpc_message(
+            "workspace.openTextDocument",
+            &json!({ "path": spaced.to_string_lossy() }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(doc_by_path["isDirty"], true);
+    assert_eq!(doc_by_path["text"], "DIRTY_BUFFER");
+
+    bridge
+        .did_open_document("untitled:Untitled-1", "plaintext", 1, "")
+        .await;
+    bridge
+        .did_change_document("untitled:Untitled-1", "plaintext", 2, "unsaved untitled text")
+        .await;
+    let doc_untitled = bridge
+        .handle_rpc_message(
+            "workspace.openTextDocument",
+            &json!({ "uri": "untitled://Untitled-1" }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(doc_untitled["isUntitled"], true);
+    assert_eq!(doc_untitled["isDirty"], true);
+    assert_eq!(doc_untitled["version"], 2);
+    assert_eq!(doc_untitled["fileName"], "Untitled-1");
+    assert_eq!(doc_untitled["text"], "unsaved untitled text");
+
+    // 4. Sync CommandCallback does NOT leak RpcBridge::pending entries
+    bridge
+        .handle_rpc_message("commands.registerCommand", &json!({ "command": "ext.syncNoLeak" }))
+        .await
+        .unwrap();
+    let exec_out = cmd_reg.execute("ext.syncNoLeak", None).unwrap();
+    assert_eq!(exec_out["dispatched"], true);
+    assert_eq!(rpc.pending_count(), 0);
+
+    // 5. env.openExternal rejects leading/trailing control chars & whitespace
+    for bad in [
+        "https://example.com\r\n",
+        "\thttps://example.com",
+        "\u{000b}https://example.com",
+        " https://example.com ",
+    ] {
+        assert_eq!(
+            bridge
+                .handle_rpc_message("env.openExternal", &json!({ "uri": bad }))
+                .await
+                .unwrap(),
+            json!(false)
+        );
+    }
+
+    // 6. %00 URI bypass rejected with EINVAL & dangling symlink rejected with EACCES
+    let nul_err = bridge
+        .handle_fs_rpc(
+            "fs.readFile",
+            &json!({ "path": format!("file://{}/evil%00.txt", sandbox.to_string_lossy()) }),
+        )
+        .await
+        .unwrap_err();
+    assert!(nul_err.starts_with("EINVAL:"), "got {}", nul_err);
+
+    #[cfg(unix)]
+    {
+        let pwned = outside.join("pwned.txt");
+        let link = sandbox.join("dangling_link");
+        std::os::unix::fs::symlink(&pwned, &link).unwrap();
+        let sym_err = bridge
+            .handle_fs_rpc(
+                "fs.writeFile",
+                &json!({ "path": "dangling_link", "data": [112, 119, 110, 101, 100] }),
+            )
+            .await
+            .unwrap_err();
+        assert!(sym_err.starts_with("EACCES:"), "got {}", sym_err);
+        assert!(!pwned.exists());
+    }
+
+    // 7. ExtHostWindowManager post-timeout immutability + abort waiter cleanup
+    let wm = bridge.window_manager();
+    wm.set_await_responses(true);
+    wm.set_response_timeout(Some(std::time::Duration::from_millis(15)));
+    let res = bridge
+        .handle_rpc_message(
+            "window.showInformationMessage",
+            &json!({ "message": "Timeout", "items": ["OK"] }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res, serde_json::Value::Null);
+    let notif_id = wm.list_notifications()[0].id.clone();
+    assert!(!wm.respond_notification(&notif_id, Some(json!("OK"))));
+
+    wm.set_response_timeout(None);
+    let bridge_clone = bridge.clone();
+    let aborted_task = tokio::spawn(async move {
+        let _ = bridge_clone
+            .handle_rpc_message(
+                "window.showInputBox",
+                &json!({ "options": { "prompt": "Aborted" } }),
+            )
+            .await;
+    });
+    tokio::task::yield_now().await;
+    aborted_task.abort();
+    let _ = aborted_task.await;
+    assert!(wm.list_prompts().iter().all(|p| p.resolved));
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

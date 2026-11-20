@@ -72,7 +72,7 @@ class TestItemCollection {
 
   _sync() {
     if (!this._controllerId) return;
-    rpc.call('tests.updateItems', {
+    rpc.fireAndForget('tests.updateItems', {
       controllerId: this._controllerId,
       parentId: this._parentItem ? this._parentItem.id : undefined,
       items: this.toJSON(),
@@ -192,7 +192,7 @@ class TestRun {
 
   _updateState(test, state, extra = {}) {
     if (this._ended) return;
-    rpc.call('tests.updateTestState', {
+    rpc.fireAndForget('tests.updateTestState', {
       runId: this._id,
       controllerId: this._controllerId,
       testId: test && test.id ? test.id : String(test || ''),
@@ -233,7 +233,7 @@ class TestRun {
 
   appendOutput(output, location, test) {
     if (this._ended) return;
-    rpc.call('tests.appendRunOutput', {
+    rpc.fireAndForget('tests.appendRunOutput', {
       runId: this._id,
       controllerId: this._controllerId,
       output: output !== undefined && output !== null ? String(output) : '',
@@ -245,7 +245,7 @@ class TestRun {
   end() {
     if (this._ended) return;
     this._ended = true;
-    rpc.call('tests.endTestRun', {
+    rpc.fireAndForget('tests.endTestRun', {
       runId: this._id,
       controllerId: this._controllerId,
     });
@@ -276,7 +276,7 @@ class TestRunProfile {
       this._onDispose();
       this._onDispose = null;
     }
-    rpc.call('tests.disposeRunProfile', {
+    rpc.fireAndForget('tests.disposeRunProfile', {
       controllerId: this._controllerId,
       id: this.id,
     });
@@ -326,7 +326,7 @@ class TestController {
       }
     );
     this._profiles.set(profileId, profile);
-    rpc.call('tests.createRunProfile', {
+    rpc.fireAndForget('tests.createRunProfile', {
       controllerId: this.id,
       id: profileId,
       label,
@@ -340,7 +340,7 @@ class TestController {
 
   createTestRun(request, name, persist = true) {
     const run = new TestRun(this.id, name, persist);
-    rpc.call('tests.createTestRun', {
+    rpc.fireAndForget('tests.createTestRun', {
       runId: run._id,
       controllerId: this.id,
       name,
@@ -356,7 +356,7 @@ class TestController {
       : items && items.id
       ? [items.id]
       : undefined;
-    rpc.call('tests.invalidateTestResults', {
+    rpc.fireAndForget('tests.invalidateTestResults', {
       controllerId: this.id,
       testIds: ids,
     });
@@ -373,7 +373,7 @@ class TestController {
       this._onDispose();
       this._onDispose = null;
     }
-    rpc.call('tests.disposeController', { id: this.id });
+    rpc.fireAndForget('tests.disposeController', { id: this.id });
   }
 }
 
@@ -421,7 +421,7 @@ const tests = {
       { selector: id, id, label }
     );
 
-    rpc.call('tests.createController', { id, label });
+    rpc.fireAndForget('tests.createController', { id, label });
     controller._onDispose = () => {
       proxyDisp.dispose();
     };

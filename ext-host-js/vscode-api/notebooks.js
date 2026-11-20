@@ -190,7 +190,7 @@ class NotebookCellExecution {
 
   start(startTime) {
     const meta = this._cellMeta();
-    return rpc.call('notebooks.updateExecution', {
+    rpc.fireAndForget('notebooks.updateExecution', {
       controllerId: this._controllerId,
       notebookUri: meta.notebookUri,
       cellIndex: meta.cellIndex,
@@ -202,7 +202,7 @@ class NotebookCellExecution {
 
   end(success, endTime) {
     const meta = this._cellMeta();
-    return rpc.call('notebooks.updateExecution', {
+    rpc.fireAndForget('notebooks.updateExecution', {
       controllerId: this._controllerId,
       notebookUri: meta.notebookUri,
       cellIndex: meta.cellIndex,
@@ -225,6 +225,11 @@ class NotebookCellExecution {
       notebookUri,
       cellIndex,
       outputs: [],
+    }).catch((err) => {
+      if (err && err.code === 'ERR_RPC_CLOSED') {
+        return undefined;
+      }
+      throw err;
     });
   }
 
@@ -241,6 +246,11 @@ class NotebookCellExecution {
       notebookUri,
       cellIndex,
       outputs,
+    }).catch((err) => {
+      if (err && err.code === 'ERR_RPC_CLOSED') {
+        return undefined;
+      }
+      throw err;
     });
   }
 
@@ -257,6 +267,11 @@ class NotebookCellExecution {
       notebookUri,
       cellIndex,
       outputs,
+    }).catch((err) => {
+      if (err && err.code === 'ERR_RPC_CLOSED') {
+        return undefined;
+      }
+      throw err;
     });
   }
 }
@@ -284,7 +299,7 @@ class NotebookController {
 
   updateNotebookAffinity(notebook, affinity) {
     const uri = notebook && notebook.uri ? notebook.uri.toString() : String(notebook || '');
-    return rpc.call('notebooks.updateControllerAffinity', {
+    rpc.fireAndForget('notebooks.updateControllerAffinity', {
       id: this.id,
       notebookUri: uri,
       affinity,
@@ -308,14 +323,14 @@ const notebooks = {
       ['deserializeNotebook', 'serializeNotebook'],
       { selector: notebookType, notebookType, options }
     );
-    rpc.call('notebooks.registerSerializer', {
+    rpc.fireAndForget('notebooks.registerSerializer', {
       id: notebookType,
       notebookType,
       options,
     });
     return new Disposable(() => {
       proxyDisp.dispose();
-      rpc.call('notebooks.unregisterSerializer', {
+      rpc.fireAndForget('notebooks.unregisterSerializer', {
         id: notebookType,
         notebookType,
       });
@@ -344,7 +359,7 @@ const notebooks = {
       ['execute', 'interrupt'],
       { selector: notebookType, id, notebookType, label }
     );
-    rpc.call('notebooks.createController', {
+    rpc.fireAndForget('notebooks.createController', {
       id,
       notebookType,
       label,
@@ -353,7 +368,7 @@ const notebooks = {
     });
     controller._onDispose = () => {
       proxyDisp.dispose();
-      rpc.call('notebooks.disposeController', { id });
+      rpc.fireAndForget('notebooks.disposeController', { id });
     };
     return controller;
   },

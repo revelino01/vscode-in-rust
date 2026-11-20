@@ -561,19 +561,24 @@ impl ExtHostTestManager {
         controller_id: &str,
         item_id: Option<&str>,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "tests.resolveChildren",
-            json!({
-                "controllerId": controller_id,
-                "providerId": controller_id,
-                "itemId": item_id,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "tests.resolveChildren",
+                json!({
+                    "controllerId": controller_id,
+                    "providerId": controller_id,
+                    "itemId": item_id,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for resolveChildren".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'tests.resolveChildren' timed out") {
+                    "Timed out waiting for resolveChildren".to_string()
+                } else {
+                    e
+                }
+            })
     }
 
     pub async fn request_refresh_tests(
@@ -581,18 +586,23 @@ impl ExtHostTestManager {
         rpc_bridge: &RpcBridge,
         controller_id: &str,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "tests.refreshTests",
-            json!({
-                "controllerId": controller_id,
-                "providerId": controller_id,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "tests.refreshTests",
+                json!({
+                    "controllerId": controller_id,
+                    "providerId": controller_id,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for refreshTests".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'tests.refreshTests' timed out") {
+                    "Timed out waiting for refreshTests".to_string()
+                } else {
+                    e
+                }
+            })
     }
 
     pub async fn request_run_tests(
@@ -601,19 +611,24 @@ impl ExtHostTestManager {
         controller_id: &str,
         request: Value,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "tests.runTests",
-            json!({
-                "controllerId": controller_id,
-                "providerId": controller_id,
-                "request": request,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "tests.runTests",
+                json!({
+                    "controllerId": controller_id,
+                    "providerId": controller_id,
+                    "request": request,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for runTests".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'tests.runTests' timed out") {
+                    "Timed out waiting for runTests".to_string()
+                } else {
+                    e
+                }
+            })
     }
 }
 

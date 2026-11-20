@@ -19,7 +19,7 @@ class DiagnosticCollection {
       // Convert VS Code API 0-indexed severity (0=Error) to LSP 1-indexed (1=Error)
       severity: typeof d.severity === 'number' ? d.severity + 1 : 1,
     }));
-    rpc.call('languages.setDiagnostics', {
+    rpc.fireAndForget('languages.setDiagnostics', {
       name: this.name,
       uri: key,
       diagnostics: mappedDiagnostics,
@@ -29,12 +29,12 @@ class DiagnosticCollection {
   delete(uri) {
     const key = uri.toString();
     this._entries.delete(key);
-    rpc.call('languages.clearDiagnostics', { name: this.name, uri: key });
+    rpc.fireAndForget('languages.clearDiagnostics', { name: this.name, uri: key });
   }
 
   clear() {
     this._entries.clear();
-    rpc.call('languages.clearAllDiagnostics', { name: this.name });
+    rpc.fireAndForget('languages.clearAllDiagnostics', { name: this.name });
   }
 
   dispose() {

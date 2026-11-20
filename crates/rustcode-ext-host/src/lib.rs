@@ -27,7 +27,11 @@ pub use debug::{
     DebugEventListener, ExtDebugBreakpoint, ExtDebugConsoleEntry, ExtDebugCustomEvent,
     ExtDebugEvent, ExtDebugProviderInfo, ExtDebugSessionState, ExtHostDebugManager,
 };
-pub use env::{EnvEventListener, ExtEnvEvent, ExtHostEnvManager};
+pub use env::{
+    is_valid_external_uri, ClipboardBackend, EnvEventListener, ExtEnvironmentInfo, ExtEnvEvent,
+    ExtHostEnvManager, ExternalUriOpener, InMemoryClipboardBackend, OsClipboardBackend,
+    OsExternalUriOpener, RecordingExternalUriOpener,
+};
 pub use manifest::{
     AuthenticationContribution, ContributedCommand, Contributions, CustomEditorContribution,
     CustomEditorSelector, DebuggerContribution, ExtensionLoader, ExtensionManifest,
@@ -48,10 +52,14 @@ pub use output::{
     ExtHostOutputManager, OutputChannelEvent, OutputChannelState, OutputEventListener,
 };
 pub use provider::{
-    DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, LanguageFeatureBridge,
-    ProviderRegistration, ProviderRegistry, ProviderType, TreeItem, TreeItemCollapsibleState,
+    DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, ExtWorkspaceFolder,
+    LanguageFeatureBridge, OpenDocumentSnapshot, ProviderRegistration, ProviderRegistry,
+    ProviderType, TreeItem, TreeItemCollapsibleState, TreeRefreshEvent,
 };
-pub use rpc::{RpcBridge, RpcMessage};
+pub use rpc::{
+    resolve_ext_host_entry, resolve_node_binary, NodeExtHostConfig, NodeExtHostProcess,
+    RpcBridge, RpcError, RpcErrorPayload, RpcMessage, RpcRequestHandler, RpcWireFormat,
+};
 pub use scm::{
     git_status_badge, parse_git_status_kind, ExtHostScmManager, ExtScmEvent, ExtScmInputBoxState,
     ExtScmResourceGroupState, ExtScmResourceState, ExtSourceControlState, ScmEventListener,
@@ -73,7 +81,7 @@ pub use webview::{
     WebviewEventListener, WebviewMessageListener, WebviewOptions, WebviewPanelState,
 };
 pub use window::{
-    ExtHostWindowManager, ExtNotificationState, ExtPromptKind, ExtPromptState, ExtWindowEvent,
-    NotificationActionItem, NotificationResponder, NotificationSeverity, PromptResponder,
-    WindowEventListener,
+    ExtHostWindowManager, ExtNotificationState, ExtPromptKind, ExtPromptState, ExtSelection,
+    ExtTextEditorState, ExtWindowEvent, NotificationActionItem, NotificationResponder,
+    NotificationSeverity, PromptResponder, ShowTextDocumentRequest, WindowEventListener,
 };

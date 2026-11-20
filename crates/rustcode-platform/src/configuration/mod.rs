@@ -12,6 +12,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct ConfigurationChangeEvent {
     pub affected_keys: Vec<String>,
+    pub affected_folders: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,18 +161,34 @@ impl ConfigurationService {
         }
         let mut normalized = json!({});
         merge_json_values(&mut normalized, &val);
-        self.folders.write().insert(folder.to_path_buf(), normalized);
+        let key = {
+            let mut folders_guard = self.folders.write();
+            let key = resolve_existing_folder_key(&folders_guard, folder);
+            folders_guard.insert(key.clone(), normalized);
+            key
+        };
         self.on_did_change.fire(ConfigurationChangeEvent {
             affected_keys: vec!["*".to_string()],
+            affected_folders: vec![key],
         });
         Ok(())
     }
 
     /// Remove folder-specific settings for a workspace folder.
     pub fn remove_folder_settings(&self, folder: &Path) {
-        if self.folders.write().remove(folder).is_some() {
+        let removed_key = {
+            let mut folders_guard = self.folders.write();
+            let key = resolve_existing_folder_key(&folders_guard, folder);
+            if folders_guard.remove(&key).is_some() {
+                Some(key)
+            } else {
+                None
+            }
+        };
+        if let Some(key) = removed_key {
             self.on_did_change.fire(ConfigurationChangeEvent {
                 affected_keys: vec!["*".to_string()],
+                affected_folders: vec![key],
             });
         }
     }
@@ -228,6 +245,15 @@ impl ConfigurationService {
     /// Return the complete merged configuration tree (defaults <- user <- workspace).
     pub fn get_all(&self) -> Value {
         self.merged.read().clone()
+    }
+
+    /// Return a snapshot of all folder-specific settings overrides.
+    pub fn folder_settings_snapshot(&self) -> Vec<(PathBuf, Value)> {
+        self.folders
+            .read()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 
     /// Return the merged configuration tree with any matching workspace folder overrides applied.
@@ -312,17 +338,20 @@ impl ConfigurationService {
                 self.recompute_with_keys(vec![path.to_string()]);
             }
             ConfigurationTarget::WorkspaceFolder(folder) => {
-                {
+                let key = {
                     let mut folders_guard = self.folders.write();
-                    let entry = folders_guard.entry(folder).or_insert_with(|| json!({}));
+                    let key = resolve_existing_folder_key(&folders_guard, &folder);
+                    let entry = folders_guard.entry(key.clone()).or_insert_with(|| json!({}));
                     let map = entry
                         .as_object_mut()
                         .ok_or_else(|| "Folder configuration is not a JSON object".to_string())?;
                     remove_nested_value(map, path);
                     set_nested_value(map, path, value);
-                }
+                    key
+                };
                 self.on_did_change.fire(ConfigurationChangeEvent {
                     affected_keys: vec![path.to_string()],
+                    affected_folders: vec![key],
                 });
             }
         }
@@ -360,22 +389,28 @@ impl ConfigurationService {
                 }
             }
             ConfigurationTarget::WorkspaceFolder(folder) => {
-                let removed = {
+                let removed_key = {
                     let mut folders_guard = self.folders.write();
+                    let key = resolve_existing_folder_key(&folders_guard, &folder);
                     let mut was_removed = false;
                     let mut should_remove_folder = false;
-                    if let Some(Value::Object(map)) = folders_guard.get_mut(&folder) {
+                    if let Some(Value::Object(map)) = folders_guard.get_mut(&key) {
                         was_removed = remove_nested_value(map, path);
                         should_remove_folder = map.is_empty();
                     }
                     if should_remove_folder {
-                        folders_guard.remove(&folder);
+                        folders_guard.remove(&key);
                     }
-                    was_removed
+                    if was_removed {
+                        Some(key)
+                    } else {
+                        None
+                    }
                 };
-                if removed {
+                if let Some(key) = removed_key {
                     self.on_did_change.fire(ConfigurationChangeEvent {
                         affected_keys: vec![path.to_string()],
+                        affected_folders: vec![key],
                     });
                 }
             }
@@ -397,9 +432,18 @@ impl ConfigurationService {
         merge_json_values(&mut merged, &ws);
 
         *self.merged.write() = merged;
-        self.on_did_change
-            .fire(ConfigurationChangeEvent { affected_keys });
+        self.on_did_change.fire(ConfigurationChangeEvent {
+            affected_keys,
+            affected_folders: Vec::new(),
+        });
     }
+}
+
+fn resolve_existing_folder_key(map: &HashMap<PathBuf, Value>, folder: &Path) -> PathBuf {
+    map.keys()
+        .find(|existing| crate::fs::paths_equivalent(existing, folder))
+        .cloned()
+        .unwrap_or_else(|| folder.to_path_buf())
 }
 
 fn lookup_in_layer(root: &Value, path: &str) -> Option<Value> {
@@ -1195,5 +1239,78 @@ mod tests {
             cfg.inspect("editor.tabSize", Some(file)).workspace_folder_value,
             Some(Value::Null)
         );
+    }
+
+    #[test]
+    fn test_folder_settings_snapshot_and_canonical_key_equivalence() {
+        let cfg = ConfigurationService::new();
+        let folder_slash = Path::new("/workspace/equiv/");
+        let folder_clean = Path::new("/workspace/equiv");
+        cfg.update(
+            "editor.tabSize",
+            json!(6),
+            ConfigurationTarget::WorkspaceFolder(folder_slash.to_path_buf()),
+        )
+        .unwrap();
+        cfg.update(
+            "editor.fontSize",
+            json!(16),
+            ConfigurationTarget::WorkspaceFolder(folder_clean.to_path_buf()),
+        )
+        .unwrap();
+        // Both updates must collapse into a single folder entry via paths_equivalent
+        let snap = cfg.folder_settings_snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].1["editor"]["tabSize"], json!(6));
+        assert_eq!(snap[0].1["editor"]["fontSize"], json!(16));
+
+        cfg.reset(
+            "editor.tabSize",
+            ConfigurationTarget::WorkspaceFolder(folder_clean.to_path_buf()),
+        );
+        cfg.remove_folder_settings(folder_clean);
+        assert!(cfg.folder_settings_snapshot().is_empty());
+    }
+
+    #[test]
+    fn test_configuration_change_event_affected_folders() {
+        let cfg = ConfigurationService::new();
+        let events = Arc::new(parking_lot::Mutex::new(Vec::<ConfigurationChangeEvent>::new()));
+        let events_bg = events.clone();
+        let mut sub = cfg.on_did_change.event().attach(move |ev| {
+            events_bg.lock().push(ev.clone());
+        });
+
+        let folder_a = Path::new("/workspace/folder_a");
+        cfg.update(
+            "editor.tabSize",
+            json!(2),
+            ConfigurationTarget::WorkspaceFolder(folder_a.to_path_buf()),
+        )
+        .unwrap();
+        cfg.update("editor.fontSize", json!(16), ConfigurationTarget::Workspace)
+            .unwrap();
+        cfg.reset(
+            "editor.tabSize",
+            ConfigurationTarget::WorkspaceFolder(folder_a.to_path_buf()),
+        );
+        cfg.load_folder_settings(folder_a, r#"{"editor.insertSpaces": false}"#)
+            .unwrap();
+        cfg.remove_folder_settings(folder_a);
+
+        let captured = events.lock();
+        assert_eq!(captured.len(), 5);
+        assert_eq!(captured[0].affected_keys, vec!["editor.tabSize".to_string()]);
+        assert_eq!(captured[0].affected_folders, vec![folder_a.to_path_buf()]);
+        assert_eq!(captured[1].affected_keys, vec!["editor.fontSize".to_string()]);
+        assert!(captured[1].affected_folders.is_empty());
+        assert_eq!(captured[2].affected_keys, vec!["editor.tabSize".to_string()]);
+        assert_eq!(captured[2].affected_folders, vec![folder_a.to_path_buf()]);
+        assert_eq!(captured[3].affected_keys, vec!["*".to_string()]);
+        assert_eq!(captured[3].affected_folders, vec![folder_a.to_path_buf()]);
+        assert_eq!(captured[4].affected_keys, vec!["*".to_string()]);
+        assert_eq!(captured[4].affected_folders, vec![folder_a.to_path_buf()]);
+
+        sub.dispose();
     }
 }

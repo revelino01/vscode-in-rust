@@ -78,11 +78,15 @@
 - [x] **M5 (`6a736ba`) — Documentation & Compatibility Matrix Refresh**: Refreshed `docs/extension-compat-matrix.md`, `docs/architecture.md`, `README.md`, and `rustcode-implementation-plan.md` (+ brain sync), with final full workspace/compat_suite/clippy verification (`404` workspace tests, `26/26` `compat_suite`, `0` clippy warnings)
 
 ### Phase 7: Full RPC Bridge Parity, In-Editor Widgets & Extended Ecosystem
-- [x] **M1 — 100% Extension Host RPC Bridge Parity**: Closed remaining `LanguageFeatureBridge::handle_rpc_message` deltas (`window.{showInformationMessage,showWarningMessage,showErrorMessage,showQuickPick,showInputBox}`, `'TreeDataProvider'`/`'TreeData'` & outbound `"treeView.getChildren"` in `rpc-bridge.js`, `workspace.{getConfiguration,updateConfiguration,openTextDocument}`, `commands.{registerCommand,unregisterCommand,executeCommand,getCommands}`, `env.{clipboardRead,clipboardWrite,openExternal}`, `vscode.extensions.all`/`getExtension`, and `node-compat/fs.js` `fs.*` RPC handlers; `424` workspace tests, `34/34` `compat_suite`, `0` clippy warnings)
-- [ ] **M2 — In-Editor Find & Replace Widget (`Ctrl+F` / `Ctrl+H`) & QuickInput Navigation (`Ctrl+G` / `@`)**: Floating `FindReplaceWidget` overlay in `EditorView` (live match decorations, next/prev match, case/whole-word/regex toggles, replace/replace-all) and `QuickInput` `:line[:col]` (`Ctrl+G` Go to Line) & `@symbol` (`Ctrl+Shift+O` Go to Symbol in Editor) modes
-- [ ] **M3 — Notification Toast Overlay & Testing Sidebar View (`workbench.view.testing`)**: Non-blocking bottom-right notification toast stack (`Info`/`Warning`/`Error` + action buttons) in `WorkbenchView` and interactive `TestingSidebarView` wired to `ExtHostTestManager` (`vscode.tests`)
-- [ ] **M4 — Interactive File Explorer CRUD & Contributed TreeViews**: Inline file/folder creation, inline rename (`F2`), delete confirmation in `FileExplorerView`, and rendering extension-contributed `views` (`registerTreeDataProvider`) in the sidebar
-- [ ] **M5 — Expanded `node-compat` Polyfills, Additional Language Tokenizers & Docs Refresh**: Add `ext-host-js/node-compat/{buffer,url,util,os,crypto,child_process}.js`, pure-Rust state-machine syntax tokenizers for Go, C/C++, HTML/CSS, and TOML/YAML in `rustcode-editor`, and update `docs/` & `README.md`
+- [x] **M1.1 — Live Framed Stdio RPC Transport, Structured Error Envelope & `node-compat/{fs,path}.js` Parity**: `NodeExtHostProcess` (`ContentLengthJson`, `ContentLengthMsgPack`, `NewlineJson`, `from_io`, `JoinSet` half-close EOF draining, Windows `CREATE_NO_WINDOW`), O(N) `read_content_length_frame` with 64 KiB header / 64 MiB frame limits, structured `{ error: { code, message } }` (`RpcError` / `RpcErrorPayload`) across 12+ namespaces via `handle_rpc_message_result`, `node-compat/fs.js` (`Dirent`, encodings, `mkdir` `firstCreated`, `promises.{access,rm,rename,copyFile}`, `constants`, `invokeCallback`, 11 `*Sync` methods throwing `ENOSYS` in live stdio except `existsSync`), OS-aware `node-compat/path.js` (`win32`/`posix`, `relative`, `parse`, `format`, UNC/drive-letter parity), and Windows/Linux `map_io_error` + `EISDIR` parity
+- [x] **M1.2 — Extension Host VS Code API Parity (`commands`, `window`, `workspace`, `env`, `extensions`) & Live Fixture E2E**: Sequential FIFO incoming notification worker + `IncomingNotifWork::Barrier` causal fence; `reader_closed` fast-fail; `command_mutation_lock` + token-checked `CommandRegistry` disposal; Windows folder-config equivalence & `extract_scope_path` `Uri` normalization + `affectsConfiguration(section, scope)`; CRLF/UTF-16 `TextDocumentProxy`; pluggable `ClipboardBackend` (`OsClipboardBackend`/`InMemoryClipboardBackend`) & `ExternalUriOpener` (`OsExternalUriOpener`/`RecordingExternalUriOpener`); `TreeDataProvider`/`TreeData` synthetic handles & `onDidChangeTreeData`; `require('vscode')` resolution (`installVscodeModuleHook` + `globalThis` singleton); live fixture (`hello-world`, `treeview_ext`, `theme_ext`) & multi-threaded 4-worker stdio reverse-split stress tests (**457** workspace tests, **41/41** `compat_suite`, **25/25** `ext-host-js/test.js` sections, **0** Windows/Linux clippy warnings)
+- [ ] **M1.3 — `RustCodeContext` & `WorkbenchWindow` End-to-End Wiring (Deferred / Next)**: Construct and attach shared `LanguageFeatureBridge` + `FileSystemService` in `RustCodeContext::create_window()`, replace dummy builtin command JSON stubs with real `WorkbenchWindow` command effects, forward document open/change/save/close & active-editor changes, add `WorkbenchWindow` sync hooks for `ExtHostWindowManager` / `ExtHostEnvManager` / `ExtStatusBarManager`, and add Windows Explorer drive-root name fallback
+- [ ] **M2 — In-Editor Find & Replace Widget (`Ctrl+F` / `Ctrl+H`) & QuickInput Navigation (`Ctrl+G` / `@`) (Not Started)**: Floating `FindReplaceWidget` overlay in `EditorView` (live match decorations, next/prev match, case/whole-word/regex toggles, replace/replace-all) and `QuickInput` `:line[:col]` (`Ctrl+G` Go to Line) & `@symbol` (`Ctrl+Shift+O` Go to Symbol in Editor) interactive modes
+- [ ] **M3 — Notification Toast Overlay & Testing Sidebar View (`workbench.view.testing`) (Not Started)**: Non-blocking bottom-right `NotificationsOverlay` toast stack (`Info`/`Warning`/`Error` + action buttons) + interactive QuickPick/InputBox sync in `WorkbenchView`, and interactive `TestingSidebarView` wired to `ExtHostTestManager` (`vscode.tests`)
+- [ ] **M4 — Interactive File Explorer CRUD & Contributed TreeViews (Not Started)**: Inline file/folder creation, inline rename (`F2`), delete confirmation in `FileExplorerView`, and rendering extension-contributed `views` (`registerTreeDataProvider`) in the sidebar
+- [ ] **M5 — Expanded `node-compat` Polyfills & Additional Language Tokenizers (Not Started)**: Add `ext-host-js/node-compat/{buffer,url,util,os,crypto,child_process}.js` + `env.getOsInfo` / `process.{spawn,exec,spawnSync}` RPC, and pure-Rust state-machine syntax tokenizers for 7 additional languages (`Go`, `C`, `C++`, `HTML`, `CSS`, `TOML`, `YAML`) in `rustcode-editor`
+- [~] **M6 — Documentation & Trackers Wrap-Up**: M1.1 + M1.2 documentation & tracker wrap-up complete across `README.md`, `rustcode-implementation-plan.md`, `docs/extension-compat-matrix.md`, and `docs/architecture.md`; final refresh follows M2–M5
+- [ ] **M7 — Standalone E2E Suite Pass (`tests/phase7-e2e/`) & Tier 5 Hardening (Not Started)**: Pass all standalone Tiers 1–4 tests (`286` Win / `287` Unix tests via `node tests/phase7-e2e/runner.js`, outside root Cargo `[workspace]`) + Tier 5 adversarial hardening after M1.3 and M2–M5 complete
 
 ---
 
@@ -1673,20 +1677,24 @@ flowchart LR
 
 ### Automated Tests
 
-Verified status on `main` (Phase 6 M5): **404 workspace tests passing**, **26/26 `compat_suite` tests passing**, **0 `clippy` warnings**.
+Verified status (Phase 7 M1.2): **457 workspace tests passing** across **8** crates (`rustcode-app` 25, `rustcode-base` 10, `rustcode-editor` 100, `rustcode-ext-host` 120 [79 unit + 41 `compat_suite`], `rustcode-platform` 40, `rustcode-protocols` 24, `rustcode-terminal` 9, `rustcode-workbench` 129), **25/25 `ext-host-js/test.js` sections passing** (**271** `assert(...)` call sites), and **0 `clippy` warnings** (`-D warnings`) on both **Windows (`x86_64-pc-windows-gnu`)** and **Linux (`x86_64-unknown-linux-gnu`)** cross-target clippy *(runtime tests executed on Windows 11 x64; Linux verified via cross-target `cargo clippy`)*.
 
 ```bash
-# Unit and integration tests for all crates
-cargo test --workspace
+# Unit and integration tests for all crates (use -j 2 on constrained Windows hosts)
+cargo test -j 2 --workspace
 
 # Piece Table stress tests (random edits, verify content integrity)
-cargo test -p rustcode-editor -- piece_table --test-threads=1
+cargo test -j 2 -p rustcode-editor -- piece_table --test-threads=1
 
-# Extension compatibility suite
-cargo test -p rustcode-ext-host --test compat_suite
+# Extension compatibility suite (41 tests)
+cargo test -j 2 -p rustcode-ext-host --test compat_suite
 
-# Workspace lint check (warnings treated as errors)
-cargo clippy --workspace --all-targets -- -D warnings
+# JavaScript extension host suite (25 [Test] sections / 271 asserts)
+node ext-host-js/test.js
+
+# Workspace lint check on host and Linux cross-target (warnings treated as errors)
+cargo clippy -j 2 --workspace --all-targets -- -D warnings
+cargo clippy -j 2 --target x86_64-unknown-linux-gnu --workspace --all-targets -- -D warnings
 
 # Performance benchmarks
 cargo bench --bench startup_time
@@ -1694,9 +1702,11 @@ cargo bench --bench memory_footprint
 cargo bench --bench editor_latency
 ```
 
+> **Standalone E2E Suite (`tests/phase7-e2e/`):** Isolated standalone Cargo `[workspace]` outside root `Cargo.toml` (`node tests/phase7-e2e/runner.js`; `--syntax-check` passes **8/8**), containing **286** Windows / **287** Unix opaque-box tests across Tiers 1–4 awaiting completion of remaining Phase 7 milestones (**M1.3**, **M2–M5**).
+
 ### Extension Compatibility Matrix
 
-See the living compatibility matrix in [docs/extension-compat-matrix.md](docs/extension-compat-matrix.md) for the complete breakdown of all 12 `vscode.*` namespaces, 16 `ProviderType` variants, 12 Rust extension host managers, 11 manifest contribution types, 6 synthetic fixture extensions, 8-item Open VSX curated catalog, and `compat_suite` / `ext-host-js/test.js` test coverage.
+See the living compatibility matrix in [docs/extension-compat-matrix.md](docs/extension-compat-matrix.md) for the complete breakdown of all 12 `vscode.*` namespaces (`commands`, `window`, `workspace`, `languages`, `notebooks`, `scm`, `debug`, `tasks`, `tests`, `authentication`, `env`, `extensions`), 16 `ProviderType` variants, **14** Rust extension host managers on `LanguageFeatureBridge` (including `ExtHostWindowManager` and `ExtHostEnvManager`), 11 manifest contribution types, 1 sample extension (`hello-world`), 6 synthetic fixture extensions, 8-item Open VSX curated catalog, `41/41` `compat_suite` tests, and `25/25` `ext-host-js/test.js` sections.
 
 | Extension | Status | Blocking / Key API | Notes |
 |---|---|---|---|

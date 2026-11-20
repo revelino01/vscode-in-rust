@@ -116,6 +116,30 @@ function hasWindowsDrivePrefix(str, offset) {
   );
 }
 
+function safeDecodeUriPath(p) {
+  if (typeof p !== 'string' || p.indexOf('%') === -1) {
+    return p;
+  }
+  return p.replace(/%(?:[0-9A-Fa-f]{2})+/g, (seq) => {
+    try {
+      return decodeURIComponent(seq);
+    } catch {
+      return seq;
+    }
+  });
+}
+
+function encodeUriPath(p) {
+  if (typeof p !== 'string' || !p) {
+    return '';
+  }
+  try {
+    return encodeURI(p).replace(/#/g, '%23').replace(/\?/g, '%3F');
+  } catch {
+    return p;
+  }
+}
+
 class Uri {
   constructor(scheme, authority, path, query, fragment) {
     this.scheme = scheme || 'file';
@@ -126,21 +150,22 @@ class Uri {
   }
 
   get fsPath() {
+    const decodedPath = safeDecodeUriPath(this.path);
     if (this.scheme === 'file') {
       if (
         this.authority &&
         this.authority.toLowerCase() !== 'localhost' &&
-        this.path.length > 1
+        decodedPath.length > 1
       ) {
-        const winTail = this.path.split('/').join('\\');
+        const winTail = decodedPath.split('/').join('\\');
         return `\\\\${this.authority}${winTail}`;
       }
-      if (this.path.startsWith('/') && hasWindowsDrivePrefix(this.path, 1)) {
-        const winPath = this.path.slice(1).split('/').join('\\');
+      if (decodedPath.startsWith('/') && hasWindowsDrivePrefix(decodedPath, 1)) {
+        const winPath = decodedPath.slice(1).split('/').join('\\');
         return winPath.length === 2 ? `${winPath}\\` : winPath;
       }
     }
-    return this.path;
+    return decodedPath;
   }
 
   static file(path) {
@@ -161,16 +186,54 @@ class Uri {
   }
 
   static parse(value) {
+    const str = typeof value === 'string' ? value : String(value || '');
+    const slashNorm = str.split('\\').join('/');
+    if (hasWindowsDrivePrefix(slashNorm, 0)) {
+      return Uri.file(str);
+    }
     try {
-      const u = new URL(value);
-      return new Uri(u.protocol.replace(':', ''), u.host, u.pathname, u.search, u.hash);
+      const u = new URL(str);
+      const query = u.search ? u.search.slice(1) : '';
+      const fragment = u.hash ? u.hash.slice(1) : '';
+      return new Uri(
+        u.protocol.replace(':', ''),
+        u.host,
+        safeDecodeUriPath(u.pathname),
+        query,
+        fragment
+      );
     } catch {
-      return new Uri('file', '', value, '', '');
+      return new Uri('file', '', str, '', '');
     }
   }
 
-  toString() {
-    return `${this.scheme}://${this.authority}${this.path}`;
+  static from(components = {}) {
+    return new Uri(
+      components.scheme || 'file',
+      components.authority || '',
+      components.path || '',
+      components.query || '',
+      components.fragment || ''
+    );
+  }
+
+  toString(skipEncoding = false) {
+    const pathPart = skipEncoding ? this.path : encodeUriPath(this.path);
+    const hasAuthority = Boolean(this.authority && this.authority.length > 0);
+    const useDoubleSlash =
+      this.scheme === 'file' || hasAuthority || pathPart.startsWith('//');
+    let out = useDoubleSlash
+      ? `${this.scheme}://${this.authority}${
+          hasAuthority && pathPart && !pathPart.startsWith('/') ? `/${pathPart}` : pathPart
+        }`
+      : `${this.scheme}:${pathPart}`;
+    if (this.query) {
+      out += this.query.startsWith('?') ? this.query : `?${this.query}`;
+    }
+    if (this.fragment) {
+      out += this.fragment.startsWith('#') ? this.fragment : `#${this.fragment}`;
+    }
+    return out;
   }
 
   toJSON() {
@@ -552,8 +615,10 @@ class TreeItem {
       } else {
         this.label = String(labelOrResourceUri);
       }
+    } else if (labelOrResourceUri === undefined || labelOrResourceUri === null) {
+      this.label = undefined;
     } else {
-      this.label = '';
+      this.label = String(labelOrResourceUri);
     }
     this.id = undefined;
     this.description = undefined;
@@ -575,6 +640,105 @@ const EndOfLine = {
   LF: 1,
   CRLF: 2,
 };
+
+const UIKind = {
+  Desktop: 1,
+  Web: 2,
+};
+
+const ViewColumn = {
+  Active: -1,
+  Beside: -2,
+  One: 1,
+  Two: 2,
+  Three: 3,
+  Four: 4,
+  Five: 5,
+  Six: 6,
+  Seven: 7,
+  Eight: 8,
+  Nine: 9,
+};
+
+const TextEditorRevealType = {
+  Default: 0,
+  InCenter: 1,
+  InCenterIfOutsideViewport: 2,
+  AtTop: 3,
+};
+
+const TextEditorSelectionChangeKind = {
+  Keyboard: 1,
+  Mouse: 2,
+  Command: 3,
+};
+
+const FileType = {
+  Unknown: 0,
+  File: 1,
+  Directory: 2,
+  SymbolicLink: 64,
+};
+
+class FileSystemError extends Error {
+  constructor(messageOrUri, code = 'Unknown') {
+    const msg =
+      messageOrUri && typeof messageOrUri === 'object' && typeof messageOrUri.toString === 'function'
+        ? messageOrUri.toString()
+        : String(messageOrUri || code);
+    super(msg);
+    this.name = 'FileSystemError';
+    this.code = code;
+  }
+
+  static FileNotFound(messageOrUri) {
+    return new FileSystemError(messageOrUri, 'FileNotFound');
+  }
+
+  static FileExists(messageOrUri) {
+    return new FileSystemError(messageOrUri, 'FileExists');
+  }
+
+  static FileNotADirectory(messageOrUri) {
+    return new FileSystemError(messageOrUri, 'FileNotADirectory');
+  }
+
+  static FileIsADirectory(messageOrUri) {
+    return new FileSystemError(messageOrUri, 'FileIsADirectory');
+  }
+
+  static NoPermissions(messageOrUri) {
+    return new FileSystemError(messageOrUri, 'NoPermissions');
+  }
+
+  static Unavailable(messageOrUri) {
+    return new FileSystemError(messageOrUri, 'Unavailable');
+  }
+}
+
+class RelativePattern {
+  constructor(base, pattern) {
+    if (base && typeof base === 'object' && base.uri) {
+      this.baseUri = base.uri;
+      this.base = base.uri.fsPath || base.uri.path || String(base.uri);
+    } else if (base && typeof base === 'object' && (base.fsPath || base.path)) {
+      this.baseUri = base;
+      this.base = base.fsPath || base.path || String(base);
+    } else {
+      this.base = String(base || '');
+      this.baseUri = Uri.file(this.base);
+    }
+    this.pattern = String(pattern || '');
+  }
+
+  toJSON() {
+    return {
+      base: this.base,
+      baseUri: this.baseUri,
+      pattern: this.pattern,
+    };
+  }
+}
 
 module.exports = {
   Position,
@@ -603,4 +767,11 @@ module.exports = {
   TreeItem,
   ConfigurationTarget,
   EndOfLine,
+  UIKind,
+  ViewColumn,
+  TextEditorRevealType,
+  TextEditorSelectionChangeKind,
+  FileType,
+  FileSystemError,
+  RelativePattern,
 };

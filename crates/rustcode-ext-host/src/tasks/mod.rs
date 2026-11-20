@@ -319,18 +319,23 @@ impl ExtHostTaskManager {
         rpc_bridge: &RpcBridge,
         provider_id: &str,
     ) -> Result<Vec<Value>, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "tasks.provideTasks",
-            json!({
-                "providerId": provider_id,
-                "taskType": provider_id,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "tasks.provideTasks",
+                json!({
+                    "providerId": provider_id,
+                    "taskType": provider_id,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for provideTasks".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'tasks.provideTasks' timed out") {
+                    "Timed out waiting for provideTasks".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         Ok(val.as_array().cloned().unwrap_or_default())
     }
@@ -341,19 +346,24 @@ impl ExtHostTaskManager {
         provider_id: &str,
         task: Value,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "tasks.resolveTask",
-            json!({
-                "providerId": provider_id,
-                "taskType": provider_id,
-                "task": task,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "tasks.resolveTask",
+                json!({
+                    "providerId": provider_id,
+                    "taskType": provider_id,
+                    "task": task,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for resolveTask".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'tasks.resolveTask' timed out") {
+                    "Timed out waiting for resolveTask".to_string()
+                } else {
+                    e
+                }
+            })
     }
 }
 

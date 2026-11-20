@@ -30,7 +30,7 @@ const authentication = {
     let sessionsSub = null;
     if (provider && typeof provider.onDidChangeSessions === 'function') {
       sessionsSub = provider.onDidChangeSessions((ev) => {
-        rpc.call('authentication.didChangeSessions', {
+        rpc.fireAndForget('authentication.didChangeSessions', {
           providerId: id,
           added: (ev && ev.added) || [],
           removed: (ev && ev.removed) || [],
@@ -39,7 +39,7 @@ const authentication = {
       });
     }
 
-    rpc.call('authentication.registerProvider', {
+    rpc.fireAndForget('authentication.registerProvider', {
       id,
       label,
       supportsMultipleAccounts,
@@ -50,7 +50,7 @@ const authentication = {
         sessionsSub.dispose();
       }
       proxyDisp.dispose();
-      rpc.call('authentication.unregisterProvider', { id });
+      rpc.fireAndForget('authentication.unregisterProvider', { id });
     });
   },
 

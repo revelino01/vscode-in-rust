@@ -260,18 +260,23 @@ impl ExtHostAuthManager {
         provider_id: &str,
         scopes: &[String],
     ) -> Result<Vec<ExtAuthSessionInfo>, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "authentication.getSessions",
-            json!({
-                "providerId": provider_id,
-                "scopes": scopes,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "authentication.getSessions",
+                json!({
+                    "providerId": provider_id,
+                    "scopes": scopes,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for getSessions".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'authentication.getSessions' timed out") {
+                    "Timed out waiting for getSessions".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         serde_json::from_value::<Vec<ExtAuthSessionInfo>>(val)
             .map_err(|e| format!("Invalid auth sessions response: {}", e))
@@ -283,18 +288,23 @@ impl ExtHostAuthManager {
         provider_id: &str,
         scopes: &[String],
     ) -> Result<ExtAuthSessionInfo, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "authentication.createSession",
-            json!({
-                "providerId": provider_id,
-                "scopes": scopes,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "authentication.createSession",
+                json!({
+                    "providerId": provider_id,
+                    "scopes": scopes,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for createSession".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'authentication.createSession' timed out") {
+                    "Timed out waiting for createSession".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         serde_json::from_value::<ExtAuthSessionInfo>(val)
             .map_err(|e| format!("Invalid auth session response: {}", e))
@@ -306,18 +316,23 @@ impl ExtHostAuthManager {
         provider_id: &str,
         session_id: &str,
     ) -> Result<bool, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "authentication.removeSession",
-            json!({
-                "providerId": provider_id,
-                "sessionId": session_id,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "authentication.removeSession",
+                json!({
+                    "providerId": provider_id,
+                    "sessionId": session_id,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for removeSession".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'authentication.removeSession' timed out") {
+                    "Timed out waiting for removeSession".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         val.as_bool()
             .ok_or_else(|| "Invalid removeSession response: expected boolean".to_string())

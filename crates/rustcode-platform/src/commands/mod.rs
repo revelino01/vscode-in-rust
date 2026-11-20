@@ -4,13 +4,22 @@ use parking_lot::RwLock;
 use rustcode_base::disposable::{to_disposable, Disposable};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub type CommandCallback = Arc<dyn Fn(Option<Value>) -> Result<Value, String> + Send + Sync + 'static>;
 
+static NEXT_COMMAND_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone)]
+struct CommandEntry {
+    token: u64,
+    callback: CommandCallback,
+}
+
 #[derive(Clone)]
 pub struct CommandRegistry {
-    commands: Arc<RwLock<HashMap<String, CommandCallback>>>,
+    commands: Arc<RwLock<HashMap<String, CommandEntry>>>,
 }
 
 impl Default for CommandRegistry {
@@ -26,17 +35,28 @@ impl CommandRegistry {
         }
     }
 
-    /// Register a command handler. Returns a `Disposable` that unregisters the command.
+    /// Register a command handler. Returns a `Disposable` that unregisters the command
+    /// only if the registered entry still belongs to this registration token.
     pub fn register<F>(&self, id: &str, handler: F) -> Box<dyn Disposable>
     where
         F: Fn(Option<Value>) -> Result<Value, String> + Send + Sync + 'static,
     {
         let id_str = id.to_string();
-        self.commands.write().insert(id_str.clone(), Arc::new(handler));
+        let token = NEXT_COMMAND_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.commands.write().insert(
+            id_str.clone(),
+            CommandEntry {
+                token,
+                callback: Arc::new(handler),
+            },
+        );
 
         let commands = Arc::clone(&self.commands);
         to_disposable(move || {
-            commands.write().remove(&id_str);
+            let mut guard = commands.write();
+            if guard.get(&id_str).is_some_and(|entry| entry.token == token) {
+                guard.remove(&id_str);
+            }
         })
     }
 
@@ -44,7 +64,10 @@ impl CommandRegistry {
     pub fn execute(&self, id: &str, args: Option<Value>) -> Result<Value, String> {
         let handler = {
             let guard = self.commands.read();
-            guard.get(id).cloned().ok_or_else(|| format!("Command '{}' not found", id))?
+            guard
+                .get(id)
+                .map(|entry| Arc::clone(&entry.callback))
+                .ok_or_else(|| format!("Command '{}' not found", id))?
         };
         handler(args)
     }
@@ -99,5 +122,24 @@ mod tests {
         let res = registry.execute("parent.command", None).unwrap();
         assert_eq!(res, json!("parent"));
         assert!(registry.has_command("child.command"));
+    }
+
+    #[test]
+    fn test_command_re_registration_old_disposable_does_not_remove_new_handler() {
+        let registry = CommandRegistry::new();
+        let mut first_disp = registry.register("dup.cmd", |_| Ok(json!("first")));
+        let mut second_disp = registry.register("dup.cmd", |_| Ok(json!("second")));
+
+        assert_eq!(registry.execute("dup.cmd", None).unwrap(), json!("second"));
+
+        // Disposing/dropping the older disposable must NOT delete the newer registration
+        first_disp.dispose();
+        drop(first_disp);
+        assert!(registry.has_command("dup.cmd"));
+        assert_eq!(registry.execute("dup.cmd", None).unwrap(), json!("second"));
+
+        // Disposing the current registration removes it
+        second_disp.dispose();
+        assert!(!registry.has_command("dup.cmd"));
     }
 }

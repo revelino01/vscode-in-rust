@@ -127,13 +127,13 @@ let activeSession = undefined;
 
 const activeDebugConsole = {
   append(value) {
-    rpc.call('debug.appendConsole', {
+    rpc.fireAndForget('debug.appendConsole', {
       value: value !== undefined && value !== null ? String(value) : '',
       newLine: false,
     });
   },
   appendLine(value) {
-    rpc.call('debug.appendConsole', {
+    rpc.fireAndForget('debug.appendConsole', {
       value: value !== undefined && value !== null ? String(value) : '',
       newLine: true,
     });
@@ -193,14 +193,14 @@ const debug = {
       ],
       { selector: debugType, debugType, triggerKind }
     );
-    rpc.call('debug.registerConfigurationProvider', {
+    rpc.fireAndForget('debug.registerConfigurationProvider', {
       id,
       debugType,
       triggerKind,
     });
     return new Disposable(() => {
       proxyDisp.dispose();
-      rpc.call('debug.unregisterConfigurationProvider', { id, debugType });
+      rpc.fireAndForget('debug.unregisterConfigurationProvider', { id, debugType });
     });
   },
 
@@ -213,25 +213,25 @@ const debug = {
       ['createDebugAdapterDescriptor'],
       { selector: debugType, debugType }
     );
-    rpc.call('debug.registerAdapterDescriptorFactory', {
+    rpc.fireAndForget('debug.registerAdapterDescriptorFactory', {
       id,
       debugType,
     });
     return new Disposable(() => {
       proxyDisp.dispose();
-      rpc.call('debug.unregisterAdapterDescriptorFactory', { id, debugType });
+      rpc.fireAndForget('debug.unregisterAdapterDescriptorFactory', { id, debugType });
     });
   },
 
   registerDebugAdapterTrackerFactory(debugType, factory) {
     const id = `debug_tracker_${nextDebugAdapterId++}`;
-    rpc.call('debug.registerAdapterTrackerFactory', {
+    rpc.fireAndForget('debug.registerAdapterTrackerFactory', {
       id,
       debugType,
       hasFactory: Boolean(factory),
     });
     return new Disposable(() => {
-      rpc.call('debug.unregisterAdapterTrackerFactory', { id, debugType });
+      rpc.fireAndForget('debug.unregisterAdapterTrackerFactory', { id, debugType });
     });
   },
 
@@ -245,7 +245,7 @@ const debug = {
       }
     }
     if (added.length > 0) {
-      rpc.call('debug.addBreakpoints', { breakpoints: added });
+      rpc.fireAndForget('debug.addBreakpoints', { breakpoints: added });
     }
   },
 
@@ -260,7 +260,7 @@ const debug = {
       ids.push(bp.id);
     }
     if (ids.length > 0) {
-      rpc.call('debug.removeBreakpoints', { ids });
+      rpc.fireAndForget('debug.removeBreakpoints', { ids });
     }
   },
 

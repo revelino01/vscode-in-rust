@@ -1,9 +1,10 @@
 //! Extension Host Window UI Management (`vscode.window.show*Message`, `showQuickPick`, `showInputBox`).
 
 use parking_lot::{Mutex, RwLock};
+use rustcode_protocols::lsp::{LspPosition, LspRange};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,6 +50,8 @@ pub enum ExtPromptKind {
         #[serde(rename = "placeHolder")]
         place_holder: Option<String>,
         title: Option<String>,
+        #[serde(default)]
+        has_on_did_select_item: bool,
         options: Value,
     },
     InputBox {
@@ -58,6 +61,8 @@ pub enum ExtPromptKind {
         value: Option<String>,
         password: bool,
         title: Option<String>,
+        #[serde(default)]
+        has_validate_input: bool,
         options: Value,
     },
 }
@@ -66,10 +71,56 @@ pub enum ExtPromptKind {
 #[serde(rename_all = "camelCase")]
 pub struct ExtPromptState {
     pub id: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
     #[serde(flatten)]
     pub kind: ExtPromptKind,
     pub response: Option<Value>,
     pub resolved: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtSelection {
+    pub anchor: LspPosition,
+    pub active: LspPosition,
+    pub start: LspPosition,
+    pub end: LspPosition,
+    pub is_reversed: bool,
+}
+
+impl ExtSelection {
+    pub fn from_range(range: LspRange) -> Self {
+        Self {
+            anchor: range.start,
+            active: range.end,
+            start: range.start,
+            end: range.end,
+            is_reversed: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtTextEditorState {
+    pub id: String,
+    pub document: crate::provider::OpenDocumentSnapshot,
+    pub selection: ExtSelection,
+    pub selections: Vec<ExtSelection>,
+    pub visible_ranges: Vec<LspRange>,
+    pub view_column: Option<i32>,
+    pub options: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ShowTextDocumentRequest {
+    pub uri: String,
+    pub view_column: Option<i32>,
+    pub preserve_focus: bool,
+    pub preview: Option<bool>,
+    pub selection: Option<LspRange>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -118,6 +169,10 @@ pub struct ExtHostWindowManager {
     response_timeout: Arc<RwLock<Option<Duration>>>,
     pending_notification_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Option<Value>>>>>,
     pending_prompt_waiters: Arc<Mutex<HashMap<String, oneshot::Sender<Option<Value>>>>>,
+    cancelled_client_ids: Arc<Mutex<HashSet<String>>>,
+    active_editor: Arc<RwLock<Option<ExtTextEditorState>>>,
+    visible_editors: Arc<RwLock<Vec<ExtTextEditorState>>>,
+    pending_show_document_requests: Arc<Mutex<Vec<ShowTextDocumentRequest>>>,
 }
 
 impl ExtHostWindowManager {
@@ -212,8 +267,60 @@ impl ExtHostWindowManager {
         order.iter().filter_map(|id| map.get(id).cloned()).collect()
     }
 
+    pub fn active_prompts(&self) -> Vec<ExtPromptState> {
+        self.list_prompts()
+            .into_iter()
+            .filter(|p| !p.resolved)
+            .collect()
+    }
+
     pub fn get_prompt(&self, id: &str) -> Option<ExtPromptState> {
         self.prompts.read().get(id).cloned()
+    }
+
+    pub fn cancel_prompt(&self, id_or_client_id: &str) -> bool {
+        let target_id = {
+            let map = self.prompts.read();
+            if map.get(id_or_client_id).is_some_and(|p| !p.resolved) {
+                Some(id_or_client_id.to_string())
+            } else {
+                map.values()
+                    .find(|p| !p.resolved && p.client_id.as_deref() == Some(id_or_client_id))
+                    .map(|p| p.id.clone())
+            }
+        };
+        if let Some(id) = target_id {
+            self.respond_prompt(&id, None)
+        } else {
+            self.cancelled_client_ids
+                .lock()
+                .insert(id_or_client_id.to_string());
+            false
+        }
+    }
+
+    pub fn active_editor(&self) -> Option<ExtTextEditorState> {
+        self.active_editor.read().clone()
+    }
+
+    pub fn set_active_editor(&self, editor: Option<ExtTextEditorState>) {
+        *self.active_editor.write() = editor;
+    }
+
+    pub fn visible_editors(&self) -> Vec<ExtTextEditorState> {
+        self.visible_editors.read().clone()
+    }
+
+    pub fn set_visible_editors(&self, editors: Vec<ExtTextEditorState>) {
+        *self.visible_editors.write() = editors;
+    }
+
+    pub fn push_show_document_request(&self, req: ShowTextDocumentRequest) {
+        self.pending_show_document_requests.lock().push(req);
+    }
+
+    pub fn take_pending_show_document_requests(&self) -> Vec<ShowTextDocumentRequest> {
+        std::mem::take(&mut *self.pending_show_document_requests.lock())
     }
 
     pub fn respond_notification(&self, id: &str, selection: Option<Value>) -> bool {
@@ -317,6 +424,17 @@ impl ExtHostWindowManager {
             }
             "window.showQuickPick" => self.handle_show_quick_pick(params).await,
             "window.showInputBox" => self.handle_show_input_box(params).await,
+            "window.cancelPrompt" => {
+                let target = params
+                    .get("id")
+                    .or_else(|| params.get("clientId"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "Missing string 'id' or 'clientId' parameter".to_string())?;
+                let cancelled = self.cancel_prompt(target);
+                Ok(json!({ "cancelled": cancelled }))
+            }
             _ => Err(format!("Unsupported window RPC method: {}", method)),
         }
     }
@@ -498,15 +616,24 @@ impl ExtHostWindowManager {
             .get("title")
             .and_then(|v| v.as_str())
             .map(ToString::to_string);
+        let has_on_did_select_item = params
+            .get("hasOnDidSelectItem")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let client_id = params
+            .get("clientId")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
 
         let kind = ExtPromptKind::QuickPick {
             items,
             can_pick_many,
             place_holder,
             title,
+            has_on_did_select_item,
             options,
         };
-        self.dispatch_prompt(kind).await
+        self.dispatch_prompt(kind, client_id).await
     }
 
     async fn handle_show_input_box(&self, params: &Value) -> Result<Value, String> {
@@ -531,6 +658,14 @@ impl ExtHostWindowManager {
             .get("title")
             .and_then(|v| v.as_str())
             .map(ToString::to_string);
+        let has_validate_input = params
+            .get("hasValidateInput")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let client_id = params
+            .get("clientId")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
 
         let kind = ExtPromptKind::InputBox {
             prompt,
@@ -538,19 +673,41 @@ impl ExtHostWindowManager {
             value,
             password,
             title,
+            has_validate_input,
             options,
         };
-        self.dispatch_prompt(kind).await
+        self.dispatch_prompt(kind, client_id).await
     }
 
-    async fn dispatch_prompt(&self, kind: ExtPromptKind) -> Result<Value, String> {
+    async fn dispatch_prompt(
+        &self,
+        kind: ExtPromptKind,
+        client_id: Option<String>,
+    ) -> Result<Value, String> {
         let id = self.next_prompt_id();
+        let pre_cancelled = client_id
+            .as_deref()
+            .is_some_and(|cid| self.cancelled_client_ids.lock().remove(cid));
         let state = ExtPromptState {
             id: id.clone(),
+            client_id: client_id.clone(),
             kind: kind.clone(),
             response: None,
-            resolved: false,
+            resolved: pre_cancelled,
         };
+
+        if pre_cancelled {
+            {
+                self.prompts.write().insert(id.clone(), state);
+                self.prompt_order.write().push(id.clone());
+            }
+            self.emit(ExtWindowEvent::PromptRequested {
+                id: id.clone(),
+                prompt: kind,
+            });
+            self.emit(ExtWindowEvent::PromptResolved { id, response: None });
+            return Ok(Value::Null);
+        }
 
         let should_await =
             self.prompt_responder.read().is_none() && self.await_responses.load(Ordering::SeqCst);
@@ -571,6 +728,16 @@ impl ExtHostWindowManager {
             id: id.clone(),
             prompt: kind,
         });
+
+        // Re-check cancelled_client_ids after inserting into self.prompts to close
+        // the pre-insertion TOCTOU window with concurrent cancel_prompt(client_id).
+        if client_id
+            .as_deref()
+            .is_some_and(|cid| self.cancelled_client_ids.lock().remove(cid))
+        {
+            self.respond_prompt(&id, None);
+            return Ok(Value::Null);
+        }
 
         let responder_opt = self.prompt_responder.read().clone();
         if let Some(responder) = responder_opt {
@@ -987,5 +1154,114 @@ mod tests {
         assert!(mgr.pending_prompt_waiters.lock().is_empty());
         assert!(mgr.active_notifications().is_empty());
         assert!(mgr.list_prompts().iter().all(|p| p.resolved));
+    }
+
+    #[tokio::test]
+    async fn test_window_cancel_prompt_mid_flight_and_race_guard_and_flags() {
+        let mgr = ExtHostWindowManager::new();
+        mgr.set_await_responses(true);
+        mgr.set_response_timeout(Some(Duration::from_secs(2)));
+
+        // 1. Mid-flight cancelPrompt by clientId
+        let mgr_bg = mgr.clone();
+        let prompt_task = tokio::spawn(async move {
+            mgr_bg
+                .handle_rpc_call(
+                    "window.showInputBox",
+                    &json!({
+                        "clientId": "cid_1",
+                        "hasValidateInput": true,
+                        "options": { "prompt": "Enter name" }
+                    }),
+                )
+                .await
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        let active = mgr.active_prompts();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].client_id.as_deref(), Some("cid_1"));
+        assert!(matches!(
+            active[0].kind,
+            ExtPromptKind::InputBox {
+                has_validate_input: true,
+                ..
+            }
+        ));
+
+        let cancel_res = mgr
+            .handle_rpc_call("window.cancelPrompt", &json!({ "clientId": "cid_1" }))
+            .await
+            .unwrap();
+        assert_eq!(cancel_res["cancelled"], json!(true));
+        assert_eq!(prompt_task.await.unwrap(), Value::Null);
+        assert!(mgr.active_prompts().is_empty());
+
+        // 2. Pre-arrival cancelPrompt race guard
+        let pre_cancel = mgr
+            .handle_rpc_call("window.cancelPrompt", &json!({ "clientId": "cid_race" }))
+            .await
+            .unwrap();
+        assert_eq!(pre_cancel["cancelled"], json!(false));
+
+        let raced_res = mgr
+            .handle_rpc_call(
+                "window.showQuickPick",
+                &json!({
+                    "clientId": "cid_race",
+                    "hasOnDidSelectItem": true,
+                    "items": ["A", "B"]
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raced_res, Value::Null);
+        assert!(mgr.active_prompts().is_empty());
+        let last = mgr.list_prompts().pop().unwrap();
+        assert!(matches!(
+            last.kind,
+            ExtPromptKind::QuickPick {
+                has_on_did_select_item: true,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_dispatch_prompt_concurrent_cancel_never_loses_cancellation() {
+        let mgr = ExtHostWindowManager::new();
+        mgr.set_await_responses(true);
+        mgr.set_response_timeout(Some(Duration::from_secs(2)));
+
+        for i in 0..25 {
+            let cid = format!("cid_concurrent_{}", i);
+            let mgr_a = mgr.clone();
+            let cid_a = cid.clone();
+            let prompt_fut = tokio::spawn(async move {
+                mgr_a
+                    .handle_rpc_call(
+                        "window.showInputBox",
+                        &json!({ "clientId": cid_a, "options": { "prompt": "race" } }),
+                    )
+                    .await
+                    .unwrap()
+            });
+
+            let mgr_b = mgr.clone();
+            let cid_b = cid.clone();
+            let cancel_fut = tokio::spawn(async move {
+                mgr_b
+                    .handle_rpc_call("window.cancelPrompt", &json!({ "clientId": cid_b }))
+                    .await
+                    .unwrap()
+            });
+
+            let (prompt_res, cancel_res) = tokio::join!(prompt_fut, cancel_fut);
+            assert_eq!(prompt_res.unwrap(), Value::Null);
+            assert!(cancel_res.is_ok());
+        }
+        assert!(mgr.active_prompts().is_empty());
+        assert!(mgr.pending_prompt_waiters.lock().is_empty());
     }
 }

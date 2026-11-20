@@ -36,7 +36,7 @@ class SourceControlInputBox {
 
   _sync() {
     if (!this._sourceControlId) return;
-    rpc.call('scm.updateInputBox', {
+    rpc.fireAndForget('scm.updateInputBox', {
       sourceControlId: this._sourceControlId,
       value: this._value,
       placeholder: this._placeholder,
@@ -115,7 +115,7 @@ class SourceControlResourceGroup {
 
   _sync() {
     if (this._disposed) return;
-    rpc.call('scm.updateResourceGroup', {
+    rpc.fireAndForget('scm.updateResourceGroup', {
       sourceControlId: this._sourceControlId,
       id: this.id,
       label: this._label,
@@ -158,7 +158,7 @@ class SourceControlResourceGroup {
       this._onDispose();
       this._onDispose = null;
     }
-    rpc.call('scm.disposeResourceGroup', {
+    rpc.fireAndForget('scm.disposeResourceGroup', {
       sourceControlId: this._sourceControlId,
       id: this.id,
     });
@@ -192,7 +192,7 @@ class SourceControl {
 
   _sync() {
     if (this._disposed) return;
-    rpc.call('scm.updateSourceControl', {
+    rpc.fireAndForget('scm.updateSourceControl', {
       id: this.id,
       label: this.label,
       rootUri: _uriToString(this.rootUri),
@@ -257,7 +257,7 @@ class SourceControl {
       this._groups.delete(id);
     });
     this._groups.set(id, group);
-    rpc.call('scm.createResourceGroup', {
+    rpc.fireAndForget('scm.createResourceGroup', {
       sourceControlId: this.id,
       id,
       label,
@@ -277,7 +277,7 @@ class SourceControl {
       this._onDispose();
       this._onDispose = null;
     }
-    rpc.call('scm.disposeSourceControl', { id: this.id });
+    rpc.fireAndForget('scm.disposeSourceControl', { id: this.id });
   }
 
   toJSON() {
@@ -324,7 +324,7 @@ const scm = {
     );
 
     activeSourceControls.push(sc);
-    rpc.call('scm.createSourceControl', {
+    rpc.fireAndForget('scm.createSourceControl', {
       id,
       label,
       rootUri: rootUriStr,

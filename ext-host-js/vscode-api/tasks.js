@@ -144,10 +144,10 @@ const tasks = {
       ['provideTasks', 'resolveTask'],
       { selector: type, taskType: type }
     );
-    rpc.call('tasks.registerProvider', { id, type });
+    rpc.fireAndForget('tasks.registerProvider', { id, type });
     return new Disposable(() => {
       proxyDisp.dispose();
-      rpc.call('tasks.unregisterProvider', { id, type });
+      rpc.fireAndForget('tasks.unregisterProvider', { id, type });
     });
   },
 
@@ -167,7 +167,7 @@ const tasks = {
         if (idx !== -1) {
           activeExecutions.splice(idx, 1);
         }
-        return rpc.call('tasks.terminateTask', {
+        rpc.fireAndForget('tasks.terminateTask', {
           id: executionId,
           name: task && task.name,
           source: task && task.source,

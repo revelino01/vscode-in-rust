@@ -210,6 +210,22 @@ pub struct LoadedExtension {
     pub is_activated: bool,
 }
 
+impl LoadedExtension {
+    pub fn id(&self) -> String {
+        crate::marketplace::ExtensionInstaller::extension_id(
+            &self.manifest.publisher,
+            &self.manifest.name,
+        )
+    }
+
+    pub fn matches_id(&self, id_or_name: &str) -> bool {
+        let trimmed = id_or_name.trim();
+        !trimmed.is_empty()
+            && (self.id().eq_ignore_ascii_case(trimmed)
+                || self.manifest.name.eq_ignore_ascii_case(trimmed))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionSnapshot {
@@ -250,6 +266,7 @@ impl From<&LoadedExtension> for ExtensionSnapshot {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct ExtensionLoader {
     search_paths: Vec<PathBuf>,
     extensions: Vec<LoadedExtension>,
@@ -309,9 +326,34 @@ impl ExtensionLoader {
         &self.extensions
     }
 
-    /// Mark an extension as activated by its manifest name. Returns true if found.
-    pub fn activate(&mut self, name: &str) -> bool {
-        if let Some(ext) = self.extensions.iter_mut().find(|e| e.manifest.name == name) {
+    fn find_index_by_id(&self, id_or_name: &str) -> Option<usize> {
+        let target = id_or_name.trim();
+        if target.is_empty() {
+            return None;
+        }
+        self.extensions
+            .iter()
+            .position(|e| e.id().eq_ignore_ascii_case(target))
+            .or_else(|| {
+                self.extensions
+                    .iter()
+                    .position(|e| e.manifest.name.eq_ignore_ascii_case(target))
+            })
+    }
+
+    pub fn loaded_extension(&self, id_or_name: &str) -> Option<&LoadedExtension> {
+        self.find_index_by_id(id_or_name)
+            .and_then(|idx| self.extensions.get(idx))
+    }
+
+    pub fn loaded_extension_mut(&mut self, id_or_name: &str) -> Option<&mut LoadedExtension> {
+        self.find_index_by_id(id_or_name)
+            .and_then(|idx| self.extensions.get_mut(idx))
+    }
+
+    /// Mark an extension as activated by its canonical `publisher.name` ID or manifest name (case-insensitive). Returns true if found.
+    pub fn activate(&mut self, id_or_name: &str) -> bool {
+        if let Some(ext) = self.loaded_extension_mut(id_or_name) {
             ext.is_activated = true;
             true
         } else {
@@ -319,9 +361,9 @@ impl ExtensionLoader {
         }
     }
 
-    /// Mark an extension as deactivated by its manifest name. Returns true if found.
-    pub fn deactivate(&mut self, name: &str) -> bool {
-        if let Some(ext) = self.extensions.iter_mut().find(|e| e.manifest.name == name) {
+    /// Mark an extension as deactivated by its canonical `publisher.name` ID or manifest name (case-insensitive). Returns true if found.
+    pub fn deactivate(&mut self, id_or_name: &str) -> bool {
+        if let Some(ext) = self.loaded_extension_mut(id_or_name) {
             ext.is_activated = false;
             true
         } else {
@@ -329,11 +371,9 @@ impl ExtensionLoader {
         }
     }
 
-    /// Check if an extension is activated.
-    pub fn is_activated(&self, name: &str) -> bool {
-        self.extensions
-            .iter()
-            .find(|e| e.manifest.name == name)
+    /// Check if an extension is activated by its canonical `publisher.name` ID or manifest name (case-insensitive).
+    pub fn is_activated(&self, id_or_name: &str) -> bool {
+        self.loaded_extension(id_or_name)
             .is_some_and(|e| e.is_activated)
     }
 
@@ -345,12 +385,10 @@ impl ExtensionLoader {
             .collect()
     }
 
-    /// Look up a loaded extension snapshot by canonical ID (case-insensitive).
+    /// Look up a loaded extension snapshot by canonical ID or manifest name (case-insensitive).
     pub fn snapshot_for(&self, extension_id: &str) -> Option<ExtensionSnapshot> {
-        self.extensions
-            .iter()
+        self.loaded_extension(extension_id)
             .map(ExtensionSnapshot::from_loaded)
-            .find(|snap| snap.id.eq_ignore_ascii_case(extension_id))
     }
 }
 
@@ -564,6 +602,21 @@ mod tests {
         let found = loader.snapshot_for("rustcode.hello-world").unwrap();
         assert_eq!(found.id, "RustCode.hello-world");
         assert!(loader.snapshot_for("missing.ext").is_none());
+
+        // Case-insensitive canonical ID and short manifest name matching
+        assert!(loader.is_activated("rustcode.hello-world"));
+        assert!(loader.is_activated("HELLO-WORLD"));
+        assert_eq!(
+            loader.snapshot_for("hello-world").unwrap().id,
+            "RustCode.hello-world"
+        );
+        assert!(loader.deactivate("RustCode.hello-world"));
+        assert!(!loader.is_activated("hello-world"));
+        assert!(loader.activate("RUSTCODE.hello-world"));
+        assert!(loader.is_activated("rustcode.hello-world"));
+
+        let cloned = loader.clone();
+        assert_eq!(cloned.snapshots().len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

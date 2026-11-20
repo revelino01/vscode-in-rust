@@ -747,19 +747,24 @@ impl ExtHostDebugManager {
         provider_id: &str,
         folder: Option<Value>,
     ) -> Result<Vec<Value>, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "debug.provideDebugConfigurations",
-            json!({
-                "providerId": provider_id,
-                "debugType": provider_id,
-                "folder": folder,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "debug.provideDebugConfigurations",
+                json!({
+                    "providerId": provider_id,
+                    "debugType": provider_id,
+                    "folder": folder,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for provideDebugConfigurations".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'debug.provideDebugConfigurations' timed out") {
+                    "Timed out waiting for provideDebugConfigurations".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         Ok(val.as_array().cloned().unwrap_or_default())
     }
@@ -771,20 +776,25 @@ impl ExtHostDebugManager {
         folder: Option<Value>,
         configuration: Value,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "debug.resolveDebugConfiguration",
-            json!({
-                "providerId": provider_id,
-                "debugType": provider_id,
-                "folder": folder,
-                "debugConfiguration": configuration,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "debug.resolveDebugConfiguration",
+                json!({
+                    "providerId": provider_id,
+                    "debugType": provider_id,
+                    "folder": folder,
+                    "debugConfiguration": configuration,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for resolveDebugConfiguration".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'debug.resolveDebugConfiguration' timed out") {
+                    "Timed out waiting for resolveDebugConfiguration".to_string()
+                } else {
+                    e
+                }
+            })
     }
 
     pub async fn request_create_debug_adapter_descriptor(
@@ -793,19 +803,24 @@ impl ExtHostDebugManager {
         provider_id: &str,
         session: Value,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "debug.createDebugAdapterDescriptor",
-            json!({
-                "providerId": provider_id,
-                "debugType": provider_id,
-                "session": session,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "debug.createDebugAdapterDescriptor",
+                json!({
+                    "providerId": provider_id,
+                    "debugType": provider_id,
+                    "session": session,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for createDebugAdapterDescriptor".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'debug.createDebugAdapterDescriptor' timed out") {
+                    "Timed out waiting for createDebugAdapterDescriptor".to_string()
+                } else {
+                    e
+                }
+            })
     }
 }
 

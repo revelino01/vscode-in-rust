@@ -3,13 +3,15 @@
 pub mod bridge;
 
 pub use bridge::{
-    DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, LanguageFeatureBridge,
-    TreeItem, TreeItemCollapsibleState,
+    DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, ExtWorkspaceFolder,
+    LanguageFeatureBridge, OpenDocumentSnapshot, TreeItem, TreeItemCollapsibleState,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
+use rustcode_base::event::Emitter;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -63,8 +65,18 @@ pub struct ProviderRegistration {
     pub language_selector: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeRefreshEvent {
+    pub provider_id: String,
+    pub element_ids: Vec<String>,
+}
+
 pub struct ProviderRegistry {
     providers: Arc<RwLock<HashMap<ProviderType, Vec<ProviderRegistration>>>>,
+    tree_refresh_revision: Arc<AtomicU64>,
+    pending_tree_refreshes: Arc<Mutex<Vec<TreeRefreshEvent>>>,
+    pub on_tree_data_changed: Emitter<TreeRefreshEvent>,
 }
 
 impl Default for ProviderRegistry {
@@ -77,7 +89,32 @@ impl ProviderRegistry {
     pub fn new() -> Self {
         Self {
             providers: Arc::new(RwLock::new(HashMap::new())),
+            tree_refresh_revision: Arc::new(AtomicU64::new(0)),
+            pending_tree_refreshes: Arc::new(Mutex::new(Vec::new())),
+            on_tree_data_changed: Emitter::new(),
         }
+    }
+
+    pub fn notify_tree_data_changed(
+        &self,
+        provider_id: impl Into<String>,
+        element_ids: Vec<String>,
+    ) {
+        let ev = TreeRefreshEvent {
+            provider_id: provider_id.into(),
+            element_ids,
+        };
+        self.tree_refresh_revision.fetch_add(1, Ordering::SeqCst);
+        self.pending_tree_refreshes.lock().push(ev.clone());
+        self.on_tree_data_changed.fire(ev);
+    }
+
+    pub fn tree_refresh_revision(&self) -> u64 {
+        self.tree_refresh_revision.load(Ordering::SeqCst)
+    }
+
+    pub fn take_pending_tree_refreshes(&self) -> Vec<TreeRefreshEvent> {
+        std::mem::take(&mut *self.pending_tree_refreshes.lock())
     }
 
     pub fn register(&self, registration: ProviderRegistration) {
@@ -242,5 +279,20 @@ mod tests {
         let trees = registry.get_providers(ProviderType::TreeData);
         assert_eq!(trees.len(), 1);
         assert!(trees[0].language_selector.is_none());
+
+        assert_eq!(registry.tree_refresh_revision(), 0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = Arc::clone(&events);
+        let _sub = registry.on_tree_data_changed.event().attach(move |ev| {
+            events_clone.lock().push(ev.clone());
+        });
+        registry.notify_tree_data_changed("my.treeView", vec!["node1".to_string()]);
+        assert_eq!(registry.tree_refresh_revision(), 1);
+        assert_eq!(events.lock().len(), 1);
+        let pending = registry.take_pending_tree_refreshes();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].provider_id, "my.treeView");
+        assert_eq!(pending[0].element_ids, vec!["node1".to_string()]);
+        assert!(registry.take_pending_tree_refreshes().is_empty());
     }
 }

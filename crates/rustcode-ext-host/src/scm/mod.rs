@@ -560,19 +560,24 @@ impl ExtHostScmManager {
         provider_id: &str,
         uri: &str,
     ) -> Result<Option<String>, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "scm.provideOriginalResource",
-            json!({
-                "providerId": provider_id,
-                "sourceControlId": provider_id,
-                "uri": uri,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "scm.provideOriginalResource",
+                json!({
+                    "providerId": provider_id,
+                    "sourceControlId": provider_id,
+                    "uri": uri,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for provideOriginalResource".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'scm.provideOriginalResource' timed out") {
+                    "Timed out waiting for provideOriginalResource".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         if val.is_null() {
             Ok(None)
@@ -595,19 +600,24 @@ impl ExtHostScmManager {
         provider_id: &str,
         value: Option<&str>,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "scm.acceptInput",
-            json!({
-                "providerId": provider_id,
-                "sourceControlId": provider_id,
-                "value": value,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "scm.acceptInput",
+                json!({
+                    "providerId": provider_id,
+                    "sourceControlId": provider_id,
+                    "value": value,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for acceptInput".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'scm.acceptInput' timed out") {
+                    "Timed out waiting for acceptInput".to_string()
+                } else {
+                    e
+                }
+            })
     }
 }
 

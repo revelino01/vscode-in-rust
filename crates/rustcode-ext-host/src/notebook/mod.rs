@@ -272,10 +272,11 @@ impl ExtHostNotebookManager {
                     .get("label")
                     .and_then(|v| v.as_str())
                     .unwrap_or(id);
-                let supported_languages: Vec<String> = params
-                    .get("supportedLanguages")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                let supported_languages: Vec<String> = match params.get("supportedLanguages") {
+                    Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                        .map_err(|e| format!("Invalid supportedLanguages: {}", e))?,
+                    _ => Vec::new(),
+                };
                 let supports_execution_order = params
                     .get("supportsExecutionOrder")
                     .and_then(|v| v.as_bool())
@@ -389,10 +390,11 @@ impl ExtHostNotebookManager {
                     .get("cellIndex")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                let outputs: Vec<ExtNotebookCellOutput> = params
-                    .get("outputs")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                let outputs: Vec<ExtNotebookCellOutput> = match params.get("outputs") {
+                    Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                        .map_err(|e| format!("Invalid outputs: {}", e))?,
+                    _ => Vec::new(),
+                };
                 let key = (notebook_uri.clone(), cell_index);
                 self.cell_outputs.write().insert(key.clone(), outputs.clone());
                 if let Some(exec) = self.executions.write().get_mut(&key) {
@@ -418,10 +420,11 @@ impl ExtHostNotebookManager {
                     .get("cellIndex")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
-                let extra: Vec<ExtNotebookCellOutput> = params
-                    .get("outputs")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                let extra: Vec<ExtNotebookCellOutput> = match params.get("outputs") {
+                    Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                        .map_err(|e| format!("Invalid outputs: {}", e))?,
+                    _ => Vec::new(),
+                };
                 let key = (notebook_uri.clone(), cell_index);
                 let total_len = {
                     let mut guard = self.cell_outputs.write();
@@ -457,7 +460,14 @@ impl ExtHostNotebookManager {
                     .get("affinity")
                     .and_then(|v| v.as_i64())
                     .unwrap_or(1) as i32;
-                if let Some(ctrl) = self.controllers.write().get_mut(id) {
+                {
+                    let mut guard = self.controllers.write();
+                    let ctrl = guard
+                        .get_mut(id)
+                        .ok_or_else(|| format!("Notebook controller '{}' not found", id))?;
+                    if ctrl.is_disposed {
+                        return Err(format!("Notebook controller '{}' is disposed", id));
+                    }
                     ctrl.affinities.insert(notebook_uri.clone(), affinity);
                 }
                 self.emit_event(
@@ -476,19 +486,24 @@ impl ExtHostNotebookManager {
         notebook_type: &str,
         content: &[u8],
     ) -> Result<ExtNotebookData, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "notebooks.deserializeNotebook",
-            json!({
-                "providerId": notebook_type,
-                "notebookType": notebook_type,
-                "content": content,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "notebooks.deserializeNotebook",
+                json!({
+                    "providerId": notebook_type,
+                    "notebookType": notebook_type,
+                    "content": content,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for deserializeNotebook".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'notebooks.deserializeNotebook' timed out") {
+                    "Timed out waiting for deserializeNotebook".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         serde_json::from_value::<ExtNotebookData>(val)
             .map_err(|e| format!("Invalid ExtNotebookData response: {}", e))
@@ -500,19 +515,24 @@ impl ExtHostNotebookManager {
         notebook_type: &str,
         data: &ExtNotebookData,
     ) -> Result<Vec<u8>, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "notebooks.serializeNotebook",
-            json!({
-                "providerId": notebook_type,
-                "notebookType": notebook_type,
-                "data": data,
-            }),
-        );
-
-        let val = tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        let val = rpc_bridge
+            .request(
+                "notebooks.serializeNotebook",
+                json!({
+                    "providerId": notebook_type,
+                    "notebookType": notebook_type,
+                    "data": data,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for serializeNotebook".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))??;
+            .map_err(|e| {
+                if e.starts_with("RPC request 'notebooks.serializeNotebook' timed out") {
+                    "Timed out waiting for serializeNotebook".to_string()
+                } else {
+                    e
+                }
+            })?;
 
         if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(val.clone()) {
             Ok(bytes)
@@ -531,21 +551,26 @@ impl ExtHostNotebookManager {
         cell_indices: &[usize],
         cells: &[ExtNotebookCellData],
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "notebooks.executeCells",
-            json!({
-                "controllerId": controller_id,
-                "providerId": controller_id,
-                "notebook": { "uri": notebook_uri },
-                "cellIndices": cell_indices,
-                "cells": cells,
-            }),
-        );
-
-        tokio::time::timeout(std::time::Duration::from_millis(500), rx)
+        rpc_bridge
+            .request(
+                "notebooks.executeCells",
+                json!({
+                    "controllerId": controller_id,
+                    "providerId": controller_id,
+                    "notebook": { "uri": notebook_uri },
+                    "cellIndices": cell_indices,
+                    "cells": cells,
+                }),
+                std::time::Duration::from_millis(500),
+            )
             .await
-            .map_err(|_| "Timed out waiting for executeCells".to_string())?
-            .map_err(|e| format!("RPC channel closed: {}", e))?
+            .map_err(|e| {
+                if e.starts_with("RPC request 'notebooks.executeCells' timed out") {
+                    "Timed out waiting for executeCells".to_string()
+                } else {
+                    e
+                }
+            })
     }
 }
 

@@ -250,10 +250,11 @@ impl ExtHostWebviewManager {
                     .get("title")
                     .and_then(|v| v.as_str())
                     .unwrap_or("Webview");
-                let options: WebviewOptions = params
-                    .get("options")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                let options: WebviewOptions = match params.get("options") {
+                    Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                        .map_err(|e| format!("Invalid webview options: {}", e))?,
+                    _ => WebviewOptions::default(),
+                };
 
                 let state = self.create_panel(id, view_type, title, options);
                 serde_json::to_value(state).map_err(|e| e.to_string())
@@ -267,8 +268,21 @@ impl ExtHostWebviewManager {
                     .get("html")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing html")?;
-                let ok = self.set_html(id, html);
-                Ok(Value::Bool(ok))
+                {
+                    let mut guard = self.panels.write();
+                    let panel = guard
+                        .get_mut(id)
+                        .ok_or_else(|| format!("Webview panel '{}' not found", id))?;
+                    if panel.is_disposed {
+                        return Err(format!("Webview panel '{}' is disposed", id));
+                    }
+                    panel.html = html.to_string();
+                }
+                self.emit_event(WebviewEvent::HtmlUpdated {
+                    id: id.to_string(),
+                    html: html.to_string(),
+                });
+                Ok(Value::Bool(true))
             }
             "window.postMessageToWebview" => {
                 let id = params
@@ -287,8 +301,18 @@ impl ExtHostWebviewManager {
                     .get("id")
                     .and_then(|v| v.as_str())
                     .ok_or("Missing id")?;
-                let ok = self.dispose_panel(id);
-                Ok(Value::Bool(ok))
+                {
+                    let mut guard = self.panels.write();
+                    let panel = guard
+                        .get_mut(id)
+                        .ok_or_else(|| format!("Webview panel '{}' not found", id))?;
+                    if panel.is_disposed {
+                        return Err(format!("Webview panel '{}' is disposed", id));
+                    }
+                    panel.is_disposed = true;
+                }
+                self.emit_event(WebviewEvent::PanelDisposed { id: id.to_string() });
+                Ok(Value::Bool(true))
             }
             "window.revealWebviewPanel" => {
                 let id = params
@@ -575,11 +599,20 @@ impl ExtHostCustomEditorManager {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.trim().is_empty())
                     .ok_or("Missing or empty viewType")?;
-                let opts = params.get("options").unwrap_or(&Value::Null);
-                let webview_options: WebviewOptions = opts
-                    .get("webviewOptions")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                let opts = match params.get("options") {
+                    Some(v) if !v.is_null() => {
+                        if !v.is_object() {
+                            return Err("Invalid custom editor options: expected object".to_string());
+                        }
+                        v
+                    }
+                    _ => &Value::Null,
+                };
+                let webview_options: WebviewOptions = match opts.get("webviewOptions") {
+                    Some(v) if !v.is_null() => serde_json::from_value(v.clone())
+                        .map_err(|e| format!("Invalid webviewOptions: {}", e))?,
+                    _ => WebviewOptions::default(),
+                };
                 let supports_multiple = opts
                     .get("supportsMultipleEditorsPerDocument")
                     .and_then(|v| v.as_bool())
@@ -625,23 +658,29 @@ impl ExtHostCustomEditorManager {
         title: &str,
         text: Option<&str>,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "window.resolveCustomEditor",
-            json!({
-                "providerId": view_type,
-                "viewType": view_type,
-                "uri": uri,
-                "panelId": panel_id,
-                "title": title,
-                "text": text,
-            }),
-        );
-        match tokio::time::timeout(std::time::Duration::from_millis(500), rx).await {
-            Ok(Ok(Ok(val))) => Ok(val),
-            Ok(Ok(Err(e))) => Err(format!("resolveCustomEditor RPC error: {}", e)),
-            Ok(Err(_)) => Err("resolveCustomEditor channel dropped".to_string()),
-            Err(_) => Err("resolveCustomEditor timed out".to_string()),
-        }
+        rpc_bridge
+            .request(
+                "window.resolveCustomEditor",
+                json!({
+                    "providerId": view_type,
+                    "viewType": view_type,
+                    "uri": uri,
+                    "panelId": panel_id,
+                    "title": title,
+                    "text": text,
+                }),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .map_err(|e| {
+                if e.starts_with("RPC request 'window.resolveCustomEditor' timed out") {
+                    "resolveCustomEditor timed out".to_string()
+                } else if e == "RPC response channel closed" {
+                    "resolveCustomEditor channel dropped".to_string()
+                } else {
+                    format!("resolveCustomEditor RPC error: {}", e)
+                }
+            })
     }
 
     pub async fn request_open_custom_document(
@@ -651,23 +690,29 @@ impl ExtHostCustomEditorManager {
         uri: &str,
         backup_id: Option<&str>,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "CustomEditor.openCustomDocument",
-            json!({
-                "providerId": view_type,
-                "viewType": view_type,
-                "uri": uri,
-                "openContext": {
-                    "backupId": backup_id,
-                },
-            }),
-        );
-        match tokio::time::timeout(std::time::Duration::from_millis(500), rx).await {
-            Ok(Ok(Ok(val))) => Ok(val),
-            Ok(Ok(Err(e))) => Err(format!("openCustomDocument RPC error: {}", e)),
-            Ok(Err(_)) => Err("openCustomDocument channel dropped".to_string()),
-            Err(_) => Err("openCustomDocument timed out".to_string()),
-        }
+        rpc_bridge
+            .request(
+                "CustomEditor.openCustomDocument",
+                json!({
+                    "providerId": view_type,
+                    "viewType": view_type,
+                    "uri": uri,
+                    "openContext": {
+                        "backupId": backup_id,
+                    },
+                }),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .map_err(|e| {
+                if e.starts_with("RPC request 'CustomEditor.openCustomDocument' timed out") {
+                    "openCustomDocument timed out".to_string()
+                } else if e == "RPC response channel closed" {
+                    "openCustomDocument channel dropped".to_string()
+                } else {
+                    format!("openCustomDocument RPC error: {}", e)
+                }
+            })
     }
 
     pub async fn request_save_custom_document(
@@ -676,20 +721,26 @@ impl ExtHostCustomEditorManager {
         view_type: &str,
         uri: &str,
     ) -> Result<Value, String> {
-        let (_req, rx) = rpc_bridge.create_request(
-            "CustomEditor.saveCustomDocument",
-            json!({
-                "providerId": view_type,
-                "viewType": view_type,
-                "uri": uri,
-            }),
-        );
-        match tokio::time::timeout(std::time::Duration::from_millis(500), rx).await {
-            Ok(Ok(Ok(val))) => Ok(val),
-            Ok(Ok(Err(e))) => Err(format!("saveCustomDocument RPC error: {}", e)),
-            Ok(Err(_)) => Err("saveCustomDocument channel dropped".to_string()),
-            Err(_) => Err("saveCustomDocument timed out".to_string()),
-        }
+        rpc_bridge
+            .request(
+                "CustomEditor.saveCustomDocument",
+                json!({
+                    "providerId": view_type,
+                    "viewType": view_type,
+                    "uri": uri,
+                }),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .map_err(|e| {
+                if e.starts_with("RPC request 'CustomEditor.saveCustomDocument' timed out") {
+                    "saveCustomDocument timed out".to_string()
+                } else if e == "RPC response channel closed" {
+                    "saveCustomDocument channel dropped".to_string()
+                } else {
+                    format!("saveCustomDocument RPC error: {}", e)
+                }
+            })
     }
 }
 
@@ -865,14 +916,30 @@ mod tests {
         assert!(wv.dispose_panel("p_guard"));
         assert!(!wv.dispose_panel("p_guard"));
         assert!(!wv.set_html("p_guard", "<h1>Zombie</h1>"));
-        assert!(!wv
+        assert!(wv
             .handle_rpc_call(
                 "window.setWebviewHtml",
                 json!({ "id": "p_guard", "html": "<h1>Zombie</h1>" })
             )
-            .unwrap()
-            .as_bool()
-            .unwrap());
+            .is_err());
+        assert!(wv
+            .handle_rpc_call(
+                "window.disposeWebviewPanel",
+                json!({ "id": "p_guard" })
+            )
+            .is_err());
+        assert!(wv
+            .handle_rpc_call(
+                "window.setWebviewHtml",
+                json!({ "id": "missing_panel", "html": "<h1>Missing</h1>" })
+            )
+            .is_err());
+        assert!(wv
+            .handle_rpc_call(
+                "window.disposeWebviewPanel",
+                json!({ "id": "missing_panel" })
+            )
+            .is_err());
         assert_eq!(wv.get_panel("p_guard").unwrap().html, "<h1>Alive</h1>");
 
         let events = wv.take_pending_events();

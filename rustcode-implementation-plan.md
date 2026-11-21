@@ -88,6 +88,32 @@
 - [x] **M6 — Documentation & Trackers Refresh**: Refreshed `README.md`, `rustcode-implementation-plan.md`, `docs/architecture.md`, and `docs/extension-compat-matrix.md` to reflect M1.1–M5 implementations
 - [x] **M7 — Full Verification, Tier 5 Hardening & Final Counts**: Verified **513/513** workspace tests across **8** crates (**41/41** `compat_suite`), **31/31** `ext-host-js/test.js` sections (**404** `assert(...)` call sites), **8/8** `tests/phase7-e2e/runner.js --syntax-check` checks, **286/286** Windows (**287** Unix) `tests/phase7-e2e` tests across Tiers 1–4, Tier 5 adversarial hardening, **0** Windows & Linux (`x86_64-unknown-linux-gnu`) `cargo clippy` warnings, `cargo bench --workspace --no-run`, and `rustcode` startup smoke check
 
+### Pre-Phase 8 Cleanup Checklist
+
+> Redundancies, duplicated helpers, dead code, and unused dependencies identified across Phases 1–7 prior to starting Phase 8:
+
+**Core & Codec Deduplication**
+- [ ] **Consolidate stdio `Content-Length` codecs**: Migrate `LspClient` from `crates/rustcode-protocols/src/lsp/codec.rs` onto shared `crates/rustcode-protocols/src/codec.rs` and align bounded framing with `crates/rustcode-ext-host/src/rpc/mod.rs`
+- [ ] **Unify `map_ext_to_lang_id`**: Deduplicate and reconcile extension-to-language mappings between `crates/rustcode-editor/src/document/mod.rs` and `crates/rustcode-ext-host/src/provider/bridge.rs` (`.hh`/`.hxx`, `.txt`/`.log`, `.sh`/`.bash`)
+- [ ] **Deduplicate `ext-host-js/node-compat/` Base64 & UTF-8 codecs**: Reuse `ext-host-js/node-compat/buffer.js` Base64 and UTF-8 helpers in `fs.js` (`decodeBase64Pure`/`encodeBase64Pure`) and `util.js` (`TextEncoder`/`TextDecoder`)
+
+**UI, Geometry & Search Helpers**
+- [ ] **Centralize `is_finite_rect` on `Rect`**: Remove 5 duplicate local copies (`crates/rustcode-editor/src/{completion/mod.rs,diff/view.rs,view/mod.rs,find_replace.rs}` and `crates/rustcode-workbench/src/lib.rs`)
+- [ ] **Extract `push_finite_quad` & `push_finite_text`**: Deduplicate 3 copies in `crates/rustcode-editor/src/{completion/mod.rs,diff/view.rs,view/mod.rs}`
+- [ ] **Unify `clamp_rect` / `clamp_rect_to_bounds`**: Consolidate 4 copies in `crates/rustcode-editor/src/find_replace.rs` and `crates/rustcode-workbench/src/{explorer/mod.rs,notifications/mod.rs,testing/mod.rs}`
+- [ ] **Deduplicate `fuzzy_match` & `BenchmarkStats`**: Merge identical `fuzzy_match` helpers in `crates/rustcode-workbench/src/{quickinput/mod.rs,search/symbols.rs}` and share `BenchmarkStats` across `crates/rustcode-app/benches/startup_time.rs` & `crates/rustcode-editor/benches/editor_latency.rs`
+
+**Dead Code, Legacy State & Unused Cargo Dependencies**
+- [ ] **Remove dead AVL rotation methods in `PieceTable`**: Delete unused `#[allow(dead_code)]` `balance_factor`, `rotate_right`, `rotate_left`, and `balance` in `crates/rustcode-editor/src/model/piece_table.rs`
+- [ ] **Remove unused `RustCodeContext::editor_area` field**: Drop unused allocation in `crates/rustcode-app/src/lib.rs`
+- [ ] **Resolve no-op `gpui` Cargo feature**: Either wire real `#[cfg(feature = "gpui")]` desktop gates or remove/replace unused `gpui` feature declarations in `crates/{rustcode-platform,rustcode-workbench,rustcode-app}/Cargo.toml`
+- [ ] **Simplify `FileExplorer` dual `root`/`roots` state**: Consolidate legacy single `root: Option<FileTreeNode>` into `roots: Vec<FileTreeNode>` across `crates/rustcode-workbench/src/explorer/mod.rs` and `crates/rustcode-app/src/lib.rs`
+- [ ] **Prune unused `[dependencies]`**: Remove `smallvec` (`rustcode-base`), `thiserror` (`rustcode-editor`, `rustcode-workbench`), `serde` (`rustcode-app`), and move test/bench-only `rustcode-editor` & `rustcode-terminal` in `crates/rustcode-app/Cargo.toml` to `[dev-dependencies]`
+
+**Sync Wrappers & Documentation Hygiene**
+- [ ] **Share `WorkbenchWindow::sync_*` & `sync_for_render` mapping helpers & tidy `LanguageFeatureBridge` RPC/doc wrappers**: Factor repeated status-bar/notification/test projection logic in `crates/rustcode-workbench/src/window.rs` and evaluate deprecating legacy `LanguageFeatureBridge::handle_rpc_message` in `crates/rustcode-ext-host/src/provider/bridge.rs`
+- [ ] **Archive/update superseded pre-implementation blueprint notes**: Clarify or update the legacy Phase 0–3 proposal section below in `rustcode-implementation-plan.md` referencing `deno_core`, `alacritty_terminal`, `wry`, and `rust-toolchain.toml`
+
 ### Phase 8 (Planned): Native Interactive Desktop Shell, Live Workspace Runtime & Daily-Driver Parity
 
 > Open architectural decisions prior to implementation:

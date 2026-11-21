@@ -159,6 +159,19 @@ The pure-Rust Open VSX marketplace client (`MarketplaceClient`) and VSIX unpacke
 
 ---
 
+## Pre-Phase 8 Cleanup Checklist
+
+| Cleanup Item | Status | Scope & Target Files |
+|---|---|---|
+| **Consolidate stdio `Content-Length` codecs** | 📋 Planned | Migrate `LspClient` from `crates/rustcode-protocols/src/lsp/codec.rs` to shared `crates/rustcode-protocols/src/codec.rs` and align bounded framing with `crates/rustcode-ext-host/src/rpc/mod.rs` |
+| **Unify `map_ext_to_lang_id`** | 📋 Planned | Reconcile extension-to-language mappings across `crates/rustcode-editor/src/document/mod.rs` and `crates/rustcode-ext-host/src/provider/bridge.rs` (`.hh`/`.hxx`, `.txt`/`.log`, `.sh`/`.bash`) |
+| **Deduplicate `node-compat/` Base64 & UTF-8 codecs** | 📋 Planned | Share `ext-host-js/node-compat/buffer.js` Base64/UTF-8 helpers across `fs.js` (`decodeBase64Pure`/`encodeBase64Pure`) and `util.js` (`TextEncoder`/`TextDecoder`) |
+| **Extract shared geometry, scene & fuzzy-match helpers** | 📋 Planned | Centralize `is_finite_rect` (5 copies), `push_finite_quad`/`push_finite_text` (3 copies), `clamp_rect`/`clamp_rect_to_bounds` (4 copies), identical `fuzzy_match` (`quickinput/mod.rs` & `search/symbols.rs`), and `BenchmarkStats` |
+| **Remove dead code, legacy dual state & unused Cargo deps** | 📋 Planned | Drop dead AVL rotation methods in `piece_table.rs`, unused `RustCodeContext::editor_area`, no-op `gpui` feature gates, legacy `FileExplorer::root` fallback, and unused `[dependencies]` (`smallvec`, `thiserror`, `serde`, `rustcode-app` `[dev-dependencies]` cleanup) |
+| **Tidy dual sync/RPC wrappers & stale blueprint text** | 📋 Planned | Deduplicate `WorkbenchWindow::sync_*` vs. `sync_for_render` projection helpers, evaluate deprecating `LanguageFeatureBridge::handle_rpc_message`, and refresh superseded Phase 0–3 notes in `rustcode-implementation-plan.md` |
+
+---
+
 ## Phase 8 Roadmap (Planned)
 
 | Milestone | Status | Scope & Extension-Host / Runtime Impact |

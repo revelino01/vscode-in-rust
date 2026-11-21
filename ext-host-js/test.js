@@ -1575,6 +1575,428 @@ exec.end(true, 200);
     }
   }
 
+  console.log('[Test] Testing node-compat/buffer.js (encodings, slice/subarray, BE/LE, bounds)...');
+  {
+    const bufMod = require('./node-compat/buffer');
+    const CompatBuffer = bufMod.Buffer || bufMod;
+    assert(typeof bufMod.SlowBuffer === 'function', 'SlowBuffer export missing');
+    assert(typeof bufMod.kMaxLength === 'number' && bufMod.kMaxLength > 0, 'kMaxLength export missing');
+    assert(bufMod.INSPECT_MAX_BYTES === 50, 'INSPECT_MAX_BYTES mismatch');
+    assert(bufMod.constants && bufMod.constants.MAX_LENGTH === bufMod.kMaxLength, 'constants mismatch');
+
+    const utf8 = CompatBuffer.from('café 🚀', 'utf8');
+    assert(CompatBuffer.isBuffer(utf8) === true, 'CompatBuffer.isBuffer(utf8) failed');
+    assert(CompatBuffer.isBuffer(new Uint8Array(4)) === false, 'Uint8Array must not satisfy isBuffer');
+    assert(utf8.toString('utf8') === 'café 🚀', 'UTF-8 roundtrip failed');
+    assert(String(utf8) === 'café 🚀', 'Buffer.prototype.toString() default utf8 failed');
+    assert(CompatBuffer.byteLength('café 🚀', 'utf8') === utf8.length, 'byteLength UTF-8 mismatch');
+
+    assert(CompatBuffer.isEncoding('utf8') && CompatBuffer.isEncoding('UTF-8'), 'isEncoding utf8 failed');
+    assert(CompatBuffer.isEncoding('base64url') && CompatBuffer.isEncoding('ucs2'), 'isEncoding base64url/ucs2 failed');
+    assert(!CompatBuffer.isEncoding('unknown-enc'), 'isEncoding must reject unknown encoding');
+
+    const hexBuf = CompatBuffer.from('deadbeef', 'hex');
+    assert(hexBuf.readUInt32BE(0) === 0xdeadbeef, 'readUInt32BE failed');
+    assert(hexBuf.readUInt32LE(0) === 0xefbeadde, 'readUInt32LE failed');
+    assert(hexBuf.toString('hex') === 'deadbeef', 'hex toString failed');
+    assert(hexBuf.toString('base64') === '3q2+7w==', 'base64 toString failed');
+    assert(hexBuf.toString('base64url') === '3q2-7w', 'base64url toString failed');
+    assert(CompatBuffer.from('3q2-7w', 'base64url').toString('hex') === 'deadbeef', 'base64url decode failed');
+    assert(CompatBuffer.from('hi', 'utf16le').toString('ucs2') === 'hi', 'utf16le/ucs2 roundtrip failed');
+    assert(CompatBuffer.from('ABC', 'ascii').toString('latin1') === 'ABC', 'ascii/latin1 roundtrip failed');
+
+    const a = CompatBuffer.alloc(2, 0x41);
+    const b = CompatBuffer.from('BC');
+    const c = CompatBuffer.concat([a, b]);
+    assert(c.toString('utf8') === 'AABC', 'Buffer.concat failed');
+    assert(c.indexOf('AB') === 1 && c.includes('BC') === true, 'indexOf/includes failed');
+
+    const sliceView = c.slice(1, 3);
+    assert(CompatBuffer.isBuffer(sliceView), 'slice must return Buffer');
+    sliceView[0] = 0x5a; // 'Z'
+    assert(c.toString('utf8') === 'AZBC', 'Buffer.prototype.slice must share memory');
+
+    const subView = c.subarray(2, 4);
+    assert(CompatBuffer.isBuffer(subView) && subView.toString('utf8') === 'BC', 'subarray failed');
+
+    const wBuf = CompatBuffer.alloc(16);
+    const written = wBuf.write('hello', 2, 5, 'utf8');
+    assert(written === 5 && wBuf.toString('utf8', 2, 7) === 'hello', 'Buffer.write failed');
+    wBuf.writeInt16BE(-1234, 8);
+    assert(wBuf.readInt16BE(8) === -1234, 'writeInt16BE/readInt16BE failed');
+    wBuf.writeInt32LE(-0x123456, 10);
+    assert(wBuf.readInt32LE(10) === -0x123456, 'writeInt32LE/readInt32LE failed');
+
+    const copyDest = CompatBuffer.alloc(4);
+    assert(CompatBuffer.from('abcdef').copy(copyDest, 0, 1, 5) === 4, 'copy count mismatch');
+    assert(copyDest.equals(CompatBuffer.from('bcde')), 'copy/equals failed');
+    assert(CompatBuffer.compare(CompatBuffer.from('a'), CompatBuffer.from('b')) < 0, 'Buffer.compare failed');
+    assert(CompatBuffer.isBuffer(bufMod.SlowBuffer(4)), 'SlowBuffer must return Buffer');
+
+    let negAllocThrew = false;
+    try { CompatBuffer.alloc(-1); } catch (e) { negAllocThrew = e instanceof RangeError; }
+    assert(negAllocThrew, 'Buffer.alloc(-1) must throw RangeError');
+
+    let oobReadThrew = false;
+    try { CompatBuffer.from([1, 2]).readUInt32BE(0); } catch (e) { oobReadThrew = e instanceof RangeError; }
+    assert(oobReadThrew, 'out-of-bounds readUInt32BE must throw RangeError');
+
+    // Tier 5 regression: Buffer.prototype.write bounds & NaN validation
+    for (const [args, label] of [
+      [['a', NaN], 'write NaN offset'],
+      [['a', 0, NaN], 'write NaN length'],
+      [['a', Infinity], 'write Infinity offset'],
+      [['a', 1.5], 'write fractional offset'],
+      [['a', 0, 1.5], 'write fractional length'],
+      [['a', -1], 'write negative offset'],
+      [['a', 5], 'write >length offset'],
+    ]) {
+      let threwRange = false;
+      try { CompatBuffer.alloc(4).write(...args); } catch (e) { threwRange = e instanceof RangeError; }
+      assert(threwRange, label + ' must throw RangeError');
+    }
+    let nullWriteThrew = false;
+    try { CompatBuffer.alloc(4).write('a', null); } catch (e) { nullWriteThrew = e instanceof TypeError; }
+    assert(nullWriteThrew, 'write null offset must throw TypeError');
+
+    // Tier 5 regression: WHATWG UTF-8 maximal subpart emits single U+FFFD for truncated multi-byte prefix
+    const emojiBytes = CompatBuffer.from('😀');
+    assert(emojiBytes.toString('utf8', 0, 2) === '\ufffd', 'truncated 2-byte prefix of 4-byte emoji must emit single U+FFFD');
+    assert(emojiBytes.toString('utf8', 0, 3) === '\ufffd', 'truncated 3-byte prefix of 4-byte emoji must emit single U+FFFD');
+    assert(CompatBuffer.from([0xf0, 0x80]).toString('utf8') === '\ufffd\ufffd', 'invalid 0xF0 0x80 must emit two U+FFFD');
+    assert(CompatBuffer.from([0xf0, 0x9f, 0x41]).toString('utf8') === '\ufffdA', 'truncated 0xF0 0x9F before ASCII must emit one U+FFFD + A');
+
+    // Tier 5 regression: Buffer.prototype.write(str, undefined, ...) ignores trailing args like node:buffer
+    const uBuf1 = CompatBuffer.alloc(5);
+    assert(uBuf1.write('hello', undefined, 'utf8') === 5 && uBuf1.toString('utf8') === 'hello', 'write(str, undefined, utf8) must return 5');
+    const uBuf2 = CompatBuffer.alloc(5);
+    assert(uBuf2.write('hello', undefined, 3) === 5 && uBuf2.toString('utf8') === 'hello', 'write(str, undefined, 3) must return 5');
+  }
+
+  console.log('[Test] Testing node-compat/url.js (URL, URLSearchParams, parse/format/resolve, fileURLToPath, pathToFileURL, punycode)...');
+  {
+    const compatUrl = require('./node-compat/url');
+    const u = new compatUrl.URL('https://example.com:8443/docs/index.html?q=rust#top');
+    assert(u.hostname === 'example.com' && u.port === '8443', 'URL host/port mismatch');
+    assert(u.pathname === '/docs/index.html' && u.searchParams.get('q') === 'rust' && u.hash === '#top', 'URL fields mismatch');
+    u.searchParams.append('lang', 'js');
+    assert(u.search === '?q=rust&lang=js', 'URL searchParams live sync failed');
+    assert(compatUrl.URL.canParse('https://example.com') === true, 'URL.canParse valid failed');
+    assert(compatUrl.URL.canParse('not a url') === false, 'URL.canParse invalid failed');
+
+    let badUrlThrew = false;
+    try { new compatUrl.URL('not a valid url'); } catch (e) { badUrlThrew = e instanceof TypeError; }
+    assert(badUrlThrew, 'Malformed URL must throw TypeError');
+
+    const parsed = compatUrl.parse('https://example.com/a?x=1&y=2&x=3', true);
+    assert(parsed.query.x[0] === '1' && parsed.query.x[1] === '3' && parsed.query.y === '2', 'url.parse query failed');
+    assert(compatUrl.resolve('https://example.com/a/b', '../c') === 'https://example.com/c', 'url.resolve failed');
+    assert(compatUrl.format(u) === u.href, 'url.format(URL) failed');
+
+    const winFileUrl = compatUrl.pathToFileURL('C:\\my dir\\100%#?.rs', { windows: true });
+    assert(winFileUrl.href === 'file:///C:/my%20dir/100%25%23%3F.rs', 'Windows pathToFileURL encoding failed: ' + winFileUrl.href);
+    assert(compatUrl.fileURLToPath(winFileUrl, { windows: true }) === 'C:\\my dir\\100%#?.rs', 'Windows fileURLToPath roundtrip failed');
+
+    const uncUrl = compatUrl.pathToFileURL('\\\\fileserver\\share\\app\\main.rs', { windows: true });
+    assert(uncUrl.href === 'file://fileserver/share/app/main.rs', 'UNC pathToFileURL failed: ' + uncUrl.href);
+    assert(compatUrl.fileURLToPath(uncUrl, { windows: true }) === '\\\\fileserver\\share\\app\\main.rs', 'UNC fileURLToPath failed');
+
+    const posixUrl = compatUrl.pathToFileURL('/tmp/hello world.txt', { windows: false });
+    assert(posixUrl.href === 'file:///tmp/hello%20world.txt', 'POSIX pathToFileURL failed: ' + posixUrl.href);
+    assert(compatUrl.fileURLToPath(posixUrl, { windows: false }) === '/tmp/hello world.txt', 'POSIX fileURLToPath failed');
+
+    let nonFileThrew = false;
+    try { compatUrl.fileURLToPath('https://example.com/a'); } catch (e) { nonFileThrew = e instanceof TypeError; }
+    assert(nonFileThrew, 'fileURLToPath must throw TypeError for non-file URL');
+
+    assert(compatUrl.domainToASCII('münchen.de') === 'xn--mnchen-3ya.de', 'domainToASCII punycode failed');
+    assert(compatUrl.domainToUnicode('xn--mnchen-3ya.de') === 'münchen.de', 'domainToUnicode punycode failed');
+
+    // Tier 5 regression: file:///C: without trailing slash matches Node.js URL and fileURLToPath
+    const bareDriveUrl = new compatUrl.URL('file:///C:');
+    assert(bareDriveUrl.href === 'file:///C:' && bareDriveUrl.pathname === '/C:', 'URL file:///C: href/pathname mismatch: ' + bareDriveUrl.href);
+    assert(compatUrl.fileURLToPath('file:///C:', { windows: true }) === 'C:', 'fileURLToPath file:///C: must return C:');
+    assert(compatUrl.fileURLToPath('file:///C:/', { windows: true }) === 'C:\\', 'fileURLToPath file:///C:/ must return C:\\\\');
+  }
+
+  console.log('[Test] Testing node-compat/util.js (format, inspect, promisify, callbackify, isDeepStrictEqual, TextEncoder/Decoder, types)...');
+  {
+    const compatUtil = require('./node-compat/util');
+    assert(compatUtil.format('%s=%d %%', 'port', 8080) === 'port=8080 %', 'util.format failed');
+    assert(/a:\s*1/.test(compatUtil.inspect({ a: 1, b: [2, 3] })), 'util.inspect failed');
+
+    const cyclic = { name: 'root' };
+    cyclic.self = cyclic;
+    assert(compatUtil.inspect(cyclic).includes('[Circular'), 'util.inspect circular failed');
+    const jsonCirc = compatUtil.format('%j', cyclic);
+    assert(typeof jsonCirc === 'string' && jsonCirc.includes('[Circular]'), 'util.format %j circular failed');
+
+    const asyncAdd = compatUtil.promisify((x, y, cb) => cb(null, x + y));
+    assert((await asyncAdd(20, 22)) === 42, 'util.promisify resolve failed');
+    const asyncFail = compatUtil.promisify((cb) => cb(new Error('promisify-boom')));
+    let pErr = null;
+    try { await asyncFail(); } catch (e) { pErr = e; }
+    assert(pErr && pErr.message === 'promisify-boom', 'util.promisify reject failed');
+
+    const cbInc = compatUtil.callbackify(async (x) => x + 1);
+    const cbVal = await new Promise((resolve, reject) => {
+      cbInc(9, (err, v) => (err ? reject(err) : resolve(v)));
+    });
+    assert(cbVal === 10, 'util.callbackify failed');
+
+    function Base() {}
+    Base.prototype.ping = () => 'pong';
+    function Sub() {}
+    compatUtil.inherits(Sub, Base);
+    assert(new Sub().ping() === 'pong' && Sub.super_ === Base, 'util.inherits failed');
+
+    assert(compatUtil.isDeepStrictEqual({ a: [1, NaN], b: new Map([['k', 2]]) }, { a: [1, NaN], b: new Map([['k', 2]]) }) === true, 'isDeepStrictEqual true failed');
+    assert(compatUtil.isDeepStrictEqual(+0, -0) === false, 'isDeepStrictEqual +0/-0 failed');
+    assert(compatUtil.isDeepStrictEqual({ a: 1 }, { a: '1' }) === false, 'isDeepStrictEqual mismatch failed');
+
+    assert(compatUtil.types.isUint8Array(new Uint8Array(2)) === true, 'types.isUint8Array failed');
+    assert(compatUtil.types.isDate(new Date()) === true, 'types.isDate failed');
+    assert(compatUtil.types.isRegExp(/abc/) === true, 'types.isRegExp failed');
+    assert(compatUtil.types.isPromise(Promise.resolve()) === true, 'types.isPromise failed');
+    assert(compatUtil.types.isMap(new Map()) === true && compatUtil.types.isSet(new Set()) === true, 'types.isMap/isSet failed');
+    assert(compatUtil.types.isNativeError(new TypeError('x')) === true, 'types.isNativeError failed');
+
+    const enc = new compatUtil.TextEncoder();
+    const dec = new compatUtil.TextDecoder();
+    assert(dec.decode(enc.encode('rustcode 🚀')) === 'rustcode 🚀', 'TextEncoder/TextDecoder roundtrip failed');
+
+    // Tier 5 regression: TextDecoder UTF-8 maximal subpart truncation
+    assert(dec.decode(Uint8Array.from([0xf0, 0x9f])) === '\ufffd', 'TextDecoder truncated 2-byte prefix must emit single U+FFFD');
+    assert(dec.decode(Uint8Array.from([0xf0, 0x9f, 0x98])) === '\ufffd', 'TextDecoder truncated 3-byte prefix must emit single U+FFFD');
+    assert(dec.decode(Uint8Array.from([0xe2, 0x82])) === '\ufffd', 'TextDecoder truncated 3-byte char must emit single U+FFFD');
+    assert(dec.decode(Uint8Array.from([0xf0, 0x80])) === '\ufffd\ufffd', 'TextDecoder invalid 0xF0 0x80 must emit two U+FFFD');
+
+    // Tier 5 regression: isDeepStrictEqual 1-to-1 circular isomorphism & shared DAGs
+    const c1 = {}; c1.self = c1;
+    const c2 = {}; c2.self = c2;
+    const c3 = {}; c3.self = c3;
+    const c4 = { self: {} }; c4.self.self = c4.self;
+    assert(compatUtil.isDeepStrictEqual(c1, c2) === true, 'isomorphic circular graphs must be equal');
+    assert(compatUtil.isDeepStrictEqual(c3, c4) === false, 'asymmetric circular graph c3 vs c4 must be false');
+    assert(compatUtil.isDeepStrictEqual(c4, c3) === false, 'asymmetric circular graph c4 vs c3 must be false');
+    const shared = { n: 1 };
+    assert(compatUtil.isDeepStrictEqual({ p: shared, q: shared }, { p: { n: 1 }, q: { n: 1 } }) === true, 'shared DAG references must still be equal');
+
+    // Tier 5 regression: isDeepStrictEqual Date(NaN) & RegExp.lastIndex + own properties
+    assert(compatUtil.isDeepStrictEqual(new Date(NaN), new Date(NaN)) === false, 'Date(NaN) must not be deepStrictEqual');
+    const re1 = /abc/g;
+    const re2 = /abc/g;
+    re1.lastIndex = 2;
+    assert(compatUtil.isDeepStrictEqual(re1, re2) === false, 'RegExp with differing lastIndex must not be deepStrictEqual');
+    const d1 = new Date(1000); d1.tag = 1;
+    const d2 = new Date(1000); d2.tag = 2;
+    assert(compatUtil.isDeepStrictEqual(d1, d2) === false, 'Date with differing own properties must not be deepStrictEqual');
+  }
+
+  console.log('[Test] Testing node-compat/os.js (env.getOsInfo RPC + fallback)...');
+  {
+    const osPath = require.resolve('./node-compat/os');
+    const savedSync = rpc.callSync;
+    try {
+      delete require.cache[osPath];
+      rpc.setSyncHandler((method) => {
+        if (method === 'env.getOsInfo') {
+          return {
+            platform: 'linux',
+            arch: 'arm64',
+            type: 'Linux',
+            release: '6.8.0-rustcode',
+            homedir: '/home/rustcode',
+            tmpdir: '/tmp/rustcode',
+            hostname: 'rustcode-box',
+            eol: '\n',
+            cpus: [{ model: 'Mock ARM', speed: 3000, times: { user: 1, nice: 0, sys: 0, idle: 99, irq: 0 } }],
+            totalmem: 16 * 1024 * 1024 * 1024,
+            freemem: 8 * 1024 * 1024 * 1024,
+            uptime: 1234,
+            loadavg: [0.1, 0.2, 0.3],
+          };
+        }
+        return null;
+      });
+      const compatOs = require('./node-compat/os');
+      assert(compatOs.platform() === 'linux' && compatOs.arch() === 'arm64', 'os RPC platform/arch mismatch');
+      assert(compatOs.homedir() === '/home/rustcode' && compatOs.tmpdir() === '/tmp/rustcode', 'os RPC dirs mismatch');
+      assert(compatOs.hostname() === 'rustcode-box' && compatOs.release() === '6.8.0-rustcode', 'os RPC host/release mismatch');
+      assert(compatOs.EOL === '\n' && compatOs.cpus().length === 1 && compatOs.cpus()[0].model === 'Mock ARM', 'os RPC EOL/cpus mismatch');
+      assert(compatOs.totalmem() === 16 * 1024 * 1024 * 1024 && compatOs.uptime() === 1234, 'os RPC mem/uptime mismatch');
+      assert(compatOs.constants && compatOs.constants.signals && compatOs.constants.errno, 'os.constants missing');
+
+      delete require.cache[osPath];
+      rpc.setSyncHandler(null);
+      const fallbackOs = require('./node-compat/os');
+      assert(typeof fallbackOs.homedir() === 'string' && fallbackOs.homedir().length > 0, 'os fallback homedir empty');
+      assert(typeof fallbackOs.tmpdir() === 'string' && fallbackOs.tmpdir().length > 0, 'os fallback tmpdir empty');
+      assert(fallbackOs.endianness() === 'LE' || fallbackOs.endianness() === 'BE', 'os fallback endianness invalid');
+      assert(Array.isArray(fallbackOs.cpus()) && fallbackOs.cpus().length >= 1, 'os fallback cpus empty');
+    } finally {
+      rpc.setSyncHandler(null);
+      rpc.callSync = savedSync;
+      delete require.cache[osPath];
+    }
+  }
+
+  console.log('[Test] Testing node-compat/crypto.js (NIST hashes, HMAC, random, timingSafeEqual, pbkdf2)...');
+  {
+    const compatCrypto = require('./node-compat/crypto');
+    assert(
+      compatCrypto.createHash('sha256').update('abc').digest('hex') ===
+      'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+      'SHA-256 NIST vector mismatch'
+    );
+    assert(
+      compatCrypto.createHash('sha224').update('abc').digest('hex') ===
+      '23097d223405d8228642a477bda255b32aadbce4bda0b3f7e36c9da7',
+      'SHA-224 NIST vector mismatch'
+    );
+    assert(
+      compatCrypto.createHash('sha1').update('abc').digest('hex') ===
+      'a9993e364706816aba3e25717850c26c9cd0d89d',
+      'SHA-1 NIST vector mismatch'
+    );
+    assert(
+      compatCrypto.createHash('md5').update('abc').digest('hex') ===
+      '900150983cd24fb0d6963f7d28e17f72',
+      'MD5 RFC vector mismatch'
+    );
+    assert(
+      compatCrypto.createHash('sha384').update('abc').digest('hex') ===
+      'cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7',
+      'SHA-384 NIST vector mismatch'
+    );
+    assert(
+      compatCrypto.createHash('sha512').update('abc').digest('hex') ===
+      'ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f',
+      'SHA-512 NIST vector mismatch'
+    );
+
+    const hStream = compatCrypto.createHash('sha256').update('a').update('b');
+    const hClone = hStream.copy();
+    assert(hStream.update('c').digest('hex') === 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad', 'streaming hash failed');
+    assert(hClone.update('d').digest().length === 32, 'hash.copy / buffer digest failed');
+
+    assert(
+      compatCrypto.createHmac('sha256', 'key').update('The quick brown fox jumps over the lazy dog').digest('hex') ===
+      'f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8',
+      'HMAC-SHA256 vector mismatch'
+    );
+    assert(
+      compatCrypto.pbkdf2Sync('password', 'salt', 1, 20, 'sha1').toString('hex') ===
+      '0c60c80f961f0e71f3a9b524af6012062fe037a6',
+      'PBKDF2 RFC 6070 vector mismatch'
+    );
+
+    assert(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(compatCrypto.randomUUID()), 'randomUUID format invalid');
+    assert(compatCrypto.randomBytes(16).length === 16, 'randomBytes length mismatch');
+    const rInt = compatCrypto.randomInt(10, 20);
+    assert(rInt >= 10 && rInt < 20, 'randomInt bounds mismatch');
+    assert(compatCrypto.timingSafeEqual(Uint8Array.from([1, 2]), Uint8Array.from([1, 2])) === true, 'timingSafeEqual equal failed');
+    assert(compatCrypto.timingSafeEqual(Uint8Array.from([1, 2]), Uint8Array.from([1, 3])) === false, 'timingSafeEqual unequal failed');
+    assert(compatCrypto.getHashes().includes('sha256') && compatCrypto.getHashes().includes('sha512'), 'getHashes missing expected algs');
+
+    let badAlgThrew = false;
+    try { compatCrypto.createHash('md2-unsupported'); } catch (e) { badAlgThrew = /not supported/i.test(e.message); }
+    assert(badAlgThrew, 'unsupported hash algorithm must throw');
+
+    let badLenThrew = false;
+    try { compatCrypto.timingSafeEqual(Uint8Array.from([1]), Uint8Array.from([1, 2])); } catch (e) { badLenThrew = e instanceof RangeError; }
+    assert(badLenThrew, 'timingSafeEqual mismatched lengths must throw RangeError');
+  }
+
+  console.log('[Test] Testing node-compat/child_process.js (spawn, exec, execFile, spawnSync, execSync, live stdio ENOSYS)...');
+  {
+    const cp = require('./node-compat/child_process');
+    const compatUtil = require('./node-compat/util');
+    const { PassThrough } = require('stream');
+    const savedCallCp = rpc.call;
+    try {
+      rpc.call = async (method, params) => {
+        if (method === 'process.exec') {
+          if (params.command === 'fail-cmd') {
+            return { pid: 10, exitCode: 2, signal: null, stdout: '', stderr: 'bad flag' };
+          }
+          return { pid: 11, exitCode: 0, signal: null, stdout: `exec:${params.command}`, stderr: '' };
+        }
+        if (method === 'process.spawn') {
+          if (params.command === 'missing-bin') {
+            return { error: { code: 'ENOENT', message: 'ENOENT: missing-bin' } };
+          }
+          return { pid: 42, exitCode: 0, signal: null, stdout: 'spawn-out\n', stderr: 'warn\n' };
+        }
+        return null;
+      };
+      rpc.setSyncHandler((method, params) => {
+        if (method === 'process.spawnSync') {
+          return { pid: 55, status: params.command === 'false' ? 1 : 0, signal: null, stdout: 'sync-out', stderr: '' };
+        }
+        if (method === 'process.exec') {
+          return { pid: 56, exitCode: 0, signal: null, stdout: 'exec-sync-ok', stderr: '' };
+        }
+        return null;
+      });
+
+      const syncRes = cp.spawnSync('node', ['-v']);
+      assert(syncRes.status === 0 && syncRes.stdout === 'sync-out', 'spawnSync failed');
+      const syncFail = cp.spawnSync('false');
+      assert(syncFail.status === 1, 'spawnSync non-zero status failed');
+      assert(cp.execSync('echo hi', { encoding: 'utf8' }) === 'exec-sync-ok', 'execSync utf8 failed');
+
+      const execAsync = compatUtil.promisify(cp.exec);
+      const execPromOut = await execAsync('echo ok');
+      assert(execPromOut.stdout === 'exec:echo ok', 'promisify(cp.exec) failed');
+
+      const execErr = await new Promise((resolve) => {
+        cp.exec('fail-cmd', (err) => resolve(err));
+      });
+      assert(execErr instanceof Error && execErr.code === 2, 'exec non-zero exit error.code mismatch');
+
+      const efOut = await new Promise((resolve, reject) => {
+        cp.execFile('node', ['-v'], (err, stdout) => (err ? reject(err) : resolve(stdout)));
+      });
+      assert(efOut === 'spawn-out\n', 'execFile failed');
+
+      const child = cp.spawn('node', ['-e', 'console.log(1)']);
+      const outChunks = [];
+      const errChunks = [];
+      child.stdout.on('data', (d) => outChunks.push(String(d)));
+      child.stderr.on('data', (d) => errChunks.push(String(d)));
+      const closeCode = await new Promise((resolve) => child.on('close', (code) => resolve(code)));
+      assert(closeCode === 0 && child.pid === 42, 'spawn close/pid mismatch');
+      assert(outChunks.join('') === 'spawn-out\n' && errChunks.join('') === 'warn\n', 'spawn stdout/stderr mismatch');
+      assert(child.kill('SIGTERM') === true && child.killed === true, 'child.kill failed');
+
+      const spawnErr = await new Promise((resolve) => {
+        const badChild = cp.spawn('missing-bin');
+        badChild.on('error', (err) => resolve(err));
+      });
+      assert(spawnErr instanceof Error && spawnErr.code === 'ENOENT', 'spawn ENOENT error event failed');
+
+      // Live stdio mode without sync handler must throw ENOSYS for spawnSync / execSync
+      rpc.setSyncHandler(null);
+      const clientIn = new PassThrough();
+      const clientOut = new PassThrough();
+      rpc.startStdioTransport({ input: clientIn, output: clientOut, format: 'content-length', redirectConsole: false });
+      try {
+        let syncErrCode = null;
+        try { cp.spawnSync('node', ['-v']); } catch (e) { syncErrCode = e.code; }
+        assert(syncErrCode === 'ENOSYS', 'spawnSync in live stdio without sync op must throw ENOSYS');
+        let execSyncErrCode = null;
+        try { cp.execSync('echo hi'); } catch (e) { execSyncErrCode = e.code; }
+        assert(execSyncErrCode === 'ENOSYS', 'execSync in live stdio without sync op must throw ENOSYS');
+      } finally {
+        rpc.stopStdioTransport();
+      }
+    } finally {
+      rpc.setSyncHandler(null);
+      rpc.call = savedCallCp;
+    }
+  }
+
   console.log('All JavaScript extension host tests passed successfully!');
 })();
 

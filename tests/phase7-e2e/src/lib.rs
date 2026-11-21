@@ -247,11 +247,57 @@ impl E2eWindow {
             Some(node.bounds)
         } else {
             let flat = tree.to_flat_list();
-            flat.iter()
+            let is_overlay = |n: &&&rustcode_platform::accessibility::AccessibleNode| {
+                n.id.starts_with("notifications.")
+                    || n.id.starts_with("prompt.")
+                    || n.id.starts_with("workbench.commandPalette")
+                    || n.id.starts_with("commandPalette.")
+            };
+            let overlay_match = flat
+                .iter()
                 .rev()
+                .filter(is_overlay)
                 .find(|n| n.name == id_or_name)
-                .or_else(|| flat.iter().rev().find(|n| n.name.contains(id_or_name)))
-                .map(|n| n.bounds)
+                .or_else(|| {
+                    flat.iter()
+                        .rev()
+                        .filter(is_overlay)
+                        .find(|n| n.name.contains(id_or_name))
+                })
+                .map(|n| n.bounds);
+            let sidebar_match = if overlay_match.is_none()
+                && self.window.view.focused_region
+                    == rustcode_workbench::workbench_view::FocusedRegion::Sidebar
+            {
+                tree.find_by_id("workbench.sidebar").and_then(|sidebar| {
+                    fn collect<'a>(
+                        n: &'a rustcode_platform::accessibility::AccessibleNode,
+                        out: &mut Vec<&'a rustcode_platform::accessibility::AccessibleNode>,
+                    ) {
+                        out.push(n);
+                        for c in &n.children {
+                            collect(c, out);
+                        }
+                    }
+                    let mut s_flat = Vec::new();
+                    collect(sidebar, &mut s_flat);
+                    s_flat
+                        .iter()
+                        .rev()
+                        .find(|n| n.name == id_or_name)
+                        .or_else(|| s_flat.iter().rev().find(|n| n.name.contains(id_or_name)))
+                        .map(|n| n.bounds)
+                })
+            } else {
+                None
+            };
+            overlay_match.or(sidebar_match).or_else(|| {
+                flat.iter()
+                    .rev()
+                    .find(|n| n.name == id_or_name)
+                    .or_else(|| flat.iter().rev().find(|n| n.name.contains(id_or_name)))
+                    .map(|n| n.bounds)
+            })
         };
         if let Some(b) = found_bounds {
             let center = Point::new(b.min_x() + b.width() * 0.5, b.min_y() + b.height() * 0.5);

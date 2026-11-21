@@ -66,6 +66,13 @@ impl ActivityBar {
                     view_container_id: "extensions".to_string(),
                     badge: None,
                 },
+                ActivityBarItem {
+                    id: "workbench.view.testing".to_string(),
+                    title: "Testing".to_string(),
+                    icon: "beaker".to_string(),
+                    view_container_id: "testing".to_string(),
+                    badge: None,
+                },
             ],
             active_item_index: 0,
         }
@@ -106,6 +113,12 @@ impl ActivityBarView {
             self.model.active_item_index = index;
         }
     }
+
+    pub fn set_badge(&mut self, item_id: &str, badge: Option<u32>) {
+        if let Some(item) = self.model.items.iter_mut().find(|i| i.id == item_id) {
+            item.badge = badge;
+        }
+    }
 }
 
 impl View for ActivityBarView {
@@ -141,6 +154,7 @@ impl View for ActivityBarView {
                 "scm" => "SCM",
                 "debug" => "DBG",
                 "extensions" => "EXT",
+                "testing" => "TST",
                 _ => &item.title[..item.title.len().min(3)],
             };
 
@@ -247,5 +261,36 @@ mod tests {
         let res2 = view.handle_event(&click_ev, bounds);
         assert_eq!(res2, EventResult::Consumed);
         assert_eq!(view.last_action, Some(ActivityBarAction::ToggleSidebar));
+    }
+
+    #[test]
+    fn test_activity_bar_testing_index_5_and_badge() {
+        let mut view = ActivityBarView::default();
+        assert_eq!(view.model.items.len(), 6);
+        assert_eq!(view.model.items[4].id, "workbench.view.extensions");
+        assert_eq!(view.model.items[5].id, "workbench.view.testing");
+        assert_eq!(view.model.items[5].title, "Testing");
+
+        view.set_badge("workbench.view.testing", Some(3));
+        assert_eq!(view.model.items[5].badge, Some(3));
+
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+        let bounds = Rect::from_xywh(0.0, 0.0, 48.0, 600.0);
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("TST"));
+        assert!(scene.contains_text("3"));
+
+        let click_testing = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(24.0, 5.0 * 48.0 + 20.0),
+            rustcode_platform::render::MouseButton::Left,
+        ));
+        assert_eq!(view.handle_event(&click_testing, bounds), EventResult::Consumed);
+        assert_eq!(view.model.active_item_index, 5);
+        assert_eq!(
+            view.last_action,
+            Some(ActivityBarAction::SelectView("testing".to_string()))
+        );
     }
 }

@@ -25,6 +25,57 @@ pub enum QuickInputMode {
     Line,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GotoLineParseResult {
+    Empty,
+    Valid {
+        line_1based: usize,
+        column_1based: Option<usize>,
+    },
+    Invalid,
+}
+
+pub fn parse_goto_line_query(query: &str) -> GotoLineParseResult {
+    let stripped = query.strip_prefix(':').unwrap_or(query).trim();
+    if stripped.is_empty() {
+        return GotoLineParseResult::Empty;
+    }
+    let mut parts = stripped.split(':');
+    let Some(line_str) = parts.next() else {
+        return GotoLineParseResult::Empty;
+    };
+    let col_str_opt = parts.next();
+    if parts.next().is_some() {
+        return GotoLineParseResult::Invalid;
+    }
+
+    let parse_digits_saturating = |s: &str| -> Option<usize> {
+        let trimmed = s.trim();
+        if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(trimmed.parse::<usize>().unwrap_or(usize::MAX))
+    };
+
+    let Some(line_1based) = parse_digits_saturating(line_str) else {
+        return GotoLineParseResult::Invalid;
+    };
+
+    let column_1based = match col_str_opt {
+        None => None,
+        Some(col_s) if col_s.trim().is_empty() => None,
+        Some(col_s) => match parse_digits_saturating(col_s) {
+            Some(c) => Some(c),
+            None => return GotoLineParseResult::Invalid,
+        },
+    };
+
+    GotoLineParseResult::Valid {
+        line_1based,
+        column_1based,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaletteItem {
     pub command_id: String,
@@ -119,6 +170,29 @@ impl PaletteItem {
             item_kind: PaletteItemKind::WorkspaceSymbol,
         }
     }
+
+    pub fn document_symbol(
+        name: impl Into<String>,
+        container: Option<String>,
+        line_1based: usize,
+        column_1based: usize,
+    ) -> Self {
+        let name_str = name.into();
+        let cat = match container {
+            Some(c) if !c.is_empty() => format!("{} (Line {})", c, line_1based),
+            _ => format!("Line {}", line_1based),
+        };
+        Self {
+            command_id: format!("doc_symbol:{}:{}:{}", name_str, line_1based, column_1based),
+            label: name_str,
+            category: Some(cat),
+            keybinding: None,
+            path: None,
+            line: Some(line_1based),
+            column: Some(column_1based),
+            item_kind: PaletteItemKind::DocumentSymbol,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -193,6 +267,25 @@ impl CommandPalette {
         }
     }
 
+    pub fn line_prompt_text(&self) -> String {
+        match parse_goto_line_query(&self.query) {
+            GotoLineParseResult::Empty => {
+                "Go to Line: Type a line number (e.g. :line or :line:column)".to_string()
+            }
+            GotoLineParseResult::Valid {
+                line_1based,
+                column_1based,
+            } => match column_1based {
+                Some(col) => format!("Go to Line {}, Column {}", line_1based.max(1), col.max(1)),
+                None => format!("Go to Line {}", line_1based.max(1)),
+            },
+            GotoLineParseResult::Invalid => {
+                "Invalid line number — enter a positive line number (e.g. :10 or :10:5)"
+                    .to_string()
+            }
+        }
+    }
+
     pub fn refilter(&mut self) {
         let (detected_mode, target_query) = if let Some(stripped) = self.query.strip_prefix('>') {
             (QuickInputMode::Command, stripped.trim().to_lowercase())
@@ -223,8 +316,8 @@ impl CommandPalette {
                     if has_files {
                         item.item_kind == PaletteItemKind::File
                     } else {
-                        // Fallback: match any item (e.g. in command-only tests)
-                        true
+                        // Fallback for command-only tests; never leak document/workspace symbols
+                        item.item_kind == PaletteItemKind::Command
                     }
                 }
             };
@@ -274,6 +367,10 @@ pub enum PaletteAction {
         line: Option<usize>,
         column: Option<usize>,
     },
+    JumpToLine {
+        line: usize,
+        column: Option<usize>,
+    },
     Close,
 }
 
@@ -305,10 +402,7 @@ impl View for CommandPaletteView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds)
-            || !crate::is_finite_font(font)
-            || !(bounds.min_y() + 37.0).is_finite()
-        {
+        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
             return;
         }
         // Shadow behind popup
@@ -328,10 +422,12 @@ impl View for CommandPaletteView {
                 .with_corner_radius(6.0),
         );
 
-        // Input container (height 36.0)
-        let input_h = 36.0;
-        let prompt_x = bounds.min_x() + 12.0;
-        let text_y = bounds.min_y() + (input_h - font.line_height) / 2.0;
+        // Input container (clamped to bounds height)
+        let input_h = 36.0f32.min(bounds.height());
+        let prompt_x = (bounds.min_x() + 12.0).min(bounds.max_x());
+        let text_y = bounds.min_y() + ((input_h - font.line_height) / 2.0).max(0.0);
+        let text_h = font.line_height.min((bounds.max_y() - text_y).max(0.0));
+        let max_input_x = (bounds.max_x() - 6.0).max(prompt_x);
 
         // Prompt string & query
         let (prompt_str, display_query) = if let Some(stripped) = self.model.query.strip_prefix('>') {
@@ -346,53 +442,134 @@ impl View for CommandPaletteView {
             ("> ", self.model.query.as_str())
         };
 
-        let prompt_w = font.text_width(prompt_str);
+        let prompt_w = font
+            .text_width(prompt_str)
+            .min((max_input_x - prompt_x).max(0.0));
 
         // Prompt
-        scene.push_text(GlyphRun::new(
-            prompt_str.to_string(),
-            Point::new(prompt_x, text_y),
-            Rect::from_xywh(prompt_x, text_y, prompt_w, font.line_height),
-            theme.command_palette_fg,
-            font.font_size,
-        ));
+        if prompt_w > 0.0 && text_h > 0.0 {
+            scene.push_text(GlyphRun::new(
+                prompt_str.to_string(),
+                Point::new(prompt_x, text_y),
+                Rect::from_xywh(prompt_x, text_y, prompt_w, text_h),
+                theme.command_palette_fg,
+                font.font_size,
+            ));
+        }
 
         // Query text
-        let query_x = prompt_x + prompt_w;
-        let query_w = font.text_width(display_query);
-        if !display_query.is_empty() {
+        let query_x = (prompt_x + prompt_w).min(max_input_x);
+        let query_w = font
+            .text_width(display_query)
+            .min((max_input_x - query_x).max(0.0));
+        if !display_query.is_empty() && query_w > 0.0 && text_h > 0.0 {
             scene.push_text(GlyphRun::new(
                 display_query.to_string(),
                 Point::new(query_x, text_y),
-                Rect::from_xywh(query_x, text_y, query_w, font.line_height),
+                Rect::from_xywh(query_x, text_y, query_w, text_h),
                 theme.command_palette_fg,
                 font.font_size,
             ));
         }
 
         // Blinking cursor after query
-        let cursor_x = query_x + query_w;
-        let cursor_rect = Rect::from_xywh(cursor_x, text_y, 2.0, font.line_height);
-        scene.push_quad(Quad::new(cursor_rect).with_background(theme.editor_cursor));
+        let cursor_x = (query_x + query_w).min((bounds.max_x() - 4.0).max(bounds.min_x()));
+        let cursor_w = 2.0f32.min((bounds.max_x() - cursor_x).max(0.0));
+        if cursor_w > 0.0 && text_h > 0.0 {
+            let cursor_rect = Rect::from_xywh(cursor_x, text_y, cursor_w, text_h);
+            scene.push_quad(Quad::new(cursor_rect).with_background(theme.editor_cursor));
+        }
 
         // Divider line below input
-        let div_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y() + input_h, bounds.width(), 1.0);
-        scene.push_quad(Quad::new(div_rect).with_background(theme.command_palette_border));
+        if bounds.height() > input_h {
+            let div_h = 1.0f32.min((bounds.max_y() - (bounds.min_y() + input_h)).max(0.0));
+            let div_rect =
+                Rect::from_xywh(bounds.min_x(), bounds.min_y() + input_h, bounds.width(), div_h);
+            scene.push_quad(Quad::new(div_rect).with_background(theme.command_palette_border));
+        }
 
         // Result rows
         let row_h = 28.0;
-        let results = self.model.results();
         let max_visible = ((bounds.height() - input_h - 1.0) / row_h)
             .floor()
             .max(0.0) as usize;
+        if max_visible == 0 {
+            return;
+        }
+
+        if self.model.mode == QuickInputMode::Line {
+            let row_y = bounds.min_y() + input_h + 1.0;
+            let clamped_row_h = row_h.min((bounds.max_y() - row_y).max(0.0));
+            let row_rect = Rect::from_xywh(
+                bounds.min_x() + 4.0f32.min(bounds.width() * 0.5),
+                row_y,
+                (bounds.width() - 8.0).max(0.0),
+                clamped_row_h,
+            );
+            scene.push_quad(
+                Quad::new(row_rect)
+                    .with_background(theme.command_palette_selected_bg)
+                    .with_corner_radius(4.0),
+            );
+            let prompt_msg = self.model.line_prompt_text();
+            let label_x = (bounds.min_x() + 14.0).min(bounds.max_x());
+            let item_y = row_y + ((clamped_row_h - font.line_height) / 2.0).max(0.0);
+            let avail_w = (bounds.max_x() - label_x - 8.0).max(0.0);
+            let label_w = font.text_width(&prompt_msg).min(avail_w);
+            let item_h = font.line_height.min((bounds.max_y() - item_y).max(0.0));
+            if label_w > 0.0 && item_h > 0.0 {
+                let color = if matches!(
+                    parse_goto_line_query(&self.model.query),
+                    GotoLineParseResult::Invalid
+                ) {
+                    theme.editor_error_foreground
+                } else {
+                    theme.command_palette_fg
+                };
+                scene.push_text(GlyphRun::new(
+                    prompt_msg,
+                    Point::new(label_x, item_y),
+                    Rect::from_xywh(label_x, item_y, label_w, item_h),
+                    color,
+                    font.font_size,
+                ));
+            }
+            return;
+        }
+
+        let results = self.model.results();
+        if self.model.mode == QuickInputMode::DocumentSymbol && results.is_empty() {
+            let row_y = bounds.min_y() + input_h + 1.0;
+            let clamped_row_h = row_h.min((bounds.max_y() - row_y).max(0.0));
+            let label_x = (bounds.min_x() + 14.0).min(bounds.max_x());
+            let item_y = row_y + ((clamped_row_h - font.line_height) / 2.0).max(0.0);
+            let avail_w = (bounds.max_x() - label_x - 8.0).max(0.0);
+            let msg = "No symbols found";
+            let label_w = font.text_width(msg).min(avail_w);
+            let item_h = font.line_height.min((bounds.max_y() - item_y).max(0.0));
+            if label_w > 0.0 && item_h > 0.0 {
+                scene.push_text(GlyphRun::new(
+                    msg.to_string(),
+                    Point::new(label_x, item_y),
+                    Rect::from_xywh(label_x, item_y, label_w, item_h),
+                    theme.tab_inactive_fg,
+                    font.font_size,
+                ));
+            }
+            return;
+        }
 
         for (idx, item) in results.iter().take(max_visible).enumerate() {
             let row_y = bounds.min_y() + input_h + 1.0 + idx as f32 * row_h;
+            let clamped_row_h = row_h.min((bounds.max_y() - row_y).max(0.0));
+            if clamped_row_h <= 0.0 {
+                break;
+            }
             let row_rect = Rect::from_xywh(
-                bounds.min_x() + 4.0,
+                bounds.min_x() + 4.0f32.min(bounds.width() * 0.5),
                 row_y,
                 (bounds.width() - 8.0).max(0.0),
-                row_h,
+                clamped_row_h,
             );
 
             let is_selected = idx == self.model.selected_index;
@@ -409,29 +586,36 @@ impl View for CommandPaletteView {
                 Some(cat) => format!("{}: {}", cat, item.label),
                 None => item.label.clone(),
             };
-            let label_x = bounds.min_x() + 14.0;
-            let item_y = row_y + (row_h - font.line_height) / 2.0;
-            let label_w = font.text_width(&display_str);
+            let label_x = (bounds.min_x() + 14.0).min(bounds.max_x());
+            let item_y = row_y + ((clamped_row_h - font.line_height) / 2.0).max(0.0);
+            let item_h = font.line_height.min((bounds.max_y() - item_y).max(0.0));
+            let avail_label_w = (bounds.max_x() - label_x - 8.0).max(0.0);
+            let label_w = font.text_width(&display_str).min(avail_label_w);
 
-            scene.push_text(GlyphRun::new(
-                display_str,
-                Point::new(label_x, item_y),
-                Rect::from_xywh(label_x, item_y, label_w, font.line_height),
-                theme.command_palette_fg,
-                font.font_size,
-            ));
+            if label_w > 0.0 && item_h > 0.0 {
+                scene.push_text(GlyphRun::new(
+                    display_str,
+                    Point::new(label_x, item_y),
+                    Rect::from_xywh(label_x, item_y, label_w, item_h),
+                    theme.command_palette_fg,
+                    font.font_size,
+                ));
+            }
 
             // Keybinding badge if present
             if let Some(kb) = &item.keybinding {
-                let kb_w = font.text_width(kb);
-                let kb_x = bounds.max_x() - 14.0 - kb_w;
-                scene.push_text(GlyphRun::new(
-                    kb.clone(),
-                    Point::new(kb_x, item_y),
-                    Rect::from_xywh(kb_x, item_y, kb_w, font.line_height),
-                    theme.tab_inactive_fg,
-                    font.font_size * 0.9,
-                ));
+                let raw_kb_w = font.text_width(kb);
+                let kb_x = (bounds.max_x() - 14.0 - raw_kb_w).max(label_x);
+                let kb_w = raw_kb_w.min((bounds.max_x() - kb_x - 4.0).max(0.0));
+                if kb_w > 0.0 && item_h > 0.0 {
+                    scene.push_text(GlyphRun::new(
+                        kb.clone(),
+                        Point::new(kb_x, item_y),
+                        Rect::from_xywh(kb_x, item_y, kb_w, item_h),
+                        theme.tab_inactive_fg,
+                        font.font_size * 0.9,
+                    ));
+                }
             }
         }
     }
@@ -448,8 +632,27 @@ impl View for CommandPaletteView {
                     EventResult::Consumed
                 }
                 KeyCode::Enter => {
+                    if self.model.mode == QuickInputMode::Line {
+                        if let GotoLineParseResult::Valid {
+                            line_1based,
+                            column_1based,
+                        } = parse_goto_line_query(&self.model.query)
+                        {
+                            self.last_action = Some(PaletteAction::JumpToLine {
+                                line: line_1based,
+                                column: column_1based,
+                            });
+                        }
+                        return EventResult::Consumed;
+                    }
                     if let Some(item) = self.model.selected_item() {
-                        if let Some(path) = &item.path {
+                        if item.item_kind == PaletteItemKind::DocumentSymbol && item.path.is_none()
+                        {
+                            self.last_action = Some(PaletteAction::JumpToLine {
+                                line: item.line.unwrap_or(1),
+                                column: item.column,
+                            });
+                        } else if let Some(path) = &item.path {
                             self.last_action = Some(PaletteAction::OpenFile {
                                 path: path.clone(),
                                 line: item.line,
@@ -482,8 +685,17 @@ impl View for CommandPaletteView {
                     EventResult::Consumed
                 }
                 KeyCode::Char(c) if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
-                    let ch = if key.modifiers.shift { c.to_ascii_uppercase() } else { *c };
-                    self.model.query.push(ch);
+                    match &key.text {
+                        Some(txt) if !txt.is_empty() => self.model.query.push_str(txt),
+                        _ => {
+                            let ch = if key.modifiers.shift {
+                                c.to_ascii_uppercase()
+                            } else {
+                                *c
+                            };
+                            self.model.query.push(ch);
+                        }
+                    }
                     self.model.refilter();
                     EventResult::Consumed
                 }
@@ -493,13 +705,33 @@ impl View for CommandPaletteView {
                 if !bounds.contains(mouse.position) {
                     return EventResult::Ignored;
                 }
-                let input_h = 36.0;
+                let input_h = 36.0f32.min(bounds.height());
                 let row_h = 28.0;
                 if mouse.position.y > bounds.min_y() + input_h {
                     let idx = ((mouse.position.y - (bounds.min_y() + input_h + 1.0)) / row_h)
-                        .floor() as usize;
+                        .floor()
+                        .max(0.0) as usize;
+                    if self.model.mode == QuickInputMode::Line && idx == 0 {
+                        if let GotoLineParseResult::Valid {
+                            line_1based,
+                            column_1based,
+                        } = parse_goto_line_query(&self.model.query)
+                        {
+                            self.last_action = Some(PaletteAction::JumpToLine {
+                                line: line_1based,
+                                column: column_1based,
+                            });
+                        }
+                        return EventResult::Consumed;
+                    }
                     let maybe_action = if let Some(item) = self.model.results().get(idx) {
-                        if let Some(path) = &item.path {
+                        if item.item_kind == PaletteItemKind::DocumentSymbol && item.path.is_none()
+                        {
+                            Some(PaletteAction::JumpToLine {
+                                line: item.line.unwrap_or(1),
+                                column: item.column,
+                            })
+                        } else if let Some(path) = &item.path {
                             Some(PaletteAction::OpenFile {
                                 path: path.clone(),
                                 line: item.line,
@@ -778,6 +1010,90 @@ mod tests {
             let mut scene = Scene::new();
             view.render(bad_bounds, &theme, &font, &mut scene);
             assert!(scene.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_quickinput_goto_line_parsing_and_dynamic_prefix_switching() {
+        assert_eq!(parse_goto_line_query(":"), GotoLineParseResult::Empty);
+        assert_eq!(
+            parse_goto_line_query(":0"),
+            GotoLineParseResult::Valid {
+                line_1based: 0,
+                column_1based: None
+            }
+        );
+        assert_eq!(
+            parse_goto_line_query(":999999"),
+            GotoLineParseResult::Valid {
+                line_1based: 999999,
+                column_1based: None
+            }
+        );
+        assert_eq!(
+            parse_goto_line_query(":2:99999"),
+            GotoLineParseResult::Valid {
+                line_1based: 2,
+                column_1based: Some(99999)
+            }
+        );
+        assert_eq!(parse_goto_line_query(":abc"), GotoLineParseResult::Invalid);
+        assert_eq!(parse_goto_line_query(":1:2:3"), GotoLineParseResult::Invalid);
+
+        let mut palette = CommandPalette::new();
+        palette.set_items(vec![
+            PaletteItem::file(PathBuf::from("/w/main.rs"), "main.rs"),
+            PaletteItem::document_symbol("alpha_fn", None, 4, 1),
+            PaletteItem::command("workbench.action.toggleSidebar", "Toggle Sidebar", None, None),
+        ]);
+        palette.open_mode(QuickInputMode::File);
+        assert_eq!(palette.mode, QuickInputMode::File);
+        assert_eq!(palette.results().len(), 1);
+        assert_eq!(palette.results()[0].label, "main.rs");
+
+        // Prefix '@' switches to DocumentSymbol
+        palette.set_query("@alpha");
+        assert_eq!(palette.mode, QuickInputMode::DocumentSymbol);
+        assert_eq!(palette.results().len(), 1);
+        assert_eq!(palette.results()[0].label, "alpha_fn");
+
+        // Prefix ':' switches to Line; non-numeric does not emit JumpToLine
+        let mut view = CommandPaletteView::new(palette);
+        view.model.set_query(":abc");
+        assert_eq!(view.model.mode, QuickInputMode::Line);
+        let bounds = Rect::from_xywh(20.0, 40.0, 200.0, 100.0);
+        view.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none())),
+            bounds,
+        );
+        assert!(view.last_action.is_none());
+
+        // Valid ':3:5' emits JumpToLine
+        view.model.set_query(":3:5");
+        view.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none())),
+            bounds,
+        );
+        assert_eq!(
+            view.last_action,
+            Some(PaletteAction::JumpToLine {
+                line: 3,
+                column: Some(5)
+            })
+        );
+
+        // Tiny viewport renders finite non-negative bounds
+        let mut scene = Scene::new();
+        view.render(bounds, &WorkbenchThemeStyles::dark_default(), &FontMetrics::default_monospace(), &mut scene);
+        for q in scene.quads() {
+            assert!(
+                q.bounds.origin.x.is_finite()
+                    && q.bounds.origin.y.is_finite()
+                    && q.bounds.width().is_finite()
+                    && q.bounds.height().is_finite()
+                    && q.bounds.width() >= 0.0
+                    && q.bounds.height() >= 0.0
+            );
         }
     }
 }

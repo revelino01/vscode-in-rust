@@ -259,6 +259,10 @@ pub enum GrammarState {
     MultiLineString { quote: char },
     TemplateLiteral,
     CodeBlock { lang: String },
+    RawString { delimiter: String },
+    HtmlInTag,
+    HtmlScript,
+    HtmlStyle,
 }
 
 /// Tokenizer grammar trait representing an incremental tokenizer for a programming language.

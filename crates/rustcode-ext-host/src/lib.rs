@@ -10,6 +10,7 @@ pub mod manifest;
 pub mod marketplace;
 pub mod notebook;
 pub mod output;
+pub mod process;
 pub mod provider;
 pub mod rpc;
 pub mod scm;

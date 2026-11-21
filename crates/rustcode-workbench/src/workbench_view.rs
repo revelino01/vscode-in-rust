@@ -7,15 +7,19 @@ use crate::debug::{
 use crate::editor_area::EditorAreaView;
 use crate::explorer::{ExplorerAction, FileExplorerView};
 use crate::extensions_view::{ExtensionsSidebarView, ExtensionsViewAction};
-use crate::layout::WorkbenchLayout;
+use crate::layout::SharedWorkbenchLayout;
+use crate::notifications::{
+    NotificationUiAction, NotificationsOverlay, PromptOverlay, PromptUiAction,
+};
 use crate::output_panel::{OutputAction, OutputPanelView};
 use crate::problems::{ProblemsAction, ProblemsPanel};
-use crate::quickinput::{CommandPaletteView, PaletteAction};
+use crate::quickinput::{CommandPaletteView, PaletteAction, QuickInputMode};
 use crate::scm::{ScmAction, ScmView};
 use crate::search::{SearchAction, SearchInputFocus, SearchView};
-use crate::settings_ui::SettingsFocus;
-use crate::statusbar::{StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
+use crate::settings_ui::{SettingsFocus, SettingsUiView};
+use crate::statusbar::{StatusBar, StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
 use crate::terminal_panel::{TerminalAction, TerminalPanelView};
+use crate::testing::{decode_test_uri_to_path, TestingAction, TestingSidebarView};
 use crate::webview::WebviewElementKind;
 use crate::workspace::Workspace;
 use parking_lot::RwLock;
@@ -26,6 +30,8 @@ use rustcode_platform::render::{
     WorkbenchThemeStyles,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FocusedRegion {
@@ -35,7 +41,7 @@ pub enum FocusedRegion {
     CommandPalette,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum WorkbenchAction {
     ExecuteCommand(String),
     OpenFile(PathBuf),
@@ -56,17 +62,22 @@ pub enum WorkbenchAction {
     ExtensionsAction(ExtensionsViewAction),
     OutputAction(OutputAction),
     TerminalAction(TerminalAction),
+    NotificationAction(NotificationUiAction),
+    PromptAction(PromptUiAction),
+    TestingAction(TestingAction),
+    ExplorerAction(ExplorerAction),
     SidebarToggled(bool),
     PanelToggled(bool),
 }
 
 pub struct WorkbenchView {
-    pub layout: WorkbenchLayout,
+    pub layout: SharedWorkbenchLayout,
     pub activity_bar: ActivityBarView,
     pub explorer: FileExplorerView,
     pub scm_view: ScmView,
     pub search_view: SearchView,
     pub extensions_view: ExtensionsSidebarView,
+    pub testing_view: TestingSidebarView,
     pub workspace: Workspace,
     pub debug_sidebar: DebugSidebarView,
     pub debug_toolbar: DebugToolbarView,
@@ -79,8 +90,13 @@ pub struct WorkbenchView {
     pub panel_tab_bounds: RwLock<Vec<(String, Rect)>>,
     pub command_palette: Option<CommandPaletteView>,
     pub is_command_palette_open: bool,
+    pub notifications: NotificationsOverlay,
+    pub prompt_overlay: PromptOverlay,
     pub focused_region: FocusedRegion,
     pub last_action: Option<WorkbenchAction>,
+    pub pending_settings_open: Arc<AtomicBool>,
+    pub(crate) cached_config: Option<ConfigurationService>,
+    pub(crate) pending_ext_status_bar: RwLock<Option<Vec<StatusBarItem>>>,
 }
 
 impl Default for WorkbenchView {
@@ -102,12 +118,13 @@ impl WorkbenchView {
         });
 
         Self {
-            layout: WorkbenchLayout::new(),
+            layout: SharedWorkbenchLayout::new(),
             activity_bar: ActivityBarView::default(),
             explorer: FileExplorerView::default(),
             scm_view: ScmView::default(),
             search_view: SearchView::default(),
             extensions_view: ExtensionsSidebarView::default(),
+            testing_view: TestingSidebarView::default(),
             workspace: Workspace::default(),
             debug_sidebar: DebugSidebarView::default(),
             debug_toolbar: DebugToolbarView::default(),
@@ -120,9 +137,24 @@ impl WorkbenchView {
             panel_tab_bounds: RwLock::new(Vec::new()),
             command_palette: None,
             is_command_palette_open: false,
+            notifications: NotificationsOverlay::new(),
+            prompt_overlay: PromptOverlay::new(),
             focused_region: FocusedRegion::Editor,
             last_action: None,
+            pending_settings_open: Arc::new(AtomicBool::new(false)),
+            cached_config: None,
+            pending_ext_status_bar: RwLock::new(None),
         }
+    }
+
+    fn merged_status_bar(&self) -> Option<StatusBar> {
+        let ext_guard = self.pending_ext_status_bar.read();
+        let ext_items = ext_guard.as_ref()?;
+        let mut bar = self.status_bar.model.clone();
+        for item in ext_items {
+            bar.set_item(item.clone());
+        }
+        Some(bar)
     }
 
     pub fn update_problems(&mut self, uri: &str, diags: Vec<rustcode_editor::viewmodel::EditorDiagnostic>) {
@@ -187,6 +219,7 @@ impl WorkbenchView {
     }
 
     pub fn open_settings(&mut self, config: Option<ConfigurationService>) {
+        self.pending_settings_open.store(false, Ordering::SeqCst);
         self.editor_area.open_settings(config);
         self.editor_area.sync_breadcrumbs(Some(&self.workspace));
         self.focused_region = FocusedRegion::Editor;
@@ -216,6 +249,106 @@ impl WorkbenchView {
     fn process_extensions_action(&mut self) {
         if let Some(act) = self.extensions_view.last_action.take() {
             self.last_action = Some(WorkbenchAction::ExtensionsAction(act));
+        }
+    }
+
+    pub fn is_prompt_open(&self) -> bool {
+        self.prompt_overlay.is_open()
+    }
+
+    pub fn is_explorer_input_active(&self) -> bool {
+        self.focused_region == FocusedRegion::Sidebar && self.explorer.is_input_active()
+    }
+
+    pub fn has_modal_overlay(&self) -> bool {
+        self.is_command_palette_open
+            || self.prompt_overlay.is_open()
+            || self.notifications.has_modal()
+    }
+
+    fn process_explorer_action(&mut self) {
+        if let Some(action) = self.explorer.last_action.take() {
+            match action {
+                ExplorerAction::OpenFile(path) => {
+                    let target_uri = self
+                        .editor_area
+                        .find_open_tab_uri_for_path(&path)
+                        .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&path));
+                    let title = path
+                        .file_name()
+                        .map_or("untitled", |n| n.to_str().unwrap_or(""));
+                    let content = if self.editor_area.any_editor_for_uri(&target_uri).is_some() {
+                        String::new()
+                    } else {
+                        std::fs::read_to_string(&path).unwrap_or_default()
+                    };
+                    self.editor_area.open_file(&target_uri, title, &content, true);
+                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
+                    self.last_action = Some(WorkbenchAction::OpenFile(path));
+                }
+                ExplorerAction::CreateFile(path) => {
+                    let target_uri = self
+                        .editor_area
+                        .find_open_tab_uri_for_path(&path)
+                        .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&path));
+                    let title = path
+                        .file_name()
+                        .map_or("untitled", |n| n.to_str().unwrap_or(""));
+                    let content = std::fs::read_to_string(&path).unwrap_or_default();
+                    self.editor_area.open_file(&target_uri, title, &content, false);
+                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
+                    self.last_action =
+                        Some(WorkbenchAction::ExplorerAction(ExplorerAction::CreateFile(path)));
+                }
+                ExplorerAction::Renamed { old_path, new_path } => {
+                    self.editor_area.rename_tab(&old_path, &new_path);
+                    self.last_action =
+                        Some(WorkbenchAction::ExplorerAction(ExplorerAction::Renamed {
+                            old_path,
+                            new_path,
+                        }));
+                }
+                ExplorerAction::Deleted(path) => {
+                    self.editor_area.close_tabs_for_path(&path);
+                    self.last_action =
+                        Some(WorkbenchAction::ExplorerAction(ExplorerAction::Deleted(path)));
+                }
+                ExplorerAction::ToggleDir(_) => {}
+                other => {
+                    self.last_action = Some(WorkbenchAction::ExplorerAction(other));
+                }
+            }
+        }
+    }
+
+    fn process_testing_action(&mut self) {
+        if let Some(act) = self.testing_view.last_action.take() {
+            match act {
+                TestingAction::OpenUri(uri) => {
+                    if let Some(path) = decode_test_uri_to_path(&uri) {
+                        let target_uri = self
+                            .editor_area
+                            .find_open_tab_uri_for_path(&path)
+                            .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&path));
+                        let title = path
+                            .file_name()
+                            .map_or("untitled", |n| n.to_str().unwrap_or(""));
+                        let content = if self.editor_area.any_editor_for_uri(&target_uri).is_some()
+                        {
+                            String::new()
+                        } else {
+                            std::fs::read_to_string(&path).unwrap_or_default()
+                        };
+                        self.editor_area.open_file(&target_uri, title, &content, false);
+                        self.editor_area.sync_breadcrumbs(Some(&self.workspace));
+                        self.focused_region = FocusedRegion::Editor;
+                        self.last_action = Some(WorkbenchAction::OpenFile(path));
+                    }
+                }
+                other => {
+                    self.last_action = Some(WorkbenchAction::TestingAction(other));
+                }
+            }
         }
     }
 
@@ -857,43 +990,13 @@ impl WorkbenchView {
                         vec![search_node, installed_list, marketplace_list],
                         input_focused,
                     )
+                } else if view_id == "testing" || view_id == "workbench.view.testing" {
+                    let nodes = self.testing_view.accessibility_nodes(regions.sidebar, font);
+                    ("Testing", nodes, false)
                 } else {
-                    let header_h = 28.0;
-                    let row_h = 22.0;
-                    let mut tree = AccessibleNode::new(
-                        "workbench.sidebar.explorer.tree",
-                        AccessibleRole::Tree,
-                        "Explorer",
-                        Rect::from_xywh(
-                            regions.sidebar.min_x(),
-                            regions.sidebar.min_y() + header_h,
-                            regions.sidebar.width(),
-                            (regions.sidebar.height() - header_h).max(0.0),
-                        ),
-                    );
-                    for (idx, row) in self.explorer.flattened_rows().into_iter().enumerate() {
-                        let row_y = regions.sidebar.min_y() + header_h + idx as f32 * row_h;
-                        if row_y + row_h > regions.sidebar.max_y() {
-                            break;
-                        }
-                        let mut item = AccessibleNode::new(
-                            format!("explorer.row.{}", idx),
-                            AccessibleRole::TreeItem,
-                            row.name,
-                            Rect::from_xywh(
-                                regions.sidebar.min_x(),
-                                row_y,
-                                regions.sidebar.width(),
-                                row_h,
-                            ),
-                        )
-                        .with_selected(row.is_selected);
-                        if row.is_dir {
-                            item = item.with_expanded(row.is_expanded);
-                        }
-                        tree.add_child(item);
-                    }
-                    ("Explorer", vec![tree], false)
+                    let nodes = self.explorer.accessibility_nodes(regions.sidebar, font);
+                    let input_focused = sidebar_focused && self.explorer.is_input_active();
+                    ("Explorer", nodes, input_focused)
                 };
 
             let sidebar_node = AccessibleNode::new(
@@ -956,6 +1059,19 @@ impl WorkbenchView {
             }
         }
         root.add_child(editor_area_node);
+
+        if self.pending_settings_open.load(Ordering::SeqCst)
+            && !self.editor_area.settings_views.contains_key("rustcode://settings")
+        {
+            if let Some(last) = root.children.last_mut() {
+                last.add_child(AccessibleNode::new(
+                    "workbench.editor.settings",
+                    AccessibleRole::Panel,
+                    "Settings",
+                    regions.editor_area,
+                ));
+            }
+        }
 
         // 4. Bottom Panel
         if self.layout.panel_visible {
@@ -1073,7 +1189,12 @@ impl WorkbenchView {
                 "Status Bar",
                 regions.status_bar,
             );
-            for (item, rect) in self.status_bar.item_rects(regions.status_bar, font) {
+            let item_rects = if let Some(merged) = self.merged_status_bar() {
+                StatusBarView::new(merged).item_rects(regions.status_bar, font)
+            } else {
+                self.status_bar.item_rects(regions.status_bar, font)
+            };
+            for (item, rect) in item_rects {
                 let role = if item.command.is_some() {
                     AccessibleRole::Button
                 } else {
@@ -1129,32 +1250,66 @@ impl WorkbenchView {
                     "Command Palette Results",
                     Rect::from_xywh(
                         regions.command_palette.min_x(),
-                        regions.command_palette.min_y() + 42.0,
+                        (regions.command_palette.min_y() + 42.0).min(regions.command_palette.max_y()),
                         regions.command_palette.width(),
                         (regions.command_palette.height() - 42.0).max(0.0),
                     ),
                 );
-                for (vis_idx, &item_idx) in palette.model.filtered.iter().enumerate() {
-                    if let Some(item) = palette.model.items.get(item_idx) {
-                        results_list.add_child(
-                            AccessibleNode::new(
-                                format!("commandPalette.item.{}", vis_idx),
-                                AccessibleRole::ListItem,
-                                item.label.clone(),
-                                Rect::from_xywh(
-                                    regions.command_palette.min_x() + 4.0,
-                                    regions.command_palette.min_y() + 42.0 + vis_idx as f32 * 26.0,
-                                    (regions.command_palette.width() - 8.0).max(0.0),
-                                    26.0,
-                                ),
-                            )
-                            .with_selected(vis_idx == palette.model.selected_index),
-                        );
+                if palette.model.mode == QuickInputMode::Line {
+                    let row_y = (regions.command_palette.min_y() + 42.0).min(regions.command_palette.max_y());
+                    let row_h = 26.0f32.min((regions.command_palette.max_y() - row_y).max(0.0));
+                    results_list.add_child(
+                        AccessibleNode::new(
+                            "commandPalette.item.0",
+                            AccessibleRole::ListItem,
+                            palette.model.line_prompt_text(),
+                            Rect::from_xywh(
+                                regions.command_palette.min_x() + 4.0f32.min(regions.command_palette.width() * 0.5),
+                                row_y,
+                                (regions.command_palette.width() - 8.0).max(0.0),
+                                row_h,
+                            ),
+                        )
+                        .with_selected(true),
+                    );
+                } else {
+                    for (vis_idx, &item_idx) in palette.model.filtered.iter().enumerate() {
+                        let row_y = regions.command_palette.min_y() + 42.0 + vis_idx as f32 * 26.0;
+                        if row_y >= regions.command_palette.max_y() {
+                            break;
+                        }
+                        let row_h = 26.0f32.min((regions.command_palette.max_y() - row_y).max(0.0));
+                        if let Some(item) = palette.model.items.get(item_idx) {
+                            results_list.add_child(
+                                AccessibleNode::new(
+                                    format!("commandPalette.item.{}", vis_idx),
+                                    AccessibleRole::ListItem,
+                                    item.label.clone(),
+                                    Rect::from_xywh(
+                                        regions.command_palette.min_x() + 4.0f32.min(regions.command_palette.width() * 0.5),
+                                        row_y,
+                                        (regions.command_palette.width() - 8.0).max(0.0),
+                                        row_h,
+                                    ),
+                                )
+                                .with_selected(vis_idx == palette.model.selected_index),
+                            );
+                        }
                     }
                 }
                 dialog.add_child(results_list);
                 root.add_child(dialog);
             }
+        }
+
+        // 7. Notifications overlay (toasts & modal dialogs)
+        for notif_node in self.notifications.accessibility_nodes(safe_bounds, font) {
+            root.add_child(notif_node);
+        }
+
+        // 8. Interactive prompt overlay (showQuickPick / showInputBox)
+        if let Some(prompt_node) = self.prompt_overlay.accessibility_node(safe_bounds, font) {
+            root.add_child(prompt_node);
         }
 
         AccessibilityTree::new(root)
@@ -1202,6 +1357,8 @@ impl View for WorkbenchView {
                 self.search_view.render(regions.sidebar, theme, font, scene);
             } else if view_id == "extensions" || view_id == "workbench.view.extensions" {
                 self.extensions_view.render(regions.sidebar, theme, font, scene);
+            } else if view_id == "testing" || view_id == "workbench.view.testing" {
+                self.testing_view.render(regions.sidebar, theme, font, scene);
             } else {
                 self.explorer.render(regions.sidebar, theme, font, scene);
             }
@@ -1209,6 +1366,45 @@ impl View for WorkbenchView {
 
         // 4. Editor area & Floating Debug Toolbar
         self.editor_area.render(regions.editor_area, theme, font, scene);
+
+        if self.pending_settings_open.load(Ordering::SeqCst)
+            && !self.editor_area.settings_views.contains_key("rustcode://settings")
+        {
+            let tab_bar_h = 35.0;
+            let tab_rect = Rect::from_xywh(
+                regions.editor_area.min_x(),
+                regions.editor_area.min_y(),
+                100.0f32.min(regions.editor_area.width()),
+                tab_bar_h,
+            );
+            if crate::is_finite_positive_rect(tab_rect) {
+                scene.push_quad(Quad::new(tab_rect).with_background(theme.tab_active_bg));
+                scene.push_text(GlyphRun::new(
+                    "Settings".to_string(),
+                    Point::new(
+                        tab_rect.min_x() + 10.0,
+                        tab_rect.min_y() + (tab_bar_h - font.line_height) / 2.0,
+                    ),
+                    tab_rect,
+                    theme.tab_active_fg,
+                    font.font_size,
+                ));
+            }
+            let content_rect = Rect::from_xywh(
+                regions.editor_area.min_x(),
+                regions.editor_area.min_y() + tab_bar_h,
+                regions.editor_area.width(),
+                (regions.editor_area.height() - tab_bar_h).max(0.0),
+            );
+            if crate::is_finite_positive_rect(content_rect) {
+                let mut settings_view = SettingsUiView::default();
+                settings_view.state.open();
+                if let Some(cfg) = &self.cached_config {
+                    settings_view.set_config(cfg.clone());
+                }
+                settings_view.render(content_rect, theme, font, scene);
+            }
+        }
 
         if self.debug_toolbar.is_visible {
             let tb_bounds = self.debug_toolbar.toolbar_bounds(regions.editor_area);
@@ -1299,7 +1495,11 @@ impl View for WorkbenchView {
 
         // 6. Status bar
         if self.layout.status_bar_visible {
-            self.status_bar.render(regions.status_bar, theme, font, scene);
+            if let Some(merged) = self.merged_status_bar() {
+                StatusBarView::new(merged).render(regions.status_bar, theme, font, scene);
+            } else {
+                self.status_bar.render(regions.status_bar, theme, font, scene);
+            }
         }
 
         // 7. Command Palette modal overlay
@@ -1310,10 +1510,39 @@ impl View for WorkbenchView {
                 palette.render(regions.command_palette, theme, font, scene);
             }
         }
+
+        // 8. Notifications overlay (toasts & modal dialogs)
+        self.notifications.render(bounds, theme, font, scene);
+
+        // 9. Interactive prompt overlay (showQuickPick / showInputBox)
+        if self.prompt_overlay.is_open() {
+            self.prompt_overlay.render(bounds, theme, font, scene);
+        }
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         let regions = self.compute_regions(bounds);
+
+        // Modal prompt overlay intercept (showQuickPick / showInputBox)
+        if self.prompt_overlay.is_open() {
+            if matches!(event, InputEvent::MouseUp(_)) {
+                self.editor_area.clear_all_drag_state();
+            }
+            let res = self.prompt_overlay.handle_event(event, bounds);
+            if let Some(act) = self.prompt_overlay.last_action.take() {
+                self.last_action = Some(WorkbenchAction::PromptAction(act));
+            }
+            return res;
+        }
+
+        // Notifications overlay (modal dialog intercepts all events; toasts intercept only button clicks)
+        let notif_res = self.notifications.handle_event(event, bounds);
+        if let Some(act) = self.notifications.last_action.take() {
+            self.last_action = Some(WorkbenchAction::NotificationAction(act));
+        }
+        if notif_res == EventResult::Consumed {
+            return EventResult::Consumed;
+        }
 
         // Modal command palette intercept
         if self.is_command_palette_open {
@@ -1335,17 +1564,44 @@ impl View for WorkbenchView {
                             let line_val = *line;
                             let col_val = *column;
                             self.close_command_palette();
-                            let path_str = path_clone.to_string_lossy().to_string();
-                            let title = path_clone.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
-                            let content = std::fs::read_to_string(&path_clone).unwrap_or_default();
-                            self.editor_area.open_file(&path_str, title, &content, false);
-                            if let Some(active_editor) = self.editor_area.active_editor_mut() {
-                                if let Some(l) = line_val {
-                                    active_editor.set_primary_position(rustcode_editor::Position::new(l.saturating_sub(1), col_val.unwrap_or(0)));
+                            let target_uri = self
+                                .editor_area
+                                .find_open_tab_uri_for_path(&path_clone)
+                                .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&path_clone));
+                            let title = path_clone
+                                .file_name()
+                                .map_or("untitled", |n| n.to_str().unwrap_or(""));
+                            let content = if self.editor_area.any_editor_for_uri(&target_uri).is_some() {
+                                String::new()
+                            } else {
+                                std::fs::read_to_string(&path_clone).unwrap_or_default()
+                            };
+                            self.editor_area.open_file(&target_uri, title, &content, false);
+                            if let Some(l) = line_val {
+                                let target_pos = rustcode_editor::Position::new(
+                                    l.saturating_sub(1),
+                                    col_val.map(|c| c.saturating_sub(1)).unwrap_or(0),
+                                );
+                                if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                    active_editor.jump_to_position_and_unfold(target_pos);
                                 }
                             }
                             self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                             self.last_action = Some(WorkbenchAction::OpenFile(path_clone));
+                            return EventResult::Consumed;
+                        }
+                        PaletteAction::JumpToLine { line, column } => {
+                            let line_val = *line;
+                            let col_val = *column;
+                            self.close_command_palette();
+                            let target_pos = rustcode_editor::Position::new(
+                                line_val.saturating_sub(1),
+                                col_val.map(|c| c.saturating_sub(1)).unwrap_or(0),
+                            );
+                            if let Some(active_editor) = self.editor_area.active_editor_mut() {
+                                active_editor.jump_to_position_and_unfold(target_pos);
+                            }
+                            self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                             return EventResult::Consumed;
                         }
                         PaletteAction::Close => {
@@ -1484,21 +1740,13 @@ impl View for WorkbenchView {
                         let res = self.extensions_view.handle_event(event, regions.sidebar);
                         self.process_extensions_action();
                         res
+                    } else if view_id == "testing" || view_id == "workbench.view.testing" {
+                        let res = self.testing_view.handle_event(event, regions.sidebar);
+                        self.process_testing_action();
+                        res
                     } else {
                         let res = self.explorer.handle_event(event, regions.sidebar);
-                        if let Some(action) = &self.explorer.last_action {
-                            match action {
-                                ExplorerAction::OpenFile(path) => {
-                                    let path_str = path.to_string_lossy().to_string();
-                                    let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
-                                    let content = std::fs::read_to_string(path).unwrap_or_default();
-                                    self.editor_area.open_file(&path_str, title, &content, true);
-                                    self.editor_area.sync_breadcrumbs(Some(&self.workspace));
-                                    self.last_action = Some(WorkbenchAction::OpenFile(path.clone()));
-                                }
-                                ExplorerAction::ToggleDir(_) => {}
-                            }
-                        }
+                        self.process_explorer_action();
                         res
                     }
                 } else if self.layout.status_bar_visible && regions.status_bar.contains(mouse.position) {
@@ -1507,8 +1755,10 @@ impl View for WorkbenchView {
                         match action {
                             StatusBarAction::ExecuteCommand(cmd) => {
                                 if cmd == "workbench.action.problems.focus" {
-                                    self.layout.panel_visible = true;
-                                    self.layout.set_panel_tab("problems");
+                                    self.layout.mutate(|l| {
+                                        l.panel_visible = true;
+                                        l.set_panel_tab("problems");
+                                    });
                                     self.focused_region = FocusedRegion::Panel;
                                 }
                                 self.last_action = Some(WorkbenchAction::ExecuteCommand(cmd.clone()));
@@ -1527,7 +1777,7 @@ impl View for WorkbenchView {
                         for (tab_id, rect) in tabs {
                             if rect.contains(mouse.position) {
                                 if tab_id == "close" {
-                                    self.layout.panel_visible = false;
+                                    self.layout.mutate(|l| l.panel_visible = false);
                                     if self.focused_region == FocusedRegion::Panel {
                                         self.focused_region = FocusedRegion::Editor;
                                     }
@@ -1693,8 +1943,14 @@ impl View for WorkbenchView {
                             let res = self.extensions_view.handle_event(event, regions.sidebar);
                             self.process_extensions_action();
                             res
+                        } else if view_id == "testing" || view_id == "workbench.view.testing" {
+                            let res = self.testing_view.handle_event(event, regions.sidebar);
+                            self.process_testing_action();
+                            res
                         } else {
-                            self.explorer.handle_event(event, regions.sidebar)
+                            let res = self.explorer.handle_event(event, regions.sidebar);
+                            self.process_explorer_action();
+                            res
                         }
                     }
                     FocusedRegion::Panel => {
@@ -1741,6 +1997,8 @@ impl View for WorkbenchView {
                         self.debug_sidebar.handle_event(event, regions.sidebar)
                     } else if view_id == "extensions" || view_id == "workbench.view.extensions" {
                         self.extensions_view.handle_event(event, regions.sidebar)
+                    } else if view_id == "testing" || view_id == "workbench.view.testing" {
+                        self.testing_view.handle_event(event, regions.sidebar)
                     } else {
                         self.explorer.handle_event(event, regions.sidebar)
                     }
@@ -2648,5 +2906,184 @@ mod tests {
             .breakpoints
             .get("file:///demo/other.rs")
             .is_some_and(|bps| !bps.is_empty()));
+    }
+
+    #[test]
+    fn test_workbench_palette_open_file_dedups_uri_and_clamps_utf16_column() {
+        use crate::quickinput::{CommandPalette, PaletteItem, PaletteItemKind};
+
+        let tmp = std::env::temp_dir().join(format!("rc_wb_open_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file_path = tmp.join("utf16.txt");
+        std::fs::write(&file_path, "line0\n🚀x\nline2\n").unwrap();
+        let uri = rustcode_platform::path_to_file_uri(&file_path);
+
+        let mut view = WorkbenchView::new();
+        view.editor_area
+            .open_file(&uri, "utf16.txt", "line0\n🚀x\nline2\n", false);
+
+        // Open same path via PaletteAction::OpenFile with 1-based line=2, col=99999
+        let mut palette = CommandPalette::new();
+        palette.set_items(vec![PaletteItem {
+            command_id: "open:u".to_string(),
+            label: "utf16.txt".to_string(),
+            category: None,
+            keybinding: None,
+            path: Some(file_path.clone()),
+            line: Some(2),
+            column: Some(99999),
+            item_kind: PaletteItemKind::File,
+        }]);
+        palette.open_mode(QuickInputMode::File);
+        view.open_command_palette(CommandPaletteView::new(palette));
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let enter_ev = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Enter,
+            rustcode_platform::keybindings::Modifiers::none(),
+        ));
+        assert_eq!(view.handle_event(&enter_ev, bounds), EventResult::Consumed);
+
+        // Did NOT duplicate tab
+        assert_eq!(view.editor_area.model.current_group_ref().tabs.len(), 1);
+        // Clamped to line 1, UTF-16 col 3 ("🚀x")
+        assert_eq!(
+            view.editor_area.active_editor().unwrap().primary_position(),
+            rustcode_editor::Position::new(1, 3)
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_workbench_view_testing_sidebar_routing_and_overlays() {
+        use rustcode_ext_host::testing::ExtHostTestManager;
+        use rustcode_ext_host::window::{
+            ExtNotificationState, ExtPromptKind, ExtPromptState, NotificationActionItem,
+            NotificationSeverity,
+        };
+        use rustcode_platform::render::{MouseButton, MouseEvent};
+        use serde_json::json;
+
+        let tmp = std::env::temp_dir().join(format!("rc_wb_m3_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let spec_path = tmp.join("spec.rs");
+        std::fs::write(&spec_path, "#[test]\nfn demo_test() {}\n").unwrap();
+        let spec_uri = rustcode_platform::path_to_file_uri(&spec_path);
+
+        let mut view = WorkbenchView::new();
+        let mgr = ExtHostTestManager::new();
+        mgr.handle_rpc_call(
+            "tests.createController",
+            &json!({ "id": "c1", "label": "Suite" }),
+        )
+        .unwrap();
+        mgr.handle_rpc_call(
+            "tests.updateItems",
+            &json!({
+                "controllerId": "c1",
+                "items": [{ "id": "demo_test", "label": "demo_test", "uri": spec_uri }]
+            }),
+        )
+        .unwrap();
+        view.testing_view.sync_from_manager(&mgr);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+
+        // Click ActivityBar slot 5 -> activates testing sidebar
+        let slot5 = Point::new(24.0, 5.0 * 48.0 + 24.0);
+        assert_eq!(
+            view.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(slot5, MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(view.layout.active_sidebar_view, "testing");
+
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("TESTING"));
+        assert!(scene.contains_text("demo_test"));
+
+        // Clicking test item opens file in editor_area and emits OpenFile
+        let tree = view.accessibility_tree(bounds, &font);
+        let item_bounds = tree
+            .find_by_role(AccessibleRole::TreeItem)
+            .into_iter()
+            .find(|n| n.name == "demo_test")
+            .unwrap()
+            .bounds;
+        assert_eq!(
+            view.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(
+                    Point::new(item_bounds.min_x() + 10.0, item_bounds.min_y() + 8.0),
+                    MouseButton::Left
+                )),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert!(view.editor_area.active_editor().is_some());
+        assert_eq!(view.last_action, Some(WorkbenchAction::OpenFile(spec_path)));
+
+        // Non-blocking toast renders alongside modal prompt & prompt intercepts Escape
+        view.notifications.sync_notifications(&[ExtNotificationState {
+            id: "n1".to_string(),
+            severity: NotificationSeverity::Info,
+            message: "ToastMsg".to_string(),
+            detail: None,
+            modal: false,
+            items: vec![NotificationActionItem {
+                title: "OK".to_string(),
+                is_close_affordance: false,
+                raw: json!("OK"),
+            }],
+            selected_action: None,
+            dismissed: false,
+            resolved: false,
+        }]);
+        view.prompt_overlay.sync_prompts(&[ExtPromptState {
+            id: "p1".to_string(),
+            client_id: None,
+            kind: ExtPromptKind::InputBox {
+                prompt: Some("Enter val".to_string()),
+                place_holder: None,
+                value: None,
+                password: false,
+                title: None,
+                has_validate_input: false,
+                options: json!({}),
+            },
+            response: None,
+            resolved: false,
+        }]);
+
+        let mut overlay_scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut overlay_scene);
+        assert!(overlay_scene.contains_text("ToastMsg"));
+        assert!(overlay_scene.contains_text("Enter val"));
+
+        assert_eq!(
+            view.handle_event(
+                &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                    KeyCode::Escape,
+                    rustcode_platform::keybindings::Modifiers::none()
+                )),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert!(!view.is_prompt_open());
+        assert_eq!(
+            view.last_action,
+            Some(WorkbenchAction::PromptAction(PromptUiAction::Cancel {
+                id: "p1".to_string()
+            }))
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

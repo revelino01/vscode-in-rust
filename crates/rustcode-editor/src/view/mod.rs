@@ -7,6 +7,7 @@ pub use minimap::MinimapState;
 use crate::completion::{AutocompleteWidget, CompletionItem, CompletionItemKind};
 use crate::cursor::{CursorState, Position, RangeEdit, Selection};
 use crate::document::TextDocument;
+use crate::find_replace::{FindReplaceClickTarget, FindReplaceFocus, FindReplaceWidget};
 use crate::folding::FoldingModel;
 use crate::model::piece_table::{utf16_col_to_byte_offset, PieceTable};
 use crate::model::undo_redo::{TextEdit, UndoRedoStack};
@@ -368,6 +369,7 @@ pub struct EditorView {
     pub folding_model: FoldingModel,
     pub word_wrap: WordWrapMode,
     pub word_wrap_column: usize,
+    pub find_replace: FindReplaceWidget,
     cursor_undo_snapshots: Vec<Option<CursorUndoSnapshot>>,
     cursor_redo_snapshots: Vec<Option<CursorUndoSnapshot>>,
     last_render_bounds: Mutex<Option<(Rect, FontMetrics)>>,
@@ -403,6 +405,7 @@ impl EditorView {
             folding_model,
             word_wrap: WordWrapMode::Off,
             word_wrap_column: 80,
+            find_replace: FindReplaceWidget::new(),
             cursor_undo_snapshots: Vec::new(),
             cursor_redo_snapshots: Vec::new(),
             last_render_bounds: Mutex::new(None),
@@ -796,6 +799,11 @@ impl EditorView {
                     );
                 }
             }
+        }
+
+        if self.find_replace.is_visible {
+            node.state.focused = false;
+            node.add_child(self.find_replace.accessibility_node(id, safe_bounds, font));
         }
 
         node
@@ -1906,6 +1914,289 @@ impl EditorView {
 
         true
     }
+
+    pub fn ensure_line_visible(&mut self, line: usize) {
+        let cached = self.last_render_bounds.lock().clone();
+        let Some((bounds, font)) = cached else {
+            return;
+        };
+        if !is_finite_positive_rect(bounds) || !font.line_height.is_finite() || font.line_height <= 0.0 {
+            return;
+        }
+        let gutter_w = self.gutter_width(&font);
+        let max_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
+        let buf = self.buffer.read();
+        let visual = VisualLayout::build(&buf, &self.folding_model, max_cols);
+        let pos = clamp_position_to_buffer(&buf, Position::new(line, 0));
+        let (vis_row, _) = visual.buffer_pos_to_visual(pos, &buf, &self.folding_model);
+        let visible_rows = (bounds.height() / font.line_height).floor().max(1.0);
+        let cur_top = if self.scroll_top.is_finite() {
+            self.scroll_top.max(0.0)
+        } else {
+            0.0
+        };
+        let row_f = vis_row as f32;
+        if row_f < cur_top || row_f >= cur_top + visible_rows {
+            self.scroll_top = (row_f - 2.0).max(0.0);
+        }
+        drop(buf);
+        self.clamp_scroll_top();
+    }
+
+    pub fn jump_to_position_and_unfold(&mut self, pos: Position) {
+        let clamped = {
+            let buf = self.buffer.read();
+            clamp_position_to_buffer(&buf, pos)
+        };
+        self.folding_model.unfold_containing(clamped.line);
+        self.cursor_state.clear_secondary_cursors();
+        self.cursor_state.set_primary(clamped);
+        self.ensure_line_visible(clamped.line);
+    }
+
+    fn selected_single_line_text(&self) -> Option<String> {
+        let primary = self.cursor_state.primary();
+        if primary.is_empty() {
+            return None;
+        }
+        let s = primary.start();
+        let e = primary.end();
+        let buf = self.buffer.read();
+        let s_off = buf.position_to_offset(s.line, s.column);
+        let e_off = buf.position_to_offset(e.line, e.column);
+        if e_off <= s_off {
+            return None;
+        }
+        let text = buf.get_range(s_off, e_off);
+        if text.is_empty() || text.contains('\n') || text.contains('\r') {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    fn primary_start_offset(&self) -> usize {
+        let s = self.cursor_state.primary().start();
+        self.buffer.read().position_to_offset(s.line, s.column)
+    }
+
+    pub fn open_find(&mut self) {
+        self.autocomplete.hide();
+        self.is_focused = true;
+        let prefill = self.selected_single_line_text();
+        let origin = self.primary_start_offset();
+        self.find_replace.open_find(prefill, origin);
+        if !self.find_replace.query.is_empty() {
+            self.recompute_find_matches(true);
+        }
+    }
+
+    pub fn open_replace(&mut self) {
+        self.autocomplete.hide();
+        self.is_focused = true;
+        let prefill = self.selected_single_line_text();
+        let origin = self.primary_start_offset();
+        self.find_replace.open_replace(prefill, origin);
+        if !self.find_replace.query.is_empty() {
+            self.recompute_find_matches(true);
+        }
+    }
+
+    pub fn close_find(&mut self) {
+        self.find_replace.close();
+        self.is_focused = true;
+    }
+
+    fn recompute_find_matches(&mut self, jump_to_current: bool) {
+        {
+            let buf = self.buffer.read();
+            self.find_replace.compute_matches(&buf);
+        }
+        if jump_to_current {
+            if let Some(idx) = self.find_replace.current_match {
+                self.jump_to_find_match(idx);
+            }
+        }
+    }
+
+    fn jump_to_find_match(&mut self, idx: usize) {
+        let Some(m) = self.find_replace.matches.get(idx).cloned() else {
+            return;
+        };
+        self.folding_model.unfold_containing(m.range.start.line);
+        self.folding_model.unfold_containing(m.range.end.line);
+        self.cursor_state.clear_secondary_cursors();
+        *self.cursor_state.primary_mut() = Selection::new(m.range.start, m.range.end);
+        self.ensure_line_visible(m.range.start.line);
+    }
+
+    pub fn find_next(&mut self) -> bool {
+        if let Some(idx) = self.find_replace.next_match() {
+            self.jump_to_find_match(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn find_prev(&mut self) -> bool {
+        if let Some(idx) = self.find_replace.prev_match() {
+            self.jump_to_find_match(idx);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_offset_edits(&mut self, mut offset_edits: Vec<(usize, usize, String)>) -> bool {
+        if offset_edits.is_empty() {
+            return false;
+        }
+        let pre_sels = self.cursor_state.selections.clone();
+        let prev_past_len = self.undo_stack.past_len();
+
+        offset_edits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+
+        let mut fold_shifts: Vec<(usize, isize)> = Vec::new();
+        let mut any_changed = false;
+        self.undo_stack.begin_group();
+        {
+            let mut buf = self.buffer.write();
+            for (start_offset, end_offset, new_text) in offset_edits {
+                let start = buf.floor_char_boundary(start_offset.min(buf.len()));
+                let end = buf.floor_char_boundary(end_offset.min(buf.len())).max(start);
+                let del_len = end.saturating_sub(start);
+                if del_len == 0 && new_text.is_empty() {
+                    continue;
+                }
+                any_changed = true;
+                let edit_start_line = buf.offset_to_position(start).0;
+                let deleted_text = if del_len > 0 {
+                    buf.delete(start, del_len)
+                } else {
+                    String::new()
+                };
+                if !new_text.is_empty() {
+                    buf.insert(start, &new_text);
+                }
+                let del_lines = deleted_text.bytes().filter(|&b| b == b'\n').count() as isize;
+                let ins_lines = new_text.bytes().filter(|&b| b == b'\n').count() as isize;
+                let delta = ins_lines - del_lines;
+                if delta != 0 {
+                    fold_shifts.push((edit_start_line, delta));
+                }
+                self.undo_stack.push_edit(TextEdit::replace(
+                    start,
+                    &deleted_text,
+                    &new_text,
+                ));
+            }
+        }
+        self.undo_stack.end_group();
+        if !any_changed {
+            return false;
+        }
+
+        let (new_line, new_col) = {
+            let buf = self.buffer.read();
+            let primary = self.primary_position();
+            let offset = buf.position_to_offset(primary.line, primary.column).min(buf.len());
+            let pos = buf.offset_to_position(offset);
+            let lang = self.detected_language_id();
+            for &(edit_line, delta) in &fold_shifts {
+                self.folding_model.shift_lines_for_edit(edit_line, delta);
+            }
+            self.folding_model.recompute(&buf, lang.as_deref());
+            pos
+        };
+        self.cursor_state.clear_secondary_cursors();
+        self.cursor_state.set_primary(Position::new(new_line, new_col));
+        let post_sels = self.cursor_state.selections.clone();
+        self.record_cursor_undo_snapshot(prev_past_len, pre_sels, post_sels, fold_shifts);
+        self.folding_model.unfold_containing(new_line);
+        self.clamp_scroll_top();
+
+        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+            sh.invalidate_all();
+        }
+        if let Some(doc) = &self.document {
+            doc.write().mark_edited();
+        }
+        true
+    }
+
+    pub fn replace_current(&mut self) -> bool {
+        if self.find_replace.error.is_some()
+            || self.find_replace.query.is_empty()
+            || self.find_replace.matches.is_empty()
+        {
+            return false;
+        }
+        let idx = self
+            .find_replace
+            .current_match
+            .unwrap_or(0)
+            .min(self.find_replace.matches.len() - 1);
+        let m = self.find_replace.matches[idx].clone();
+        let full_text = self.buffer.read().to_string();
+        let rep = self
+            .find_replace
+            .compute_replacement_for_match(&full_text, &m);
+        if m.start_offset == m.end_offset {
+            let next_origin_in_orig =
+                crate::find_replace::advance_past_zero_width(&full_text, m.start_offset);
+            if rep.is_empty() {
+                self.find_replace.search_origin_offset = next_origin_in_orig;
+                self.recompute_find_matches(true);
+                return true;
+            }
+            let next_origin = next_origin_in_orig.saturating_add(rep.len());
+            if self.apply_offset_edits(vec![(m.start_offset, m.end_offset, rep)]) {
+                self.find_replace.search_origin_offset = next_origin;
+                self.recompute_find_matches(true);
+                true
+            } else {
+                false
+            }
+        } else {
+            let after_off = m.start_offset + rep.len();
+            if self.apply_offset_edits(vec![(m.start_offset, m.end_offset, rep)]) {
+                self.find_replace.search_origin_offset = after_off;
+                self.recompute_find_matches(true);
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    pub fn replace_all(&mut self) -> usize {
+        if self.find_replace.error.is_some()
+            || self.find_replace.query.is_empty()
+            || self.find_replace.matches.is_empty()
+        {
+            return 0;
+        }
+        let count = self.find_replace.matches.len();
+        let full_text = self.buffer.read().to_string();
+        let edits: Vec<(usize, usize, String)> = self
+            .find_replace
+            .matches
+            .iter()
+            .map(|m| {
+                let rep = self
+                    .find_replace
+                    .compute_replacement_for_match(&full_text, m);
+                (m.start_offset, m.end_offset, rep)
+            })
+            .collect();
+        if self.apply_offset_edits(edits) {
+            self.recompute_find_matches(false);
+            count
+        } else {
+            0
+        }
+    }
 }
 
 impl View for EditorView {
@@ -2198,6 +2489,55 @@ impl View for EditorView {
                                 scene,
                                 Quad::new(sel_rect).with_background(theme.editor_selection),
                             );
+                        }
+                    }
+                }
+            }
+
+            // 5b2. Find/Replace match highlights intersecting this visual segment
+            if self.find_replace.is_visible {
+                for (m_idx, m) in self.find_replace.matches.iter().enumerate() {
+                    if line_idx >= m.range.start.line && line_idx <= m.range.end.line {
+                        let line_start_col = if line_idx == m.range.start.line {
+                            m.range.start.column
+                        } else {
+                            0
+                        };
+                        let line_end_col = if line_idx == m.range.end.line {
+                            m.range.end.column
+                        } else {
+                            line_utf16_len
+                        };
+                        let seg_m_start = line_start_col.clamp(seg.utf16_start, seg.utf16_end);
+                        let seg_m_end = line_end_col.clamp(seg.utf16_start, seg.utf16_end);
+                        if seg_m_end > seg_m_start
+                            || (seg_m_start == seg_m_end
+                                && m.range.start == m.range.end
+                                && line_idx == m.range.start.line
+                                && seg_m_start >= seg.utf16_start
+                                && (seg.is_last_segment || seg_m_start < seg.utf16_end))
+                        {
+                            let start_visual = utf16_col_to_char_count(
+                                seg_text,
+                                seg_m_start - seg.utf16_start,
+                            );
+                            let end_visual = utf16_col_to_char_count(
+                                seg_text,
+                                seg_m_end - seg.utf16_start,
+                            );
+                            let hl_x = text_area_x
+                                + (start_visual as f32 - scroll_left) * font.char_width;
+                            let hl_w = ((end_visual.saturating_sub(start_visual)) as f32
+                                * font.char_width)
+                                .max(4.0);
+                            let hl_rect = Rect::from_xywh(hl_x, line_y, hl_w, font.line_height);
+                            let is_current = self.find_replace.current_match == Some(m_idx);
+                            let color = if is_current {
+                                Rgba::new(0.92, 0.55, 0.12, 0.45)
+                            } else {
+                                Rgba::new(0.80, 0.45, 0.10, 0.22)
+                            };
+                            push_finite_quad(scene, Quad::new(hl_rect).with_background(color));
                         }
                     }
                 }
@@ -2525,6 +2865,11 @@ impl View for EditorView {
                 );
             }
         }
+
+        // 8. Find & Replace widget overlay
+        if self.find_replace.is_visible {
+            self.find_replace.render(bounds, theme, font, scene);
+        }
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
@@ -2561,6 +2906,50 @@ impl View for EditorView {
                     return EventResult::Ignored;
                 }
                 self.is_focused = true;
+                let find_target = if self.find_replace.is_visible {
+                    self.find_replace.hit_test(mouse.position, bounds, &font)
+                } else {
+                    None
+                };
+                if let Some(target) = find_target {
+                    match target {
+                        FindReplaceClickTarget::Close => {
+                            self.close_find();
+                        }
+                        FindReplaceClickTarget::FindInput => {
+                            self.find_replace.focus = FindReplaceFocus::FindInput;
+                        }
+                        FindReplaceClickTarget::ReplaceInput => {
+                            self.find_replace.focus = FindReplaceFocus::ReplaceInput;
+                        }
+                        FindReplaceClickTarget::MatchCase => {
+                            self.find_replace.case_sensitive = !self.find_replace.case_sensitive;
+                            self.recompute_find_matches(true);
+                        }
+                        FindReplaceClickTarget::WholeWord => {
+                            self.find_replace.whole_word = !self.find_replace.whole_word;
+                            self.recompute_find_matches(true);
+                        }
+                        FindReplaceClickTarget::Regex => {
+                            self.find_replace.is_regex = !self.find_replace.is_regex;
+                            self.recompute_find_matches(true);
+                        }
+                        FindReplaceClickTarget::PrevMatch => {
+                            self.find_prev();
+                        }
+                        FindReplaceClickTarget::NextMatch => {
+                            self.find_next();
+                        }
+                        FindReplaceClickTarget::ReplaceOne => {
+                            self.replace_current();
+                        }
+                        FindReplaceClickTarget::ReplaceAll => {
+                            self.replace_all();
+                        }
+                        FindReplaceClickTarget::Widget => {}
+                    }
+                    return EventResult::Consumed;
+                }
                 let scroll_top = if self.scroll_top.is_finite() {
                     self.scroll_top.max(0.0)
                 } else {
@@ -2747,6 +3136,113 @@ impl View for EditorView {
                 self.hover_position = None;
                 if !self.is_focused {
                     return EventResult::Ignored;
+                }
+
+                // Direct Find/Replace shortcuts (when not intercepted by WorkbenchWindow keybindings)
+                if key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta && !key.modifiers.shift {
+                    if key.key == KeyCode::Char('f') {
+                        self.open_find();
+                        return EventResult::Consumed;
+                    } else if key.key == KeyCode::Char('h') {
+                        self.open_replace();
+                        return EventResult::Consumed;
+                    }
+                }
+
+                // Route keys to Find & Replace widget when visible
+                if self.find_replace.is_visible {
+                    match &key.key {
+                        KeyCode::Escape => {
+                            self.close_find();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Tab if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                            if self.find_replace.show_replace {
+                                self.find_replace.focus = match self.find_replace.focus {
+                                    FindReplaceFocus::FindInput => FindReplaceFocus::ReplaceInput,
+                                    FindReplaceFocus::ReplaceInput => FindReplaceFocus::FindInput,
+                                };
+                            }
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::F3 if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                            if key.modifiers.shift {
+                                self.find_prev();
+                            } else {
+                                self.find_next();
+                            }
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Enter if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                            if key.modifiers.shift {
+                                self.find_prev();
+                            } else if self.find_replace.focus == FindReplaceFocus::ReplaceInput {
+                                self.replace_current();
+                            } else {
+                                self.find_next();
+                            }
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Backspace if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                            match self.find_replace.focus {
+                                FindReplaceFocus::FindInput => {
+                                    self.find_replace.query.pop();
+                                    self.recompute_find_matches(true);
+                                }
+                                FindReplaceFocus::ReplaceInput => {
+                                    self.find_replace.replacement.pop();
+                                }
+                            }
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Space if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                            match self.find_replace.focus {
+                                FindReplaceFocus::FindInput => {
+                                    self.find_replace.query.push(' ');
+                                    self.recompute_find_matches(true);
+                                }
+                                FindReplaceFocus::ReplaceInput => {
+                                    self.find_replace.replacement.push(' ');
+                                }
+                            }
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Char(c) if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                            let text_to_push = match &key.text {
+                                Some(txt) if !txt.is_empty() => txt.clone(),
+                                _ => {
+                                    let ch = if key.modifiers.shift {
+                                        c.to_ascii_uppercase()
+                                    } else {
+                                        *c
+                                    };
+                                    ch.to_string()
+                                }
+                            };
+                            match self.find_replace.focus {
+                                FindReplaceFocus::FindInput => {
+                                    self.find_replace.query.push_str(&text_to_push);
+                                    self.recompute_find_matches(true);
+                                }
+                                FindReplaceFocus::ReplaceInput => {
+                                    self.find_replace.replacement.push_str(&text_to_push);
+                                }
+                            }
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::ArrowLeft
+                        | KeyCode::ArrowRight
+                        | KeyCode::ArrowUp
+                        | KeyCode::ArrowDown
+                        | KeyCode::Home
+                        | KeyCode::End
+                        | KeyCode::Delete
+                            if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta =>
+                        {
+                            return EventResult::Consumed;
+                        }
+                        _ => {}
+                    }
                 }
 
                 // Multi-cursor & folding direct keybindings
@@ -5978,6 +6474,230 @@ mod tests {
             assert!(unrendered.last_render_bounds.lock().is_none());
             assert_eq!(unrendered.scroll_top, 0.0);
         }
+    }
+
+    #[test]
+    fn test_editor_view_find_replace_single_undo_utf16_crlf_and_fold_unfold() {
+        // 1. Replace All is a single atomic undo entry and preserves UTF-16 + CRLF
+        let original = "🚀 café\r\nhello café\r\n";
+        let doc = Arc::new(RwLock::new(TextDocument::new(original, None, Some("plaintext"))));
+        let mut view = EditorView::new(doc.read().buffer.clone()).with_document(doc.clone());
+
+        view.open_replace();
+        view.find_replace.query = "café".to_string();
+        view.recompute_find_matches(true);
+        assert_eq!(view.find_replace.matches.len(), 2);
+        assert_eq!(view.find_replace.status_text(), "1 of 2");
+        assert_eq!(view.find_replace.matches[0].range.start, Position::new(0, 3));
+        assert_eq!(view.find_replace.matches[0].range.end, Position::new(0, 7));
+
+        view.find_replace.replacement = "espresso".to_string();
+        let replaced = view.replace_all();
+        assert_eq!(replaced, 2);
+        assert_eq!(view.text(), "🚀 espresso\r\nhello espresso\r\n");
+        assert!(view.is_dirty());
+
+        // Single undo reverts both replacements atomically
+        assert!(view.undo());
+        assert_eq!(view.text(), original);
+
+        // Single redo reapplies both replacements atomically
+        assert!(view.redo());
+        assert_eq!(view.text(), "🚀 espresso\r\nhello espresso\r\n");
+
+        // 2. Selection-seeded open_find & collapsed fold auto-unfold
+        let mut fold_view = EditorView::from_str("fn outer() {\n    let hidden = 1;\n}\n");
+        fold_view.set_primary_position(Position::new(0, 0));
+        assert!(fold_view.fold_at_cursor());
+        assert!(fold_view.folding_model.is_collapsed(0));
+
+        fold_view.open_find();
+        fold_view.find_replace.query = "hidden".to_string();
+        fold_view.recompute_find_matches(true);
+        assert!(!fold_view.folding_model.is_collapsed(0));
+        assert_eq!(fold_view.primary_position().line, 1);
+
+        // 3. Invalid regex does not panic or mutate buffer
+        let before = fold_view.text();
+        fold_view.open_replace();
+        fold_view.find_replace.is_regex = true;
+        fold_view.find_replace.query = "[unclosed".to_string();
+        fold_view.recompute_find_matches(true);
+        assert!(fold_view.find_replace.error.is_some());
+        assert_eq!(fold_view.replace_all(), 0);
+        assert_eq!(fold_view.text(), before);
+
+        // 4. Selection-seeded Ctrl+F
+        let mut sel_view = EditorView::from_str("word one\nword two\n");
+        *sel_view.cursor_state.primary_mut() =
+            Selection::new(Position::new(0, 0), Position::new(0, 4));
+        sel_view.open_find();
+        assert_eq!(sel_view.find_replace.query, "word");
+        assert_eq!(sel_view.find_replace.status_text(), "1 of 2");
+        assert!(sel_view.find_next());
+        assert_eq!(sel_view.find_replace.status_text(), "2 of 2");
+        assert!(sel_view.find_next());
+        assert_eq!(sel_view.find_replace.status_text(), "1 of 2");
+        assert!(sel_view.find_prev());
+        assert_eq!(sel_view.find_replace.status_text(), "2 of 2");
+    }
+
+    #[test]
+    fn test_editor_view_find_replace_tier5_zero_width_regex_and_emoji_crlf() {
+        // Zero-width regex Replace All on emoji + CRLF terminates cleanly and never corrupts \r\n
+        let mut view = EditorView::from_str("😀\r\na😀b\r\n");
+        view.open_replace();
+        view.find_replace.is_regex = true;
+        view.find_replace.query = "^".to_string();
+        view.find_replace.replacement = "> ".to_string();
+        view.recompute_find_matches(false);
+        let replaced = view.replace_all();
+        assert_eq!(replaced, 3);
+        assert_eq!(view.text(), "> 😀\r\n> a😀b\r\n> ");
+        assert!(view.undo());
+        assert_eq!(view.text(), "😀\r\na😀b\r\n");
+
+        // Lookaround and malformed regexes fail safely without mutating buffer
+        for pat in ["(?=a)", "(?invalid"] {
+            view.find_replace.query = pat.to_string();
+            view.recompute_find_matches(false);
+            assert!(view.find_replace.error.is_some());
+            assert_eq!(view.replace_all(), 0);
+            assert_eq!(view.text(), "😀\r\na😀b\r\n");
+        }
+    }
+
+    #[test]
+    fn test_editor_view_replace_current_zero_width_empty_replacement_advances() {
+        let mut view = EditorView::from_str("😀\r\nfoo\r\n");
+        view.open_replace();
+        view.find_replace.is_regex = true;
+        view.find_replace.query = "^".to_string();
+        view.find_replace.replacement = String::new();
+        view.recompute_find_matches(true);
+
+        assert_eq!(view.find_replace.matches.len(), 3);
+        assert_eq!(view.find_replace.current_match, Some(0));
+
+        // Each replace_current() advances cleanly without pushing no-op undo entries
+        assert!(view.replace_current());
+        assert_eq!(view.find_replace.current_match, Some(1));
+        assert!(!view.undo_stack.can_undo());
+
+        assert!(view.replace_current());
+        assert_eq!(view.find_replace.current_match, Some(2));
+        assert!(!view.undo_stack.can_undo());
+
+        // Advancing from EOF match wraps back to match 0
+        assert!(view.replace_current());
+        assert_eq!(view.find_replace.current_match, Some(0));
+        assert_eq!(view.text(), "😀\r\nfoo\r\n");
+        assert!(!view.undo_stack.can_undo());
+
+        // Also check CRLF-only lines ("\r\n\r\n") advance cleanly past 2-byte CRLF
+        let mut crlf_view = EditorView::from_str("\r\n\r\n");
+        crlf_view.open_replace();
+        crlf_view.find_replace.is_regex = true;
+        crlf_view.find_replace.query = "^".to_string();
+        crlf_view.find_replace.replacement = String::new();
+        crlf_view.recompute_find_matches(true);
+        assert_eq!(crlf_view.find_replace.current_match, Some(0));
+        assert!(crlf_view.replace_current());
+        assert_eq!(crlf_view.find_replace.current_match, Some(1));
+        assert!(!crlf_view.undo_stack.can_undo());
+    }
+
+    #[test]
+    fn test_editor_view_replace_current_zero_width_non_empty_converges_and_replace_all_noop() {
+        let cases: &[(&str, &str, &str, usize, &str)] = &[
+            ("😀\r\nfoo\r\n", "$", "X", 3, "😀X\r\nfooX\r\nX"),
+            ("😀\r\nfoo\r\n", "a*", "X", 7, "X😀X\r\nXfXoXoX\r\nX"),
+            ("😀\r\nfoo\r\n", ".*", "X", 5, "XX\r\nXX\r\nX"),
+            ("\r\n\r\n", "$", "X", 3, "X\r\nX\r\nX"),
+            ("\r\n\r\n", ".*", "X", 3, "X\r\nX\r\nX"),
+            ("aaab", "a*", "X", 3, "XXbX"),
+            ("😀\r\nfoo\r\n", "^", "X\n", 3, "X\n😀\r\nX\nfoo\r\nX\n"),
+            ("", ".*", "X", 1, "X"),
+        ];
+
+        for &(initial, query, rep, expected_steps, expected_text) in cases {
+            let mut view = EditorView::from_str(initial);
+            view.open_replace();
+            view.find_replace.is_regex = true;
+            view.find_replace.query = query.to_string();
+            view.find_replace.replacement = rep.to_string();
+            view.recompute_find_matches(true);
+            assert_eq!(
+                view.find_replace.matches.len(),
+                expected_steps,
+                "initial={initial:?} query={query:?}"
+            );
+
+            for step in 0..expected_steps {
+                assert!(
+                    view.replace_current(),
+                    "step {step} failed for initial={initial:?} query={query:?}"
+                );
+            }
+            assert_eq!(
+                view.text(),
+                expected_text,
+                "diverged for initial={initial:?} query={query:?} rep={rep:?}"
+            );
+            assert_eq!(
+                view.find_replace.current_match,
+                Some(0),
+                "did not wrap to Some(0) for initial={initial:?} query={query:?}"
+            );
+
+            // Verify N replace_current steps converge identically to replace_all
+            let mut all_view = EditorView::from_str(initial);
+            all_view.open_replace();
+            all_view.find_replace.is_regex = true;
+            all_view.find_replace.query = query.to_string();
+            all_view.find_replace.replacement = rep.to_string();
+            all_view.recompute_find_matches(false);
+            assert_eq!(all_view.replace_all(), expected_steps);
+            assert_eq!(all_view.text(), expected_text);
+
+            // Undo step-by-step restores initial text
+            for _ in 0..expected_steps {
+                assert!(view.undo());
+            }
+            assert_eq!(view.text(), initial);
+            assert!(!view.undo_stack.can_undo());
+        }
+
+        // replace_all() on zero-width regex with empty replacement is a true no-op
+        let doc = Arc::new(RwLock::new(TextDocument::new(
+            "😀\r\nfoo\r\n",
+            None,
+            Some("plaintext"),
+        )));
+        let mut noop_view =
+            EditorView::new(doc.read().buffer.clone()).with_document(doc.clone());
+        noop_view.open_replace();
+        noop_view.find_replace.is_regex = true;
+        noop_view.find_replace.query = "^".to_string();
+        noop_view.find_replace.replacement = String::new();
+        noop_view.recompute_find_matches(false);
+        assert_eq!(noop_view.replace_all(), 0);
+        assert!(!noop_view.undo_stack.can_undo());
+        assert!(!noop_view.is_dirty());
+        assert_eq!(noop_view.text(), "😀\r\nfoo\r\n");
+
+        // Mixed zero-width + non-zero-width with empty replacement applies only the real edit
+        let mut mixed_view = EditorView::from_str("aaab");
+        mixed_view.open_replace();
+        mixed_view.find_replace.is_regex = true;
+        mixed_view.find_replace.query = "a*".to_string();
+        mixed_view.find_replace.replacement = String::new();
+        mixed_view.recompute_find_matches(false);
+        assert_eq!(mixed_view.replace_all(), 3);
+        assert_eq!(mixed_view.text(), "b");
+        assert!(mixed_view.undo_stack.can_undo());
+        assert!(mixed_view.undo());
+        assert_eq!(mixed_view.text(), "aaab");
     }
 }
 

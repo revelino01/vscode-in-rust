@@ -271,6 +271,7 @@ let nextTerminalId = 1;
 let nextPromptClientId = 1;
 
 let _activeTextEditor = undefined;
+let _activeTextEditorFromSync = false;
 let _visibleTextEditors = [];
 const _onDidChangeActiveTextEditor = new EventEmitter();
 const _onDidChangeVisibleTextEditors = new EventEmitter();
@@ -301,9 +302,13 @@ const window = {
     if (rpc.hasSyncTransport()) {
       const raw = rpc.callSync('window.getActiveTextEditor');
       if (raw === null) {
-        _activeTextEditor = undefined;
+        if (_activeTextEditorFromSync) {
+          _activeTextEditor = undefined;
+          _activeTextEditorFromSync = false;
+        }
       } else if (raw !== undefined) {
         _activeTextEditor = wrapTextEditor(raw);
+        _activeTextEditorFromSync = Boolean(_activeTextEditor);
       }
     }
     return _activeTextEditor;
@@ -354,6 +359,7 @@ const window = {
     if (editor) {
       if (!resolvedPreserveFocus || !_activeTextEditor) {
         _activeTextEditor = editor;
+        _activeTextEditorFromSync = false;
       }
       if (!_visibleTextEditors.some((e) => e.document.uri.toString() === editor.document.uri.toString())) {
         _visibleTextEditors.push(editor);
@@ -485,6 +491,17 @@ const window = {
         : await rpcPromise;
       if ((token && token.isCancellationRequested) || res === null || res === undefined) {
         return undefined;
+      }
+      if (hasValidateInput && typeof options.validateInput === 'function') {
+        const validationResult = await options.validateInput(res);
+        const invalidMsg = typeof validationResult === 'string'
+          ? validationResult
+          : (validationResult && typeof validationResult === 'object' && typeof validationResult.message === 'string'
+              ? validationResult.message
+              : '');
+        if (invalidMsg) {
+          return undefined;
+        }
       }
       return res;
     } finally {
@@ -656,6 +673,7 @@ const window = {
 rpc.createEvent('window.onDidChangeActiveTextEditor')((payload) => {
   const editor = wrapTextEditor(payload);
   _activeTextEditor = editor;
+  _activeTextEditorFromSync = Boolean(editor);
   _onDidChangeActiveTextEditor.fire(editor);
 });
 

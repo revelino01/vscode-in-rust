@@ -16,6 +16,7 @@ pub mod explorer;
 pub mod extensions_view;
 pub mod layout;
 pub mod notebook;
+pub mod notifications;
 pub mod output_panel;
 pub mod problems;
 pub mod quickinput;
@@ -24,6 +25,7 @@ pub mod search;
 pub mod settings_ui;
 pub mod statusbar;
 pub mod terminal_panel;
+pub mod testing;
 pub mod webview;
 pub mod window;
 pub mod workbench_view;
@@ -50,6 +52,10 @@ pub use notebook::{
     CellKind, CellOutput, KernelValue, NotebookAction, NotebookCell, NotebookClickTarget,
     NotebookDocument, NotebookEditorView, NotebookKernel,
 };
+pub use notifications::{
+    ActivePromptKind, ActivePromptUi, NotificationUiAction, NotificationsOverlay, PromptOverlay,
+    PromptUiAction,
+};
 pub use output_panel::{
     OutputAction, OutputChannelData, OutputClickTarget, OutputPanelView, DEFAULT_MAX_SCROLLBACK,
 };
@@ -65,6 +71,7 @@ pub use statusbar::{
     StatusBar, StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView,
 };
 pub use terminal_panel::{TerminalAction, TerminalClickTarget, TerminalPanelView};
+pub use testing::{decode_test_uri_to_path, TestingAction, TestingSidebarView, TestingTreeRow};
 pub use webview::{ParsedWebviewNode, WebviewEditorView, WebviewElementKind};
 pub use window::WorkbenchWindow;
 pub use workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchRegions, WorkbenchView};

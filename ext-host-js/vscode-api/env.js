@@ -190,7 +190,7 @@ async function _activateLocalModule(ext) {
     const mainRel = ext.packageJSON && typeof ext.packageJSON.main === 'string'
       ? ext.packageJSON.main.trim()
       : '';
-    let exportsVal = undefined;
+    let exportsVal = ext.exports;
     let mod = null;
     let context = null;
 
@@ -267,8 +267,15 @@ function normalizeExtension(raw) {
       }
       if (!ext.isActive && (rpc.isLiveStdioMode() || rpc.hasSyncTransport() || hasDenoOps)) {
         const res = await rpc.call('extensions.activate', { id: ext.id });
+        if (res && res.activated === false) {
+          ext.isActive = false;
+          return undefined;
+        }
         if (res && res.activated) {
           ext.isActive = true;
+          if (res.exports !== undefined) {
+            ext.exports = res.exports;
+          }
         }
       }
       return await _activateLocalModule(ext);

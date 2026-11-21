@@ -485,6 +485,184 @@ impl Default for ExtEnvironmentInfo {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtOsInfo {
+    pub platform: String,
+    pub arch: String,
+    pub eol: String,
+    pub homedir: String,
+    pub tmpdir: String,
+    #[serde(rename = "type")]
+    pub os_type: String,
+    pub release: String,
+    pub machine: String,
+    pub hostname: String,
+    pub endianness: String,
+    pub cpus: usize,
+    pub username: String,
+}
+
+impl ExtOsInfo {
+    pub fn detect() -> Self {
+        let platform = match std::env::consts::OS {
+            "windows" => "win32",
+            "macos" => "darwin",
+            "linux" => "linux",
+            other => other,
+        }
+        .to_string();
+
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "x64",
+            "aarch64" => "arm64",
+            "x86" => "ia32",
+            other => other,
+        }
+        .to_string();
+
+        let os_type = match std::env::consts::OS {
+            "windows" => "Windows_NT",
+            "macos" => "Darwin",
+            "linux" => "Linux",
+            other => other,
+        }
+        .to_string();
+
+        let eol = if cfg!(windows) { "\r\n" } else { "\n" }.to_string();
+        let endianness = if cfg!(target_endian = "big") {
+            "BE"
+        } else {
+            "LE"
+        }
+        .to_string();
+
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .max(1);
+
+        Self {
+            platform,
+            arch,
+            eol,
+            homedir: detect_homedir(),
+            tmpdir: detect_tmpdir(),
+            os_type,
+            release: detect_os_release(),
+            machine: std::env::consts::ARCH.to_string(),
+            hostname: detect_hostname(),
+            endianness,
+            cpus,
+            username: detect_username(),
+        }
+    }
+}
+
+impl Default for ExtOsInfo {
+    fn default() -> Self {
+        Self::detect()
+    }
+}
+
+fn detect_homedir() -> String {
+    #[cfg(windows)]
+    {
+        if let Some(up) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            let cleaned =
+                rustcode_platform::strip_windows_verbatim_prefix(std::path::PathBuf::from(up));
+            let s = cleaned.to_string_lossy().into_owned();
+            if !s.trim().is_empty() {
+                return s;
+            }
+        }
+        if let (Some(hd), Some(hp)) = (
+            std::env::var_os("HOMEDRIVE").filter(|v| !v.is_empty()),
+            std::env::var_os("HOMEPATH").filter(|v| !v.is_empty()),
+        ) {
+            let mut combined = hd.to_string_lossy().into_owned();
+            combined.push_str(&hp.to_string_lossy());
+            if !combined.trim().is_empty() {
+                return combined;
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            let s = home.to_string_lossy().into_owned();
+            if !s.trim().is_empty() {
+                return s;
+            }
+        }
+        "C:\\Users\\user".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOME")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "/home/user".to_string())
+    }
+}
+
+fn detect_tmpdir() -> String {
+    let tmp = rustcode_platform::strip_windows_verbatim_prefix(std::env::temp_dir());
+    let s = tmp.to_string_lossy().into_owned();
+    if !s.trim().is_empty() {
+        s
+    } else if cfg!(windows) {
+        "C:\\Windows\\Temp".to_string()
+    } else {
+        "/tmp".to_string()
+    }
+}
+
+fn detect_os_release() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(content) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+            let trimmed = content.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    if cfg!(windows) {
+        "10.0.0".to_string()
+    } else {
+        "0.0.0".to_string()
+    }
+}
+
+fn detect_hostname() -> String {
+    for key in ["COMPUTERNAME", "HOSTNAME"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(content) = std::fs::read_to_string("/etc/hostname") {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    "localhost".to_string()
+}
+
+fn detect_username() -> String {
+    for key in ["USERNAME", "USER", "LOGNAME"] {
+        if let Ok(val) = std::env::var(key) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    "user".to_string()
+}
+
 #[derive(Clone)]
 pub struct ExtHostEnvManager {
     clipboard_backend: Arc<RwLock<Arc<dyn ClipboardBackend>>>,
@@ -556,6 +734,10 @@ impl ExtHostEnvManager {
 
     pub fn environment(&self) -> ExtEnvironmentInfo {
         self.environment.read().clone()
+    }
+
+    pub fn os_info(&self) -> ExtOsInfo {
+        ExtOsInfo::detect()
     }
 
     pub fn with_app_root(self, root: impl AsRef<Path>) -> Self {
@@ -768,6 +950,7 @@ impl ExtHostEnvManager {
     pub fn handle_rpc_call(&self, method: &str, params: &Value) -> Result<Value, String> {
         match method {
             "env.getEnvironment" => Ok(serde_json::to_value(self.environment()).unwrap_or_else(|_| json!({}))),
+            "env.getOsInfo" => Ok(serde_json::to_value(self.os_info()).unwrap_or_else(|_| json!({}))),
             "env.clipboardRead" => self
                 .try_clipboard_read()
                 .map(|v| json!(v))
@@ -1142,5 +1325,39 @@ mod tests {
         assert!(envs.iter().any(|(k, v)| {
             *k == "RUSTCODE_OPEN_URI" && v.as_deref() == Some(std::ffi::OsStr::new(uri))
         }));
+    }
+
+    #[test]
+    fn test_env_get_os_info_returns_valid_host_metadata() {
+        let mgr = ExtHostEnvManager::new();
+        let info = mgr.handle_rpc_call("env.getOsInfo", &json!({})).unwrap();
+
+        let expected_platform = if cfg!(windows) {
+            "win32"
+        } else if cfg!(target_os = "macos") {
+            "darwin"
+        } else {
+            "linux"
+        };
+        assert_eq!(info["platform"], json!(expected_platform));
+        assert!(info["arch"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(
+            info["eol"],
+            json!(if cfg!(windows) { "\r\n" } else { "\n" })
+        );
+        assert!(info["homedir"].as_str().is_some_and(|s| !s.is_empty()));
+        let tmpdir = info["tmpdir"].as_str().expect("tmpdir string");
+        assert!(!tmpdir.is_empty());
+        assert!(
+            !tmpdir.starts_with(r"\\?\"),
+            "tmpdir must strip Windows verbatim prefix: {}",
+            tmpdir
+        );
+        assert!(info["type"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(info["release"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(info["hostname"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(matches!(info["endianness"].as_str(), Some("LE" | "BE")));
+        assert!(info["cpus"].as_u64().is_some_and(|n| n >= 1));
+        assert!(info["username"].as_str().is_some_and(|s| !s.is_empty()));
     }
 }

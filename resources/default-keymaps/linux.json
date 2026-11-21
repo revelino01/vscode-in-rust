@@ -128,5 +128,21 @@
   {
     "key": "ctrl+k w",
     "command": "workbench.action.closeEditorsInGroup"
+  },
+  {
+    "key": "ctrl+f",
+    "command": "actions.find"
+  },
+  {
+    "key": "ctrl+h",
+    "command": "editor.action.startFindReplaceAction"
+  },
+  {
+    "key": "ctrl+g",
+    "command": "workbench.action.gotoLine"
+  },
+  {
+    "key": "ctrl+shift+o",
+    "command": "workbench.action.gotoSymbol"
   }
 ]

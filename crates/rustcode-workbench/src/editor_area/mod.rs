@@ -683,6 +683,175 @@ impl EditorAreaView {
         })
     }
 
+    pub fn find_open_tab_uri_for_path(&self, target_path: &std::path::Path) -> Option<String> {
+        let active_gid = self.model.active_group_id();
+        let matches_target = |uri: &str| -> bool {
+            if rustcode_platform::is_file_uri(uri) || !uri.contains("://") {
+                let open_path = rustcode_platform::file_uri_to_path(uri);
+                rustcode_platform::paths_equivalent(&open_path, target_path)
+            } else {
+                false
+            }
+        };
+        if let Some(active_group) = self.model.group_by_id(active_gid) {
+            if let Some(tab) = active_group.tabs.iter().find(|t| matches_target(&t.uri)) {
+                return Some(tab.uri.clone());
+            }
+        }
+        for group in &self.model.groups {
+            if let Some(tab) = group.tabs.iter().find(|t| matches_target(&t.uri)) {
+                return Some(tab.uri.clone());
+            }
+        }
+        None
+    }
+
+    pub fn rename_tab(
+        &mut self,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) -> bool {
+        let mut renamed_entries: Vec<(String, String, PathBuf)> = Vec::new();
+        for group in &mut self.model.groups {
+            for tab in &mut group.tabs {
+                if !(rustcode_platform::is_file_uri(&tab.uri) || !tab.uri.contains("://")) {
+                    continue;
+                }
+                let open_path = rustcode_platform::file_uri_to_path(&tab.uri);
+                let updated_path = if rustcode_platform::paths_equivalent(&open_path, old_path) {
+                    Some(new_path.to_path_buf())
+                } else {
+                    rustcode_platform::path_strip_prefix(&open_path, old_path)
+                        .filter(|rel| !rel.as_os_str().is_empty())
+                        .map(|rel| new_path.join(rel))
+                };
+                let Some(updated_path) = updated_path else {
+                    continue;
+                };
+                let old_uri = tab.uri.clone();
+                let new_uri = if rustcode_platform::is_file_uri(&old_uri) {
+                    rustcode_platform::path_to_file_uri(&updated_path)
+                } else {
+                    updated_path.to_string_lossy().into_owned()
+                };
+                let new_title = updated_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("untitled")
+                    .to_string();
+
+                tab.id = new_uri.clone();
+                tab.uri = new_uri.clone();
+                tab.title = new_title;
+                if !renamed_entries.iter().any(|(o, _, _)| o == &old_uri) {
+                    renamed_entries.push((old_uri, new_uri, updated_path));
+                }
+            }
+        }
+
+        if renamed_entries.is_empty() {
+            return false;
+        }
+
+        for (old_uri, new_uri, updated_path) in renamed_entries {
+            let new_lang = self.grammar_registry.get_for_path(&updated_path).language_id();
+
+            if let Some(mut editor) = self.editors.remove(&old_uri) {
+                if let Some(doc) = &editor.document {
+                    let mut d = doc.write();
+                    d.path = Some(updated_path.clone());
+                    d.language_id = new_lang.to_string();
+                }
+                let theme = ThemeService::default_dark_theme();
+                editor.set_language(new_lang, theme, &self.grammar_registry);
+                self.editors.insert(new_uri.clone(), editor);
+            }
+
+            let split_keys: Vec<(usize, String)> = self
+                .split_editors
+                .keys()
+                .filter(|(_, u)| u == &old_uri)
+                .cloned()
+                .collect();
+            for (gid, u) in split_keys {
+                if let Some(mut editor) = self.split_editors.remove(&(gid, u)) {
+                    if let Some(doc) = &editor.document {
+                        let mut d = doc.write();
+                        d.path = Some(updated_path.clone());
+                        d.language_id = new_lang.to_string();
+                    }
+                    let theme = ThemeService::default_dark_theme();
+                    editor.set_language(new_lang, theme, &self.grammar_registry);
+                    self.split_editors.insert((gid, new_uri.clone()), editor);
+                }
+            }
+
+            if let Some(gid) = self.primary_editor_group.remove(&old_uri) {
+                self.primary_editor_group.insert(new_uri.clone(), gid);
+            }
+            if let Some(diff) = self.diff_editors.remove(&old_uri) {
+                self.diff_editors.insert(new_uri.clone(), diff);
+            }
+            if let Some(wv) = self.webviews.remove(&old_uri) {
+                self.webviews.insert(new_uri.clone(), wv);
+            }
+            let wv_split_keys: Vec<(usize, String)> = self
+                .split_webviews
+                .keys()
+                .filter(|(_, u)| u == &old_uri)
+                .cloned()
+                .collect();
+            for (gid, u) in wv_split_keys {
+                if let Some(wv) = self.split_webviews.remove(&(gid, u)) {
+                    self.split_webviews.insert((gid, new_uri.clone()), wv);
+                }
+            }
+            if let Some(gid) = self.primary_webview_group.remove(&old_uri) {
+                self.primary_webview_group.insert(new_uri.clone(), gid);
+            }
+            if let Some(mut nb) = self.notebooks.remove(&old_uri) {
+                nb.document.uri = new_uri.clone();
+                nb.document.path = Some(updated_path.clone());
+                self.notebooks.insert(new_uri.clone(), nb);
+            }
+            for uri_val in self.custom_editor_panels.values_mut() {
+                if *uri_val == old_uri {
+                    *uri_val = new_uri.clone();
+                }
+            }
+        }
+
+        self.sync_editor_focus();
+        self.sync_breadcrumbs(None);
+        true
+    }
+
+    pub fn close_tabs_for_path(&mut self, target_path: &std::path::Path) -> usize {
+        let mut to_close: Vec<(usize, usize)> = Vec::new();
+        for group in &self.model.groups {
+            for (idx, tab) in group.tabs.iter().enumerate() {
+                if !(rustcode_platform::is_file_uri(&tab.uri) || !tab.uri.contains("://")) {
+                    continue;
+                }
+                let open_path = rustcode_platform::file_uri_to_path(&tab.uri);
+                if rustcode_platform::paths_equivalent(&open_path, target_path)
+                    || rustcode_platform::path_starts_with(&open_path, target_path)
+                {
+                    to_close.push((group.id, idx));
+                }
+            }
+        }
+
+        let mut closed_count = 0;
+        for (gid, idx) in to_close.into_iter().rev() {
+            if self.close_tab_in_group(gid, idx) {
+                closed_count += 1;
+            }
+        }
+        closed_count
+    }
+
     pub fn for_each_editor_mut(&mut self, mut f: impl FnMut(&str, &mut EditorView)) {
         for (uri, ed) in &mut self.editors {
             f(uri, ed);
@@ -1636,7 +1805,8 @@ impl EditorAreaView {
             self.sync_dirty_states();
             res
         } else if let Some(editor) = self.editor_for_group_mut(group_id, &uri) {
-            let before_state = if matches!(event, InputEvent::KeyDown(_)) {
+            let track_edit = matches!(event, InputEvent::KeyDown(_) | InputEvent::MouseDown(_));
+            let before_state = if track_edit {
                 Some((
                     editor.buffer.read().len(),
                     editor.buffer.read().line_count(),
@@ -1646,7 +1816,7 @@ impl EditorAreaView {
                 None
             };
             let res = editor.handle_event(event, content_rect);
-            let after_state = if matches!(event, InputEvent::KeyDown(_)) && res == EventResult::Consumed {
+            let after_state = if track_edit && res == EventResult::Consumed {
                 Some((
                     editor.buffer.read().len(),
                     editor.buffer.read().line_count(),
@@ -1655,15 +1825,13 @@ impl EditorAreaView {
             } else {
                 None
             };
-            if matches!(event, InputEvent::KeyDown(_)) && res == EventResult::Consumed {
+            if track_edit && res == EventResult::Consumed {
                 self.sync_dirty_states();
                 if before_state != after_state {
                     self.for_each_editor_for_uri_mut(&uri, |ed| {
                         ed.recompute_folding();
                     });
                 }
-                self.sync_breadcrumbs(None);
-            } else if matches!(event, InputEvent::MouseDown(_)) {
                 self.sync_breadcrumbs(None);
             }
             res
@@ -3161,6 +3329,87 @@ mod tests {
         // Closing the last group disposes the panel
         assert!(area_view.close_tab_in_group(gid1, 0));
         assert!(wv_mgr.get_panel("ce_split_1").unwrap().is_disposed);
+    }
+
+    #[test]
+    fn test_editor_area_rename_tab_file_and_directory_descendants() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustcode_rename_tab_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let src_dir = tmp.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let old_file = src_dir.join("before.rs");
+        let other_file = src_dir.join("nested.rs");
+        std::fs::write(&old_file, "fn before() {}\n").unwrap();
+        std::fs::write(&other_file, "fn nested() {}\n").unwrap();
+
+        let old_uri = rustcode_platform::path_to_file_uri(&old_file);
+        let other_uri = rustcode_platform::path_to_file_uri(&other_file);
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(&old_uri, "before.rs", "fn before() {}\n", false);
+        area_view.open_file(&other_uri, "nested.rs", "fn nested() {}\n", false);
+        let gid1 = area_view.split_active_group(SplitDirection::Horizontal);
+        let _ = gid1;
+
+        let new_file = src_dir.join("after.py");
+        let new_uri = rustcode_platform::path_to_file_uri(&new_file);
+        assert!(area_view.rename_tab(&old_file, &new_file));
+
+        assert!(area_view.editors.contains_key(&new_uri));
+        assert!(!area_view.editors.contains_key(&old_uri));
+        assert!(area_view.find_open_tab_uri_for_path(&new_file).is_some());
+        assert!(area_view.find_open_tab_uri_for_path(&old_file).is_none());
+        let ed = area_view.editors.get(&new_uri).unwrap();
+        assert_eq!(ed.document.as_ref().unwrap().read().language_id, "python");
+        assert!(area_view
+            .model
+            .groups
+            .iter()
+            .any(|g| g.tabs.iter().any(|t| t.title == "after.py" && t.uri == new_uri)));
+
+        // Rename parent directory src -> lib updates both open files
+        let lib_dir = tmp.join("lib");
+        assert!(area_view.rename_tab(&src_dir, &lib_dir));
+        assert!(area_view
+            .find_open_tab_uri_for_path(&lib_dir.join("after.py"))
+            .is_some());
+        assert!(area_view
+            .find_open_tab_uri_for_path(&lib_dir.join("nested.rs"))
+            .is_some());
+        assert!(area_view.find_open_tab_uri_for_path(&other_file).is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_editor_area_close_tabs_for_path_file_and_directory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "rustcode_close_tab_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let pkg_dir = tmp.join("pkg");
+        std::fs::create_dir_all(&pkg_dir).unwrap();
+        let f1 = pkg_dir.join("a.rs");
+        let f2 = pkg_dir.join("b.rs");
+        let f3 = tmp.join("keep.rs");
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file(&rustcode_platform::path_to_file_uri(&f1), "a.rs", "a", false);
+        area_view.open_file(&rustcode_platform::path_to_file_uri(&f2), "b.rs", "b", false);
+        area_view.open_file(&rustcode_platform::path_to_file_uri(&f3), "keep.rs", "k", false);
+
+        assert_eq!(area_view.close_tabs_for_path(&f1), 1);
+        assert!(area_view.find_open_tab_uri_for_path(&f1).is_none());
+        assert!(area_view.find_open_tab_uri_for_path(&f2).is_some());
+
+        // Deleting directory closes remaining descendant tab f2 but leaves f3 open
+        assert_eq!(area_view.close_tabs_for_path(&pkg_dir), 1);
+        assert!(area_view.find_open_tab_uri_for_path(&f2).is_none());
+        assert!(area_view.find_open_tab_uri_for_path(&f3).is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

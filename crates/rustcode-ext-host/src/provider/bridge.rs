@@ -255,27 +255,37 @@ pub struct ExtStatusBarItem {
 #[derive(Default)]
 pub struct ExtStatusBarManager {
     items: RwLock<HashMap<String, ExtStatusBarItem>>,
+    revision: AtomicU64,
 }
 
 impl ExtStatusBarManager {
     pub fn new() -> Self {
         Self {
             items: RwLock::new(HashMap::new()),
+            revision: AtomicU64::new(0),
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
     }
 
     pub fn set_item(&self, item: ExtStatusBarItem) {
         self.items.write().insert(item.id.clone(), item);
+        self.revision.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn hide_item(&self, id: &str) {
         if let Some(item) = self.items.write().get_mut(id) {
             item.visible = false;
+            self.revision.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     pub fn remove_item(&self, id: &str) {
-        self.items.write().remove(id);
+        if self.items.write().remove(id).is_some() {
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     pub fn get_visible_items(&self) -> Vec<ExtStatusBarItem> {
@@ -1806,6 +1816,11 @@ impl LanguageFeatureBridge {
                 .map_err(RpcError::from_prefixed_string);
         }
 
+        if method.starts_with("process.") {
+            return crate::process::handle_process_rpc(method, params, self.fs_root.as_deref())
+                .await;
+        }
+
         match method {
             "window.showInformationMessage"
             | "window.showWarningMessage"
@@ -1992,7 +2007,41 @@ impl LanguageFeatureBridge {
 
     // --- Document Lifecycle Forwarding ---
 
-    pub async fn did_open_document(&self, uri: &str, language_id: &str, version: i32, text: &str) {
+    fn refresh_editor_snapshots(&self, snap: &OpenDocumentSnapshot) {
+        if let Some(mut active) = self.window_manager.active_editor() {
+            if active.document.uri == snap.uri
+                || (!snap.is_untitled
+                    && !active.document.is_untitled
+                    && rustcode_platform::paths_equivalent(
+                        Path::new(&active.document.file_name),
+                        Path::new(&snap.file_name),
+                    ))
+            {
+                active.document = snap.clone();
+                self.window_manager.set_active_editor(Some(active));
+            }
+        }
+        let mut visible = self.window_manager.visible_editors();
+        let mut changed = false;
+        for ed in &mut visible {
+            if ed.document.uri == snap.uri
+                || (!snap.is_untitled
+                    && !ed.document.is_untitled
+                    && rustcode_platform::paths_equivalent(
+                        Path::new(&ed.document.file_name),
+                        Path::new(&snap.file_name),
+                    ))
+            {
+                ed.document = snap.clone();
+                changed = true;
+            }
+        }
+        if changed {
+            self.window_manager.set_visible_editors(visible);
+        }
+    }
+
+    fn did_open_document_local(&self, uri: &str, language_id: &str, version: i32, text: &str) {
         let is_untitled = uri.starts_with("untitled:");
         let file_name = if is_untitled {
             strip_untitled_prefix(uri)
@@ -2018,13 +2067,9 @@ impl LanguageFeatureBridge {
         };
         self.rpc_bridge
             .notify("workspace.onDidOpenTextDocument", snap.to_json());
-        let _ = self
-            .lsp_manager
-            .did_open_document(uri, language_id, version, text)
-            .await;
     }
 
-    pub async fn did_change_document(&self, uri: &str, language_id: &str, version: i32, text: &str) {
+    fn did_change_document_local(&self, uri: &str, language_id: &str, version: i32, text: &str) {
         let snap = {
             let mut docs = self.open_documents.write();
             let existing_key = find_open_document_key(&docs, uri);
@@ -2057,6 +2102,7 @@ impl LanguageFeatureBridge {
                 snap
             }
         };
+        self.refresh_editor_snapshots(&snap);
         self.rpc_bridge.notify(
             "workspace.onDidChangeTextDocument",
             json!({
@@ -2065,13 +2111,9 @@ impl LanguageFeatureBridge {
                 "reason": Value::Null,
             }),
         );
-        let _ = self
-            .lsp_manager
-            .did_change_document(uri, language_id, version, text)
-            .await;
     }
 
-    pub async fn did_save_document(&self, uri: &str) {
+    fn did_save_document_local(&self, uri: &str) {
         let saved_snap = {
             let mut docs = self.open_documents.write();
             let key = find_open_document_key(&docs, uri);
@@ -2083,6 +2125,7 @@ impl LanguageFeatureBridge {
             }
         };
         if let Some(snap) = saved_snap {
+            self.refresh_editor_snapshots(&snap);
             self.rpc_bridge
                 .notify("workspace.onDidSaveTextDocument", snap.to_json());
         } else {
@@ -2102,12 +2145,27 @@ impl LanguageFeatureBridge {
         }
     }
 
-    pub async fn did_close_document(&self, uri: &str, language_id: &str) {
+    fn did_close_document_local(&self, uri: &str, language_id: &str) {
         let removed = {
             let mut docs = self.open_documents.write();
             let key = find_open_document_key(&docs, uri);
             key.and_then(|k| docs.remove(&k))
         };
+        let target_path = decode_file_uri(uri);
+        let mut visible = self.window_manager.visible_editors();
+        let prev_len = visible.len();
+        visible.retain(|e| {
+            e.document.uri != uri
+                && (uri.starts_with("untitled:")
+                    || e.document.is_untitled
+                    || !rustcode_platform::paths_equivalent(
+                        Path::new(&e.document.file_name),
+                        &target_path,
+                    ))
+        });
+        if visible.len() != prev_len {
+            self.window_manager.set_visible_editors(visible);
+        }
         if let Some(snap) = removed {
             let mut payload = snap.to_json();
             if let Some(obj) = payload.as_object_mut() {
@@ -2125,6 +2183,76 @@ impl LanguageFeatureBridge {
                 }),
             );
         }
+    }
+
+    pub fn did_open_document_sync(&self, uri: &str, language_id: &str, version: i32, text: &str) {
+        self.did_open_document_local(uri, language_id, version, text);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let lsp = Arc::clone(&self.lsp_manager);
+            let uri_owned = uri.to_string();
+            let lang_owned = language_id.to_string();
+            let text_owned = text.to_string();
+            handle.spawn(async move {
+                let _ = lsp
+                    .did_open_document(&uri_owned, &lang_owned, version, &text_owned)
+                    .await;
+            });
+        }
+    }
+
+    pub fn did_change_document_sync(&self, uri: &str, language_id: &str, version: i32, text: &str) {
+        self.did_change_document_local(uri, language_id, version, text);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let lsp = Arc::clone(&self.lsp_manager);
+            let uri_owned = uri.to_string();
+            let lang_owned = language_id.to_string();
+            let text_owned = text.to_string();
+            handle.spawn(async move {
+                let _ = lsp
+                    .did_change_document(&uri_owned, &lang_owned, version, &text_owned)
+                    .await;
+            });
+        }
+    }
+
+    pub fn did_save_document_sync(&self, uri: &str) {
+        self.did_save_document_local(uri);
+    }
+
+    pub fn did_close_document_sync(&self, uri: &str, language_id: &str) {
+        self.did_close_document_local(uri, language_id);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let lsp = Arc::clone(&self.lsp_manager);
+            let uri_owned = uri.to_string();
+            let lang_owned = language_id.to_string();
+            handle.spawn(async move {
+                let _ = lsp.did_close_document(&uri_owned, &lang_owned).await;
+            });
+        }
+    }
+
+    pub async fn did_open_document(&self, uri: &str, language_id: &str, version: i32, text: &str) {
+        self.did_open_document_local(uri, language_id, version, text);
+        let _ = self
+            .lsp_manager
+            .did_open_document(uri, language_id, version, text)
+            .await;
+    }
+
+    pub async fn did_change_document(&self, uri: &str, language_id: &str, version: i32, text: &str) {
+        self.did_change_document_local(uri, language_id, version, text);
+        let _ = self
+            .lsp_manager
+            .did_change_document(uri, language_id, version, text)
+            .await;
+    }
+
+    pub async fn did_save_document(&self, uri: &str) {
+        self.did_save_document_local(uri);
+    }
+
+    pub async fn did_close_document(&self, uri: &str, language_id: &str) {
+        self.did_close_document_local(uri, language_id);
         let _ = self.lsp_manager.did_close_document(uri, language_id).await;
     }
 

@@ -178,6 +178,14 @@ fn map_ext_to_lang_id(ext: &str) -> String {
         "py" | "pyw" | "pyi" => "python".to_string(),
         "json" | "jsonc" => "json".to_string(),
         "md" | "markdown" => "markdown".to_string(),
+        "go" => "go".to_string(),
+        "c" | "h" => "c".to_string(),
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp".to_string(),
+        "html" | "htm" => "html".to_string(),
+        "css" | "scss" | "less" => "css".to_string(),
+        "toml" => "toml".to_string(),
+        "yaml" | "yml" => "yaml".to_string(),
+        "txt" | "text" | "log" => "plaintext".to_string(),
         other => other.to_string(),
     }
 }
@@ -218,5 +226,50 @@ mod tests {
         assert!(!doc.is_dirty);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_document_map_ext_to_lang_id_all_14_languages() {
+        for (filename, expected) in [
+            ("main.rs", "rust"),
+            ("app.js", "javascript"),
+            ("app.jsx", "javascript"),
+            ("app.mjs", "javascript"),
+            ("app.cjs", "javascript"),
+            ("app.ts", "typescript"),
+            ("app.tsx", "typescript"),
+            ("app.mts", "typescript"),
+            ("app.cts", "typescript"),
+            ("script.py", "python"),
+            ("script.pyw", "python"),
+            ("stubs.pyi", "python"),
+            ("data.json", "json"),
+            ("settings.jsonc", "json"),
+            ("README.md", "markdown"),
+            ("notes.markdown", "markdown"),
+            ("server.go", "go"),
+            ("driver.c", "c"),
+            ("driver.h", "c"),
+            ("widget.cpp", "cpp"),
+            ("widget.cc", "cpp"),
+            ("widget.cxx", "cpp"),
+            ("widget.hpp", "cpp"),
+            ("widget.hh", "cpp"),
+            ("widget.hxx", "cpp"),
+            ("page.html", "html"),
+            ("page.htm", "html"),
+            ("style.css", "css"),
+            ("theme.scss", "css"),
+            ("base.less", "css"),
+            ("Cargo.toml", "toml"),
+            ("deploy.yaml", "yaml"),
+            ("deploy.yml", "yaml"),
+            ("notes.txt", "plaintext"),
+            ("output.log", "plaintext"),
+        ] {
+            let doc = TextDocument::new("", Some(PathBuf::from(filename)), None);
+            assert_eq!(doc.language_id, expected, "mismatch for {filename}");
+        }
+        assert_eq!(TextDocument::new("", None, None).language_id, "plaintext");
     }
 }

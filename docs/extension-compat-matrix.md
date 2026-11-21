@@ -156,3 +156,15 @@ The pure-Rust Open VSX marketplace client (`MarketplaceClient`) and VSIX unpacke
 
 ### Completed Stage 3 Verification (`M7`)
 - [x] **M7 — Full Verification, Tier 5 Hardening & Final Counts**: Verified **513/513** workspace tests (`41/41` `compat_suite`), **31/31** `ext-host-js/test.js` sections (**404** `assert(...)` call sites), **8/8** `runner.js --syntax-check`, **286/286** Windows (**287** Unix) `tests/phase7-e2e` Tiers 1–4, Tier 5 adversarial hardening, **0** Windows + Linux (`x86_64-unknown-linux-gnu`) `cargo clippy` warnings, `cargo bench --workspace --no-run`, and `rustcode` startup smoke check.
+
+---
+
+## Phase 8 Roadmap (Planned)
+
+| Milestone | Status | Scope & Extension-Host / Runtime Impact |
+|---|---|---|
+| **M1 — Native OS Window & Live Scene Rasterizer** | 📋 Planned | Feature-gated `desktop` `RenderSurface` backend (`winit` + `softbuffer`/`fontdue` or `wgpu`/`cosmic-text`) rendering `Scene` primitives with live OS event loop while preserving `MockRenderSurface` for headless tests. |
+| **M2 — CLI Arguments, Disk Config/Session Persistence & Live Background Runtime** | 📋 Planned | CLI flags (`[path...]`, `--headless`, `--goto`, `--extensions-dir`, `--disable-extensions`), disk loading of `~/.rustcode/` & `.vscode/` configs/extensions, session restore, and live Tokio background loop driving `FileSystemWatcher`, `AutoSaveService`, and `NodeExtHostProcess` auto-activation/recovery. |
+| **M3 — Daily-Driver Editor Ergonomics & Workspace Search/Replace** | 📋 Planned | OS clipboard shortcuts wired to `ClipboardBackend`, mouse drag/word/line selection & scrollbar/Minimap dragging, `Ctrl+/` comments across all 14 grammars, line move/duplicate/indent ops, bracket auto-close, context menus, and live multi-file `SearchView`. |
+| **M4 — Live Git CLI Integration & Real LSP/DAP Process Wiring** | 📋 Planned | Pure-Rust `GitCliBackend` replacing `ScmRepository::sample_repository()`, auto-attached `LspClientManager` language servers (`rust-analyzer`, `typescript-language-server`, `pyright`, `gopls`), and `.vscode/launch.json` DAP launch replacing `DebugSessionState::sample_session()`. |
+| **M5 — Cross-Platform Hardening, Native Linux CI & Phase 8 Verification** | 📋 Planned | Unix `setsid`/`killpg` process-group termination in `crates/rustcode-ext-host/src/process/mod.rs`, remaining `util.isDeepStrictEqual` & `ContextKey` `[^]/]` edge cases, GitHub Actions CI matrix (`windows-latest` + `ubuntu-latest` running native 286 Win / 287 Unix `phase7-e2e` + `compat_suite` + `test.js` + `clippy`), and `tests/phase8-e2e/`. |

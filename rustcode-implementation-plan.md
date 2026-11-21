@@ -88,6 +88,19 @@
 - [x] **M6 — Documentation & Trackers Refresh**: Refreshed `README.md`, `rustcode-implementation-plan.md`, `docs/architecture.md`, and `docs/extension-compat-matrix.md` to reflect M1.1–M5 implementations
 - [x] **M7 — Full Verification, Tier 5 Hardening & Final Counts**: Verified **513/513** workspace tests across **8** crates (**41/41** `compat_suite`), **31/31** `ext-host-js/test.js` sections (**404** `assert(...)` call sites), **8/8** `tests/phase7-e2e/runner.js --syntax-check` checks, **286/286** Windows (**287** Unix) `tests/phase7-e2e` tests across Tiers 1–4, Tier 5 adversarial hardening, **0** Windows & Linux (`x86_64-unknown-linux-gnu`) `cargo clippy` warnings, `cargo bench --workspace --no-run`, and `rustcode` startup smoke check
 
+### Phase 8 (Planned): Native Interactive Desktop Shell, Live Workspace Runtime & Daily-Driver Parity
+
+> Open architectural decisions prior to implementation:
+> 1. Desktop renderer choice (`winit` + `softbuffer` + `fontdue` portable CPU rasterizer vs. `winit` + `wgpu` + `cosmic-text` GPU acceleration)
+> 2. Delivery phasing (Interactive Desktop MVP M1–M3 first vs. full M1–M5 together)
+> 3. Default binary launch mode (keep headless default + `--gui` flag vs. GUI-by-default + `--headless` flag)
+
+- [ ] **Phase 8 M1 — Native OS Window & Live Scene Rasterizer**: Feature-gated desktop backend (`desktop` feature in `rustcode-platform` & `rustcode-app`) rendering `Scene::{Quad, GlyphRun, Shadow, PushClip, PopClip}` with rounded corners, borders, clip stack, glyph atlas caching, HiDPI scaling, and live OS keyboard/mouse/resize/close event loop (preserving `MockRenderSurface` as default headless test backend)
+- [ ] **Phase 8 M2 — CLI Arguments, Disk Config/Session Persistence & Live Background Runtime**: CLI parser (`rustcode [path...]`, `--headless`, `--version`, `--goto file:line[:col]`, `--user-data-dir`, `--extensions-dir`, `--disable-extensions`), disk config & session loading/persistence (`~/.rustcode/{settings.json,keybindings.json}`, `<workspace>/.vscode/settings.json`, `~/.rustcode/extensions/`), and background Tokio loop driving `FileSystemWatcher`, `AutoSaveService`, and live `NodeExtHostProcess` activation/restart recovery
+- [ ] **Phase 8 M3 — Daily-Driver Editor Ergonomics & Live Workspace Search/Replace**: OS clipboard (`Ctrl+C`/`X`/`V` incl. empty-selection full-line copy/cut), mouse drag/double/triple-click selection & scrollbar/Minimap dragging, `Ctrl+/` language-aware line comments across all 14 grammars, `Alt+Up/Down` move & `Shift+Alt+Up/Down` duplicate lines, multi-line `Tab`/`Shift+Tab` indent/outdent, bracket auto-close/matching, right-click context menus, and live multi-file `SearchView` (`Ctrl+Shift+F` / `Ctrl+Shift+H`)
+- [ ] **Phase 8 M4 — Live Git CLI Integration & Real LSP/DAP Process Wiring**: Replace default sample SCM/Debug states with pure-Rust `GitCliBackend` wired to `ScmView`/`DiffEditorView`/Status Bar, auto-attached `LspClientManager` servers (`rust-analyzer`, `typescript-language-server`, `pyright`, `gopls`) for hover/go-to-def/completions/diagnostics/`editor.formatOnSave`, and `.vscode/launch.json` DAP launch
+- [ ] **Phase 8 M5 — Cross-Platform Hardening, Native Linux CI & Phase 8 Verification**: Unix process-group `killpg` termination in `crates/rustcode-ext-host/src/process/mod.rs`, remaining `util.isDeepStrictEqual` & `ContextKey` `[^]/]` edge cases, GitHub Actions CI matrix (`windows-latest` + `ubuntu-latest` running workspace tests, `ext-host-js/test.js`, `phase7-e2e` 286 Win / 287 Unix tests, `clippy -D warnings`, benches, and `package.ps1`/`package.sh`), plus `tests/phase8-e2e/` & doc refresh
+
 ---
 
 ## Goal
@@ -1653,6 +1666,18 @@ flowchart LR
 | Extension mgmt | Enable/disable/uninstall from UI, extension recommendations |
 
 **Exit**: 80%+ of top-100 VS Code extensions work. Daily-drivable for professional development.
+
+### Phase 8: Native Interactive Desktop Shell, Live Workspace Runtime & Daily-Driver Parity (Planned)
+
+| Milestone | Target Crates / Paths | Deliverable |
+|---|---|---|
+| **M1 — Native OS Window & Live Scene Rasterizer** | `rustcode-platform::render`, `rustcode-app` | Feature-gated `desktop` `RenderSurface` backend (`winit` + `softbuffer`/`fontdue` or `wgpu`/`cosmic-text`) rendering `Scene::{Quad, GlyphRun, Shadow, PushClip, PopClip}` with rounded corners, borders, clip stack, glyph atlas caching, HiDPI scaling, and live OS input/resize/close event loop (keeping `MockRenderSurface` default for headless tests) |
+| **M2 — CLI Arguments, Disk Config/Session Persistence & Live Background Runtime** | `rustcode-app`, `rustcode-platform`, `rustcode-workbench` | CLI parser (`rustcode [path...]`, `--headless`, `--version`, `--goto file:line[:col]`, `--user-data-dir`, `--extensions-dir`, `--disable-extensions`), disk config/extension/session loading (`~/.rustcode/`, `.vscode/`), and background Tokio loop driving `FileSystemWatcher`, `AutoSaveService`, and live `NodeExtHostProcess` activation/recovery |
+| **M3 — Daily-Driver Editor Ergonomics & Workspace Search/Replace** | `rustcode-editor`, `rustcode-workbench` | OS clipboard shortcuts (`Ctrl+C`/`X`/`V` incl. empty-selection line copy/cut), mouse drag/double/triple-click selection & scrollbar/Minimap dragging, `Ctrl+/` comments across all 14 grammars, `Alt+Up/Down` move & `Shift+Alt+Up/Down` duplicate lines, multi-line indent/outdent, bracket auto-close/matching, context menus, and live multi-file `SearchView` (`Ctrl+Shift+F` / `Ctrl+Shift+H`) |
+| **M4 — Live Git CLI Integration & Real LSP/DAP Process Wiring** | `rustcode-protocols`, `rustcode-workbench`, `rustcode-app` | Pure-Rust `GitCliBackend` wired to `ScmView`/`DiffEditorView`/Status Bar (replacing `ScmRepository::sample_repository()`), auto-attached `LspClientManager` servers (`rust-analyzer`, `typescript-language-server`, `pyright`, `gopls`), and `.vscode/launch.json` DAP launch (replacing `DebugSessionState::sample_session()`) |
+| **M5 — Cross-Platform Hardening, Native Linux CI & Verification** | `rustcode-ext-host`, `rustcode-base`, `ext-host-js`, `.github/workflows/ci.yml`, `tests/phase8-e2e/` | Unix `setsid`/`killpg` process-group termination in `process/mod.rs`, remaining `util.isDeepStrictEqual` & `ContextKey` `[^]/]` edge cases, GitHub Actions CI matrix (`windows-latest` + `ubuntu-latest`), `tests/phase8-e2e/` visual/runtime suite, and doc refresh |
+
+**Exit**: Launchable, interactive Windows & Linux desktop IDE capable of opening real Git repositories, running language servers/extensions/terminal side-by-side, with native Windows & Linux CI green.
 
 ---
 

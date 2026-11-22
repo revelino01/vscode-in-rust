@@ -46,8 +46,48 @@ impl ClipboardBackend for InMemoryClipboardBackend {
     }
 }
 
+/// Adapter bridging a shared `rustcode_platform::os_ux::ClipboardBackend` into
+/// `rustcode_ext_host::env::ClipboardBackend`.
+#[derive(Clone)]
+pub struct PlatformClipboardAdapter {
+    backend: Arc<dyn rustcode_platform::os_ux::ClipboardBackend>,
+}
+
+impl std::fmt::Debug for PlatformClipboardAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlatformClipboardAdapter").finish()
+    }
+}
+
+impl PlatformClipboardAdapter {
+    pub fn new(backend: Arc<dyn rustcode_platform::os_ux::ClipboardBackend>) -> Self {
+        Self { backend }
+    }
+
+    pub fn inner(&self) -> &Arc<dyn rustcode_platform::os_ux::ClipboardBackend> {
+        &self.backend
+    }
+}
+
+impl From<Arc<dyn rustcode_platform::os_ux::ClipboardBackend>> for PlatformClipboardAdapter {
+    fn from(backend: Arc<dyn rustcode_platform::os_ux::ClipboardBackend>) -> Self {
+        Self::new(backend)
+    }
+}
+
+impl ClipboardBackend for PlatformClipboardAdapter {
+    fn read_text(&self) -> Result<String, String> {
+        self.backend.read_text()
+    }
+
+    fn write_text(&self, text: &str) -> Result<(), String> {
+        self.backend.write_text(text)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OsClipboardBackend {
+    inner: Arc<rustcode_platform::os_ux::ArboardClipboardBackend>,
     fallback: InMemoryClipboardBackend,
     fallback_on_unavailable: bool,
 }
@@ -61,6 +101,7 @@ impl Default for OsClipboardBackend {
 impl OsClipboardBackend {
     pub fn new() -> Self {
         Self {
+            inner: Arc::new(rustcode_platform::os_ux::ArboardClipboardBackend::new()),
             fallback: InMemoryClipboardBackend::new(),
             fallback_on_unavailable: true,
         }
@@ -68,188 +109,16 @@ impl OsClipboardBackend {
 
     pub fn with_fallback(fallback_on_unavailable: bool) -> Self {
         Self {
+            inner: Arc::new(rustcode_platform::os_ux::ArboardClipboardBackend::new()),
             fallback: InMemoryClipboardBackend::new(),
             fallback_on_unavailable,
-        }
-    }
-
-    fn run_read(&self) -> Result<String, String> {
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $v = Get-Clipboard -Raw; if ($null -ne $v) { [Console]::Out.Write($v) }";
-            for exe in ["powershell.exe", "pwsh.exe"] {
-                if let Ok(out) = Command::new(exe)
-                    .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .output()
-                {
-                    if out.status.success() {
-                        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-                    }
-                }
-            }
-            Err("Windows clipboard command unavailable".to_string())
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let out = Command::new("pbpaste")
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .output()
-                .map_err(|e| format!("pbpaste failed: {}", e))?;
-            if out.status.success() {
-                return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-            }
-            Err("pbpaste returned non-zero status".to_string())
-        }
-
-        #[cfg(all(not(windows), not(target_os = "macos")))]
-        {
-            let has_wayland = std::env::var_os("WAYLAND_DISPLAY")
-                .is_some_and(|v| !v.is_empty());
-            let has_x11 = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
-            if !has_wayland && !has_x11 {
-                return Err("No display server (WAYLAND_DISPLAY/DISPLAY) available".to_string());
-            }
-            if has_wayland {
-                if let Ok(out) = Command::new("wl-paste")
-                    .arg("--no-newline")
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .output()
-                {
-                    if out.status.success() {
-                        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-                    }
-                }
-            }
-            if has_x11 {
-                for (cmd, args) in [
-                    ("xclip", &["-selection", "clipboard", "-o"][..]),
-                    ("xsel", &["--clipboard", "--output"][..]),
-                ] {
-                    if let Ok(out) = Command::new(cmd)
-                        .args(args)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::null())
-                        .output()
-                    {
-                        if out.status.success() {
-                            return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
-                        }
-                    }
-                }
-            }
-            Err("No Linux clipboard utility (wl-paste/xclip/xsel) available".to_string())
-        }
-    }
-
-    fn run_write(&self, text: &str) -> Result<(), String> {
-        #[cfg(windows)]
-        {
-            use std::io::Write;
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            let script = "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; $t = [Console]::In.ReadToEnd(); if ($t.Length -eq 0) { Set-Clipboard -Value $null } else { Set-Clipboard -Value $t }";
-            for exe in ["powershell.exe", "pwsh.exe"] {
-                if let Ok(mut child) = Command::new(exe)
-                    .args(["-NoProfile", "-NonInteractive", "-Command", script])
-                    .creation_flags(CREATE_NO_WINDOW)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(text.as_bytes());
-                    }
-                    if let Ok(status) = child.wait() {
-                        if status.success() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            Err("Windows clipboard write command unavailable".to_string())
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            use std::io::Write;
-            let mut child = Command::new("pbcopy")
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|e| format!("pbcopy failed: {}", e))?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin
-                    .write_all(text.as_bytes())
-                    .map_err(|e| format!("pbcopy write failed: {}", e))?;
-            }
-            let status = child.wait().map_err(|e| format!("pbcopy wait failed: {}", e))?;
-            if status.success() {
-                Ok(())
-            } else {
-                Err("pbcopy returned non-zero status".to_string())
-            }
-        }
-
-        #[cfg(all(not(windows), not(target_os = "macos")))]
-        {
-            use std::io::Write;
-            let has_wayland = std::env::var_os("WAYLAND_DISPLAY")
-                .is_some_and(|v| !v.is_empty());
-            let has_x11 = std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty());
-            if !has_wayland && !has_x11 {
-                return Err("No display server (WAYLAND_DISPLAY/DISPLAY) available".to_string());
-            }
-            let candidates: Vec<(&str, &[&str])> = {
-                let mut v = Vec::new();
-                if has_wayland {
-                    v.push(("wl-copy", &[][..]));
-                }
-                if has_x11 {
-                    v.push(("xclip", &["-selection", "clipboard", "-in"][..]));
-                    v.push(("xsel", &["--clipboard", "--input"][..]));
-                }
-                v
-            };
-            for (cmd, args) in candidates {
-                if let Ok(mut child) = Command::new(cmd)
-                    .args(args)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn()
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = stdin.write_all(text.as_bytes());
-                    }
-                    if let Ok(status) = child.wait() {
-                        if status.success() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-            Err("No Linux clipboard write utility (wl-copy/xclip/xsel) available".to_string())
         }
     }
 }
 
 impl ClipboardBackend for OsClipboardBackend {
     fn read_text(&self) -> Result<String, String> {
-        match self.run_read() {
+        match rustcode_platform::os_ux::ClipboardBackend::read_text(&*self.inner) {
             Ok(text) => {
                 let _ = self.fallback.write_text(&text);
                 Ok(text)
@@ -265,7 +134,7 @@ impl ClipboardBackend for OsClipboardBackend {
     }
 
     fn write_text(&self, text: &str) -> Result<(), String> {
-        match self.run_write(text) {
+        match rustcode_platform::os_ux::ClipboardBackend::write_text(&*self.inner, text) {
             Ok(()) => {
                 let _ = self.fallback.write_text(text);
                 Ok(())
@@ -712,6 +581,21 @@ impl ExtHostEnvManager {
 
     pub fn set_clipboard_backend(&self, backend: Arc<dyn ClipboardBackend>) {
         *self.clipboard_backend.write() = backend;
+    }
+
+    pub fn with_platform_clipboard(
+        self,
+        backend: Arc<dyn rustcode_platform::os_ux::ClipboardBackend>,
+    ) -> Self {
+        self.set_platform_clipboard(backend);
+        self
+    }
+
+    pub fn set_platform_clipboard(
+        &self,
+        backend: Arc<dyn rustcode_platform::os_ux::ClipboardBackend>,
+    ) {
+        self.set_clipboard_backend(Arc::new(PlatformClipboardAdapter::new(backend)));
     }
 
     pub fn with_external_uri_opener(self, opener: Arc<dyn ExternalUriOpener>) -> Self {
@@ -1359,5 +1243,26 @@ mod tests {
         assert!(matches!(info["endianness"].as_str(), Some("LE" | "BE")));
         assert!(info["cpus"].as_u64().is_some_and(|n| n >= 1));
         assert!(info["username"].as_str().is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn test_platform_clipboard_adapter_bridges_shared_backend() {
+        let shared: Arc<dyn rustcode_platform::os_ux::ClipboardBackend> =
+            Arc::new(rustcode_platform::os_ux::InMemoryClipboardBackend::new());
+        let mgr = ExtHostEnvManager::new().with_platform_clipboard(Arc::clone(&shared));
+
+        mgr.handle_rpc_call("env.clipboardWrite", &json!({ "value": "shared-clip-123" }))
+            .unwrap();
+        assert_eq!(shared.read_text().unwrap(), "shared-clip-123");
+
+        shared.write_text("from-editor-456").unwrap();
+        assert_eq!(
+            mgr.handle_rpc_call("env.clipboardRead", &json!({})).unwrap(),
+            json!("from-editor-456")
+        );
+
+        let os_fallback = OsClipboardBackend::new();
+        os_fallback.write_text("fallback-safe").unwrap();
+        assert!(!os_fallback.read_text().unwrap().is_empty());
     }
 }

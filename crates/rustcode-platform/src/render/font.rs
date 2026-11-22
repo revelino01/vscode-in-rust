@@ -49,6 +49,19 @@ impl FontMetrics {
     pub fn text_width(&self, text: &str) -> f32 {
         text.chars().count() as f32 * self.char_width
     }
+
+    pub fn is_finite(&self) -> bool {
+        const MAX_FONT_METRIC: f32 = 10_000.0;
+        self.line_height.is_finite()
+            && self.line_height > 0.0
+            && self.line_height <= MAX_FONT_METRIC
+            && self.char_width.is_finite()
+            && self.char_width >= 0.0
+            && self.char_width <= MAX_FONT_METRIC
+            && self.font_size.is_finite()
+            && self.font_size >= 0.0
+            && self.font_size <= MAX_FONT_METRIC
+    }
 }
 
 #[cfg(test)]
@@ -63,5 +76,17 @@ mod tests {
         assert_eq!(metrics.line_height, 21.0);
         assert_eq!(metrics.ascent, 11.0);
         assert_eq!(metrics.descent, 10.0);
+        assert!(metrics.is_finite());
+    }
+
+    #[test]
+    fn test_font_metrics_is_finite_validation() {
+        let base = FontMetrics::default_monospace();
+        assert!(base.is_finite());
+        assert!(!(FontMetrics { line_height: 0.0, ..base.clone() }).is_finite());
+        assert!(!(FontMetrics { line_height: f32::NAN, ..base.clone() }).is_finite());
+        assert!(!(FontMetrics { char_width: -1.0, ..base.clone() }).is_finite());
+        assert!(!(FontMetrics { font_size: f32::INFINITY, ..base.clone() }).is_finite());
+        assert!(!(FontMetrics { font_size: 20_000.0, ..base }).is_finite());
     }
 }

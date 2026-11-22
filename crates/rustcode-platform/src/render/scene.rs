@@ -1,7 +1,7 @@
 //! Scene graph and display list primitives mirroring GPUI element rendering pipeline.
 
 use crate::render::color::Rgba;
-use crate::render::geometry::{Corners, Edges, Point, Rect};
+use crate::render::geometry::{Corners, Edges, Point, Rect, MAX_RECT_COORD};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +132,49 @@ impl Scene {
 
     pub fn push_shadow(&mut self, shadow: Shadow) {
         self.nodes.push(SceneNode::Shadow(shadow));
+    }
+
+    pub fn push_finite_quad(&mut self, quad: Quad) {
+        if quad.bounds.is_finite()
+            && quad.bounds.width() >= 0.0
+            && quad.bounds.height() >= 0.0
+        {
+            self.push_quad(quad);
+        }
+    }
+
+    pub fn push_finite_text(&mut self, glyph_run: GlyphRun) {
+        if glyph_run.origin.x.is_finite()
+            && glyph_run.origin.y.is_finite()
+            && glyph_run.origin.x.abs() <= MAX_RECT_COORD
+            && glyph_run.origin.y.abs() <= MAX_RECT_COORD
+            && glyph_run.bounds.is_finite()
+            && glyph_run.bounds.width() >= 0.0
+            && glyph_run.bounds.height() >= 0.0
+            && glyph_run.font_size.is_finite()
+            && glyph_run.font_size >= 0.0
+        {
+            self.push_text(glyph_run);
+        }
+    }
+
+    pub fn push_finite_shadow(&mut self, shadow: Shadow) {
+        if shadow.bounds.is_finite()
+            && shadow.bounds.width() >= 0.0
+            && shadow.bounds.height() >= 0.0
+            && shadow.offset.x.is_finite()
+            && shadow.offset.y.is_finite()
+            && shadow.offset.x.abs() <= MAX_RECT_COORD
+            && shadow.offset.y.abs() <= MAX_RECT_COORD
+            && shadow.blur.is_finite()
+            && shadow.blur >= 0.0
+            && shadow.blur <= MAX_RECT_COORD
+            && shadow.spread.is_finite()
+            && shadow.spread.abs() <= MAX_RECT_COORD
+            && (shadow.blur * 2.0 + shadow.spread.abs()).is_finite()
+        {
+            self.push_shadow(shadow);
+        }
     }
 
     pub fn push_clip(&mut self, rect: Rect) {
@@ -268,5 +311,91 @@ mod tests {
 
         let hits = scene.hit_test(Point::new(15.0, 15.0));
         assert_eq!(hits.len(), 2); // Both quad and glyph run
+    }
+
+    #[test]
+    fn test_scene_push_finite_helpers_filter_invalid_nodes() {
+        use crate::render::geometry::Size;
+
+        let mut scene = Scene::new();
+        let valid_rect = Rect::from_xywh(10.0, 10.0, 50.0, 20.0);
+
+        // Invalid quads (NaN, > MAX_RECT_COORD, negative dimension) dropped
+        scene.push_finite_quad(Quad::new(Rect::new(Point::new(f32::NAN, 0.0), Size::new(10.0, 10.0))));
+        scene.push_finite_quad(Quad::new(Rect::new(Point::new(1.0e16, 0.0), Size::new(10.0, 10.0))));
+        scene.push_finite_quad(Quad::new(Rect::new(Point::zero(), Size::new(-1.0, 10.0))));
+        assert!(scene.is_empty());
+
+        // Valid quad pushed
+        scene.push_finite_quad(Quad::new(valid_rect).with_background(Rgba::white()));
+        assert_eq!(scene.quads().len(), 1);
+
+        // Invalid text (negative font_size, Inf origin, NaN bounds) dropped
+        scene.push_finite_text(GlyphRun::new(
+            "bad".to_string(),
+            Point::new(0.0, 0.0),
+            valid_rect,
+            Rgba::black(),
+            -1.0,
+        ));
+        scene.push_finite_text(GlyphRun::new(
+            "bad".to_string(),
+            Point::new(f32::INFINITY, 0.0),
+            valid_rect,
+            Rgba::black(),
+            12.0,
+        ));
+        assert_eq!(scene.glyph_runs().len(), 0);
+
+        // Valid text pushed
+        scene.push_finite_text(GlyphRun::new(
+            "ok".to_string(),
+            Point::new(10.0, 10.0),
+            valid_rect,
+            Rgba::black(),
+            12.0,
+        ));
+        assert_eq!(scene.glyph_runs().len(), 1);
+
+        // Invalid shadows (NaN offset, negative blur, negative width) dropped
+        scene.push_finite_shadow(Shadow {
+            bounds: valid_rect,
+            offset: Point::new(f32::NAN, 2.0),
+            blur: 4.0,
+            spread: 0.0,
+            color: Rgba::black(),
+        });
+        scene.push_finite_shadow(Shadow {
+            bounds: valid_rect,
+            offset: Point::new(0.0, 2.0),
+            blur: -1.0,
+            spread: 0.0,
+            color: Rgba::black(),
+        });
+        scene.push_finite_shadow(Shadow {
+            bounds: valid_rect,
+            offset: Point::new(0.0, 2.0),
+            blur: f32::MAX,
+            spread: 0.0,
+            color: Rgba::black(),
+        });
+        scene.push_finite_shadow(Shadow {
+            bounds: valid_rect,
+            offset: Point::new(0.0, 2.0),
+            blur: 4.0,
+            spread: f32::MAX,
+            color: Rgba::black(),
+        });
+        assert_eq!(scene.nodes().len(), 2);
+
+        // Valid shadow pushed
+        scene.push_finite_shadow(Shadow {
+            bounds: valid_rect,
+            offset: Point::new(0.0, 2.0),
+            blur: 4.0,
+            spread: 0.0,
+            color: Rgba::black(),
+        });
+        assert_eq!(scene.nodes().len(), 3);
     }
 }

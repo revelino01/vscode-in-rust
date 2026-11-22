@@ -1,5 +1,10 @@
 //! RustCode application service container and GPUI window bootstrap.
 
+pub mod cli;
+#[cfg(feature = "desktop")]
+pub mod desktop;
+pub mod runtime;
+
 use parking_lot::Mutex;
 use rustcode_base::context_key::ContextKeyService;
 use rustcode_base::disposable::DisposableStore;
@@ -13,7 +18,7 @@ use rustcode_protocols::lsp::LspClientManager;
 use rustcode_workbench::layout::{LayoutHandle, SharedWorkbenchLayout};
 use rustcode_workbench::window::WindowCommandSink;
 pub use rustcode_workbench::WorkbenchWindow;
-use rustcode_workbench::{EditorArea, FileExplorer};
+use rustcode_workbench::FileExplorer;
 use serde_json::json;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
@@ -25,7 +30,6 @@ pub struct RustCodeContext {
     pub context_keys: ContextKeyService,
     pub theme: ThemeService,
     pub layout: SharedWorkbenchLayout,
-    pub editor_area: EditorArea,
     pub explorer: FileExplorer,
     pub ext_loader: ExtensionLoader,
     pub file_system: Arc<FileSystemService>,
@@ -73,7 +77,6 @@ impl RustCodeContext {
         let context_keys = ContextKeyService::new();
         let theme = ThemeService::new();
         let layout = SharedWorkbenchLayout::new();
-        let editor_area = EditorArea::new();
         let explorer = FileExplorer::new();
         let ext_loader = ExtensionLoader::new();
         let file_system = Arc::new(FileSystemService::new());
@@ -98,7 +101,6 @@ impl RustCodeContext {
             context_keys,
             theme,
             layout,
-            editor_area,
             explorer,
             ext_loader,
             file_system,
@@ -514,14 +516,13 @@ impl RustCodeContext {
             .env_manager
             .hydrate_from_loader(&self.ext_loader);
 
-        let mut folders = Vec::new();
-        if !self.explorer.roots.is_empty() {
-            for (idx, root) in self.explorer.roots.iter().enumerate() {
-                folders.push(ExtWorkspaceFolder::from_path(idx, &root.path));
-            }
-        } else if let Some(root) = &self.explorer.root {
-            folders.push(ExtWorkspaceFolder::from_path(0, &root.path));
-        }
+        let folders: Vec<ExtWorkspaceFolder> = self
+            .explorer
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(idx, root)| ExtWorkspaceFolder::from_path(idx, &root.path))
+            .collect();
         if !folders.is_empty() && self.language_bridge.workspace_folders().is_empty() {
             self.language_bridge.set_workspace_folders(folders);
         }

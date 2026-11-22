@@ -5,7 +5,7 @@ edition = "2021"
 
 [features]
 default = []
-gpui = ["rustcode-platform/gpui"]
+desktop = ["rustcode-platform/desktop", "rustcode-editor/desktop", "dep:wry", "dep:raw-window-handle"]
 
 [dependencies]
 rustcode-base = { path = "../rustcode-base" }
@@ -14,11 +14,17 @@ rustcode-editor = { path = "../rustcode-editor" }
 rustcode-protocols = { path = "../rustcode-protocols" }
 rustcode-ext-host = { path = "../rustcode-ext-host" }
 rustcode-terminal = { path = "../rustcode-terminal" }
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+nucleo-matcher = "0.3"
 parking_lot = "0.12"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4"] }
+wry = { version = "0.50", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
 

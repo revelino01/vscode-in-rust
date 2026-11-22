@@ -1,8 +1,10 @@
-//! Webview panel container and pure-Rust visual renderer in GPUI scene graph.
+//! Webview panel container, OS WebView backend (`wry`), and pure-Rust fallback renderer.
 //!
 //! Hosts custom extension HTML views (`vscode.window.createWebviewPanel`) and provides
 //! a bidirectional MessagePort / RPC bridge (`postMessage`, `onDidReceiveMessage`).
 
+#[cfg(feature = "desktop")]
+use parking_lot::Mutex;
 use parking_lot::RwLock;
 use rustcode_ext_host::webview::{ExtHostWebviewManager, WebviewOptions};
 use rustcode_platform::render::{
@@ -10,6 +12,335 @@ use rustcode_platform::render::{
     WorkbenchThemeStyles,
 };
 use serde_json::Value;
+#[cfg(feature = "desktop")]
+use std::sync::Arc;
+
+/// Backend abstraction for hosting WebView HTML and bidirectional `postMessage` IPC.
+pub trait WebviewBackend: Send + Sync {
+    fn load_html(&mut self, html: &str);
+    fn post_message(&mut self, payload: &Value) -> Result<(), String>;
+    fn drain_outbound_messages(&mut self) -> Vec<Value>;
+    fn set_bounds(&mut self, bounds: Rect);
+    fn set_visible(&mut self, visible: bool);
+    fn current_html(&self) -> &str;
+}
+
+/// Deterministic in-memory WebView backend for headless CI and unit tests.
+#[derive(Debug, Clone)]
+pub struct HeadlessWebviewBackend {
+    html: String,
+    posted_messages: Vec<Value>,
+    outbound_queue: Vec<Value>,
+    bounds: Rect,
+    visible: bool,
+}
+
+impl Default for HeadlessWebviewBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HeadlessWebviewBackend {
+    pub fn new() -> Self {
+        Self {
+            html: String::new(),
+            posted_messages: Vec::new(),
+            outbound_queue: Vec::new(),
+            bounds: Rect::from_xywh(0.0, 0.0, 200.0, 200.0),
+            visible: true,
+        }
+    }
+
+    pub fn with_html(html: &str) -> Self {
+        let mut backend = Self::new();
+        backend.load_html(html);
+        backend
+    }
+
+    pub fn inject_outbound_message(&mut self, payload: Value) {
+        self.outbound_queue.push(payload);
+    }
+
+    pub fn posted_messages(&self) -> &[Value] {
+        &self.posted_messages
+    }
+
+    pub fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+}
+
+impl WebviewBackend for HeadlessWebviewBackend {
+    fn load_html(&mut self, html: &str) {
+        self.html = html.to_string();
+    }
+
+    fn post_message(&mut self, payload: &Value) -> Result<(), String> {
+        self.posted_messages.push(payload.clone());
+        Ok(())
+    }
+
+    fn drain_outbound_messages(&mut self) -> Vec<Value> {
+        std::mem::take(&mut self.outbound_queue)
+    }
+
+    fn set_bounds(&mut self, bounds: Rect) {
+        if bounds.is_finite() {
+            self.bounds = bounds;
+        }
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+    }
+
+    fn current_html(&self) -> &str {
+        &self.html
+    }
+}
+
+#[cfg(feature = "desktop")]
+const VSCODE_WEBVIEW_IPC_SHIM_JS: &str = r#"
+(function() {
+    if (typeof window.acquireVsCodeApi !== 'function') {
+        var __state = undefined;
+        window.acquireVsCodeApi = function() {
+            return {
+                postMessage: function(msg) {
+                    if (window.ipc && typeof window.ipc.postMessage === 'function') {
+                        window.ipc.postMessage(JSON.stringify(msg));
+                    }
+                },
+                getState: function() { return __state; },
+                setState: function(next) { __state = next; return next; }
+            };
+        };
+    }
+})();
+"#;
+
+#[cfg(feature = "desktop")]
+fn to_wry_rect(bounds: Rect) -> wry::Rect {
+    let x = if bounds.min_x().is_finite() {
+        bounds.min_x().max(0.0) as f64
+    } else {
+        0.0
+    };
+    let y = if bounds.min_y().is_finite() {
+        bounds.min_y().max(0.0) as f64
+    } else {
+        0.0
+    };
+    let w = if bounds.width().is_finite() {
+        bounds.width().max(1.0) as f64
+    } else {
+        200.0
+    };
+    let h = if bounds.height().is_finite() {
+        bounds.height().max(1.0) as f64
+    } else {
+        200.0
+    };
+    wry::Rect {
+        position: wry::dpi::LogicalPosition::new(x, y).into(),
+        size: wry::dpi::LogicalSize::new(w, h).into(),
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn format_post_message_script(payload: &Value) -> Result<String, String> {
+    let serialized = serde_json::to_string(payload)
+        .map_err(|e| format!("Failed to serialize webview postMessage payload: {e}"))?
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029");
+    Ok(format!(
+        "window.dispatchEvent(new MessageEvent('message', {{ data: {} }}));",
+        serialized
+    ))
+}
+
+#[cfg(feature = "desktop")]
+struct SendSyncWryWebView {
+    inner: wry::WebView,
+    owner_thread: std::thread::ThreadId,
+}
+
+#[cfg(feature = "desktop")]
+// SAFETY: All calls touching `wry::WebView` are guarded by `owner_thread` matching
+// the UI thread that constructed it and synchronized through `parking_lot::Mutex`.
+unsafe impl Send for SendSyncWryWebView {}
+#[cfg(feature = "desktop")]
+unsafe impl Sync for SendSyncWryWebView {}
+
+/// Native OS WebView backend powered by `wry` (WebView2 / WebKitGTK / WKWebView).
+#[cfg(feature = "desktop")]
+pub struct WryWebviewBackend {
+    html: String,
+    enable_scripts: bool,
+    bounds: Rect,
+    visible: bool,
+    pending_inbound: Vec<Value>,
+    outbound_queue: Arc<Mutex<Vec<Value>>>,
+    webview: Mutex<Option<SendSyncWryWebView>>,
+}
+
+#[cfg(feature = "desktop")]
+impl Default for WryWebviewBackend {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "desktop")]
+impl WryWebviewBackend {
+    pub fn new() -> Self {
+        Self::with_options(true)
+    }
+
+    pub fn with_options(enable_scripts: bool) -> Self {
+        Self {
+            html: String::new(),
+            enable_scripts,
+            bounds: Rect::from_xywh(0.0, 0.0, 200.0, 200.0),
+            visible: true,
+            pending_inbound: Vec::new(),
+            outbound_queue: Arc::new(Mutex::new(Vec::new())),
+            webview: Mutex::new(None),
+        }
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.webview.lock().is_some()
+    }
+
+    pub fn bounds(&self) -> Rect {
+        self.bounds
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn pending_inbound_messages(&self) -> &[Value] {
+        &self.pending_inbound
+    }
+
+    pub fn attach_to_window<W>(&mut self, window: &Arc<W>) -> Result<(), String>
+    where
+        W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
+    {
+        self.attach_to_wry_parent(window.as_ref())
+    }
+
+    pub fn attach_to_wry_parent<W>(&mut self, parent: &W) -> Result<(), String>
+    where
+        W: raw_window_handle::HasWindowHandle,
+    {
+        let outbound = Arc::clone(&self.outbound_queue);
+        let initial_html = if self.html.is_empty() {
+            "<!DOCTYPE html><html><body></body></html>".to_string()
+        } else {
+            self.html.clone()
+        };
+
+        let mut builder = wry::WebViewBuilder::new()
+            .with_bounds(to_wry_rect(self.bounds))
+            .with_visible(self.visible)
+            .with_initialization_script(VSCODE_WEBVIEW_IPC_SHIM_JS)
+            .with_ipc_handler(move |request| {
+                let body = request.body();
+                let payload = serde_json::from_str::<Value>(body)
+                    .unwrap_or_else(|_| Value::String(body.clone()));
+                outbound.lock().push(payload);
+            })
+            .with_html(initial_html);
+
+        if !self.enable_scripts {
+            builder = builder.with_javascript_disabled();
+        }
+
+        let built = builder
+            .build_as_child(parent)
+            .map_err(|e| format!("Failed to create wry child WebView: {e}"))?;
+
+        let pending = std::mem::take(&mut self.pending_inbound);
+        for msg in pending {
+            let script = format_post_message_script(&msg)?;
+            let _ = built.evaluate_script(&script);
+        }
+
+        *self.webview.lock() = Some(SendSyncWryWebView {
+            inner: built,
+            owner_thread: std::thread::current().id(),
+        });
+        Ok(())
+    }
+}
+
+#[cfg(feature = "desktop")]
+impl WebviewBackend for WryWebviewBackend {
+    fn load_html(&mut self, html: &str) {
+        self.html = html.to_string();
+        let guard = self.webview.lock();
+        if let Some(wv) = guard.as_ref() {
+            if wv.owner_thread == std::thread::current().id() {
+                let _ = wv.inner.load_html(html);
+            }
+        }
+    }
+
+    fn post_message(&mut self, payload: &Value) -> Result<(), String> {
+        let script = format_post_message_script(payload)?;
+        let guard = self.webview.lock();
+        if let Some(wv) = guard.as_ref() {
+            if wv.owner_thread != std::thread::current().id() {
+                return Err("WryWebviewBackend::post_message called from non-owner thread".to_string());
+            }
+            wv.inner
+                .evaluate_script(&script)
+                .map_err(|e| format!("wry evaluate_script failed: {e}"))
+        } else {
+            drop(guard);
+            self.pending_inbound.push(payload.clone());
+            Ok(())
+        }
+    }
+
+    fn drain_outbound_messages(&mut self) -> Vec<Value> {
+        std::mem::take(&mut *self.outbound_queue.lock())
+    }
+
+    fn set_bounds(&mut self, bounds: Rect) {
+        if bounds.is_finite() {
+            self.bounds = bounds;
+            let guard = self.webview.lock();
+            if let Some(wv) = guard.as_ref() {
+                if wv.owner_thread == std::thread::current().id() {
+                    let _ = wv.inner.set_bounds(to_wry_rect(bounds));
+                }
+            }
+        }
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+        let guard = self.webview.lock();
+        if let Some(wv) = guard.as_ref() {
+            if wv.owner_thread == std::thread::current().id() {
+                let _ = wv.inner.set_visible(visible);
+            }
+        }
+    }
+
+    fn current_html(&self) -> &str {
+        &self.html
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebviewElementKind {
@@ -40,9 +371,21 @@ pub struct WebviewEditorView {
     pub scroll_top: f32,
     pub ext_host_manager: Option<ExtHostWebviewManager>,
     pub button_targets: RwLock<Vec<(Rect, Value)>>,
+    pub backend: Box<dyn WebviewBackend>,
+    pub last_bounds: RwLock<Option<Rect>>,
 }
 
 impl WebviewEditorView {
+    pub fn sanitize_html(html: &str, enable_scripts: bool) -> String {
+        if enable_scripts {
+            html.to_string()
+        } else {
+            let mut out = html.to_string();
+            strip_tag_block(&mut out, "script");
+            out
+        }
+    }
+
     pub fn new(
         id: &str,
         view_type: &str,
@@ -52,6 +395,8 @@ impl WebviewEditorView {
         ext_host_manager: Option<ExtHostWebviewManager>,
     ) -> Self {
         let nodes = Self::parse_html(html);
+        let prepared = Self::sanitize_html(html, options.enable_scripts);
+        let backend: Box<dyn WebviewBackend> = Box::new(HeadlessWebviewBackend::with_html(&prepared));
         Self {
             id: id.to_string(),
             view_type: view_type.to_string(),
@@ -64,17 +409,64 @@ impl WebviewEditorView {
             scroll_top: 0.0,
             ext_host_manager,
             button_targets: RwLock::new(Vec::new()),
+            backend,
+            last_bounds: RwLock::new(None),
         }
+    }
+
+    pub fn with_backend(mut self, mut backend: Box<dyn WebviewBackend>) -> Self {
+        let prepared = Self::sanitize_html(&self.html, self.options.enable_scripts);
+        backend.load_html(&prepared);
+        if let Some(bounds) = *self.last_bounds.read() {
+            backend.set_bounds(bounds);
+        }
+        self.backend = backend;
+        self
+    }
+
+    pub fn set_backend(&mut self, mut backend: Box<dyn WebviewBackend>) {
+        let prepared = Self::sanitize_html(&self.html, self.options.enable_scripts);
+        backend.load_html(&prepared);
+        if let Some(bounds) = *self.last_bounds.read() {
+            backend.set_bounds(bounds);
+        }
+        self.backend = backend;
+    }
+
+    #[cfg(feature = "desktop")]
+    pub fn upgrade_to_wry<W>(&mut self, window: Option<&Arc<W>>) -> Result<(), String>
+    where
+        W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
+    {
+        let mut wry_backend = WryWebviewBackend::with_options(self.options.enable_scripts);
+        let prepared = Self::sanitize_html(&self.html, self.options.enable_scripts);
+        wry_backend.load_html(&prepared);
+        if let Some(bounds) = *self.last_bounds.read() {
+            wry_backend.set_bounds(bounds);
+        }
+        if let Some(win) = window {
+            wry_backend.attach_to_window(win)?;
+        }
+        self.backend = Box::new(wry_backend);
+        Ok(())
     }
 
     pub fn set_html(&mut self, html: &str) {
         self.html = html.to_string();
         self.nodes = Self::parse_html(html);
+        let prepared = Self::sanitize_html(html, self.options.enable_scripts);
+        self.backend.load_html(&prepared);
+    }
+
+    /// Post a message from extension host into the webview backend & history.
+    pub fn post_message_from_host(&mut self, msg: Value) -> Result<(), String> {
+        self.inbound_messages.push(msg.clone());
+        self.backend.post_message(&msg)
     }
 
     /// Receive message from extension host into webview.
     pub fn receive_message_from_host(&mut self, msg: Value) {
-        self.inbound_messages.push(msg);
+        let _ = self.post_message_from_host(msg);
     }
 
     /// Send message from webview out to extension host.
@@ -83,6 +475,29 @@ impl WebviewEditorView {
         if let Some(mgr) = &self.ext_host_manager {
             let _ = mgr.receive_message_from_webview(&self.id, msg);
         }
+    }
+
+    /// Drain outbound IPC messages from the active `WebviewBackend` and forward to extension host.
+    pub fn drain_messages_to_host(&mut self) -> Vec<Value> {
+        let msgs = self.backend.drain_outbound_messages();
+        for msg in &msgs {
+            self.outbound_messages.push(msg.clone());
+            if let Some(mgr) = &self.ext_host_manager {
+                let _ = mgr.receive_message_from_webview(&self.id, msg.clone());
+            }
+        }
+        msgs
+    }
+
+    pub fn sync_backend_bounds(&mut self, bounds: Rect) {
+        if bounds.is_finite() {
+            *self.last_bounds.write() = Some(bounds);
+            self.backend.set_bounds(bounds);
+        }
+    }
+
+    pub fn set_visible(&mut self, visible: bool) {
+        self.backend.set_visible(visible);
     }
 
     /// Robust pure-Rust HTML tag scanner converting tags into renderable nodes.
@@ -424,12 +839,13 @@ impl View for WebviewEditorView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
+        *self.last_bounds.write() = Some(bounds);
 
         // Base Webview background
-        crate::push_finite_quad(scene, Quad::new(bounds).with_background(theme.editor_background));
+        scene.push_finite_quad(Quad::new(bounds).with_background(theme.editor_background));
 
         let safe_scroll = if self.scroll_top.is_finite() {
             self.scroll_top.max(0.0)
@@ -455,8 +871,7 @@ impl View for WebviewEditorView {
                 WebviewElementKind::Heading1(text) => {
                     let h1_size = font.font_size * 1.5;
                     let line_h = font.line_height * 1.5;
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             text.clone(),
                             Point::new(left_x, cur_y),
@@ -470,8 +885,7 @@ impl View for WebviewEditorView {
                 WebviewElementKind::Heading2(text) => {
                     let h2_size = font.font_size * 1.25;
                     let line_h = font.line_height * 1.25;
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             text.clone(),
                             Point::new(left_x, cur_y),
@@ -484,8 +898,7 @@ impl View for WebviewEditorView {
                 }
                 WebviewElementKind::Heading3(text) => {
                     let h3_size = font.font_size * 1.1;
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             text.clone(),
                             Point::new(left_x, cur_y),
@@ -497,8 +910,7 @@ impl View for WebviewEditorView {
                     cur_y += font.line_height + 8.0;
                 }
                 WebviewElementKind::Paragraph(text) => {
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             text.clone(),
                             Point::new(left_x, cur_y),
@@ -511,8 +923,7 @@ impl View for WebviewEditorView {
                 }
                 WebviewElementKind::ListItem(text) => {
                     let bullet_text = format!("•  {}", text);
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             bullet_text,
                             Point::new(left_x + 8.0, cur_y),
@@ -528,8 +939,7 @@ impl View for WebviewEditorView {
                     let block_h = (block_lines.len() as f32 * font.line_height + 12.0).max(28.0);
                     let block_rect = Rect::from_xywh(left_x, cur_y, content_w, block_h);
 
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(block_rect)
                             .with_background(theme.command_palette_bg)
                             .with_border_edges(theme.panel_border, Edges::all(1.0))
@@ -541,8 +951,7 @@ impl View for WebviewEditorView {
                         if !line_y.is_finite() || !(line_y + font.line_height).is_finite() {
                             break;
                         }
-                        crate::push_finite_text(
-                            scene,
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 line.to_string(),
                                 Point::new(left_x + 10.0, line_y),
@@ -564,19 +973,17 @@ impl View for WebviewEditorView {
                     let btn_w = font.text_width(label) + 24.0;
                     let btn_h = 28.0;
                     let btn_rect = Rect::from_xywh(left_x, cur_y, btn_w, btn_h);
-                    if crate::is_finite_positive_rect(btn_rect) {
+                    if btn_rect.is_finite_positive() {
                         targets.push((btn_rect, message_payload.clone()));
 
-                        crate::push_finite_quad(
-                            scene,
+                        scene.push_finite_quad(
                             Quad::new(btn_rect)
                                 .with_background(theme.command_palette_selected_bg)
                                 .with_border_edges(theme.panel_border, Edges::all(1.0))
                                 .with_corner_radius(4.0),
                         );
 
-                        crate::push_finite_text(
-                            scene,
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 label.clone(),
                                 Point::new(left_x + 12.0, cur_y + 4.0),
@@ -596,7 +1003,7 @@ impl View for WebviewEditorView {
                 }
                 WebviewElementKind::HorizontalRule => {
                     let hr_rect = Rect::from_xywh(left_x, cur_y + 6.0, content_w, 1.0);
-                    crate::push_finite_quad(scene, Quad::new(hr_rect).with_background(theme.panel_border));
+                    scene.push_finite_quad(Quad::new(hr_rect).with_background(theme.panel_border));
                     cur_y += 14.0;
                 }
             }
@@ -607,7 +1014,7 @@ impl View for WebviewEditorView {
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return EventResult::Ignored;
         }
         match event {
@@ -621,7 +1028,7 @@ impl View for WebviewEditorView {
 
                 let targets = self.button_targets.read().clone();
                 for (rect, payload) in targets {
-                    if crate::is_finite_positive_rect(rect) && rect.contains(mouse.position) {
+                    if rect.is_finite_positive() && rect.contains(mouse.position) {
                         self.send_message_to_host(payload);
                         return EventResult::Consumed;
                     }
@@ -817,7 +1224,109 @@ mod tests {
         webview.render(valid_bounds, &theme, &font, &mut scene);
         assert!(!scene.is_empty());
         for q in scene.quads() {
-            assert!(crate::is_finite_rect(q.bounds));
+            assert!(q.bounds.is_finite());
         }
+    }
+
+    #[test]
+    fn test_webview_backend_headless_post_message_bounds_and_script_sanitization() {
+        use rustcode_ext_host::webview::ExtHostCustomEditorManager;
+        use std::sync::Arc;
+
+        let ext_wv = ExtHostWebviewManager::new();
+        let ext_ce = ExtHostCustomEditorManager::new();
+        let received = Arc::new(RwLock::new(Vec::new()));
+        let received_clone = Arc::clone(&received);
+
+        ext_ce.register_provider(
+            "catEdit.canvas",
+            WebviewOptions {
+                enable_scripts: false,
+                local_resource_roots: vec![],
+            },
+            false,
+        );
+        let session = ext_ce.open_session(
+            Some("ce_wv_1"),
+            "catEdit.canvas",
+            "file:///art.canvas",
+            Some("art.canvas"),
+            Some(&ext_wv),
+        );
+        ext_wv.on_did_receive_message(&session.panel_id, move |msg| {
+            received_clone.write().push(msg);
+        });
+
+        let mut backend = HeadlessWebviewBackend::new();
+        backend.inject_outbound_message(serde_json::json!({ "command": "ready", "zoom": 1.5 }));
+
+        let mut view = WebviewEditorView::new(
+            &session.panel_id,
+            &session.view_type,
+            &session.title,
+            "<script>alert(1)</script><h1>Canvas</h1>",
+            WebviewOptions {
+                enable_scripts: false,
+                local_resource_roots: vec![],
+            },
+            Some(ext_wv.clone()),
+        )
+        .with_backend(Box::new(backend));
+
+        // enable_scripts == false strips script blocks from backend HTML while preserving parsed heading
+        assert!(!view.backend.current_html().contains("<script>"));
+        assert!(view.backend.current_html().contains("<h1>Canvas</h1>"));
+
+        // Re-inject outbound IPC message after with_backend replaced backend, then drain
+        let mut custom_backend = HeadlessWebviewBackend::new();
+        custom_backend.inject_outbound_message(serde_json::json!({ "command": "save", "stroke": 3 }));
+        view.set_backend(Box::new(custom_backend));
+        let drained = view.drain_messages_to_host();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0]["command"], "save");
+        assert_eq!(received.read().len(), 1);
+        assert_eq!(received.read()[0]["stroke"], 3);
+
+        // Host -> Webview post_message_from_host & bounds/visibility forwarding
+        view.post_message_from_host(serde_json::json!({ "command": "render", "layer": 2 }))
+            .unwrap();
+        assert_eq!(view.inbound_messages.len(), 1);
+        assert_eq!(view.inbound_messages[0]["layer"], 2);
+
+        let bounds = Rect::from_xywh(12.0, 40.0, 640.0, 480.0);
+        view.sync_backend_bounds(bounds);
+        assert_eq!(*view.last_bounds.read(), Some(bounds));
+        view.set_visible(false);
+        view.set_html("<h2>Updated</h2>");
+        assert!(view.backend.current_html().contains("<h2>Updated</h2>"));
+
+        // Close custom editor session cleanly
+        assert!(ext_ce.close_session(&session.id, Some(&ext_wv)));
+        assert!(ext_wv.get_panel(&session.panel_id).unwrap().is_disposed);
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_wry_webview_backend_unattached_fallback_and_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WryWebviewBackend>();
+
+        let mut backend = WryWebviewBackend::new();
+        assert!(!backend.is_attached());
+        backend.load_html("<h1>Desktop Wry</h1>");
+        assert_eq!(backend.current_html(), "<h1>Desktop Wry</h1>");
+
+        let rect = Rect::from_xywh(10.0, 20.0, 500.0, 400.0);
+        backend.set_bounds(rect);
+        assert_eq!(backend.bounds(), rect);
+        backend.set_visible(false);
+        assert!(!backend.is_visible());
+
+        // Unattached post_message buffers cleanly instead of panicking
+        backend
+            .post_message(&serde_json::json!({ "type": "ping" }))
+            .unwrap();
+        assert_eq!(backend.pending_inbound_messages().len(), 1);
+        assert!(backend.drain_outbound_messages().is_empty());
     }
 }

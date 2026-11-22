@@ -627,7 +627,7 @@ impl ExtensionsSidebarView {
     pub fn compute_layout(&self, bounds: Rect) -> ExtensionsSidebarLayout {
         let header_h = 28.0;
         let input_h = 26.0;
-        let safe_bounds = if crate::is_finite_rect(bounds)
+        let safe_bounds = if bounds.is_finite()
             && (bounds.min_y() + header_h + input_h + 6.0).is_finite()
         {
             Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), bounds.height())
@@ -850,8 +850,8 @@ impl View for ExtensionsSidebarView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds)
-            || !crate::is_finite_font(font)
+        if !bounds.is_finite_positive()
+            || !font.is_finite()
             || !(bounds.min_x() + 12.0).is_finite()
             || !(bounds.min_y() + 60.0).is_finite()
         {
@@ -1366,7 +1366,7 @@ impl View for ExtensionsSidebarView {
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         match event {
             InputEvent::MouseDown(mouse) => {
-                if !crate::is_finite_positive_rect(bounds)
+                if !bounds.is_finite_positive()
                     || !mouse.position.x.is_finite()
                     || !mouse.position.y.is_finite()
                     || mouse.button != MouseButton::Left
@@ -1491,7 +1491,7 @@ impl View for ExtensionsSidebarView {
                 }
             }
             InputEvent::ScrollWheel(scroll) => {
-                if !crate::is_finite_positive_rect(bounds)
+                if !bounds.is_finite_positive()
                     || !scroll.position.x.is_finite()
                     || !scroll.position.y.is_finite()
                     || !bounds.contains(scroll.position)
@@ -1979,10 +1979,10 @@ mod tests {
 
         for &b in &bad_bounds {
             let layout = view.compute_layout(b);
-            assert!(crate::is_finite_rect(layout.search_rect));
-            assert!(crate::is_finite_rect(layout.body_rect));
-            assert!(crate::is_finite_rect(layout.installed_list_rect));
-            assert!(crate::is_finite_rect(layout.marketplace_list_rect));
+            assert!(layout.search_rect.is_finite());
+            assert!(layout.body_rect.is_finite());
+            assert!(layout.installed_list_rect.is_finite());
+            assert!(layout.marketplace_list_rect.is_finite());
 
             let mut scene = Scene::new();
             view.render(b, &theme, &font, &mut scene);
@@ -2003,7 +2003,7 @@ mod tests {
         assert!(scene.contains_text("MARKETPLACE"));
         for node in scene.nodes() {
             if let SceneNode::Quad(q) = node {
-                assert!(crate::is_finite_rect(q.bounds));
+                assert!(q.bounds.is_finite());
             }
         }
     }

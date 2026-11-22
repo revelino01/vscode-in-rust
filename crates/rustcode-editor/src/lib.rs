@@ -23,22 +23,30 @@ pub use diff::{
     myers_diff, DiffCell, DiffChange, DiffEditorView, DiffModel, DiffOpKind, DiffViewMode, EditOp,
     InlineDiffRow, SideBySideDiffRow,
 };
-pub use document::{AutoSaveConfig, AutoSaveMode, AutoSaveService, TextDocument};
+pub use document::{AutoSaveConfig, AutoSaveMode, AutoSaveService, TextDocument, TextEncoding};
 pub use find_replace::{
     FindMatch, FindReplaceClickTarget, FindReplaceFocus, FindReplaceLayout, FindReplaceWidget,
 };
 pub use folding::{FoldingModel, FoldingRange, FoldingRangeKind};
 pub use model::{
-    byte_offset_to_utf16_col, utf16_col_to_byte_offset, Piece, PieceSource, PieceTable, TextEdit,
-    UndoElement, UndoRedoStack,
+    byte_offset_to_utf16_col, display_col_to_utf16_col, display_x_col_to_utf16_col,
+    grapheme_display_width, str_display_width, utf16_col_to_byte_offset, utf16_col_to_display_col,
+    Piece, PieceSource, PieceTable, TextEdit, UndoElement, UndoRedoStack,
 };
 pub use syntax::{
-    CGrammar, CppGrammar, CssGrammar, GoGrammar, Grammar, GrammarRegistry, GrammarState,
-    HtmlGrammar, JavaScriptGrammar, JsonGrammar, MarkdownGrammar, PlainTextGrammar,
-    PythonGrammar, RustGrammar, SyntaxHighlighter, SyntaxScope, TokenMetadata, TokenSpan,
+    load_textmate_contribution, map_tm_scope_to_syntax_scope, CGrammar, CppGrammar, CssGrammar,
+    GoGrammar, Grammar, GrammarContribution, GrammarRegistry, GrammarState, HtmlGrammar,
+    JavaScriptGrammar, JsonGrammar, MarkdownGrammar, PlainTextGrammar, PythonGrammar, RustGrammar,
+    SyntaxHighlighter, SyntaxScope, TextMateGrammar, TextMateStackFrame, TokenMetadata, TokenSpan,
     TomlGrammar, TypeScriptGrammar, YamlGrammar,
 };
-pub use view::{EditorGutterAction, EditorView, MinimapState, WordWrapMode};
+#[cfg(feature = "desktop")]
+pub use syntax::{TreeSitterDocument, TreeSitterEngine};
+pub use view::{
+    ClipboardReadFn, ClipboardWriteFn, CommentConfig, ContextMenuAction, ContextMenuItem,
+    EditorAction, EditorContextMenu, EditorGutterAction, EditorView, LspHoverInfo, MinimapState,
+    ScrollbarAxis, WordWrapMode,
+};
 pub use viewmodel::{
     DecorationKind, DecorationModel, DiagnosticSeverity, EditorDiagnostic, LineDecoration,
 };

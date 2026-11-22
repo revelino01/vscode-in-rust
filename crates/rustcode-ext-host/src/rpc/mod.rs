@@ -2,7 +2,7 @@
 
 use parking_lot::Mutex;
 use rustcode_platform::strip_windows_verbatim_prefix;
-use rustcode_protocols::codec::write_framed_message;
+use rustcode_protocols::codec::{read_framed_message, write_framed_message, MAX_FRAME_BYTES};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
@@ -13,13 +13,11 @@ use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 
-const MAX_RPC_FRAME_BYTES: usize = 64 * 1024 * 1024;
-const MAX_RPC_HEADER_BYTES: usize = 64 * 1024;
 const STDERR_TAIL_LIMIT: usize = 200;
 
 /// Structured RPC error propagated across the Rust <-> JS extension host boundary.
@@ -635,148 +633,6 @@ async fn write_rpc_message<W: AsyncWrite + Unpin>(
     }
 }
 
-fn find_header_terminator(buf: &[u8]) -> Option<(usize, usize)> {
-    let pos_crlf = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|p| (p, p + 4));
-    let pos_lf = buf
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|p| (p, p + 2));
-    match (pos_crlf, pos_lf) {
-        (Some((h1, b1)), Some((h2, b2))) => {
-            if h1 <= h2 {
-                Some((h1, b1))
-            } else {
-                Some((h2, b2))
-            }
-        }
-        (Some(pair), None) | (None, Some(pair)) => Some(pair),
-        (None, None) => None,
-    }
-}
-
-fn trim_leading_line_breaks(buf: &mut Vec<u8>) {
-    let trim_count = buf
-        .iter()
-        .take_while(|&&b| b == b'\r' || b == b'\n')
-        .count();
-    if trim_count > 0 {
-        buf.drain(0..trim_count);
-    }
-}
-
-/// O(N) linear bounded `Content-Length` frame reader with pre-read `MAX_RPC_FRAME_BYTES` guard.
-async fn read_content_length_frame<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    leftover: &mut Vec<u8>,
-) -> Result<Option<Vec<u8>>, std::io::Error> {
-    trim_leading_line_breaks(leftover);
-
-    let mut scan_from = 0usize;
-    let (header_len, body_start) = loop {
-        let search_end = leftover.len().min(MAX_RPC_HEADER_BYTES);
-        if search_end > scan_from {
-            if let Some((rel_h, rel_b)) = find_header_terminator(&leftover[scan_from..search_end])
-            {
-                break (scan_from + rel_h, scan_from + rel_b);
-            }
-        }
-
-        if leftover.len() >= MAX_RPC_HEADER_BYTES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("RPC frame header exceeds {} bytes", MAX_RPC_HEADER_BYTES),
-            ));
-        }
-
-        let prev_len = leftover.len();
-        let mut temp = [0u8; 8192];
-        let n = reader.read(&mut temp).await?;
-        if n == 0 {
-            if leftover.is_empty() {
-                return Ok(None);
-            }
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "Stream closed with incomplete framed message",
-            ));
-        }
-
-        if prev_len == 0 {
-            let lead = temp[..n]
-                .iter()
-                .take_while(|&&b| b == b'\r' || b == b'\n')
-                .count();
-            leftover.extend_from_slice(&temp[lead..n]);
-            scan_from = 0;
-        } else {
-            leftover.extend_from_slice(&temp[..n]);
-            scan_from = prev_len.saturating_sub(3);
-        }
-    };
-
-    let header_str = std::str::from_utf8(&leftover[..header_len]).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Header is not valid UTF-8: {}", e),
-        )
-    })?;
-
-    let mut content_length: Option<usize> = None;
-    for line in header_str.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = trimmed.split_once(':') {
-            if k.trim().eq_ignore_ascii_case("Content-Length") {
-                let val = v.trim();
-                let len: usize = val.parse().map_err(|_| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Invalid Content-Length value: {}", val),
-                    )
-                })?;
-                content_length = Some(len);
-            }
-        }
-    }
-
-    let length = content_length.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "Missing Content-Length header",
-        )
-    })?;
-
-    if length > MAX_RPC_FRAME_BYTES {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "RPC frame exceeds maximum size ({} > {})",
-                length, MAX_RPC_FRAME_BYTES
-            ),
-        ));
-    }
-
-    let available = leftover.len().saturating_sub(body_start);
-    if available >= length {
-        let body = leftover[body_start..body_start + length].to_vec();
-        leftover.drain(0..body_start + length);
-        return Ok(Some(body));
-    }
-
-    let mut body = vec![0u8; length];
-    if available > 0 {
-        body[..available].copy_from_slice(&leftover[body_start..]);
-    }
-    leftover.clear();
-    reader.read_exact(&mut body[available..]).await?;
-    Ok(Some(body))
-}
-
 async fn read_rpc_message<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     frame_buf: &mut Vec<u8>,
@@ -785,7 +641,7 @@ async fn read_rpc_message<R: AsyncRead + Unpin>(
 ) -> Result<Option<RpcMessage>, String> {
     match format {
         RpcWireFormat::ContentLengthJson => {
-            match read_content_length_frame(reader, frame_buf).await {
+            match read_framed_message(reader, frame_buf).await {
                 Ok(Some(bytes)) => {
                     let msg: RpcMessage = serde_json::from_slice(&bytes)
                         .map_err(|e| format!("JSON RPC decode error: {}", e))?;
@@ -796,7 +652,7 @@ async fn read_rpc_message<R: AsyncRead + Unpin>(
             }
         }
         RpcWireFormat::ContentLengthMsgPack => {
-            match read_content_length_frame(reader, frame_buf).await {
+            match read_framed_message(reader, frame_buf).await {
                 Ok(Some(bytes)) => {
                     let msg = RpcMessage::from_msgpack(&bytes)?;
                     Ok(Some(msg))
@@ -818,11 +674,11 @@ async fn read_rpc_message<R: AsyncRead + Unpin>(
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed.len() > MAX_RPC_FRAME_BYTES {
+            if trimmed.len() > MAX_FRAME_BYTES {
                 return Err(format!(
                     "RPC line exceeds maximum size ({} > {})",
                     trimmed.len(),
-                    MAX_RPC_FRAME_BYTES
+                    MAX_FRAME_BYTES
                 ));
             }
             let msg = RpcMessage::from_json(trimmed)?;
@@ -1334,7 +1190,7 @@ impl Drop for NodeExtHostProcess {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::io::duplex;
+    use tokio::io::{duplex, AsyncReadExt};
 
     #[test]
     fn test_rpc_msgpack_roundtrip() {
@@ -1737,7 +1593,7 @@ mod tests {
 
         let mut cursor = &raw_out[..];
         let mut leftover = Vec::new();
-        let frame = read_content_length_frame(&mut cursor, &mut leftover)
+        let frame = read_framed_message(&mut cursor, &mut leftover)
             .await
             .unwrap()
             .expect("Expected complete Response frame before EOF");
@@ -1814,7 +1670,7 @@ mod tests {
         let mut leftover = Vec::new();
         let mut seen_response = false;
         let mut seen_notification = false;
-        while let Some(frame) = read_content_length_frame(&mut cursor, &mut leftover)
+        while let Some(frame) = read_framed_message(&mut cursor, &mut leftover)
             .await
             .unwrap()
         {

@@ -198,17 +198,16 @@ impl View for ProblemsPanel {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
 
         // 1. Panel base background
-        crate::push_finite_quad(scene, Quad::new(bounds).with_background(theme.panel_bg));
+        scene.push_finite_quad(Quad::new(bounds).with_background(theme.panel_bg));
 
         let toolbar_h = 24.0f32;
         let toolbar_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), toolbar_h);
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(toolbar_rect)
                 .with_background(theme.sidebar_bg)
                 .with_border_edges(theme.panel_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
@@ -223,8 +222,7 @@ impl View for ProblemsPanel {
             "{} Errors, {} Warnings, {} Info",
             err_count, warn_count, info_count
         );
-        crate::push_finite_text(
-            scene,
+        scene.push_finite_text(
             GlyphRun::new(
                 summary_text,
                 Point::new(bounds.min_x() + 10.0, bounds.min_y() + 4.0),
@@ -238,8 +236,7 @@ impl View for ProblemsPanel {
         if !self.filter.is_empty() {
             let filter_str = format!("Filter: \"{}\"", self.filter);
             let filter_w = font.text_width(&filter_str);
-            crate::push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     filter_str,
                     Point::new(bounds.max_x() - filter_w - 12.0, bounds.min_y() + 4.0),
@@ -290,8 +287,7 @@ impl View for ProblemsPanel {
             } else {
                 "No problems match the current filter."
             };
-            crate::push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     empty_text.to_string(),
                     Point::new(bounds.min_x() + 16.0, content_top + 8.0),
@@ -309,7 +305,7 @@ impl View for ProblemsPanel {
                 let file_row_rect = Rect::from_xywh(bounds.min_x(), cur_y, content_w, row_h);
 
                 if cur_y + row_h >= content_top && cur_y < content_bottom {
-                    if crate::is_finite_positive_rect(file_row_rect) {
+                    if file_row_rect.is_finite_positive() {
                         row_cache.push((uri.clone(), None, file_row_rect));
                     }
 
@@ -321,8 +317,7 @@ impl View for ProblemsPanel {
                     let file_w = font.text_width(&file_label);
                     let badge_w = font.text_width(&badge);
 
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             file_label,
                             Point::new(bounds.min_x() + 8.0, cur_y + 3.0),
@@ -333,8 +328,7 @@ impl View for ProblemsPanel {
                         .with_style(true, false, false),
                     );
 
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             badge,
                             Point::new(bounds.min_x() + 8.0 + file_w, cur_y + 3.0),
@@ -356,14 +350,13 @@ impl View for ProblemsPanel {
                         let diag_rect = Rect::from_xywh(bounds.min_x(), cur_y, content_w, row_h);
 
                         if cur_y + row_h >= content_top && cur_y < content_bottom {
-                            if crate::is_finite_positive_rect(diag_rect) {
+                            if diag_rect.is_finite_positive() {
                                 row_cache.push((uri.clone(), Some(orig_idx), diag_rect));
                             }
 
                             let is_selected = self.selected.as_ref().is_some_and(|(u, i)| u == &uri && *i == orig_idx);
                             if is_selected {
-                                crate::push_finite_quad(
-                                    scene,
+                                scene.push_finite_quad(
                                     Quad::new(diag_rect)
                                         .with_background(theme.list_active_selection_bg)
                                         .with_corner_radius(2.0),
@@ -389,8 +382,7 @@ impl View for ProblemsPanel {
                             let mut item_x = bounds.min_x() + 24.0;
 
                             // 1. Severity
-                            crate::push_finite_text(
-                                scene,
+                            scene.push_finite_text(
                                 GlyphRun::new(
                                     sev_str.to_string(),
                                     Point::new(item_x, cur_y + 3.0),
@@ -403,8 +395,7 @@ impl View for ProblemsPanel {
                             item_x += sev_w;
 
                             // 2. Position
-                            crate::push_finite_text(
-                                scene,
+                            scene.push_finite_text(
                                 GlyphRun::new(
                                     pos_str,
                                     Point::new(item_x, cur_y + 3.0),
@@ -421,8 +412,7 @@ impl View for ProblemsPanel {
                             } else {
                                 theme.editor_foreground
                             };
-                            crate::push_finite_text(
-                                scene,
+                            scene.push_finite_text(
                                 GlyphRun::new(
                                     diag.message.clone(),
                                     Point::new(item_x, cur_y + 3.0),
@@ -434,8 +424,7 @@ impl View for ProblemsPanel {
                             item_x += msg_w + 8.0;
 
                             // 4. Source & Code
-                            crate::push_finite_text(
-                                scene,
+                            scene.push_finite_text(
                                 GlyphRun::new(
                                     source_str,
                                     Point::new(item_x, cur_y + 3.0),
@@ -456,7 +445,7 @@ impl View for ProblemsPanel {
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return EventResult::Ignored;
         }
         match event {
@@ -494,7 +483,7 @@ impl View for ProblemsPanel {
 
                 let rows = self.row_bounds.read().clone();
                 for (uri, maybe_idx, row_rect) in rows {
-                    if crate::is_finite_positive_rect(row_rect) && row_rect.contains(mouse.position) {
+                    if row_rect.is_finite_positive() && row_rect.contains(mouse.position) {
                         match maybe_idx {
                             None => {
                                 // Clicked file group row: toggle collapsed

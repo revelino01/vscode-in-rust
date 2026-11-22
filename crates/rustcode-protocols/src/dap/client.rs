@@ -41,6 +41,7 @@ pub struct DapClient {
     capabilities: Arc<Mutex<Option<Capabilities>>>,
     is_running: Arc<AtomicBool>,
     event_listeners: Arc<Mutex<Vec<DapEventListener>>>,
+    child: Arc<Mutex<Option<tokio::process::Child>>>,
 }
 
 impl DapClient {
@@ -55,7 +56,8 @@ impl DapClient {
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -71,7 +73,9 @@ impl DapClient {
             .take()
             .ok_or_else(|| std::io::Error::other("Failed to open debug adapter stdin"))?;
 
-        Ok(Self::from_io(stdout, stdin))
+        let client = Self::from_io(stdout, stdin);
+        *client.child.lock() = Some(child);
+        Ok(client)
     }
 
     /// Creates a DAP client connected to custom async reader/writer streams.
@@ -163,6 +167,7 @@ impl DapClient {
             capabilities,
             is_running,
             event_listeners,
+            child: Arc::new(Mutex::new(None)),
         }
     }
 

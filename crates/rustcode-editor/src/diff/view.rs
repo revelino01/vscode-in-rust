@@ -61,18 +61,17 @@ impl View for DiffEditorView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !is_finite_positive_rect(bounds) || !is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
 
         // 1. Overall background
-        push_finite_quad(scene, Quad::new(bounds).with_background(theme.editor_background));
+        scene.push_finite_quad(Quad::new(bounds).with_background(theme.editor_background));
 
         // 2. Toolbar Header (height 28.0)
         let header_h = 28.0;
         let header_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), header_h);
-        push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(header_rect)
                 .with_background(theme.panel_bg)
                 .with_border_edges(theme.panel_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
@@ -80,8 +79,7 @@ impl View for DiffEditorView {
 
         // Title
         let title_w = font.text_width(&self.title);
-        push_finite_text(
-            scene,
+        scene.push_finite_text(
             GlyphRun::new(
                 self.title.clone(),
                 Point::new(bounds.min_x() + 10.0, bounds.min_y() + 5.0),
@@ -95,8 +93,7 @@ impl View for DiffEditorView {
         let stats_text = format!("+{} -{}", self.model.additions, self.model.deletions);
         let stats_w = font.text_width(&stats_text);
         let stats_x = bounds.min_x() + 20.0 + title_w;
-        push_finite_text(
-            scene,
+        scene.push_finite_text(
             GlyphRun::new(
                 stats_text,
                 Point::new(stats_x, bounds.min_y() + 5.0),
@@ -118,17 +115,15 @@ impl View for DiffEditorView {
             mode_w,
             header_h - 6.0,
         );
-        if is_finite_rect(btn_rect) {
+        if btn_rect.is_finite() {
             *self.header_button_bounds.write() = Some(btn_rect);
-            push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(btn_rect)
                     .with_background(theme.command_palette_selected_bg)
                     .with_border_edges(theme.panel_border, Edges::all(1.0))
                     .with_corner_radius(3.0),
             );
-            push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     mode_label.to_string(),
                     Point::new(btn_rect.min_x() + 8.0, btn_rect.min_y() + 3.0),
@@ -150,7 +145,7 @@ impl View for DiffEditorView {
         let content_y = bounds.min_y() + header_h;
         let content_h = (bounds.height() - header_h).max(0.0);
         let content_rect = Rect::from_xywh(bounds.min_x(), content_y, bounds.width(), content_h);
-        if !is_finite_positive_rect(content_rect) {
+        if !content_rect.is_finite_positive() {
             return;
         }
 
@@ -165,7 +160,7 @@ impl View for DiffEditorView {
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
-        if !is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return EventResult::Ignored;
         }
         match event {
@@ -179,7 +174,7 @@ impl View for DiffEditorView {
                 let clicked = self
                     .header_button_bounds
                     .read()
-                    .is_some_and(|b| is_finite_positive_rect(b) && b.contains(mouse.position));
+                    .is_some_and(|b| b.is_finite_positive() && b.contains(mouse.position));
                 if clicked {
                     self.toggle_mode();
                     return EventResult::Consumed;
@@ -235,8 +230,7 @@ impl DiffEditorView {
         }
 
         // Divider down the middle
-        push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(Rect::from_xywh(bounds.min_x() + half_w, bounds.min_y(), 1.0, bounds.height()))
                 .with_background(theme.panel_border),
         );
@@ -280,21 +274,19 @@ impl DiffEditorView {
             // --- Left Pane (Original) ---
             let left_rect = Rect::from_xywh(bounds.min_x(), row_y, half_w, font.line_height);
             let left_gutter_rect = Rect::from_xywh(bounds.min_x(), row_y, gutter_w, font.line_height);
-            push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(left_gutter_rect).with_background(theme.editor_gutter_background),
             );
 
             if let Some(left_cell) = &row.left {
                 if left_cell.kind == DiffOpKind::Delete || left_cell.kind == DiffOpKind::Modify {
-                    push_finite_quad(scene, Quad::new(left_rect).with_background(deleted_bg));
+                    scene.push_finite_quad(Quad::new(left_rect).with_background(deleted_bg));
                 }
 
                 if let Some(num) = left_cell.line_num {
                     let num_str = num.to_string();
                     let num_w = font.text_width(&num_str);
-                    push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             num_str,
                             Point::new(bounds.min_x() + gutter_w - num_w - 4.0, row_y),
@@ -312,8 +304,7 @@ impl DiffEditorView {
 
                 let text_x = bounds.min_x() + gutter_w + 6.0;
                 let text_w = half_w - gutter_w - 8.0;
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         left_cell.text.clone(),
                         Point::new(text_x, row_y),
@@ -324,8 +315,7 @@ impl DiffEditorView {
                 );
             } else {
                 // Empty filler slot on left
-                push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(left_rect).with_background(Rgba::new(0.0, 0.0, 0.0, 0.15)),
                 );
             }
@@ -335,21 +325,19 @@ impl DiffEditorView {
             let right_w = bounds.width() - half_w - 1.0;
             let right_rect = Rect::from_xywh(right_x, row_y, right_w, font.line_height);
             let right_gutter_rect = Rect::from_xywh(right_x, row_y, gutter_w, font.line_height);
-            push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(right_gutter_rect).with_background(theme.editor_gutter_background),
             );
 
             if let Some(right_cell) = &row.right {
                 if right_cell.kind == DiffOpKind::Insert || right_cell.kind == DiffOpKind::Modify {
-                    push_finite_quad(scene, Quad::new(right_rect).with_background(added_bg));
+                    scene.push_finite_quad(Quad::new(right_rect).with_background(added_bg));
                 }
 
                 if let Some(num) = right_cell.line_num {
                     let num_str = num.to_string();
                     let num_w = font.text_width(&num_str);
-                    push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             num_str,
                             Point::new(right_x + gutter_w - num_w - 4.0, row_y),
@@ -367,8 +355,7 @@ impl DiffEditorView {
 
                 let text_x = right_x + gutter_w + 6.0;
                 let text_w = right_w - gutter_w - 8.0;
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         right_cell.text.clone(),
                         Point::new(text_x, row_y),
@@ -379,8 +366,7 @@ impl DiffEditorView {
                 );
             } else {
                 // Empty filler slot on right
-                push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(right_rect).with_background(Rgba::new(0.0, 0.0, 0.0, 0.15)),
                 );
             }
@@ -440,18 +426,17 @@ impl DiffEditorView {
             // Row background based on kind
             match row.kind {
                 DiffOpKind::Insert => {
-                    push_finite_quad(scene, Quad::new(line_rect).with_background(added_bg));
+                    scene.push_finite_quad(Quad::new(line_rect).with_background(added_bg));
                 }
                 DiffOpKind::Delete => {
-                    push_finite_quad(scene, Quad::new(line_rect).with_background(deleted_bg));
+                    scene.push_finite_quad(Quad::new(line_rect).with_background(deleted_bg));
                 }
                 _ => {}
             }
 
             // Gutter background
             let gutter_rect = Rect::from_xywh(bounds.min_x(), row_y, total_gutter_w, font.line_height);
-            push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(gutter_rect).with_background(theme.editor_gutter_background),
             );
 
@@ -459,8 +444,7 @@ impl DiffEditorView {
             if let Some(num) = row.old_line {
                 let s = num.to_string();
                 let w = font.text_width(&s);
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         s,
                         Point::new(bounds.min_x() + single_gutter_w - w - 2.0, row_y),
@@ -481,8 +465,7 @@ impl DiffEditorView {
                 let s = num.to_string();
                 let w = font.text_width(&s);
                 let x = bounds.min_x() + single_gutter_w * 2.0 - w - 2.0;
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         s,
                         Point::new(x, row_y),
@@ -501,8 +484,7 @@ impl DiffEditorView {
                 DiffOpKind::Delete => theme.editor_error_foreground,
                 _ => theme.editor_line_number,
             };
-            push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     prefix_str,
                     Point::new(prefix_x, row_y),
@@ -515,8 +497,7 @@ impl DiffEditorView {
             // Text
             let text_x = bounds.min_x() + total_gutter_w + 6.0;
             let text_w = bounds.width() - total_gutter_w - 12.0;
-            push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     row.text.clone(),
                     Point::new(text_x, row_y),
@@ -526,45 +507,6 @@ impl DiffEditorView {
                 ),
             );
         }
-    }
-}
-
-fn is_finite_rect(rect: Rect) -> bool {
-    rect.min_x().is_finite()
-        && rect.min_y().is_finite()
-        && rect.width().is_finite()
-        && rect.height().is_finite()
-        && rect.max_x().is_finite()
-        && rect.max_y().is_finite()
-}
-
-fn is_finite_positive_rect(rect: Rect) -> bool {
-    is_finite_rect(rect) && rect.width() > 0.0 && rect.height() > 0.0
-}
-
-fn is_finite_font(font: &FontMetrics) -> bool {
-    font.line_height.is_finite()
-        && font.line_height > 0.0
-        && font.char_width.is_finite()
-        && font.char_width >= 0.0
-        && font.font_size.is_finite()
-        && font.font_size >= 0.0
-}
-
-fn push_finite_quad(scene: &mut Scene, quad: Quad) {
-    if is_finite_rect(quad.bounds) {
-        scene.push_quad(quad);
-    }
-}
-
-fn push_finite_text(scene: &mut Scene, run: GlyphRun) {
-    if run.origin.x.is_finite()
-        && run.origin.y.is_finite()
-        && is_finite_rect(run.bounds)
-        && run.font_size.is_finite()
-        && run.font_size >= 0.0
-    {
-        scene.push_text(run);
     }
 }
 
@@ -589,14 +531,14 @@ mod tests {
                 match node {
                     SceneNode::PushClip(r) => {
                         clip_depth += 1;
-                        assert!(is_finite_rect(*r), "{}: non-finite PushClip {:?}", label, r);
+                        assert!(r.is_finite(), "{}: non-finite PushClip {:?}", label, r);
                     }
                     SceneNode::PopClip => {
                         clip_depth -= 1;
                         assert!(clip_depth >= 0, "{}: clip stack underflow", label);
                     }
                     SceneNode::Quad(q) => {
-                        assert!(is_finite_rect(q.bounds), "{}: non-finite Quad {:?}", label, q.bounds);
+                        assert!(q.bounds.is_finite(), "{}: non-finite Quad {:?}", label, q.bounds);
                     }
                     SceneNode::GlyphRun(g) => {
                         assert!(
@@ -606,14 +548,14 @@ mod tests {
                             g.origin
                         );
                         assert!(
-                            is_finite_rect(g.bounds),
+                            g.bounds.is_finite(),
                             "{}: non-finite GlyphRun bounds {:?}",
                             label,
                             g.bounds
                         );
                     }
                     SceneNode::Shadow(s) => {
-                        assert!(is_finite_rect(s.bounds), "{}: non-finite Shadow {:?}", label, s.bounds);
+                        assert!(s.bounds.is_finite(), "{}: non-finite Shadow {:?}", label, s.bounds);
                     }
                 }
             }

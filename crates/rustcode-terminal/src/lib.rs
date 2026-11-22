@@ -1,7 +1,17 @@
 //! `rustcode-terminal` — Integrated Terminal Management.
 //!
-//! Manages terminal sessions, output buffers, and split/tab views.
+//! Manages terminal sessions, PTY backends (`HeadlessPtyBackend`, `PortablePtyBackend`),
+//! `alacritty_terminal` VT100/xterm grid emulation, and split/tab views.
 
+pub mod grid;
+pub mod pty;
+
+pub use grid::{TerminalCell, TerminalCellGrid, TerminalGridSnapshot};
+pub use pty::{
+    HeadlessPtyBackend, PortablePtyBackend, PtyBackend, PtySpawnConfig, TerminalSignal,
+};
+
+use parking_lot::Mutex as FastMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::io::Read;
@@ -12,6 +22,8 @@ use std::time::{Duration, Instant};
 
 pub const DEFAULT_MAX_SCROLLBACK: usize = 2000;
 pub const DEFAULT_COMMAND_TIMEOUT_MS: u64 = 5000;
+pub const DEFAULT_TERMINAL_ROWS: u16 = 24;
+pub const DEFAULT_TERMINAL_COLS: u16 = 80;
 
 fn default_max_scrollback() -> usize {
     DEFAULT_MAX_SCROLLBACK
@@ -19,6 +31,14 @@ fn default_max_scrollback() -> usize {
 
 fn default_command_timeout_ms() -> u64 {
     DEFAULT_COMMAND_TIMEOUT_MS
+}
+
+fn default_rows() -> u16 {
+    DEFAULT_TERMINAL_ROWS
+}
+
+fn default_cols() -> u16 {
+    DEFAULT_TERMINAL_COLS
 }
 
 /// Returns the default interactive shell executable for the current operating system.
@@ -95,8 +115,48 @@ fn find_in_path(prog: &str) -> bool {
     }
 }
 
+pub(crate) fn resolve_shell_program(shell: &str) -> String {
+    #[cfg(windows)]
+    {
+        if !shell.is_empty() {
+            if shell.contains('/') || shell.contains('\\') {
+                if Path::new(shell).is_file() {
+                    return shell.to_string();
+                }
+            } else if find_in_path(shell) {
+                return shell.to_string();
+            }
+        }
+        default_shell()
+    }
+    #[cfg(not(windows))]
+    {
+        if !shell.is_empty() {
+            if shell.contains('/') {
+                if Path::new(shell).is_file() {
+                    return shell.to_string();
+                }
+            } else if find_in_path(shell) {
+                return shell.to_string();
+            }
+        } else if let Ok(env_shell) = std::env::var("SHELL") {
+            let trimmed = env_shell.trim();
+            if !trimmed.is_empty() && Path::new(trimmed).is_file() {
+                return trimmed.to_string();
+            }
+        }
+        if Path::new("/bin/sh").exists() {
+            "/bin/sh".to_string()
+        } else if Path::new("/system/bin/sh").exists() {
+            "/system/bin/sh".to_string()
+        } else {
+            "sh".to_string()
+        }
+    }
+}
+
 #[cfg(windows)]
-fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+pub(crate) fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
     use std::path::Prefix;
     let mut comps = path.components();
     let Some(Component::Prefix(prefix_comp)) = comps.next() else {
@@ -123,7 +183,7 @@ fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
 }
 
 #[cfg(not(windows))]
-fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+pub(crate) fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
     path
 }
 
@@ -208,7 +268,7 @@ impl TerminalTab {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct TerminalInstance {
     pub id: String,
     pub title: String,
@@ -231,11 +291,70 @@ pub struct TerminalInstance {
     #[serde(default)]
     pub last_exit_code: Option<i32>,
     #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
     pub exited: bool,
     #[serde(default = "default_command_timeout_ms")]
     pub command_timeout_ms: u64,
     #[serde(default)]
     pub env_vars: BTreeMap<String, String>,
+    #[serde(default = "default_rows")]
+    pub rows: u16,
+    #[serde(default = "default_cols")]
+    pub cols: u16,
+    #[serde(skip)]
+    grid: TerminalCellGrid,
+    #[serde(skip)]
+    pty: Option<Arc<FastMutex<Box<dyn PtyBackend>>>>,
+}
+
+impl std::fmt::Debug for TerminalInstance {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalInstance")
+            .field("id", &self.id)
+            .field("title", &self.title)
+            .field("shell", &self.shell)
+            .field("cwd", &self.cwd)
+            .field("lines_len", &self.lines.len())
+            .field("exited", &self.exited)
+            .field("exit_code", &self.exit_code)
+            .field("rows", &self.rows)
+            .field("cols", &self.cols)
+            .field("has_pty", &self.pty.is_some())
+            .finish()
+    }
+}
+
+impl Clone for TerminalInstance {
+    fn clone(&self) -> Self {
+        let mut grid = TerminalCellGrid::new(self.rows, self.cols, self.max_scrollback);
+        if !self.lines.is_empty() {
+            let joined = self.lines.join("\r\n");
+            grid.feed_bytes(joined.as_bytes());
+        }
+        Self {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            shell: self.shell.clone(),
+            cwd: self.cwd.clone(),
+            lines: self.lines.clone(),
+            input_buffer: self.input_buffer.clone(),
+            cursor_pos: self.cursor_pos,
+            command_history: self.command_history.clone(),
+            history_index: self.history_index,
+            draft_buffer: self.draft_buffer.clone(),
+            max_scrollback: self.max_scrollback,
+            last_exit_code: self.last_exit_code,
+            exit_code: self.exit_code,
+            exited: self.exited,
+            command_timeout_ms: self.command_timeout_ms,
+            env_vars: self.env_vars.clone(),
+            rows: self.rows,
+            cols: self.cols,
+            grid,
+            pty: self.pty.clone(),
+        }
+    }
 }
 
 fn byte_index_at_char(s: &str, char_idx: usize) -> usize {
@@ -306,10 +425,225 @@ impl TerminalInstance {
             draft_buffer: String::new(),
             max_scrollback: DEFAULT_MAX_SCROLLBACK,
             last_exit_code: None,
+            exit_code: None,
             exited: false,
             command_timeout_ms: DEFAULT_COMMAND_TIMEOUT_MS,
             env_vars: BTreeMap::new(),
+            rows: DEFAULT_TERMINAL_ROWS,
+            cols: DEFAULT_TERMINAL_COLS,
+            grid: TerminalCellGrid::new(
+                DEFAULT_TERMINAL_ROWS,
+                DEFAULT_TERMINAL_COLS,
+                DEFAULT_MAX_SCROLLBACK,
+            ),
+            pty: None,
         }
+    }
+
+    pub fn new_pty(
+        id: &str,
+        title: &str,
+        shell: &str,
+        cwd: PathBuf,
+        rows: u16,
+        cols: u16,
+    ) -> Result<Self, String> {
+        let mut inst = Self::new(id, title, shell, cwd);
+        inst.spawn_pty_shell(rows, cols)?;
+        Ok(inst)
+    }
+
+    pub fn with_pty(mut self, backend: Box<dyn PtyBackend>) -> Self {
+        self.attach_pty(backend);
+        self
+    }
+
+    pub fn attach_pty(&mut self, mut backend: Box<dyn PtyBackend>) {
+        let _ = backend.resize(self.rows.max(1), self.cols.max(1));
+        self.pty = Some(Arc::new(FastMutex::new(backend)));
+        self.exited = false;
+        self.exit_code = None;
+        self.last_exit_code = None;
+    }
+
+    pub fn spawn_pty_shell(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let shell_opt = if self.shell.trim().is_empty() {
+            None
+        } else {
+            Some(self.shell.as_str())
+        };
+        let backend =
+            PortablePtyBackend::spawn_shell(shell_opt, Some(&self.cwd), &self.env_vars, rows, cols)?;
+        self.rows = rows;
+        self.cols = cols;
+        self.grid.resize(rows, cols);
+        self.attach_pty(Box::new(backend));
+        Ok(())
+    }
+
+    pub fn spawn_pty_command(&mut self, config: PtySpawnConfig) -> Result<(), String> {
+        let rows = config.rows.max(1);
+        let cols = config.cols.max(1);
+        let backend = PortablePtyBackend::spawn_command(config)?;
+        self.rows = rows;
+        self.cols = cols;
+        self.grid.resize(rows, cols);
+        self.attach_pty(Box::new(backend));
+        Ok(())
+    }
+
+    pub fn has_pty(&self) -> bool {
+        self.pty.is_some()
+    }
+
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+
+    pub fn grid(&self) -> &TerminalCellGrid {
+        &self.grid
+    }
+
+    pub fn grid_mut(&mut self) -> &mut TerminalCellGrid {
+        &mut self.grid
+    }
+
+    pub fn grid_snapshot(&self) -> TerminalGridSnapshot {
+        self.grid.snapshot()
+    }
+
+    pub fn scroll_display(&mut self, delta: i32) {
+        self.grid.scroll_display(delta);
+    }
+
+    pub fn feed_vt_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.grid.feed_bytes(bytes);
+        self.sync_lines_from_grid();
+    }
+
+    pub fn send_pty_input(&mut self, data: &[u8]) -> Result<(), String> {
+        if self.exited {
+            return Err("Terminal process has exited".to_string());
+        }
+        let Some(pty) = &self.pty else {
+            return Err("No PTY backend attached".to_string());
+        };
+        pty.lock().write_input(data)
+    }
+
+    pub fn send_pty_str(&mut self, text: &str) -> Result<(), String> {
+        self.send_pty_input(text.as_bytes())
+    }
+
+    pub fn poll_pty(&mut self) -> bool {
+        let Some(pty_arc) = self.pty.clone() else {
+            return false;
+        };
+
+        let mut changed = false;
+        let bytes = {
+            let mut guard = pty_arc.lock();
+            guard.read_output()
+        };
+        if !bytes.is_empty() {
+            self.grid.feed_bytes(&bytes);
+            let pty_writes = self.grid.drain_pty_writes();
+            if !pty_writes.is_empty() {
+                let mut guard = pty_arc.lock();
+                for reply in pty_writes {
+                    let _ = guard.write_input(reply.as_bytes());
+                }
+            }
+            self.sync_lines_from_grid();
+            changed = true;
+        }
+
+        let exit = {
+            let mut guard = pty_arc.lock();
+            guard.try_wait()
+        };
+        if let Some(code) = exit {
+            let tail_bytes = {
+                let mut guard = pty_arc.lock();
+                guard.read_output()
+            };
+            if !tail_bytes.is_empty() {
+                self.grid.feed_bytes(&tail_bytes);
+                self.sync_lines_from_grid();
+                changed = true;
+            }
+            if !self.exited || self.exit_code != Some(code) {
+                self.exited = true;
+                self.exit_code = Some(code);
+                self.last_exit_code = Some(code);
+                changed = true;
+            }
+        }
+
+        changed
+    }
+
+    pub fn resize(&mut self, rows: u16, cols: u16) -> Result<(), String> {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        self.rows = rows;
+        self.cols = cols;
+        self.grid.resize(rows, cols);
+        if let Some(pty) = &self.pty {
+            pty.lock().resize(rows, cols)?;
+        }
+        Ok(())
+    }
+
+    pub fn send_ctrl_c(&mut self) -> Result<(), String> {
+        if self.exited {
+            return Err("Terminal process has exited".to_string());
+        }
+        if let Some(pty) = &self.pty {
+            pty.lock().send_signal(TerminalSignal::Interrupt)
+        } else {
+            let line = format!("{}{}^C", self.prompt_prefix(), self.input_buffer);
+            self.lines.push(line);
+            self.trim_scrollback();
+            self.clear_input();
+            Ok(())
+        }
+    }
+
+    pub fn send_signal(&mut self, sig: TerminalSignal) -> Result<(), String> {
+        if let Some(pty) = &self.pty {
+            let res = {
+                let mut guard = pty.lock();
+                guard.send_signal(sig)
+            };
+            if sig == TerminalSignal::Kill {
+                let code = pty.lock().try_wait().unwrap_or(-1);
+                self.exited = true;
+                self.exit_code = Some(code);
+                self.last_exit_code = Some(code);
+            }
+            res
+        } else {
+            match sig {
+                TerminalSignal::Interrupt => self.send_ctrl_c(),
+                TerminalSignal::Kill => {
+                    self.exited = true;
+                    self.exit_code = Some(-1);
+                    self.last_exit_code = Some(-1);
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn sync_lines_from_grid(&mut self) {
+        self.lines = self.grid.all_non_empty_tail_trimmed_lines();
+        self.trim_scrollback();
     }
 
     pub fn write_output(&mut self, text: &str) {
@@ -317,6 +651,11 @@ impl TerminalInstance {
             self.lines.push(line.to_string());
         }
         self.trim_scrollback();
+        if self.pty.is_none() {
+            let normalized = text.replace("\r\n", "\n").replace('\n', "\r\n");
+            self.grid.feed_bytes(normalized.as_bytes());
+            self.grid.feed_bytes(b"\r\n");
+        }
     }
 
     pub fn append_output_block(&mut self, text: &str) {
@@ -328,6 +667,11 @@ impl TerminalInstance {
             self.lines.push(line.trim_end_matches('\r').to_string());
         }
         self.trim_scrollback();
+        if self.pty.is_none() {
+            let normalized = trimmed.replace("\r\n", "\n").replace('\n', "\r\n");
+            self.grid.feed_bytes(normalized.as_bytes());
+            self.grid.feed_bytes(b"\r\n");
+        }
     }
 
     pub fn trim_scrollback(&mut self) {
@@ -339,10 +683,12 @@ impl TerminalInstance {
 
     pub fn clear(&mut self) {
         self.lines.clear();
+        self.grid.clear();
     }
 
     pub fn set_max_scrollback(&mut self, max_lines: usize) {
         self.max_scrollback = max_lines;
+        self.grid.set_max_scrollback(max_lines);
         self.trim_scrollback();
     }
 
@@ -501,16 +847,31 @@ impl TerminalInstance {
         self.history_index = None;
         self.draft_buffer.clear();
 
-        let prompt_line = format!("{}{}", self.prompt_prefix(), cmd);
-        self.lines.push(prompt_line);
-        self.trim_scrollback();
-
         let trimmed = cmd.trim();
         if !trimmed.is_empty()
             && self.command_history.last().map(|s| s.as_str()) != Some(trimmed)
         {
             self.command_history.push(trimmed.to_string());
         }
+
+        if self.pty.is_some() {
+            let line_to_send = format!("{}\r", cmd);
+            let _ = self.send_pty_input(line_to_send.as_bytes());
+            let _ = self.poll_pty();
+            return CommandExecutionResult {
+                exit_code: self.exit_code,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                exited: self.exited,
+            };
+        }
+
+        let prompt_line = format!("{}{}", self.prompt_prefix(), cmd);
+        self.lines.push(prompt_line.clone());
+        self.trim_scrollback();
+        self.grid.feed_bytes(prompt_line.as_bytes());
+        self.grid.feed_bytes(b"\r\n");
 
         self.execute_command(trimmed)
     }
@@ -524,38 +885,12 @@ impl TerminalInstance {
     }
 
     fn resolve_shell(&self) -> String {
-        #[cfg(windows)]
-        {
-            if !self.shell.is_empty() {
-                if self.shell.contains('/') || self.shell.contains('\\') {
-                    if Path::new(&self.shell).is_file() {
-                        return self.shell.clone();
-                    }
-                } else if find_in_path(&self.shell) {
-                    return self.shell.clone();
-                }
-            }
-            default_shell()
-        }
-        #[cfg(not(windows))]
-        {
-            if !self.shell.is_empty() {
-                if self.shell.contains('/') {
-                    if Path::new(&self.shell).is_file() {
-                        return self.shell.clone();
-                    }
-                } else if find_in_path(&self.shell) {
-                    return self.shell.clone();
-                }
-            }
-            if Path::new("/bin/sh").exists() {
-                "/bin/sh".to_string()
-            } else if Path::new("/system/bin/sh").exists() {
-                "/system/bin/sh".to_string()
-            } else {
-                "sh".to_string()
-            }
-        }
+        resolve_shell_program(&self.shell)
+    }
+
+    fn set_exit_code_fields(&mut self, code: Option<i32>) {
+        self.last_exit_code = code;
+        self.exit_code = code;
     }
 
     pub fn execute_command(&mut self, cmd: &str) -> CommandExecutionResult {
@@ -569,8 +904,30 @@ impl TerminalInstance {
                 exited: true,
             };
         }
+
+        if self.pty.is_some() {
+            let line_to_send = format!("{}\r", cmd);
+            if let Err(err) = self.send_pty_input(line_to_send.as_bytes()) {
+                return CommandExecutionResult {
+                    exit_code: self.exit_code,
+                    stdout: String::new(),
+                    stderr: err,
+                    timed_out: false,
+                    exited: self.exited,
+                };
+            }
+            let _ = self.poll_pty();
+            return CommandExecutionResult {
+                exit_code: self.exit_code,
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                exited: self.exited,
+            };
+        }
+
         if trimmed.is_empty() {
-            self.last_exit_code = Some(0);
+            self.set_exit_code_fields(Some(0));
             return CommandExecutionResult {
                 exit_code: Some(0),
                 stdout: String::new(),
@@ -600,7 +957,7 @@ impl TerminalInstance {
             Err(err) => {
                 let msg = format!("Failed to spawn '{}': {}", shell_prog, err);
                 self.append_output_block(&msg);
-                self.last_exit_code = Some(127);
+                self.set_exit_code_fields(Some(127));
                 return CommandExecutionResult {
                     exit_code: Some(127),
                     stdout: String::new(),
@@ -700,7 +1057,7 @@ impl TerminalInstance {
         if timed_out {
             let msg = format!("[Command timed out after {}ms]", self.command_timeout_ms);
             self.append_output_block(&msg);
-            self.last_exit_code = None;
+            self.set_exit_code_fields(None);
             return CommandExecutionResult {
                 exit_code: None,
                 stdout,
@@ -711,7 +1068,7 @@ impl TerminalInstance {
         }
 
         let code = exit_status.and_then(|s| s.code());
-        self.last_exit_code = code;
+        self.set_exit_code_fields(code);
         CommandExecutionResult {
             exit_code: code,
             stdout,
@@ -735,7 +1092,7 @@ impl TerminalInstance {
                 };
                 let display = resolved.display().to_string();
                 self.append_output_block(&display);
-                self.last_exit_code = Some(0);
+                self.set_exit_code_fields(Some(0));
                 Some(CommandExecutionResult {
                     exit_code: Some(0),
                     stdout: format!("{}\n", display),
@@ -746,7 +1103,7 @@ impl TerminalInstance {
             }
             "clear" => {
                 self.clear();
-                self.last_exit_code = Some(0);
+                self.set_exit_code_fields(Some(0));
                 Some(CommandExecutionResult {
                     exit_code: Some(0),
                     stdout: String::new(),
@@ -762,7 +1119,7 @@ impl TerminalInstance {
                     rest.parse::<i32>().unwrap_or(0)
                 };
                 self.exited = true;
-                self.last_exit_code = Some(code);
+                self.set_exit_code_fields(Some(code));
                 self.write_output("[Process exited]");
                 Some(CommandExecutionResult {
                     exit_code: Some(code),
@@ -796,7 +1153,7 @@ impl TerminalInstance {
                     .unwrap_or_else(|_| lexical_normalize_path(&target_path));
                 if normalized.is_dir() {
                     self.cwd = normalized;
-                    self.last_exit_code = Some(0);
+                    self.set_exit_code_fields(Some(0));
                     Some(CommandExecutionResult {
                         exit_code: Some(0),
                         stdout: String::new(),
@@ -807,7 +1164,7 @@ impl TerminalInstance {
                 } else {
                     let msg = format!("cd: {}: No such file or directory", target_raw);
                     self.append_output_block(&msg);
-                    self.last_exit_code = Some(1);
+                    self.set_exit_code_fields(Some(1));
                     Some(CommandExecutionResult {
                         exit_code: Some(1),
                         stdout: String::new(),
@@ -825,7 +1182,7 @@ impl TerminalInstance {
                         self.env_vars.insert(key.to_string(), val.to_string());
                     }
                 }
-                self.last_exit_code = Some(0);
+                self.set_exit_code_fields(Some(0));
                 Some(CommandExecutionResult {
                     exit_code: Some(0),
                     stdout: String::new(),
@@ -838,7 +1195,7 @@ impl TerminalInstance {
                 for key in rest.split_whitespace() {
                     self.env_vars.remove(key);
                 }
-                self.last_exit_code = Some(0);
+                self.set_exit_code_fields(Some(0));
                 Some(CommandExecutionResult {
                     exit_code: Some(0),
                     stdout: String::new(),
@@ -907,6 +1264,57 @@ impl TerminalManager {
         self.active_tab_index = Some(self.tabs.len() - 1);
 
         self.terminals.last().unwrap()
+    }
+
+    pub fn create_pty_terminal(
+        &mut self,
+        title: Option<&str>,
+        shell: Option<&str>,
+        cwd: Option<PathBuf>,
+        rows: u16,
+        cols: u16,
+    ) -> Result<&TerminalInstance, String> {
+        let resolved_cwd = cwd.unwrap_or_else(|| PathBuf::from("."));
+        let env = BTreeMap::new();
+        let backend =
+            PortablePtyBackend::spawn_shell(shell, Some(&resolved_cwd), &env, rows, cols)?;
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+
+        let id = format!("term-{}", self.next_id);
+        self.next_id += 1;
+
+        let title = title.unwrap_or("Terminal");
+        let default_sh = default_shell();
+        let shell_str = shell.unwrap_or(&default_sh);
+
+        let mut inst = TerminalInstance::new(&id, title, shell_str, resolved_cwd);
+        let _ = inst.resize(rows, cols);
+        inst.attach_pty(Box::new(backend));
+
+        self.terminals.push(inst);
+        self.active_index = Some(self.terminals.len() - 1);
+
+        let tab_id = format!("tab-{}", self.next_tab_id);
+        self.next_tab_id += 1;
+        self.tabs.push(TerminalTab {
+            id: tab_id,
+            pane_ids: vec![id],
+            active_pane_index: 0,
+        });
+        self.active_tab_index = Some(self.tabs.len() - 1);
+
+        Ok(self.terminals.last().unwrap())
+    }
+
+    pub fn poll_all_ptys(&mut self) -> Vec<String> {
+        let mut updated = Vec::new();
+        for term in &mut self.terminals {
+            if term.poll_pty() {
+                updated.push(term.id.clone());
+            }
+        }
+        updated
     }
 
     fn sync_active_index_from_active_tab(&mut self) {
@@ -1020,7 +1428,8 @@ impl TerminalManager {
             return false;
         }
         let pane_ids = self.tabs.remove(tab_index).pane_ids;
-        self.terminals.retain(|t| !pane_ids.iter().any(|pid| pid == &t.id));
+        self.terminals
+            .retain(|t| !pane_ids.iter().any(|pid| pid == &t.id));
 
         if self.tabs.is_empty() {
             self.active_tab_index = None;
@@ -1260,6 +1669,7 @@ mod tests {
         assert_eq!(exit_res.exit_code, Some(42));
         assert!(term.exited);
         assert_eq!(term.last_exit_code, Some(42));
+        assert_eq!(term.exit_code, Some(42));
         assert!(term.lines.iter().any(|l| l.contains("[Process exited]")));
 
         let _ = std::fs::remove_dir_all(&tmp);
@@ -1524,5 +1934,210 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 8 M4 Unit Tests: HeadlessPtyBackend, alacritty_terminal VT100/xterm,
+    // resize clamping, scrollback, and PortablePtyBackend interactive shell
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_headless_pty_backend_echo_resize_signals_and_exit() {
+        let pty = HeadlessPtyBackend::new(24, 80).with_echo(true);
+        let pty_handle = pty.clone();
+
+        let mut term = TerminalInstance::new("pty-h", "headless", "sh", PathBuf::from("."))
+            .with_pty(Box::new(pty));
+        assert!(term.has_pty());
+        assert!(pty_handle.is_alive());
+
+        term.send_pty_input(b"echo HEADLESS_OK\r\n").unwrap();
+        assert_eq!(pty_handle.written_input(), b"echo HEADLESS_OK\r\n");
+        assert!(term.poll_pty());
+
+        let snap = term.grid_snapshot();
+        assert_eq!(snap.rows, 24);
+        assert_eq!(snap.cols, 80);
+        assert!(snap
+            .visible_lines()
+            .iter()
+            .any(|l| l.contains("HEADLESS_OK")));
+
+        term.send_ctrl_c().unwrap();
+        assert_eq!(pty_handle.signals(), vec![TerminalSignal::Interrupt]);
+        assert!(term.poll_pty());
+
+        term.resize(12, 40).unwrap();
+        assert_eq!(pty_handle.size(), (12, 40));
+        assert_eq!(term.grid_snapshot().rows, 12);
+        assert_eq!(term.grid_snapshot().cols, 40);
+
+        pty_handle.simulate_exit(9);
+        assert!(term.poll_pty());
+        assert!(term.exited);
+        assert_eq!(term.exit_code, Some(9));
+        assert_eq!(term.exit_code(), Some(9));
+        assert_eq!(term.last_exit_code, Some(9));
+        assert!(term.send_pty_input(b"more").is_err());
+    }
+
+    #[test]
+    fn test_alacritty_ansi_sgr_16_256_truecolor_and_styles() {
+        let mut term = TerminalInstance::new("vt-colors", "vt", "sh", PathBuf::from("."));
+
+        // SGR 16 red fg + green bg + bold/italic/underline
+        term.feed_vt_bytes(b"\x1b[1;3;4;31;42mA\x1b[0m");
+        // SGR 256 color (fg index 196 -> [255,0,0], bg index 21 -> [0,0,255])
+        term.feed_vt_bytes(b"\x1b[38;5;196;48;5;21mB\x1b[0m");
+        // Truecolor RGB (fg [10,20,30], bg [40,50,60])
+        term.feed_vt_bytes(b"\x1b[38;2;10;20;30;48;2;40;50;60mC\x1b[0m");
+
+        let snap = term.grid_snapshot();
+        let a = snap.cell(0, 0).unwrap();
+        assert_eq!(a.ch, 'A');
+        assert_eq!(a.fg, [205, 49, 49, 255]);
+        assert_eq!(a.bg, [13, 188, 121, 255]);
+        assert!(a.bold);
+        assert!(a.italic);
+        assert!(a.underline);
+
+        let b = snap.cell(0, 1).unwrap();
+        assert_eq!(b.ch, 'B');
+        assert_eq!(b.fg, [255, 0, 0, 255]);
+        assert_eq!(b.bg, [0, 0, 255, 255]);
+        assert!(!b.bold);
+        assert!(!b.italic);
+        assert!(!b.underline);
+
+        let c = snap.cell(0, 2).unwrap();
+        assert_eq!(c.ch, 'C');
+        assert_eq!(c.fg, [10, 20, 30, 255]);
+        assert_eq!(c.bg, [40, 50, 60, 255]);
+    }
+
+    #[test]
+    fn test_alacritty_cursor_move_clear_screen_and_alt_screen() {
+        let mut term = TerminalInstance::new("vt-nav", "vt", "sh", PathBuf::from("."));
+        term.feed_vt_bytes(b"PRIMARY_TEXT");
+        // Cursor positioning: 1-based row 2, col 5 -> 0-based row 1, col 4
+        term.feed_vt_bytes(b"\x1b[2;5HX");
+        let snap1 = term.grid_snapshot();
+        assert_eq!(snap1.cell(1, 4).unwrap().ch, 'X');
+        assert_eq!(snap1.cursor_row, 1);
+        assert_eq!(snap1.cursor_col, 5);
+        assert!(snap1.cursor_visible);
+        assert!(!snap1.alt_screen);
+
+        // Switch to alternate screen, write, then return to primary screen
+        term.feed_vt_bytes(b"\x1b[?1049h\x1b[1;1HALT_ONLY");
+        let snap_alt = term.grid_snapshot();
+        assert!(snap_alt.alt_screen);
+        assert_eq!(snap_alt.row_text(0).unwrap(), "ALT_ONLY");
+
+        term.feed_vt_bytes(b"\x1b[?1049l");
+        let snap_restored = term.grid_snapshot();
+        assert!(!snap_restored.alt_screen);
+        assert_eq!(snap_restored.row_text(0).unwrap(), "PRIMARY_TEXT");
+        assert_eq!(snap_restored.cell(1, 4).unwrap().ch, 'X');
+
+        // Clear screen (\x1b[2J) and home (\x1b[H)
+        term.feed_vt_bytes(b"\x1b[2J\x1b[H");
+        let snap_cleared = term.grid_snapshot();
+        assert!(snap_cleared.row_text(0).unwrap().is_empty());
+        assert!(snap_cleared.row_text(1).unwrap().is_empty());
+        assert_eq!(snap_cleared.cursor_row, 0);
+        assert_eq!(snap_cleared.cursor_col, 0);
+
+        // Hide cursor (\x1b[?25l) and show cursor (\x1b[?25h)
+        term.feed_vt_bytes(b"\x1b[?25l");
+        assert!(!term.grid_snapshot().cursor_visible);
+        term.feed_vt_bytes(b"\x1b[?25h");
+        assert!(term.grid_snapshot().cursor_visible);
+    }
+
+    #[test]
+    fn test_vt_resize_clamping_and_scrollback_limit() {
+        let pty = HeadlessPtyBackend::new(24, 80);
+        let pty_handle = pty.clone();
+        let mut term = TerminalInstance::new("vt-scroll", "vt", "sh", PathBuf::from("."))
+            .with_pty(Box::new(pty));
+
+        // Zero dimensions clamp safely >= 1 without panicking
+        term.resize(0, 0).unwrap();
+        let clamped = term.grid_snapshot();
+        assert!(clamped.rows >= 1);
+        assert!(clamped.cols >= 1);
+        assert!(pty_handle.size().0 >= 1 && pty_handle.size().1 >= 1);
+
+        // Resize to 5x40 and emit > DEFAULT_MAX_SCROLLBACK lines
+        term.resize(5, 40).unwrap();
+        let mut batch = String::new();
+        for i in 0..(DEFAULT_MAX_SCROLLBACK + 150) {
+            batch.push_str(&format!("hist_{:04}\r\n", i));
+        }
+        term.feed_vt_bytes(batch.as_bytes());
+
+        let snap = term.grid_snapshot();
+        assert!(snap.history_size <= DEFAULT_MAX_SCROLLBACK);
+        assert_eq!(snap.history_size, DEFAULT_MAX_SCROLLBACK);
+
+        // Scroll up into history and back to bottom
+        term.scroll_display(10);
+        let scrolled = term.grid_snapshot();
+        assert_eq!(scrolled.display_offset, 10);
+        assert!(!scrolled.cursor_visible);
+
+        term.grid_mut().scroll_to_bottom();
+        let bottom = term.grid_snapshot();
+        assert_eq!(bottom.display_offset, 0);
+    }
+
+    #[test]
+    fn test_portable_pty_interactive_shell_echo_and_exit() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut term =
+            TerminalInstance::new_pty("real-pty", "shell", &default_shell(), cwd, 24, 80)
+                .expect("PortablePtyBackend should spawn OS shell");
+        assert!(term.has_pty());
+
+        // Resize real PTY safely
+        term.resize(20, 90).unwrap();
+        assert_eq!(term.grid_snapshot().rows, 20);
+        assert_eq!(term.grid_snapshot().cols, 90);
+
+        // Write interactive command and verify grid updates with output
+        term.send_pty_input(b"echo PHASE8_PTY_OK\r").unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut found_echo = false;
+        while Instant::now() < deadline {
+            let _ = term.poll_pty();
+            if term
+                .grid_snapshot()
+                .visible_lines()
+                .iter()
+                .any(|line| line.trim() == "PHASE8_PTY_OK" || line.contains("PHASE8_PTY_OK"))
+            {
+                found_echo = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            found_echo,
+            "expected PHASE8_PTY_OK in PTY grid, got: {:?}",
+            term.grid_snapshot().visible_lines()
+        );
+
+        // Exit shell with explicit exit code and verify propagation
+        term.send_pty_input(b"exit 7\r").unwrap();
+        let exit_deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < exit_deadline && !term.exited {
+            let _ = term.poll_pty();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(term.exited, "expected PTY shell to exit");
+        assert_eq!(term.exit_code, Some(7));
+        assert_eq!(term.last_exit_code, Some(7));
     }
 }

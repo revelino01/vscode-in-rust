@@ -1,31 +1,80 @@
 //! GPUI EditorView component rendering text lines, line numbers, cursor, selections, and routing input.
 
+pub mod comments;
+pub mod context_menu;
 pub mod minimap;
 
+pub use comments::{comment_config_for_language, CommentConfig};
+pub use context_menu::{ContextMenuAction, ContextMenuItem, EditorContextMenu};
 pub use minimap::MinimapState;
 
 use crate::completion::{AutocompleteWidget, CompletionItem, CompletionItemKind};
-use crate::cursor::{CursorState, Position, RangeEdit, Selection};
+use crate::cursor::{CursorState, Position, Range, RangeEdit, Selection};
 use crate::document::TextDocument;
 use crate::find_replace::{FindReplaceClickTarget, FindReplaceFocus, FindReplaceWidget};
 use crate::folding::FoldingModel;
-use crate::model::piece_table::{utf16_col_to_byte_offset, PieceTable};
+use crate::model::piece_table::{
+    display_col_to_utf16_col, display_x_col_to_utf16_col, grapheme_display_width,
+    str_display_width, utf16_col_to_byte_offset, utf16_col_to_display_col, PieceTable,
+};
 use crate::model::undo_redo::{TextEdit, UndoRedoStack};
 use crate::syntax::{GrammarRegistry, SyntaxHighlighter};
+#[cfg(all(test, feature = "desktop"))]
+use crate::syntax::SyntaxScope;
 use crate::viewmodel::{DiagnosticSeverity, EditorDiagnostic};
 use parking_lot::{Mutex, RwLock};
 use rustcode_platform::accessibility::{AccessibleNode, AccessibleRole, AccessibleState};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
-    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba,
-    Scene, Shadow, View, WorkbenchThemeStyles,
+    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, MouseButton, Point, Quad, Rect,
+    Rgba, Scene, Shadow, View, WorkbenchThemeStyles,
 };
 use rustcode_platform::theme::ColorTheme;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub type CompletionProviderFn =
     Arc<dyn Fn(&str, Position, Option<char>) -> Vec<CompletionItem> + Send + Sync>;
+
+pub type ClipboardReadFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+pub type ClipboardWriteFn = Arc<dyn Fn(&str) + Send + Sync>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspHoverInfo {
+    pub contents: String,
+    pub range: Option<Range>,
+    pub position: Position,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorAction {
+    GoToDefinition(Position),
+    FormatDocument,
+    OpenCommandPalette,
+    HoverRequested(Position),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollbarAxis {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollbarDrag {
+    axis: ScrollbarAxis,
+    grab_offset: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DragSelectionMode {
+    None,
+    Char,
+    Word(Position, Position),
+    Line(usize),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum WordWrapMode {
@@ -165,15 +214,17 @@ impl VisualLayout {
         };
 
         let line_content = buf.get_line_content(eff_line).unwrap_or_default();
-        let char_in_line = utf16_col_to_char_count(&line_content, eff_col);
 
         if self.identity {
-            return (eff_line.min(self.line_count.saturating_sub(1)), char_in_line);
+            let display_col = utf16_col_to_display_col(&line_content, eff_col);
+            return (eff_line.min(self.line_count.saturating_sub(1)), display_col);
         }
 
         for seg in &self.segments {
             if seg.buffer_line == eff_line && (seg.is_last_segment || eff_col < seg.utf16_end) {
-                return (seg.visual_row, char_in_line.saturating_sub(seg.char_start));
+                let seg_slice = &line_content[seg.byte_start..seg.byte_end];
+                let rel_utf16 = eff_col.saturating_sub(seg.utf16_start);
+                return (seg.visual_row, utf16_col_to_display_col(seg_slice, rel_utf16));
             }
         }
 
@@ -184,10 +235,11 @@ impl VisualLayout {
         }
     }
 
+    #[allow(dead_code)]
     pub fn visual_to_buffer_pos(
         &self,
         visual_row: usize,
-        visual_char_col: usize,
+        visual_display_col: usize,
         buf: &PieceTable,
     ) -> Position {
         let total = self.total_rows();
@@ -200,13 +252,7 @@ impl VisualLayout {
         };
         let line_content = buf.get_line_content(seg.buffer_line).unwrap_or_default();
         let seg_slice = &line_content[seg.byte_start..seg.byte_end];
-        let seg_chars = seg.char_end - seg.char_start;
-        let rel_char = visual_char_col.min(seg_chars);
-        let rel_utf16: usize = seg_slice
-            .chars()
-            .take(rel_char)
-            .map(|c| c.len_utf16())
-            .sum();
+        let rel_utf16 = display_col_to_utf16_col(seg_slice, visual_display_col);
         Position::new(seg.buffer_line, seg.utf16_start + rel_utf16)
     }
 
@@ -360,6 +406,9 @@ pub struct EditorView {
     pub diagnostics: Vec<EditorDiagnostic>,
     pub hovered_diagnostic: Option<EditorDiagnostic>,
     pub hover_position: Option<Point>,
+    pub lsp_hover: Option<LspHoverInfo>,
+    pub hover_request_position: Option<Position>,
+    pub last_action: Option<EditorAction>,
     pub breakpoints: BTreeSet<usize>,
     pub execution_line: Option<usize>,
     pub last_gutter_action: Option<EditorGutterAction>,
@@ -370,6 +419,24 @@ pub struct EditorView {
     pub word_wrap: WordWrapMode,
     pub word_wrap_column: usize,
     pub find_replace: FindReplaceWidget,
+    pub tab_size: usize,
+    pub insert_spaces: bool,
+    pub auto_closing_brackets: bool,
+    pub context_menu: EditorContextMenu,
+    pub custom_comment_config: Option<CommentConfig>,
+    language_id: Option<String>,
+    clipboard_buffer: Arc<Mutex<String>>,
+    clipboard_read: Option<ClipboardReadFn>,
+    clipboard_write: Option<ClipboardWriteFn>,
+    last_copied_line: Option<String>,
+    is_selecting: bool,
+    drag_mode: DragSelectionMode,
+    scrollbar_dragging: Option<ScrollbarDrag>,
+    last_click_time: Option<Instant>,
+    last_click_pos: Option<Point>,
+    consecutive_clicks: u32,
+    preferred_visual_col: Option<usize>,
+    auto_closed_offsets: BTreeSet<usize>,
     cursor_undo_snapshots: Vec<Option<CursorUndoSnapshot>>,
     cursor_redo_snapshots: Vec<Option<CursorUndoSnapshot>>,
     last_render_bounds: Mutex<Option<(Rect, FontMetrics)>>,
@@ -396,6 +463,9 @@ impl EditorView {
             diagnostics: Vec::new(),
             hovered_diagnostic: None,
             hover_position: None,
+            lsp_hover: None,
+            hover_request_position: None,
+            last_action: None,
             breakpoints: BTreeSet::new(),
             execution_line: None,
             last_gutter_action: None,
@@ -406,6 +476,24 @@ impl EditorView {
             word_wrap: WordWrapMode::Off,
             word_wrap_column: 80,
             find_replace: FindReplaceWidget::new(),
+            tab_size: 4,
+            insert_spaces: true,
+            auto_closing_brackets: true,
+            context_menu: EditorContextMenu::new(),
+            custom_comment_config: None,
+            language_id: None,
+            clipboard_buffer: Arc::new(Mutex::new(String::new())),
+            clipboard_read: None,
+            clipboard_write: None,
+            last_copied_line: None,
+            is_selecting: false,
+            drag_mode: DragSelectionMode::None,
+            scrollbar_dragging: None,
+            last_click_time: None,
+            last_click_pos: None,
+            consecutive_clicks: 0,
+            preferred_visual_col: None,
+            auto_closed_offsets: BTreeSet::new(),
             cursor_undo_snapshots: Vec::new(),
             cursor_redo_snapshots: Vec::new(),
             last_render_bounds: Mutex::new(None),
@@ -507,6 +595,9 @@ impl EditorView {
         if let Some(doc) = &self.document {
             return Some(doc.read().language_id.clone());
         }
+        if let Some(lang_id) = &self.language_id {
+            return Some(lang_id.clone());
+        }
         self.syntax_highlighter
             .lock()
             .as_ref()
@@ -521,6 +612,7 @@ impl EditorView {
 
     pub fn with_syntax(mut self, highlighter: SyntaxHighlighter) -> Self {
         let lang = highlighter.grammar().language_id().to_string();
+        self.language_id = Some(lang.clone());
         *self.syntax_highlighter.lock() = Some(highlighter);
         {
             let buf = self.buffer.read();
@@ -683,7 +775,7 @@ impl EditorView {
             || self.minimap_width <= 0.0
             || !gutter_w.is_finite()
             || gutter_w < 0.0
-            || !is_finite_positive_rect(bounds)
+            || !bounds.is_finite_positive()
             || bounds.width() < gutter_w + self.minimap_width + 80.0
         {
             return None;
@@ -701,7 +793,7 @@ impl EditorView {
     }
 
     pub fn accessibility_node(&self, id: &str, bounds: Rect, font: &FontMetrics) -> AccessibleNode {
-        let safe_bounds = if is_finite_rect(bounds) {
+        let safe_bounds = if bounds.is_finite() {
             Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), bounds.height())
         } else {
             Rect::zero()
@@ -787,7 +879,7 @@ impl EditorView {
 
         if self.autocomplete.is_visible {
             if let Some(pop_bounds) = *self.autocomplete.last_bounds.lock() {
-                if is_finite_rect(pop_bounds) {
+                if pop_bounds.is_finite() {
                     node.add_child(
                         AccessibleNode::new(
                             format!("{}-autocomplete", id),
@@ -810,26 +902,172 @@ impl EditorView {
     }
 
     pub fn set_document(&mut self, doc: Arc<RwLock<TextDocument>>) {
-        let (buf_arc, lang_id) = {
+        let (buf_arc, lang_id, text_snapshot) = {
             let d = doc.read();
-            (d.buffer.clone(), d.language_id.clone())
+            (d.buffer.clone(), d.language_id.clone(), d.text())
         };
         self.buffer = buf_arc;
         self.document = Some(doc);
+        self.language_id = Some(lang_id.clone());
         let buf = self.buffer.read();
         self.folding_model.compute_from_buffer(&buf, Some(&lang_id));
+        #[cfg(feature = "desktop")]
+        {
+            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+                if sh.has_tree_sitter() {
+                    sh.enable_tree_sitter(&lang_id, &text_snapshot);
+                }
+            }
+        }
+        let _ = text_snapshot;
     }
 
     pub fn set_language(&mut self, lang_id: &str, theme: ColorTheme, registry: &GrammarRegistry) {
-        let sh = SyntaxHighlighter::for_language(lang_id, theme, registry);
-        *self.syntax_highlighter.lock() = Some(sh);
+        self.language_id = Some(lang_id.to_string());
+        #[allow(unused_mut)]
+        let mut sh = SyntaxHighlighter::for_language(lang_id, theme, registry);
         let buf = self.buffer.read();
+        #[cfg(feature = "desktop")]
+        {
+            let ts_lang = self
+                .document
+                .as_ref()
+                .and_then(|d| d.read().path.clone())
+                .and_then(|p| {
+                    p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("tsx"))
+                })
+                .filter(|&is_tsx| is_tsx)
+                .map(|_| "tsx")
+                .unwrap_or(lang_id);
+            sh.enable_tree_sitter(ts_lang, &buf.to_string());
+        }
+        *self.syntax_highlighter.lock() = Some(sh);
         self.folding_model.compute_from_buffer(&buf, Some(lang_id));
     }
 
     pub fn set_theme(&mut self, theme: ColorTheme) {
         if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
             sh.set_theme(theme);
+        }
+    }
+
+    pub fn with_clipboard_callbacks(
+        mut self,
+        read_fn: ClipboardReadFn,
+        write_fn: ClipboardWriteFn,
+    ) -> Self {
+        self.set_clipboard_callbacks(read_fn, write_fn);
+        self
+    }
+
+    pub fn set_clipboard_callbacks(
+        &mut self,
+        read_fn: ClipboardReadFn,
+        write_fn: ClipboardWriteFn,
+    ) {
+        self.clipboard_read = Some(read_fn);
+        self.clipboard_write = Some(write_fn);
+    }
+
+    pub fn set_tab_size(&mut self, tab_size: usize) {
+        self.tab_size = tab_size.clamp(1, 16);
+    }
+
+    pub fn set_insert_spaces(&mut self, insert_spaces: bool) {
+        self.insert_spaces = insert_spaces;
+    }
+
+    pub fn set_auto_closing_brackets(&mut self, enabled: bool) {
+        self.auto_closing_brackets = enabled;
+    }
+
+    pub fn indent_unit(&self) -> String {
+        if self.insert_spaces {
+            " ".repeat(self.tab_size.max(1))
+        } else {
+            "\t".to_string()
+        }
+    }
+
+    pub fn set_lsp_hover(&mut self, hover: Option<LspHoverInfo>, mouse_pt: Option<Point>) {
+        self.lsp_hover = hover;
+        if let Some(pt) = mouse_pt {
+            self.hover_position = Some(pt);
+        }
+    }
+
+    pub fn clear_lsp_hover(&mut self) {
+        self.lsp_hover = None;
+    }
+
+    pub fn hover_request_position(&self) -> Option<Position> {
+        self.hover_request_position
+    }
+
+    pub fn take_last_action(&mut self) -> Option<EditorAction> {
+        self.last_action.take()
+    }
+
+    pub fn merge_lsp_completions(
+        &mut self,
+        lsp_items: Vec<CompletionItem>,
+        trigger_pos: Position,
+        trigger_char: Option<char>,
+    ) {
+        if lsp_items.is_empty() {
+            return;
+        }
+        if self.autocomplete.is_visible {
+            let mut merged = lsp_items;
+            for existing in &self.autocomplete.all_items {
+                if !merged.iter().any(|i| i.label == existing.label) {
+                    merged.push(existing.clone());
+                }
+            }
+            let current_filter = self.autocomplete.filter_query.clone();
+            self.autocomplete.all_items = merged;
+            self.autocomplete.update_filter(&current_filter);
+        } else {
+            self.autocomplete.show(lsp_items, trigger_pos, trigger_char);
+        }
+    }
+
+    pub fn apply_format_edits(&mut self, edits: &[RangeEdit]) -> bool {
+        self.apply_text_edits(edits)
+    }
+
+    pub fn visual_column_at(&self, pos: Position) -> usize {
+        let buf = self.buffer.read();
+        let line_content = buf.get_line_content(pos.line).unwrap_or_default();
+        utf16_col_to_display_col(&line_content, pos.column)
+    }
+
+    pub fn caret_x_offset(&self, pos: Position, font: &FontMetrics) -> f32 {
+        let vis_col = self.visual_column_at(pos);
+        let char_w = if font.char_width.is_finite() && font.char_width > 0.0 {
+            font.char_width
+        } else {
+            8.0
+        };
+        vis_col as f32 * char_w
+    }
+
+    fn sync_highlighter_on_edit(&self, min_affected_line: Option<usize>) {
+        let mut guard = self.syntax_highlighter.lock();
+        if let Some(sh) = guard.as_mut() {
+            #[cfg(feature = "desktop")]
+            if sh.has_tree_sitter() {
+                let full_text = self.buffer.read().to_string();
+                sh.sync_tree_sitter_text(&full_text);
+                return;
+            }
+            if let Some(line) = min_affected_line {
+                sh.invalidate_from(line);
+            } else {
+                sh.invalidate_all();
+            }
         }
     }
 
@@ -1004,9 +1242,7 @@ impl EditorView {
                 }
             };
             self.record_cursor_undo_snapshot(prev_past_len, pre_sels, post_sels, fold_shifts);
-            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
-                sh.invalidate_from(primary_before.line);
-            }
+            self.sync_highlighter_on_edit(Some(primary_before.line));
             if let Some(doc) = &self.document {
                 doc.write().mark_edited();
             }
@@ -1138,9 +1374,7 @@ impl EditorView {
             self.folding_model.unfold_containing(l);
         }
 
-        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
-            sh.invalidate_from(min_affected_line);
-        }
+        self.sync_highlighter_on_edit(Some(min_affected_line));
         if let Some(doc) = &self.document {
             doc.write().mark_edited();
         }
@@ -1148,6 +1382,8 @@ impl EditorView {
     }
 
     pub fn delete_selection(&mut self) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
         self.cursor_state.normalize_and_merge();
         let has_non_empty = self.cursor_state.selections.iter().any(|s| !s.is_empty());
         if !has_non_empty {
@@ -1191,6 +1427,8 @@ impl EditorView {
         if text.is_empty() {
             return;
         }
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
         self.cursor_state.normalize_and_merge();
 
         let entries: Vec<(usize, usize, usize, String, bool)> = {
@@ -1218,6 +1456,7 @@ impl EditorView {
     }
 
     pub fn delete_backwards(&mut self) {
+        self.preferred_visual_col = None;
         if self.delete_selection() {
             return;
         }
@@ -1225,14 +1464,31 @@ impl EditorView {
 
         let entries: Vec<(usize, usize, usize, String, bool)> = {
             let buf = self.buffer.read();
+            let buf_len = buf.len();
             self.cursor_state
                 .selections
                 .iter()
                 .enumerate()
                 .map(|(idx, sel)| {
                     let off = buf.position_to_offset(sel.active.line, sel.active.column);
+                    // Empty-pair bracket/quote deletion: `(|)` -> deletes both opener & closer
+                    if self.auto_closing_brackets && off > 0 && off < buf_len {
+                        let prev_b = buf.get_byte(off - 1);
+                        let next_b = buf.get_byte(off);
+                        let is_empty_pair = matches!(
+                            (prev_b, next_b),
+                            (Some(b'('), Some(b')'))
+                                | (Some(b'['), Some(b']'))
+                                | (Some(b'{'), Some(b'}'))
+                                | (Some(b'"'), Some(b'"'))
+                                | (Some(b'\''), Some(b'\''))
+                        );
+                        if is_empty_pair {
+                            return (idx, off - 1, off + 1, String::new(), true);
+                        }
+                    }
                     if off > 0 {
-                        let prev = buf.prev_char_boundary(off);
+                        let prev = buf.prev_grapheme_boundary(off);
                         (idx, prev, off, String::new(), true)
                     } else {
                         (idx, 0, 0, String::new(), false)
@@ -1241,10 +1497,13 @@ impl EditorView {
                 .collect()
         };
 
+        self.auto_closed_offsets.clear();
         self.apply_cursor_edits(entries);
     }
 
     pub fn delete_forwards(&mut self) {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
         if self.delete_selection() {
             return;
         }
@@ -1260,7 +1519,7 @@ impl EditorView {
                 .map(|(idx, sel)| {
                     let off = buf.position_to_offset(sel.active.line, sel.active.column);
                     if off < buf_len {
-                        let next = buf.next_char_boundary(off);
+                        let next = buf.next_grapheme_boundary(off);
                         (idx, off, next, String::new(), true)
                     } else {
                         (idx, off, off, String::new(), false)
@@ -1273,13 +1532,15 @@ impl EditorView {
     }
 
     pub fn move_cursor_left(&mut self, select: bool) {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
         {
             let buf = self.buffer.read();
             for sel in &mut self.cursor_state.selections {
                 let pos = sel.active;
                 let offset = buf.position_to_offset(pos.line, pos.column);
                 let target = if offset > 0 {
-                    let prev_offset = buf.prev_char_boundary(offset);
+                    let prev_offset = buf.prev_grapheme_boundary(offset);
                     let (new_line, new_col) = buf.offset_to_position(prev_offset);
                     Position::new(new_line, new_col)
                 } else {
@@ -1296,6 +1557,8 @@ impl EditorView {
     }
 
     pub fn move_cursor_right(&mut self, select: bool) {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
         {
             let buf = self.buffer.read();
             let buf_len = buf.len();
@@ -1303,7 +1566,7 @@ impl EditorView {
                 let pos = sel.active;
                 let offset = buf.position_to_offset(pos.line, pos.column);
                 let target = if offset < buf_len {
-                    let next_offset = buf.next_char_boundary(offset);
+                    let next_offset = buf.next_grapheme_boundary(offset);
                     let (new_line, new_col) = buf.offset_to_position(next_offset);
                     Position::new(new_line, new_col)
                 } else {
@@ -1320,13 +1583,25 @@ impl EditorView {
     }
 
     pub fn move_cursor_up(&mut self, select: bool) {
+        self.auto_closed_offsets.clear();
         {
             let buf = self.buffer.read();
-            for sel in &mut self.cursor_state.selections {
+            let primary_pos = self.cursor_state.primary().active;
+            let desired_vis_col = *self.preferred_visual_col.get_or_insert_with(|| {
+                let line = buf.get_line_content(primary_pos.line).unwrap_or_default();
+                utf16_col_to_display_col(&line, primary_pos.column)
+            });
+            for (idx, sel) in self.cursor_state.selections.iter_mut().enumerate() {
                 let pos = sel.active;
                 if let Some(target_line) = self.folding_model.prev_visible_line(pos.line) {
+                    let cur_line = buf.get_line_content(pos.line).unwrap_or_default();
+                    let vis_col = if idx == 0 {
+                        desired_vis_col
+                    } else {
+                        utf16_col_to_display_col(&cur_line, pos.column)
+                    };
                     let content = buf.get_line_content(target_line).unwrap_or_default();
-                    let target_col = clamp_utf16_col(&content, pos.column);
+                    let target_col = display_col_to_utf16_col(&content, vis_col);
                     let target = Position::new(target_line, target_col);
                     if select {
                         sel.active = target;
@@ -1342,14 +1617,26 @@ impl EditorView {
     }
 
     pub fn move_cursor_down(&mut self, select: bool) {
+        self.auto_closed_offsets.clear();
         {
             let buf = self.buffer.read();
             let line_count = buf.line_count();
-            for sel in &mut self.cursor_state.selections {
+            let primary_pos = self.cursor_state.primary().active;
+            let desired_vis_col = *self.preferred_visual_col.get_or_insert_with(|| {
+                let line = buf.get_line_content(primary_pos.line).unwrap_or_default();
+                utf16_col_to_display_col(&line, primary_pos.column)
+            });
+            for (idx, sel) in self.cursor_state.selections.iter_mut().enumerate() {
                 let pos = sel.active;
                 if let Some(target_line) = self.folding_model.next_visible_line(pos.line, line_count) {
+                    let cur_line = buf.get_line_content(pos.line).unwrap_or_default();
+                    let vis_col = if idx == 0 {
+                        desired_vis_col
+                    } else {
+                        utf16_col_to_display_col(&cur_line, pos.column)
+                    };
                     let content = buf.get_line_content(target_line).unwrap_or_default();
-                    let target_col = clamp_utf16_col(&content, pos.column);
+                    let target_col = display_col_to_utf16_col(&content, vis_col);
                     let target = Position::new(target_line, target_col);
                     if select {
                         sel.active = target;
@@ -1365,6 +1652,8 @@ impl EditorView {
     }
 
     pub fn move_cursor_home(&mut self, select: bool) {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
         for sel in &mut self.cursor_state.selections {
             let target = Position::new(sel.active.line, 0);
             if select {
@@ -1377,6 +1666,8 @@ impl EditorView {
     }
 
     pub fn move_cursor_end(&mut self, select: bool) {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
         {
             let buf = self.buffer.read();
             for sel in &mut self.cursor_state.selections {
@@ -1730,9 +2021,7 @@ impl EditorView {
             }
             self.clamp_scroll_top();
 
-            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
-                sh.invalidate_all();
-            }
+            self.sync_highlighter_on_edit(None);
             if let Some(doc) = &self.document {
                 doc.write().mark_edited();
             }
@@ -1820,9 +2109,7 @@ impl EditorView {
             }
             self.clamp_scroll_top();
 
-            if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
-                sh.invalidate_all();
-            }
+            self.sync_highlighter_on_edit(None);
             if let Some(doc) = &self.document {
                 doc.write().mark_edited();
             }
@@ -1905,9 +2192,7 @@ impl EditorView {
         self.record_cursor_undo_snapshot(prev_past_len, pre_sels, post_sels, fold_shifts);
         self.folding_model.unfold_containing(new_line);
 
-        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
-            sh.invalidate_all();
-        }
+        self.sync_highlighter_on_edit(None);
         if let Some(doc) = &self.document {
             doc.write().mark_edited();
         }
@@ -1920,7 +2205,7 @@ impl EditorView {
         let Some((bounds, font)) = cached else {
             return;
         };
-        if !is_finite_positive_rect(bounds) || !font.line_height.is_finite() || font.line_height <= 0.0 {
+        if !bounds.is_finite_positive() || !font.line_height.is_finite() || font.line_height <= 0.0 {
             return;
         }
         let gutter_w = self.gutter_width(&font);
@@ -2116,9 +2401,7 @@ impl EditorView {
         self.folding_model.unfold_containing(new_line);
         self.clamp_scroll_top();
 
-        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
-            sh.invalidate_all();
-        }
+        self.sync_highlighter_on_edit(None);
         if let Some(doc) = &self.document {
             doc.write().mark_edited();
         }
@@ -2197,6 +2480,935 @@ impl EditorView {
             0
         }
     }
+
+    // --- Clipboard (`Ctrl+C` / `Ctrl+X` / `Ctrl+V`) ---
+
+    pub fn clipboard_text(&self) -> String {
+        if let Some(read_fn) = &self.clipboard_read {
+            if let Some(ext) = (read_fn)() {
+                return ext;
+            }
+        }
+        self.clipboard_buffer.lock().clone()
+    }
+
+    pub fn set_clipboard_text(&self, text: &str) {
+        *self.clipboard_buffer.lock() = text.to_string();
+        if let Some(write_fn) = &self.clipboard_write {
+            (write_fn)(text);
+        }
+    }
+
+    pub fn copy(&mut self) -> Option<String> {
+        self.cursor_state.normalize_and_merge();
+        let has_non_empty = self.cursor_state.selections.iter().any(|s| !s.is_empty());
+        let buf = self.buffer.read();
+        if has_non_empty {
+            let mut parts = Vec::new();
+            for sel in &self.cursor_state.selections {
+                if !sel.is_empty() {
+                    let s = sel.start();
+                    let e = sel.end();
+                    let s_off = buf.position_to_offset(s.line, s.column);
+                    let e_off = buf.position_to_offset(e.line, e.column);
+                    let (so, eo) = if s_off <= e_off { (s_off, e_off) } else { (e_off, s_off) };
+                    parts.push(buf.get_range(so, eo));
+                }
+            }
+            let joined = parts.join("\n");
+            drop(buf);
+            self.last_copied_line = None;
+            self.set_clipboard_text(&joined);
+            Some(joined)
+        } else {
+            // VS Code parity: empty-selection Ctrl+C copies entire current line including trailing newline
+            let line = self.primary_position().line;
+            let (ls, le) = buf.get_line_offsets(line)?;
+            let mut line_text = buf.get_range(ls, le);
+            if !line_text.ends_with('\n') {
+                line_text.push('\n');
+            }
+            drop(buf);
+            self.last_copied_line = Some(line_text.clone());
+            self.set_clipboard_text(&line_text);
+            Some(line_text)
+        }
+    }
+
+    pub fn cut(&mut self) -> Option<String> {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        self.cursor_state.normalize_and_merge();
+        let has_non_empty = self.cursor_state.selections.iter().any(|s| !s.is_empty());
+        if has_non_empty {
+            let copied = self.copy();
+            self.delete_selection();
+            return copied;
+        }
+
+        // Empty-selection Ctrl+X: cut entire current line including newline atomically
+        let pos = self.primary_position();
+        let (copied, del_start, del_end, target_line) = {
+            let buf = self.buffer.read();
+            let (ls, le) = buf.get_line_offsets(pos.line)?;
+            let raw = buf.get_range(ls, le);
+            let mut line_copy = raw.clone();
+            if !line_copy.ends_with('\n') {
+                line_copy.push('\n');
+            }
+            if raw.ends_with('\n') {
+                (line_copy, ls, le, pos.line)
+            } else if pos.line > 0 {
+                let prev_le = ls;
+                let prev_nl = if prev_le >= 2 && buf.get_range(prev_le - 2, prev_le) == "\r\n" {
+                    prev_le - 2
+                } else {
+                    prev_le - 1
+                };
+                (line_copy, prev_nl, le, pos.line - 1)
+            } else {
+                (line_copy, ls, le, 0)
+            }
+        };
+
+        self.last_copied_line = Some(copied.clone());
+        self.set_clipboard_text(&copied);
+        if del_end > del_start {
+            self.apply_offset_edits(vec![(del_start, del_end, String::new())]);
+            let buf = self.buffer.read();
+            let clamped_line = target_line.min(buf.line_count().saturating_sub(1));
+            let line_str = buf.get_line_content(clamped_line).unwrap_or_default();
+            let target_col = clamp_utf16_col(&line_str, pos.column);
+            drop(buf);
+            self.cursor_state
+                .set_primary(Position::new(clamped_line, target_col));
+        }
+        Some(copied)
+    }
+
+    pub fn paste(&mut self) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        let text = self.clipboard_text();
+        if text.is_empty() {
+            return false;
+        }
+        let is_line_paste = self.cursor_state.selections.len() == 1
+            && self.cursor_state.primary().is_empty()
+            && self.last_copied_line.as_deref() == Some(text.as_str());
+
+        if is_line_paste {
+            let pos = self.primary_position();
+            let line_start = {
+                let buf = self.buffer.read();
+                buf.get_line_offsets(pos.line).map_or(0, |(s, _)| s)
+            };
+            let to_insert = if text.ends_with('\n') {
+                text
+            } else {
+                format!("{text}\n")
+            };
+            if self.apply_offset_edits(vec![(line_start, line_start, to_insert)]) {
+                let buf = self.buffer.read();
+                let new_line = (pos.line + 1).min(buf.line_count().saturating_sub(1));
+                let line_str = buf.get_line_content(new_line).unwrap_or_default();
+                let col = clamp_utf16_col(&line_str, pos.column);
+                drop(buf);
+                self.cursor_state.set_primary(Position::new(new_line, col));
+                return true;
+            }
+            return false;
+        }
+
+        self.insert_text(&text);
+        true
+    }
+
+    // --- Line Range Helpers, Comments, Move/Duplicate, Indent/Outdent ---
+
+    fn selected_line_range(&self) -> (usize, usize) {
+        let primary = self.cursor_state.primary();
+        let start = primary.start();
+        let end = primary.end();
+        let end_line = if end.line > start.line && end.column == 0 {
+            end.line - 1
+        } else {
+            end.line
+        };
+        (start.line, end_line)
+    }
+
+    fn effective_comment_config(&self) -> CommentConfig {
+        if let Some(cfg) = &self.custom_comment_config {
+            return cfg.clone();
+        }
+        let lang = self
+            .detected_language_id()
+            .unwrap_or_else(|| "plaintext".to_string());
+        comments::comment_config_for_language(&lang)
+    }
+
+    pub fn toggle_line_comment(&mut self) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        let (start_line, end_line) = self.selected_line_range();
+        let cfg = self.effective_comment_config();
+        let edits = {
+            let buf = self.buffer.read();
+            comments::compute_toggle_line_comment_edits(&buf, start_line, end_line, &cfg)
+        };
+        if edits.is_empty() {
+            return false;
+        }
+        let had_selection = !self.cursor_state.primary().is_empty();
+        let saved_start_line = start_line;
+        let saved_end_line = end_line;
+        if self.apply_offset_edits(edits) {
+            if had_selection {
+                let buf = self.buffer.read();
+                let end_len = buf
+                    .get_line_content(saved_end_line)
+                    .map_or(0, |l| l.chars().map(|c| c.len_utf16()).sum());
+                drop(buf);
+                *self.cursor_state.primary_mut() = Selection::new(
+                    Position::new(saved_start_line, 0),
+                    Position::new(saved_end_line, end_len),
+                );
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn toggle_block_comment(&mut self) -> bool {
+        let cfg = self.effective_comment_config();
+        let Some((open, close)) = cfg.block_comment else {
+            return self.toggle_line_comment();
+        };
+        let primary = self.cursor_state.primary().clone();
+        let (s_off, e_off) = {
+            let buf = self.buffer.read();
+            if primary.is_empty() {
+                let (ls, le) = buf.get_line_offsets(primary.active.line).unwrap_or((0, 0));
+                let content_len = buf
+                    .get_line_content(primary.active.line)
+                    .map_or(0, |s| s.len());
+                (ls, (ls + content_len).min(le))
+            } else {
+                let s = primary.start();
+                let e = primary.end();
+                let so = buf.position_to_offset(s.line, s.column);
+                let eo = buf.position_to_offset(e.line, e.column);
+                if so <= eo { (so, eo) } else { (eo, so) }
+            }
+        };
+        let selected = self.buffer.read().get_range(s_off, e_off);
+        let trimmed = selected.trim();
+        let replacement = if trimmed.starts_with(open.as_str())
+            && trimmed.ends_with(close.as_str())
+            && trimmed.len() >= open.len() + close.len()
+        {
+            let inner = &trimmed[open.len()..trimmed.len() - close.len()];
+            inner.trim().to_string()
+        } else {
+            format!("{open} {selected} {close}")
+        };
+        self.apply_offset_edits(vec![(s_off, e_off, replacement)])
+    }
+
+    pub fn move_lines_up(&mut self) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        let primary = self.cursor_state.primary().clone();
+        let (start_line, end_line) = self.selected_line_range();
+        if start_line == 0 {
+            return false;
+        }
+        let (replace_start, replace_end, replacement) = {
+            let buf = self.buffer.read();
+            let line_count = buf.line_count();
+            if end_line >= line_count {
+                return false;
+            }
+            let Some((rs, prev_end)) = buf.get_line_offsets(start_line - 1) else {
+                return false;
+            };
+            let prev_raw = buf.get_range(rs, prev_end);
+            let eol = if prev_raw.ends_with("\r\n") { "\r\n" } else { "\n" };
+            let prev_content = buf.get_line_content(start_line - 1).unwrap_or_default();
+            let (_, end_raw_off) = buf.get_line_offsets(end_line).unwrap_or((rs, buf.len()));
+            let end_raw = buf.get_range(rs, end_raw_off);
+            let tail_eol_len = if end_line + 1 < line_count {
+                if end_raw.ends_with("\r\n") {
+                    2
+                } else if end_raw.ends_with('\n') {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let re = end_raw_off - tail_eol_len;
+            let mut moved_parts: Vec<String> = (start_line..=end_line)
+                .map(|l| buf.get_line_content(l).unwrap_or_default())
+                .collect();
+            moved_parts.push(prev_content);
+            (rs, re, moved_parts.join(eol))
+        };
+
+        if self.apply_offset_edits(vec![(replace_start, replace_end, replacement)]) {
+            let new_anchor = Position::new(primary.anchor.line.saturating_sub(1), primary.anchor.column);
+            let new_active = Position::new(primary.active.line.saturating_sub(1), primary.active.column);
+            *self.cursor_state.primary_mut() = Selection::new(new_anchor, new_active);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn move_lines_down(&mut self) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        let primary = self.cursor_state.primary().clone();
+        let (start_line, end_line) = self.selected_line_range();
+        let (replace_start, replace_end, replacement) = {
+            let buf = self.buffer.read();
+            let line_count = buf.line_count();
+            if end_line + 1 >= line_count {
+                return false;
+            }
+            let Some((rs, first_end)) = buf.get_line_offsets(start_line) else {
+                return false;
+            };
+            let first_raw = buf.get_range(rs, first_end);
+            let eol = if first_raw.ends_with("\r\n") { "\r\n" } else { "\n" };
+            let next_line = end_line + 1;
+            let next_content = buf.get_line_content(next_line).unwrap_or_default();
+            let (_, next_end_off) = buf.get_line_offsets(next_line).unwrap_or((rs, buf.len()));
+            let next_raw = buf.get_range(rs, next_end_off);
+            let tail_eol_len = if next_line + 1 < line_count {
+                if next_raw.ends_with("\r\n") {
+                    2
+                } else if next_raw.ends_with('\n') {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let re = next_end_off - tail_eol_len;
+            let mut moved_parts = vec![next_content];
+            for l in start_line..=end_line {
+                moved_parts.push(buf.get_line_content(l).unwrap_or_default());
+            }
+            (rs, re, moved_parts.join(eol))
+        };
+
+        if self.apply_offset_edits(vec![(replace_start, replace_end, replacement)]) {
+            let new_anchor = Position::new(primary.anchor.line + 1, primary.anchor.column);
+            let new_active = Position::new(primary.active.line + 1, primary.active.column);
+            *self.cursor_state.primary_mut() = Selection::new(new_anchor, new_active);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn duplicate_lines_up(&mut self) -> bool {
+        self.duplicate_lines_impl(false)
+    }
+
+    pub fn duplicate_lines_down(&mut self) -> bool {
+        self.duplicate_lines_impl(true)
+    }
+
+    fn duplicate_lines_impl(&mut self, move_cursor_down: bool) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        let primary = self.cursor_state.primary().clone();
+        let (start_line, end_line) = self.selected_line_range();
+        let (replace_start, replace_end, replacement) = {
+            let buf = self.buffer.read();
+            let line_count = buf.line_count();
+            if end_line >= line_count {
+                return false;
+            }
+            let Some((rs, first_end)) = buf.get_line_offsets(start_line) else {
+                return false;
+            };
+            let first_raw = buf.get_range(rs, first_end);
+            let eol = if first_raw.ends_with("\r\n") { "\r\n" } else { "\n" };
+            let (_, end_raw_off) = buf.get_line_offsets(end_line).unwrap_or((rs, buf.len()));
+            let end_raw = buf.get_range(rs, end_raw_off);
+            let tail_eol_len = if end_line + 1 < line_count {
+                if end_raw.ends_with("\r\n") {
+                    2
+                } else if end_raw.ends_with('\n') {
+                    1
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let re = end_raw_off - tail_eol_len;
+            let block: Vec<String> = (start_line..=end_line)
+                .map(|l| buf.get_line_content(l).unwrap_or_default())
+                .collect();
+            let joined = block.join(eol);
+            (rs, re, format!("{joined}{eol}{joined}"))
+        };
+
+        let line_delta = end_line - start_line + 1;
+        if self.apply_offset_edits(vec![(replace_start, replace_end, replacement)]) {
+            let shift = if move_cursor_down { line_delta } else { 0 };
+            *self.cursor_state.primary_mut() = Selection::new(
+                Position::new(primary.anchor.line + shift, primary.anchor.column),
+                Position::new(primary.active.line + shift, primary.active.column),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn indent_selection(&mut self) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        let primary = self.cursor_state.primary().clone();
+        let is_multiline = primary.start().line != primary.end().line;
+        if !is_multiline {
+            let unit = self.indent_unit();
+            self.insert_text(&unit);
+            return true;
+        }
+        let (start_line, end_line) = self.selected_line_range();
+        let unit = self.indent_unit();
+        let unit_utf16_len: usize = unit.chars().map(|c| c.len_utf16()).sum();
+        let edits: Vec<(usize, usize, String)> = {
+            let buf = self.buffer.read();
+            (start_line..=end_line)
+                .filter_map(|l| buf.get_line_offsets(l).map(|(ls, _)| (ls, ls, unit.clone())))
+                .collect()
+        };
+        if self.apply_offset_edits(edits) {
+            let adj = |p: Position| {
+                if p.line >= start_line && p.line <= end_line && (p.column > 0 || p.line == start_line) {
+                    Position::new(p.line, p.column + unit_utf16_len)
+                } else {
+                    p
+                }
+            };
+            *self.cursor_state.primary_mut() = Selection::new(adj(primary.anchor), adj(primary.active));
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn outdent_selection(&mut self) -> bool {
+        self.preferred_visual_col = None;
+        self.auto_closed_offsets.clear();
+        let primary = self.cursor_state.primary().clone();
+        let (start_line, end_line) = self.selected_line_range();
+        let mut edits = Vec::new();
+        let mut removed_per_line: Vec<(usize, usize)> = Vec::new();
+        {
+            let buf = self.buffer.read();
+            for l in start_line..=end_line {
+                let Some((ls, _)) = buf.get_line_offsets(l) else {
+                    continue;
+                };
+                let content = buf.get_line_content(l).unwrap_or_default();
+                let remove_bytes = if content.starts_with('\t') {
+                    1
+                } else {
+                    content
+                        .bytes()
+                        .take(self.tab_size.max(1))
+                        .take_while(|&b| b == b' ')
+                        .count()
+                };
+                if remove_bytes > 0 {
+                    edits.push((ls, ls + remove_bytes, String::new()));
+                    removed_per_line.push((l, remove_bytes));
+                }
+            }
+        }
+        if edits.is_empty() {
+            return false;
+        }
+        if self.apply_offset_edits(edits) {
+            let adj = |p: Position| {
+                let removed = removed_per_line
+                    .iter()
+                    .find(|&&(l, _)| l == p.line)
+                    .map_or(0, |&(_, r)| r);
+                Position::new(p.line, p.column.saturating_sub(removed))
+            };
+            *self.cursor_state.primary_mut() = Selection::new(adj(primary.anchor), adj(primary.active));
+            true
+        } else {
+            false
+        }
+    }
+
+    // --- Bracket Auto-Close, Overtype & Matching Highlight ---
+
+    fn handle_char_input_with_brackets(&mut self, s: &str) {
+        if !self.auto_closing_brackets || s.chars().count() != 1 {
+            self.insert_text(s);
+            return;
+        }
+        let ch = s.chars().next().unwrap();
+
+        // Overtype: if cursor is empty & right before an auto-closed closing char, skip over it
+        if matches!(ch, ')' | ']' | '}' | '"' | '\'')
+            && self.cursor_state.selections.len() == 1
+            && self.cursor_state.primary().is_empty()
+        {
+            let pos = self.primary_position();
+            let off = {
+                let buf = self.buffer.read();
+                buf.position_to_offset(pos.line, pos.column)
+            };
+            let next_byte = self.buffer.read().get_byte(off);
+            let is_auto_closed = self.auto_closed_offsets.contains(&off);
+            let should_overtype = next_byte == Some(ch as u8)
+                && (is_auto_closed || matches!(ch, ')' | ']' | '}'));
+            if should_overtype {
+                self.auto_closed_offsets.remove(&off);
+                let next_pos = {
+                    let buf = self.buffer.read();
+                    buf.offset_to_position(off + 1)
+                };
+                self.cursor_state
+                    .set_primary(Position::new(next_pos.0, next_pos.1));
+                return;
+            }
+        }
+
+        // Auto-close pairs
+        let pair_close = match ch {
+            '(' => Some(')'),
+            '[' => Some(']'),
+            '{' => Some('}'),
+            '"' => Some('"'),
+            '\'' => Some('\''),
+            _ => None,
+        };
+
+        if let Some(close_ch) = pair_close {
+            if self.cursor_state.selections.len() == 1 && self.cursor_state.primary().is_empty() {
+                let pos = self.primary_position();
+                let off = {
+                    let buf = self.buffer.read();
+                    buf.position_to_offset(pos.line, pos.column)
+                };
+                let pair_str = format!("{ch}{close_ch}");
+                // Shift tracked auto-closed offsets after `off` by +2 and insert new closer at `off + 1`
+                let shifted: BTreeSet<usize> = self
+                    .auto_closed_offsets
+                    .iter()
+                    .map(|&o| if o >= off { o + 2 } else { o })
+                    .collect();
+                self.insert_text(&pair_str);
+                self.auto_closed_offsets = shifted;
+                self.auto_closed_offsets.insert(off + 1);
+                let inside_pos = {
+                    let buf = self.buffer.read();
+                    buf.offset_to_position(off + 1)
+                };
+                self.cursor_state
+                    .set_primary(Position::new(inside_pos.0, inside_pos.1));
+                return;
+            }
+        }
+
+        // Regular single-char insertion: preserve & shift any active auto_closed_offsets
+        if self.cursor_state.selections.len() == 1 && self.cursor_state.primary().is_empty() {
+            let pos = self.primary_position();
+            let off = self.buffer.read().position_to_offset(pos.line, pos.column);
+            let delta = s.len();
+            let shifted: BTreeSet<usize> = self
+                .auto_closed_offsets
+                .iter()
+                .map(|&o| if o >= off { o + delta } else { o })
+                .collect();
+            self.insert_text(s);
+            self.auto_closed_offsets = shifted;
+        } else {
+            self.insert_text(s);
+        }
+    }
+
+    /// Find matching bracket pair `(cursor_bracket_pos, partner_pos)` when cursor is adjacent
+    /// to `(`, `)`, `[`, `]`, `{`, `}`, skipping brackets inside strings and comments.
+    pub fn matching_bracket_pair(&self) -> Option<(Position, Position)> {
+        let buf = self.buffer.read();
+        let text = buf.to_string();
+        if text.is_empty() {
+            return None;
+        }
+        let pos = self.primary_position();
+        let off = buf.position_to_offset(pos.line, pos.column).min(text.len());
+        let lang = self
+            .detected_language_id()
+            .unwrap_or_else(|| "rust".to_string());
+        let masked = compute_code_only_bracket_mask(&text, &lang);
+
+        let is_bracket = |b: u8| matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+        let bytes = text.as_bytes();
+        let bracket_off = if off < bytes.len() && is_bracket(bytes[off]) && masked[off] {
+            Some(off)
+        } else if off > 0 && is_bracket(bytes[off - 1]) && masked[off - 1] {
+            Some(off - 1)
+        } else {
+            None
+        }?;
+
+        let ch = bytes[bracket_off];
+        let (partner, forward) = match ch {
+            b'(' => (b')', true),
+            b'[' => (b']', true),
+            b'{' => (b'}', true),
+            b')' => (b'(', false),
+            b']' => (b'[', false),
+            b'}' => (b'{', false),
+            _ => return None,
+        };
+
+        let mut depth = 0usize;
+        let match_off = if forward {
+            let mut found = None;
+            for (i, &b) in bytes.iter().enumerate().skip(bracket_off) {
+                if !masked[i] {
+                    continue;
+                }
+                if b == ch {
+                    depth += 1;
+                } else if b == partner {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            found
+        } else {
+            let mut found = None;
+            for i in (0..=bracket_off).rev() {
+                if !masked[i] {
+                    continue;
+                }
+                let b = bytes[i];
+                if b == ch {
+                    depth += 1;
+                } else if b == partner {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        found = Some(i);
+                        break;
+                    }
+                }
+            }
+            found
+        }?;
+
+        let (l1, c1) = buf.offset_to_position(bracket_off);
+        let (l2, c2) = buf.offset_to_position(match_off);
+        Some((Position::new(l1, c1), Position::new(l2, c2)))
+    }
+
+    // --- Word, Line, Hit-Test & Scrollbar Helpers ---
+
+    fn word_range_at(&self, pos: Position) -> (Position, Position) {
+        let buf = self.buffer.read();
+        let Some(line) = buf.get_line_content(pos.line) else {
+            return (pos, pos);
+        };
+        if line.is_empty() {
+            return (Position::new(pos.line, 0), Position::new(pos.line, 0));
+        }
+        let byte_col = utf16_col_to_byte_offset(&line, pos.column).min(line.len());
+        let probe_byte = if byte_col < line.len() {
+            byte_col
+        } else {
+            line.grapheme_indices(true).next_back().map_or(0, |(i, _)| i)
+        };
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum CharKind {
+            Ident,
+            Space,
+            Punct,
+        }
+        let classify = |s: &str| -> CharKind {
+            let c = s.chars().next().unwrap_or(' ');
+            if c.is_alphanumeric() || c == '_' {
+                CharKind::Ident
+            } else if c.is_whitespace() {
+                CharKind::Space
+            } else {
+                CharKind::Punct
+            }
+        };
+
+        let graphemes: Vec<(usize, &str)> = line.grapheme_indices(true).collect();
+        let Some(idx) = graphemes
+            .iter()
+            .position(|&(s, g)| probe_byte >= s && probe_byte < s + g.len())
+        else {
+            return (pos, pos);
+        };
+        let target_kind = classify(graphemes[idx].1);
+        let mut start_idx = idx;
+        while start_idx > 0 && classify(graphemes[start_idx - 1].1) == target_kind {
+            start_idx -= 1;
+        }
+        let mut end_idx = idx;
+        while end_idx + 1 < graphemes.len() && classify(graphemes[end_idx + 1].1) == target_kind {
+            end_idx += 1;
+        }
+        let start_byte = graphemes[start_idx].0;
+        let end_byte = graphemes[end_idx].0 + graphemes[end_idx].1.len();
+        let start_col = crate::model::byte_offset_to_utf16_col(&line, start_byte);
+        let end_col = crate::model::byte_offset_to_utf16_col(&line, end_byte);
+        (
+            Position::new(pos.line, start_col),
+            Position::new(pos.line, end_col),
+        )
+    }
+
+    fn whole_line_selection(&self, line: usize) -> Selection {
+        let buf = self.buffer.read();
+        let line_count = buf.line_count();
+        let clamped = line.min(line_count.saturating_sub(1));
+        if clamped + 1 < line_count {
+            Selection::new(Position::new(clamped, 0), Position::new(clamped + 1, 0))
+        } else {
+            let end_col = buf
+                .get_line_content(clamped)
+                .map_or(0, |l| l.chars().map(|c| c.len_utf16()).sum());
+            Selection::new(Position::new(clamped, 0), Position::new(clamped, end_col))
+        }
+    }
+
+    fn point_to_buffer_pos(
+        &self,
+        pt: Point,
+        bounds: Rect,
+        gutter_w: f32,
+        font: &FontMetrics,
+        round: bool,
+    ) -> Position {
+        let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, font);
+        let eff_scroll_left = if matches!(self.word_wrap, WordWrapMode::On | WordWrapMode::Bounded) {
+            0.0
+        } else if self.scroll_left.is_finite() {
+            self.scroll_left.max(0.0)
+        } else {
+            0.0
+        };
+        let buf = self.buffer.read();
+        let visual = VisualLayout::build(&buf, &self.folding_model, max_wrap_cols);
+        let max_st = visual.total_rows().saturating_sub(1) as f32;
+        let clamped_scroll_top = if self.scroll_top.is_finite() {
+            self.scroll_top.clamp(0.0, max_st)
+        } else {
+            0.0
+        };
+        let total = visual.total_rows();
+        if total == 0 {
+            return Position::new(0, 0);
+        }
+        let clicked_row = ((pt.y - bounds.min_y()) / font.line_height + clamped_scroll_top)
+            .floor()
+            .max(0.0) as usize;
+        let clamped_row = clicked_row.min(total - 1);
+        let Some(seg) = visual.segment_at(clamped_row, &buf) else {
+            return Position::new(0, 0);
+        };
+        let text_area_x = bounds.min_x() + gutter_w + 8.0;
+        let char_w = if font.char_width.is_finite() && font.char_width > 0.0 {
+            font.char_width
+        } else {
+            8.0
+        };
+        let rel_vis_x = (pt.x - text_area_x) / char_w + eff_scroll_left;
+        let line_content = buf.get_line_content(seg.buffer_line).unwrap_or_default();
+        let seg_slice = &line_content[seg.byte_start..seg.byte_end];
+        let rel_utf16 = if round {
+            display_x_col_to_utf16_col(seg_slice, rel_vis_x)
+        } else {
+            display_col_to_utf16_col(seg_slice, rel_vis_x.floor().max(0.0) as usize)
+        };
+        Position::new(seg.buffer_line, seg.utf16_start + rel_utf16)
+    }
+
+    pub fn vertical_scrollbar_rect(&self, bounds: Rect, gutter_w: f32) -> Option<Rect> {
+        const SCROLLBAR_W: f32 = 12.0;
+        if !bounds.is_finite_positive() || bounds.height() < 40.0 {
+            return None;
+        }
+        let mm_rect = self.minimap_rect_with_gutter(bounds, gutter_w);
+        let right_edge = mm_rect.map_or(bounds.max_x(), |mm| mm.min_x());
+        if right_edge - bounds.min_x() < gutter_w + SCROLLBAR_W + 20.0 {
+            return None;
+        }
+        Some(Rect::from_xywh(
+            right_edge - SCROLLBAR_W,
+            bounds.min_y(),
+            SCROLLBAR_W,
+            bounds.height(),
+        ))
+    }
+
+    pub fn horizontal_scrollbar_rect(
+        &self,
+        bounds: Rect,
+        gutter_w: f32,
+        font: &FontMetrics,
+    ) -> Option<Rect> {
+        const SCROLLBAR_H: f32 = 12.0;
+        if matches!(self.word_wrap, WordWrapMode::On | WordWrapMode::Bounded)
+            || !bounds.is_finite_positive()
+            || !font.is_finite()
+            || bounds.height() < 40.0
+        {
+            return None;
+        }
+        let max_sl = self.max_scroll_left(bounds, gutter_w, font);
+        if max_sl <= 0.0 {
+            return None;
+        }
+        let vscroll_w = self
+            .vertical_scrollbar_rect(bounds, gutter_w)
+            .map_or(0.0, |r| r.width());
+        let mm_rect = self.minimap_rect_with_gutter(bounds, gutter_w);
+        let right_edge = mm_rect.map_or(bounds.max_x(), |mm| mm.min_x()) - vscroll_w;
+        let track_x = bounds.min_x() + gutter_w;
+        let track_w = (right_edge - track_x).max(0.0);
+        if track_w < 24.0 {
+            return None;
+        }
+        Some(Rect::from_xywh(
+            track_x,
+            bounds.max_y() - SCROLLBAR_H,
+            track_w,
+            SCROLLBAR_H,
+        ))
+    }
+
+    fn max_scroll_left(&self, bounds: Rect, gutter_w: f32, font: &FontMetrics) -> f32 {
+        if matches!(self.word_wrap, WordWrapMode::On | WordWrapMode::Bounded) {
+            return 0.0;
+        }
+        let char_w = if font.char_width.is_finite() && font.char_width > 0.0 {
+            font.char_width
+        } else {
+            return 0.0;
+        };
+        let mm_rect = self.minimap_rect_with_gutter(bounds, gutter_w);
+        let code_right = mm_rect.map_or(bounds.max_x(), |mm| mm.min_x());
+        let text_area_x = bounds.min_x() + gutter_w + 8.0;
+        let visible_cols = ((code_right - text_area_x).max(0.0) / char_w).floor();
+        let buf = self.buffer.read();
+        let mut max_cols = 0usize;
+        let line_count = buf.line_count();
+        let sample_limit = line_count.min(2000);
+        for l in 0..sample_limit {
+            if let Some(line) = buf.get_line_content(l) {
+                let w = str_display_width(&line);
+                if w > max_cols {
+                    max_cols = w;
+                }
+            }
+        }
+        ((max_cols as f32 + 4.0) - visible_cols).max(0.0)
+    }
+
+    fn vertical_thumb_rect(&self, track: Rect, total_rows: usize, font: &FontMetrics) -> Rect {
+        let max_scroll = total_rows.saturating_sub(1) as f32;
+        let vis_rows = (track.height() / font.line_height.max(1.0)).max(1.0);
+        let thumb_h = ((vis_rows / total_rows.max(1) as f32) * track.height())
+            .clamp(20.0_f32.min(track.height()), track.height());
+        let travel = (track.height() - thumb_h).max(0.0);
+        let ratio = if max_scroll > 0.0 {
+            (self.scroll_top.clamp(0.0, max_scroll) / max_scroll).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Rect::from_xywh(
+            track.min_x() + 2.0,
+            track.min_y() + ratio * travel,
+            (track.width() - 4.0).max(2.0),
+            thumb_h,
+        )
+    }
+
+    fn horizontal_thumb_rect(
+        &self,
+        track: Rect,
+        max_scroll_left: f32,
+        visible_cols: f32,
+    ) -> Rect {
+        let total_cols = (visible_cols + max_scroll_left).max(1.0);
+        let thumb_w = ((visible_cols / total_cols) * track.width())
+            .clamp(20.0_f32.min(track.width()), track.width());
+        let travel = (track.width() - thumb_w).max(0.0);
+        let ratio = if max_scroll_left > 0.0 {
+            (self.scroll_left.clamp(0.0, max_scroll_left) / max_scroll_left).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        Rect::from_xywh(
+            track.min_x() + ratio * travel,
+            track.min_y() + 2.0,
+            thumb_w,
+            (track.height() - 4.0).max(2.0),
+        )
+    }
+
+    fn execute_context_menu_action(&mut self, action: ContextMenuAction) {
+        match action {
+            ContextMenuAction::Cut => {
+                self.cut();
+            }
+            ContextMenuAction::Copy => {
+                self.copy();
+            }
+            ContextMenuAction::Paste => {
+                self.paste();
+            }
+            ContextMenuAction::ToggleComment => {
+                self.toggle_line_comment();
+            }
+            ContextMenuAction::SelectAll => {
+                let buf = self.buffer.read();
+                let last_line = buf.line_count().saturating_sub(1);
+                let last_col = buf
+                    .get_line_content(last_line)
+                    .map_or(0, |l| l.chars().map(|c| c.len_utf16()).sum());
+                drop(buf);
+                self.cursor_state.clear_secondary_cursors();
+                self.cursor_state.primary_mut().anchor = Position::new(0, 0);
+                self.cursor_state.primary_mut().active = Position::new(last_line, last_col);
+            }
+            ContextMenuAction::GoToDefinition => {
+                self.last_action = Some(EditorAction::GoToDefinition(self.primary_position()));
+            }
+            ContextMenuAction::FormatDocument => {
+                self.last_action = Some(EditorAction::FormatDocument);
+            }
+            ContextMenuAction::CommandPalette => {
+                self.last_action = Some(EditorAction::OpenCommandPalette);
+            }
+        }
+    }
 }
 
 impl View for EditorView {
@@ -2207,17 +3419,16 @@ impl View for EditorView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !is_finite_positive_rect(bounds)
-            || !font.line_height.is_finite()
-            || font.line_height <= 0.0
-            || !font.char_width.is_finite()
-            || font.char_width < 0.0
-            || !font.font_size.is_finite()
-            || font.font_size < 0.0
-        {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         *self.last_render_bounds.lock() = Some((bounds, font.clone()));
+
+        let matching_brackets = if self.is_focused {
+            self.matching_bracket_pair()
+        } else {
+            None
+        };
 
         let buf = self.buffer.read();
         let line_count = buf.line_count();
@@ -2244,15 +3455,13 @@ impl View for EditorView {
         };
 
         // 1. Editor background
-        push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(bounds).with_background(theme.editor_background),
         );
 
         // 2. Gutter background and border
         let gutter_rect = Rect::from_xywh(bounds.min_x(), bounds.min_y(), gutter_w, bounds.height());
-        push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(gutter_rect)
                 .with_background(theme.editor_gutter_background)
                 .with_border_edges(
@@ -2294,7 +3503,7 @@ impl View for EditorView {
             code_area_w,
             bounds.height(),
         );
-        if !is_finite_rect(code_clip_rect) {
+        if !code_clip_rect.is_finite() {
             return;
         }
 
@@ -2337,8 +3546,7 @@ impl View for EditorView {
                 let dot_size = 10.0;
                 let dot_x = bounds.min_x() + 4.0;
                 let dot_y = line_y + (font.line_height - dot_size) / 2.0;
-                push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(Rect::from_xywh(dot_x, dot_y, dot_size, dot_size))
                         .with_background(Rgba::new(0.9, 0.15, 0.15, 1.0))
                         .with_corner_radius(dot_size / 2.0),
@@ -2348,8 +3556,7 @@ impl View for EditorView {
             // Execution arrow in gutter
             if self.execution_line == Some(line_1based) {
                 let arrow_x = bounds.min_x() + 4.0;
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         "▶".to_string(),
                         Point::new(arrow_x, line_y),
@@ -2370,8 +3577,7 @@ impl View for EditorView {
                 theme.editor_line_number
             };
 
-            push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     line_num_str,
                     Point::new(num_x, line_y),
@@ -2389,8 +3595,7 @@ impl View for EditorView {
                     "▾"
                 };
                 let fold_x = bounds.min_x() + gutter_w - 14.0;
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         fold_glyph.to_string(),
                         Point::new(fold_x, line_y),
@@ -2418,8 +3623,7 @@ impl View for EditorView {
                             code_area_w,
                             font.line_height,
                         );
-                        push_finite_quad(
-                            scene,
+                        scene.push_finite_quad(
                             Quad::new(hl_rect).with_background(theme.editor_current_line),
                         );
                     }
@@ -2443,8 +3647,7 @@ impl View for EditorView {
                     code_area_w,
                     font.line_height,
                 );
-                push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(hl_rect).with_background(Rgba::new(0.4, 0.4, 0.1, 0.3)),
                 );
             }
@@ -2471,11 +3674,11 @@ impl View for EditorView {
                         let seg_sel_end = line_end_col.clamp(seg.utf16_start, seg.utf16_end);
 
                         if seg_sel_end > seg_sel_start {
-                            let start_visual = utf16_col_to_char_count(
+                            let start_visual = utf16_col_to_display_col(
                                 seg_text,
                                 seg_sel_start - seg.utf16_start,
                             );
-                            let end_visual = utf16_col_to_char_count(
+                            let end_visual = utf16_col_to_display_col(
                                 seg_text,
                                 seg_sel_end - seg.utf16_start,
                             );
@@ -2485,9 +3688,33 @@ impl View for EditorView {
                                 ((end_visual.saturating_sub(start_visual)) as f32 * font.char_width)
                                     .max(4.0);
                             let sel_rect = Rect::from_xywh(sel_x, line_y, sel_w, font.line_height);
-                            push_finite_quad(
-                                scene,
+                            scene.push_finite_quad(
                                 Quad::new(sel_rect).with_background(theme.editor_selection),
+                            );
+                        }
+                    }
+                }
+            }
+
+            // 5b1. Matching bracket pair highlights
+            if let Some((b1, b2)) = matching_brackets {
+                let bracket_bg = Rgba::new(0.45, 0.55, 0.70, 0.28);
+                let bracket_border = Rgba::new(0.65, 0.75, 0.90, 0.65);
+                for bpos in [b1, b2] {
+                    if bpos.line == line_idx {
+                        let on_seg = bpos.column >= seg.utf16_start
+                            && (seg.is_last_segment || bpos.column < seg.utf16_end);
+                        if on_seg {
+                            let rel_utf16 = bpos.column.saturating_sub(seg.utf16_start);
+                            let b_vis = utf16_col_to_display_col(seg_text, rel_utf16);
+                            let bx =
+                                text_area_x + (b_vis as f32 - scroll_left) * font.char_width;
+                            let brect =
+                                Rect::from_xywh(bx, line_y, font.char_width.max(4.0), font.line_height);
+                            scene.push_finite_quad(
+                                Quad::new(brect)
+                                    .with_background(bracket_bg)
+                                    .with_border_edges(bracket_border, Edges::all(1.0)),
                             );
                         }
                     }
@@ -2517,11 +3744,11 @@ impl View for EditorView {
                                 && seg_m_start >= seg.utf16_start
                                 && (seg.is_last_segment || seg_m_start < seg.utf16_end))
                         {
-                            let start_visual = utf16_col_to_char_count(
+                            let start_visual = utf16_col_to_display_col(
                                 seg_text,
                                 seg_m_start - seg.utf16_start,
                             );
-                            let end_visual = utf16_col_to_char_count(
+                            let end_visual = utf16_col_to_display_col(
                                 seg_text,
                                 seg_m_end - seg.utf16_start,
                             );
@@ -2537,7 +3764,7 @@ impl View for EditorView {
                             } else {
                                 Rgba::new(0.80, 0.45, 0.10, 0.22)
                             };
-                            push_finite_quad(scene, Quad::new(hl_rect).with_background(color));
+                            scene.push_finite_quad(Quad::new(hl_rect).with_background(color));
                         }
                     }
                 }
@@ -2568,7 +3795,7 @@ impl View for EditorView {
                             {
                                 let gap_text = &line_content[last_byte..span_start];
                                 let gap_start_vis =
-                                    line_content[seg.byte_start..last_byte].chars().count();
+                                    str_display_width(&line_content[seg.byte_start..last_byte]);
                                 let gap_x = text_area_x
                                     + (gap_start_vis as f32 - scroll_left) * font.char_width;
                                 push_clipped_code_glyph_run(
@@ -2593,7 +3820,7 @@ impl View for EditorView {
                             {
                                 let span_text = &line_content[span_start..span_end];
                                 let span_start_vis =
-                                    line_content[seg.byte_start..span_start].chars().count();
+                                    str_display_width(&line_content[seg.byte_start..span_start]);
                                 let span_x = text_area_x
                                     + (span_start_vis as f32 - scroll_left) * font.char_width;
                                 let span_color = span.color.unwrap_or(theme.editor_foreground);
@@ -2618,7 +3845,7 @@ impl View for EditorView {
                         if last_byte < seg.byte_end && line_content.is_char_boundary(last_byte) {
                             let tail_text = &line_content[last_byte..seg.byte_end];
                             let tail_start_vis =
-                                line_content[seg.byte_start..last_byte].chars().count();
+                                str_display_width(&line_content[seg.byte_start..last_byte]);
                             let tail_x = text_area_x
                                 + (tail_start_vis as f32 - scroll_left) * font.char_width;
                             push_clipped_code_glyph_run(
@@ -2657,8 +3884,8 @@ impl View for EditorView {
 
             // Collapsed fold summary badge (" ...") on folded header lines
             if seg.is_last_segment && self.folding_model.is_collapsed(line_idx) {
-                let seg_chars = seg.char_end - seg.char_start;
-                let badge_x = text_area_x + (seg_chars as f32 - scroll_left) * font.char_width;
+                let seg_vis = str_display_width(seg_text);
+                let badge_x = text_area_x + (seg_vis as f32 - scroll_left) * font.char_width;
                 push_clipped_code_glyph_run(
                     scene,
                     " ...",
@@ -2696,8 +3923,8 @@ impl View for EditorView {
                 let clamped_start = line_start_col.clamp(seg.utf16_start, seg.utf16_end);
                 let clamped_end = line_end_col.clamp(seg.utf16_start, seg.utf16_end);
                 let start_vis =
-                    utf16_col_to_char_count(seg_text, clamped_start - seg.utf16_start);
-                let end_vis = utf16_col_to_char_count(seg_text, clamped_end - seg.utf16_start)
+                    utf16_col_to_display_col(seg_text, clamped_start - seg.utf16_start);
+                let end_vis = utf16_col_to_display_col(seg_text, clamped_end - seg.utf16_start)
                     .max(start_vis + 1);
 
                 let sq_x = text_area_x + (start_vis as f32 - scroll_left) * font.char_width;
@@ -2732,7 +3959,7 @@ impl View for EditorView {
                                 && sel.active.column < seg.utf16_end
                         };
                         if on_seg {
-                            let visual_col = utf16_col_to_char_count(
+                            let visual_col = utf16_col_to_display_col(
                                 seg_text,
                                 sel.active.column.saturating_sub(seg.utf16_start),
                             );
@@ -2740,8 +3967,7 @@ impl View for EditorView {
                                 + (visual_col as f32 - scroll_left) * font.char_width;
                             let cursor_rect =
                                 Rect::from_xywh(cursor_x, line_y, 2.0, font.line_height);
-                            push_finite_quad(
-                                scene,
+                            scene.push_finite_quad(
                                 Quad::new(cursor_rect).with_background(theme.editor_cursor),
                             );
                         }
@@ -2774,14 +4000,63 @@ impl View for EditorView {
             );
         }
 
-        // 6. Autocomplete Popover Overlay
-        if self.autocomplete.is_visible {
-            let buf = self.buffer.read();
+        // Release buffer lock before calling helpers that acquire `buffer.read()`
+        let autocomplete_pos = if self.autocomplete.is_visible {
             let (ac_row, ac_col) = visual.buffer_pos_to_visual(primary_pos, &buf, &self.folding_model);
-            let cursor_x = text_area_x + (ac_col as f32 - scroll_left) * font.char_width;
-            let cursor_y = bounds.min_y() + (ac_row as f32 - scroll_top) * font.line_height;
-            drop(buf);
+            Some((
+                text_area_x + (ac_col as f32 - scroll_left) * font.char_width,
+                bounds.min_y() + (ac_row as f32 - scroll_top) * font.line_height,
+            ))
+        } else {
+            None
+        };
+        drop(buf);
 
+        // 5g. Vertical & Horizontal Scrollbar tracks and thumbs
+        if let Some(vtrack) = self.vertical_scrollbar_rect(bounds, gutter_w) {
+            if total_rows > 1 {
+                let track_bg = Rgba::new(0.20, 0.20, 0.22, 0.25);
+                let thumb_bg = if self
+                    .scrollbar_dragging
+                    .is_some_and(|d| d.axis == ScrollbarAxis::Vertical)
+                {
+                    Rgba::new(0.65, 0.65, 0.70, 0.70)
+                } else {
+                    Rgba::new(0.50, 0.50, 0.55, 0.45)
+                };
+                scene.push_finite_quad(Quad::new(vtrack).with_background(track_bg));
+                let vthumb = self.vertical_thumb_rect(vtrack, total_rows, font);
+                scene.push_finite_quad(
+                    Quad::new(vthumb)
+                        .with_background(thumb_bg)
+                        .with_corner_radius(3.0),
+                );
+            }
+        }
+        if let Some(htrack) = self.horizontal_scrollbar_rect(bounds, gutter_w, font) {
+            let max_sl = self.max_scroll_left(bounds, gutter_w, font);
+            let char_w = font.char_width.max(1.0);
+            let visible_cols = ((code_area_w - 8.0).max(0.0) / char_w).max(1.0);
+            let track_bg = Rgba::new(0.20, 0.20, 0.22, 0.25);
+            let thumb_bg = if self
+                .scrollbar_dragging
+                .is_some_and(|d| d.axis == ScrollbarAxis::Horizontal)
+            {
+                Rgba::new(0.65, 0.65, 0.70, 0.70)
+            } else {
+                Rgba::new(0.50, 0.50, 0.55, 0.45)
+            };
+            scene.push_finite_quad(Quad::new(htrack).with_background(track_bg));
+            let hthumb = self.horizontal_thumb_rect(htrack, max_sl, visible_cols);
+            scene.push_finite_quad(
+                Quad::new(hthumb)
+                    .with_background(thumb_bg)
+                    .with_corner_radius(3.0),
+            );
+        }
+
+        // 6. Autocomplete Popover Overlay
+        if let Some((cursor_x, cursor_y)) = autocomplete_pos {
             if cursor_x.is_finite() && cursor_y.is_finite() {
                 self.autocomplete.render(
                     Point::new(cursor_x, cursor_y),
@@ -2793,7 +4068,7 @@ impl View for EditorView {
             }
         }
 
-        // 7. Error hover tooltip overlay
+        // 7. Error hover tooltip overlay (or LSP hover card if no diagnostic hover is active)
         if let (Some(diag), Some(mouse_pt)) = (&self.hovered_diagnostic, self.hover_position) {
             let header_text = diag.formatted_header();
             let message_text = &diag.message;
@@ -2801,12 +4076,11 @@ impl View for EditorView {
             let header_w = font.text_width(&header_text);
             let message_w = font.text_width(message_text);
             let card_rect = Self::hover_card_bounds(diag, mouse_pt, bounds, font);
-            if is_finite_rect(card_rect) {
+            if card_rect.is_finite() {
                 let card_x = card_rect.min_x();
                 let card_y = card_rect.min_y();
                 let card_h = card_rect.height();
-                push_finite_shadow(
-                    scene,
+                scene.push_finite_shadow(
                     Shadow {
                         bounds: card_rect,
                         offset: Point::new(0.0, 4.0),
@@ -2823,8 +4097,7 @@ impl View for EditorView {
                     DiagnosticSeverity::Hint => theme.editor_hint_foreground,
                 };
 
-                push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(card_rect)
                         .with_background(theme.command_palette_bg)
                         .with_border_edges(theme.panel_border, Edges::all(1.0))
@@ -2832,16 +4105,14 @@ impl View for EditorView {
                 );
 
                 let bar_rect = Rect::from_xywh(card_x, card_y, 4.0, card_h);
-                push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(bar_rect)
                         .with_background(sev_color)
                         .with_corner_radius(2.0),
                 );
 
                 let header_pt = Point::new(card_x + 10.0, card_y + 6.0);
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         header_text,
                         header_pt,
@@ -2853,8 +4124,7 @@ impl View for EditorView {
                 );
 
                 let msg_pt = Point::new(card_x + 10.0, card_y + 6.0 + font.line_height);
-                push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         message_text.clone(),
                         msg_pt,
@@ -2864,11 +4134,58 @@ impl View for EditorView {
                     ),
                 );
             }
+        } else if let Some(hover) = &self.lsp_hover {
+            let lines: Vec<&str> = hover.contents.lines().take(12).collect();
+            if !lines.is_empty() {
+                let max_line_w = lines
+                    .iter()
+                    .map(|l| font.text_width(l))
+                    .fold(120.0_f32, f32::max)
+                    .min((bounds.width() - 24.0).max(120.0));
+                let card_w = max_line_w + 20.0;
+                let card_h = (lines.len() as f32 * font.line_height + 12.0)
+                    .min((bounds.height() - 16.0).max(font.line_height + 12.0));
+                let anchor_pos = hover
+                    .range
+                    .map_or(primary_pos, |r| r.start);
+                let anchor_x = bounds.min_x() + gutter_w + 8.0 + (anchor_pos.column as f32 - scroll_left) * font.char_width;
+                let anchor_y = bounds.min_y() + (anchor_pos.line as f32 - scroll_top + 1.0) * font.line_height;
+                let card_x = anchor_x.clamp(bounds.min_x() + 4.0, (bounds.max_x() - card_w - 4.0).max(bounds.min_x() + 4.0));
+                let card_y = if anchor_y + card_h <= bounds.max_y() - 4.0 {
+                    anchor_y
+                } else {
+                    (anchor_y - card_h - font.line_height).max(bounds.min_y() + 4.0)
+                };
+                let card_rect = Rect::from_xywh(card_x, card_y, card_w, card_h);
+                if card_rect.is_finite() {
+                    scene.push_finite_quad(
+                        Quad::new(card_rect)
+                            .with_background(theme.command_palette_bg)
+                            .with_border_edges(theme.panel_border, Edges::all(1.0))
+                            .with_corner_radius(4.0),
+                    );
+                    for (idx, line_text) in lines.iter().enumerate() {
+                        let line_pt = Point::new(card_x + 10.0, card_y + 6.0 + idx as f32 * font.line_height);
+                        scene.push_finite_text(GlyphRun::new(
+                            (*line_text).to_string(),
+                            line_pt,
+                            Rect::from_xywh(line_pt.x, line_pt.y, max_line_w, font.line_height),
+                            theme.editor_foreground,
+                            font.font_size,
+                        ));
+                    }
+                }
+            }
         }
 
         // 8. Find & Replace widget overlay
         if self.find_replace.is_visible {
             self.find_replace.render(bounds, theme, font, scene);
+        }
+
+        // 9. Right-click Context Menu overlay
+        if self.context_menu.is_visible {
+            self.context_menu.render(bounds, theme, font, scene);
         }
     }
 
@@ -2879,7 +4196,7 @@ impl View for EditorView {
                 f.clone()
             } else {
                 let default_font = FontMetrics::default_monospace();
-                if is_finite_positive_rect(bounds)
+                if bounds.is_finite_positive()
                     && matches!(
                         event,
                         InputEvent::ScrollWheel(_)
@@ -2898,14 +4215,33 @@ impl View for EditorView {
             InputEvent::MouseDown(mouse) => {
                 self.hovered_diagnostic = None;
                 self.hover_position = None;
-                if !is_finite_positive_rect(bounds)
+                if !bounds.is_finite_positive()
                     || !mouse.position.x.is_finite()
                     || !mouse.position.y.is_finite()
                     || !bounds.contains(mouse.position)
                 {
+                    if self.context_menu.is_visible {
+                        self.context_menu.close();
+                    }
                     return EventResult::Ignored;
                 }
                 self.is_focused = true;
+
+                // Context menu overlay hit-testing / dismissal
+                if self.context_menu.is_visible {
+                    if let Some((_, action)) =
+                        self.context_menu.hit_test_item(mouse.position, bounds)
+                    {
+                        self.context_menu.close();
+                        self.execute_context_menu_action(action);
+                        return EventResult::Consumed;
+                    }
+                    self.context_menu.close();
+                    if mouse.button != MouseButton::Right {
+                        return EventResult::Consumed;
+                    }
+                }
+
                 let find_target = if self.find_replace.is_visible {
                     self.find_replace.hit_test(mouse.position, bounds, &font)
                 } else {
@@ -2950,6 +4286,33 @@ impl View for EditorView {
                     }
                     return EventResult::Consumed;
                 }
+
+                // Right-click opens context menu
+                if mouse.button == MouseButton::Right {
+                    self.autocomplete.hide();
+                    self.is_selecting = false;
+                    self.drag_mode = DragSelectionMode::None;
+                    if mouse.position.x >= bounds.min_x() + gutter_w {
+                        let target = self.point_to_buffer_pos(
+                            mouse.position,
+                            bounds,
+                            gutter_w,
+                            &font,
+                            true,
+                        );
+                        let primary = self.cursor_state.primary().clone();
+                        if primary.is_empty()
+                            || target < primary.start()
+                            || target > primary.end()
+                        {
+                            self.cursor_state.clear_secondary_cursors();
+                            self.cursor_state.set_primary(target);
+                        }
+                    }
+                    self.context_menu.open(mouse.position);
+                    return EventResult::Consumed;
+                }
+
                 let scroll_top = if self.scroll_top.is_finite() {
                     self.scroll_top.max(0.0)
                 } else {
@@ -3009,44 +4372,152 @@ impl View for EditorView {
                     }
                 }
 
+                // Vertical scrollbar track/thumb hit test
+                if let Some(vtrack) = self.vertical_scrollbar_rect(bounds, gutter_w) {
+                    if vtrack.contains(mouse.position) {
+                        let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
+                        let total_rows = {
+                            let buf = self.buffer.read();
+                            VisualLayout::build(&buf, &self.folding_model, max_wrap_cols)
+                                .total_rows()
+                                .max(1)
+                        };
+                        let max_st = total_rows.saturating_sub(1) as f32;
+                        let thumb = self.vertical_thumb_rect(vtrack, total_rows, &font);
+                        let grab_offset = if thumb.contains(mouse.position) {
+                            mouse.position.y - thumb.min_y() - thumb.height() * 0.5
+                        } else {
+                            0.0
+                        };
+                        let travel = vtrack.height() - thumb.height();
+                        let ratio = if travel > 1.0 {
+                            ((mouse.position.y - grab_offset - vtrack.min_y() - thumb.height() * 0.5)
+                                / travel)
+                                .clamp(0.0, 1.0)
+                        } else {
+                            ((mouse.position.y - vtrack.min_y()) / vtrack.height().max(1.0))
+                                .clamp(0.0, 1.0)
+                        };
+                        self.scroll_top = (ratio * max_st).clamp(0.0, max_st);
+                        self.scrollbar_dragging = Some(ScrollbarDrag {
+                            axis: ScrollbarAxis::Vertical,
+                            grab_offset,
+                        });
+                        return EventResult::Consumed;
+                    }
+                }
+
+                // Horizontal scrollbar track/thumb hit test
+                if let Some(htrack) = self.horizontal_scrollbar_rect(bounds, gutter_w, &font) {
+                    if htrack.contains(mouse.position) {
+                        let max_sl = self.max_scroll_left(bounds, gutter_w, &font);
+                        let mm_rect = self.minimap_rect_with_gutter(bounds, gutter_w);
+                        let code_right = mm_rect.map_or(bounds.max_x(), |mm| mm.min_x());
+                        let visible_cols = ((code_right - (bounds.min_x() + gutter_w + 8.0))
+                            .max(0.0)
+                            / font.char_width.max(1.0))
+                        .max(1.0);
+                        let thumb = self.horizontal_thumb_rect(htrack, max_sl, visible_cols);
+                        let grab_offset = if thumb.contains(mouse.position) {
+                            mouse.position.x - thumb.min_x() - thumb.width() * 0.5
+                        } else {
+                            0.0
+                        };
+                        let travel = htrack.width() - thumb.width();
+                        let ratio = if travel > 1.0 {
+                            ((mouse.position.x - grab_offset - htrack.min_x() - thumb.width() * 0.5)
+                                / travel)
+                                .clamp(0.0, 1.0)
+                        } else {
+                            ((mouse.position.x - htrack.min_x()) / htrack.width().max(1.0))
+                                .clamp(0.0, 1.0)
+                        };
+                        self.scroll_left = (ratio * max_sl).clamp(0.0, max_sl);
+                        self.scrollbar_dragging = Some(ScrollbarDrag {
+                            axis: ScrollbarAxis::Horizontal,
+                            grab_offset,
+                        });
+                        return EventResult::Consumed;
+                    }
+                }
+
                 if mouse.position.x >= bounds.min_x() + gutter_w {
                     let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
-                    let eff_scroll_left =
-                        if matches!(self.word_wrap, WordWrapMode::On | WordWrapMode::Bounded) {
-                            0.0
-                        } else {
-                            scroll_left
-                        };
-                    let (target, clamped_scroll_top) = {
+                    let total_rows = {
                         let buf = self.buffer.read();
-                        let visual = VisualLayout::build(&buf, &self.folding_model, max_wrap_cols);
-                        let max_st = visual.total_rows().saturating_sub(1) as f32;
-                        let clamped_scroll_top = scroll_top.clamp(0.0, max_st);
-                        let clicked_row = ((mouse.position.y - bounds.min_y()) / font.line_height
-                            + clamped_scroll_top)
-                            .floor()
-                            .max(0.0) as usize;
-                        let text_area_x = bounds.min_x() + gutter_w + 8.0;
-                        let clicked_char_col = ((mouse.position.x - text_area_x
-                            + eff_scroll_left * font.char_width)
-                            / font.char_width)
-                            .round()
-                            .max(0.0) as usize;
-                        (
-                            visual.visual_to_buffer_pos(clicked_row, clicked_char_col, &buf),
-                            clamped_scroll_top,
-                        )
+                        VisualLayout::build(&buf, &self.folding_model, max_wrap_cols).total_rows()
                     };
-                    self.scroll_top = clamped_scroll_top;
+                    let max_st = total_rows.saturating_sub(1) as f32;
+                    self.scroll_top = scroll_top.clamp(0.0, max_st);
+                    self.scroll_left = scroll_left;
+                    let target = self.point_to_buffer_pos(
+                        mouse.position,
+                        bounds,
+                        gutter_w,
+                        &font,
+                        true,
+                    );
 
-                    if mouse.modifiers.shift {
-                        self.cursor_state.primary_mut().active = target;
-                    } else {
+                    // Ctrl+Click triggers Go to Definition
+                    if mouse.modifiers.ctrl && !mouse.modifiers.alt && !mouse.modifiers.meta {
                         self.cursor_state.clear_secondary_cursors();
                         self.cursor_state.set_primary(target);
+                        self.preferred_visual_col = None;
+                        self.last_action = Some(EditorAction::GoToDefinition(target));
+                        return EventResult::Consumed;
+                    }
+
+                    // Determine single/double/triple click via click_count or rapid click proximity
+                    let now = Instant::now();
+                    let clicks = if mouse.click_count >= 2 {
+                        mouse.click_count
+                    } else if let (Some(prev_t), Some(prev_p)) =
+                        (self.last_click_time, self.last_click_pos)
+                    {
+                        let dx = mouse.position.x - prev_p.x;
+                        let dy = mouse.position.y - prev_p.y;
+                        if now.duration_since(prev_t).as_millis() <= 450
+                            && (dx * dx + dy * dy) <= 25.0
+                        {
+                            (self.consecutive_clicks + 1).min(3)
+                        } else {
+                            1
+                        }
+                    } else {
+                        1
+                    };
+                    self.last_click_time = Some(now);
+                    self.last_click_pos = Some(mouse.position);
+                    self.consecutive_clicks = clicks;
+                    self.preferred_visual_col = None;
+
+                    if clicks >= 3 {
+                        let line_sel = self.whole_line_selection(target.line);
+                        self.cursor_state.clear_secondary_cursors();
+                        *self.cursor_state.primary_mut() = line_sel;
+                        self.is_selecting = true;
+                        self.drag_mode = DragSelectionMode::Line(target.line);
+                    } else if clicks == 2 {
+                        let (ws, we) = self.word_range_at(target);
+                        self.cursor_state.clear_secondary_cursors();
+                        *self.cursor_state.primary_mut() = Selection::new(ws, we);
+                        self.is_selecting = true;
+                        self.drag_mode = DragSelectionMode::Word(ws, we);
+                    } else {
+                        if mouse.modifiers.shift {
+                            self.cursor_state.primary_mut().active = target;
+                        } else {
+                            self.cursor_state.clear_secondary_cursors();
+                            self.cursor_state.set_primary(target);
+                        }
+                        self.is_selecting = true;
+                        self.drag_mode = DragSelectionMode::Char;
                     }
                     EventResult::Consumed
                 } else {
+                    self.is_selecting = false;
+                    self.drag_mode = DragSelectionMode::None;
+                    self.preferred_visual_col = None;
                     // Click in gutter: fold chevron on right edge, or breakpoint/line select on left margin
                     let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
                     let (line_idx, line_len, clamped_scroll_top) = {
@@ -3136,6 +4607,50 @@ impl View for EditorView {
                 self.hover_position = None;
                 if !self.is_focused {
                     return EventResult::Ignored;
+                }
+
+                // Route keys to context menu overlay when open
+                if self.context_menu.is_visible {
+                    match &key.key {
+                        KeyCode::Escape => {
+                            self.context_menu.close();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::ArrowDown => {
+                            self.context_menu.select_next();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::ArrowUp => {
+                            self.context_menu.select_prev();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Enter => {
+                            let chosen = self
+                                .context_menu
+                                .selected_index
+                                .and_then(|idx| self.context_menu.items.get(idx))
+                                .map(|item| item.action);
+                            self.context_menu.close();
+                            if let Some(action) = chosen {
+                                self.execute_context_menu_action(action);
+                            }
+                            return EventResult::Consumed;
+                        }
+                        _ => {
+                            self.context_menu.close();
+                        }
+                    }
+                }
+
+                // F12 Go to Definition hook
+                if key.key == KeyCode::F12
+                    && !key.modifiers.ctrl
+                    && !key.modifiers.alt
+                    && !key.modifiers.meta
+                    && !key.modifiers.shift
+                {
+                    self.last_action = Some(EditorAction::GoToDefinition(self.primary_position()));
+                    return EventResult::Consumed;
                 }
 
                 // Direct Find/Replace shortcuts (when not intercepted by WorkbenchWindow keybindings)
@@ -3270,6 +4785,51 @@ impl View for EditorView {
                         return EventResult::Consumed;
                     } else if matches!(key.key, KeyCode::Char(']') | KeyCode::Char('}')) {
                         self.unfold_at_cursor();
+                        return EventResult::Consumed;
+                    } else if key.key == KeyCode::Char('/') {
+                        self.toggle_block_comment();
+                        return EventResult::Consumed;
+                    }
+                }
+
+                // Clipboard & Comment shortcuts: Ctrl+C / Ctrl+X / Ctrl+V / Ctrl+/
+                if key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta && !key.modifiers.shift {
+                    match key.key {
+                        KeyCode::Char('c') => {
+                            self.copy();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Char('x') => {
+                            self.cut();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Char('v') => {
+                            self.paste();
+                            return EventResult::Consumed;
+                        }
+                        KeyCode::Char('/') => {
+                            self.toggle_line_comment();
+                            return EventResult::Consumed;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Alt+Up/Down move line/block; Shift+Alt+Up/Down duplicate line/block
+                if key.modifiers.alt && !key.modifiers.ctrl && !key.modifiers.meta {
+                    if key.key == KeyCode::ArrowUp {
+                        if key.modifiers.shift {
+                            self.duplicate_lines_up();
+                        } else {
+                            self.move_lines_up();
+                        }
+                        return EventResult::Consumed;
+                    } else if key.key == KeyCode::ArrowDown {
+                        if key.modifiers.shift {
+                            self.duplicate_lines_down();
+                        } else {
+                            self.move_lines_down();
+                        }
                         return EventResult::Consumed;
                     }
                 }
@@ -3419,8 +4979,12 @@ impl View for EditorView {
                         self.insert_text("\n");
                         EventResult::Consumed
                     }
-                    KeyCode::Tab => {
-                        self.insert_text("    ");
+                    KeyCode::Tab if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                        if key.modifiers.shift {
+                            self.outdent_selection();
+                        } else {
+                            self.indent_selection();
+                        }
                         EventResult::Consumed
                     }
                     KeyCode::Space if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
@@ -3428,11 +4992,20 @@ impl View for EditorView {
                         EventResult::Consumed
                     }
                     KeyCode::Char(c) if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
-                        let ch = if key.modifiers.shift { c.to_ascii_uppercase() } else { *c };
-                        let s = ch.to_string();
-                        self.insert_text(&s);
-                        if ch == '.' || ch == ':' || ch == '/' {
-                            self.trigger_suggest(Some(ch));
+                        let s = match &key.text {
+                            Some(txt) if !txt.is_empty() => txt.clone(),
+                            _ => {
+                                let ch = if key.modifiers.shift {
+                                    c.to_ascii_uppercase()
+                                } else {
+                                    *c
+                                };
+                                ch.to_string()
+                            }
+                        };
+                        self.handle_char_input_with_brackets(&s);
+                        if s == "." || s == ":" || s == "/" {
+                            self.trigger_suggest(s.chars().next());
                         }
                         EventResult::Consumed
                     }
@@ -3449,7 +5022,7 @@ impl View for EditorView {
                     }
                     _ => {
                         if let Some(txt) = &key.text {
-                            self.insert_text(txt);
+                            self.handle_char_input_with_brackets(txt);
                             EventResult::Consumed
                         } else {
                             EventResult::Ignored
@@ -3458,11 +5031,15 @@ impl View for EditorView {
                 }
             }
             InputEvent::MouseMove(mouse) => {
-                if !is_finite_positive_rect(bounds)
+                if !bounds.is_finite_positive()
                     || !mouse.position.x.is_finite()
                     || !mouse.position.y.is_finite()
                 {
                     self.minimap_dragging = false;
+                    self.scrollbar_dragging = None;
+                    self.is_selecting = false;
+                    self.drag_mode = DragSelectionMode::None;
+                    self.hover_request_position = None;
                     if self.hovered_diagnostic.is_some() {
                         self.hovered_diagnostic = None;
                         self.hover_position = None;
@@ -3470,6 +5047,91 @@ impl View for EditorView {
                     }
                     return EventResult::Ignored;
                 }
+
+                // Clamp stale scroll_top before drag/hover hit-testing
+                if self.scrollbar_dragging.is_none() && !self.minimap_dragging {
+                    let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
+                    let max_st = {
+                        let buf = self.buffer.read();
+                        VisualLayout::build(&buf, &self.folding_model, max_wrap_cols)
+                            .total_rows()
+                            .saturating_sub(1) as f32
+                    };
+                    self.scroll_top = if self.scroll_top.is_finite() {
+                        self.scroll_top.clamp(0.0, max_st)
+                    } else {
+                        0.0
+                    };
+                }
+
+                // Active vertical/horizontal scrollbar drag
+                if let Some(drag) = self.scrollbar_dragging {
+                    match drag.axis {
+                        ScrollbarAxis::Vertical => {
+                            if let Some(vtrack) = self.vertical_scrollbar_rect(bounds, gutter_w) {
+                                let max_wrap_cols =
+                                    self.effective_wrap_columns(bounds, gutter_w, &font);
+                                let total_rows = {
+                                    let buf = self.buffer.read();
+                                    VisualLayout::build(&buf, &self.folding_model, max_wrap_cols)
+                                        .total_rows()
+                                        .max(1)
+                                };
+                                let max_st = total_rows.saturating_sub(1) as f32;
+                                let thumb = self.vertical_thumb_rect(vtrack, total_rows, &font);
+                                let travel = vtrack.height() - thumb.height();
+                                let ratio = if travel > 1.0 {
+                                    ((mouse.position.y
+                                        - drag.grab_offset
+                                        - vtrack.min_y()
+                                        - thumb.height() * 0.5)
+                                        / travel)
+                                        .clamp(0.0, 1.0)
+                                } else {
+                                    ((mouse.position.y - vtrack.min_y()) / vtrack.height().max(1.0))
+                                        .clamp(0.0, 1.0)
+                                };
+                                self.scroll_top = (ratio * max_st).clamp(0.0, max_st);
+                                return EventResult::Consumed;
+                            } else {
+                                self.scrollbar_dragging = None;
+                            }
+                        }
+                        ScrollbarAxis::Horizontal => {
+                            if let Some(htrack) =
+                                self.horizontal_scrollbar_rect(bounds, gutter_w, &font)
+                            {
+                                let max_sl = self.max_scroll_left(bounds, gutter_w, &font);
+                                let mm_rect = self.minimap_rect_with_gutter(bounds, gutter_w);
+                                let code_right =
+                                    mm_rect.map_or(bounds.max_x(), |mm| mm.min_x());
+                                let visible_cols = ((code_right - (bounds.min_x() + gutter_w + 8.0))
+                                    .max(0.0)
+                                    / font.char_width.max(1.0))
+                                .max(1.0);
+                                let thumb =
+                                    self.horizontal_thumb_rect(htrack, max_sl, visible_cols);
+                                let travel = htrack.width() - thumb.width();
+                                let ratio = if travel > 1.0 {
+                                    ((mouse.position.x
+                                        - drag.grab_offset
+                                        - htrack.min_x()
+                                        - thumb.width() * 0.5)
+                                        / travel)
+                                        .clamp(0.0, 1.0)
+                                } else {
+                                    ((mouse.position.x - htrack.min_x()) / htrack.width().max(1.0))
+                                        .clamp(0.0, 1.0)
+                                };
+                                self.scroll_left = (ratio * max_sl).clamp(0.0, max_sl);
+                                return EventResult::Consumed;
+                            } else {
+                                self.scrollbar_dragging = None;
+                            }
+                        }
+                    }
+                }
+
                 if self.minimap_dragging {
                     if let Some(mm_rect) = self.minimap_rect_with_gutter(bounds, gutter_w) {
                         let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
@@ -3500,7 +5162,44 @@ impl View for EditorView {
                     }
                 }
 
+                // Active mouse drag selection (forward & backward)
+                if self.is_selecting {
+                    let clamped_pt = Point::new(
+                        mouse.position.x.max(bounds.min_x() + gutter_w + 8.0),
+                        mouse.position.y.clamp(bounds.min_y(), bounds.max_y()),
+                    );
+                    let target =
+                        self.point_to_buffer_pos(clamped_pt, bounds, gutter_w, &font, true);
+                    match self.drag_mode.clone() {
+                        DragSelectionMode::Char | DragSelectionMode::None => {
+                            self.cursor_state.primary_mut().active = target;
+                        }
+                        DragSelectionMode::Word(aw_s, aw_e) => {
+                            let (ws, we) = self.word_range_at(target);
+                            if target >= aw_s {
+                                *self.cursor_state.primary_mut() = Selection::new(aw_s, we);
+                            } else {
+                                *self.cursor_state.primary_mut() = Selection::new(aw_e, ws);
+                            }
+                        }
+                        DragSelectionMode::Line(anchor_line) => {
+                            let anchor_sel = self.whole_line_selection(anchor_line);
+                            let target_sel = self.whole_line_selection(target.line);
+                            if target.line >= anchor_line {
+                                *self.cursor_state.primary_mut() =
+                                    Selection::new(anchor_sel.anchor, target_sel.active);
+                            } else {
+                                *self.cursor_state.primary_mut() =
+                                    Selection::new(anchor_sel.active, target_sel.anchor);
+                            }
+                        }
+                    }
+                    self.preferred_visual_col = None;
+                    return EventResult::Consumed;
+                }
+
                 if !bounds.contains(mouse.position) {
+                    self.hover_request_position = None;
                     if self.hovered_diagnostic.is_some() {
                         self.hovered_diagnostic = None;
                         self.hover_position = None;
@@ -3521,6 +5220,7 @@ impl View for EditorView {
                     .minimap_rect_with_gutter(bounds, gutter_w)
                     .is_some_and(|r| r.contains(mouse.position));
                 if over_minimap {
+                    self.hover_request_position = None;
                     if self.hovered_diagnostic.is_some() {
                         self.hovered_diagnostic = None;
                         self.hover_position = None;
@@ -3530,48 +5230,18 @@ impl View for EditorView {
                 }
 
                 if mouse.position.x >= bounds.min_x() + gutter_w {
-                    let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
-                    let eff_scroll_left =
-                        if matches!(self.word_wrap, WordWrapMode::On | WordWrapMode::Bounded) {
-                            0.0
-                        } else if self.scroll_left.is_finite() {
-                            self.scroll_left.max(0.0)
-                        } else {
-                            0.0
-                        };
-                    let safe_scroll_top = if self.scroll_top.is_finite() {
-                        self.scroll_top.max(0.0)
-                    } else {
-                        0.0
-                    };
-                    let buf = self.buffer.read();
-                    let visual = VisualLayout::build(&buf, &self.folding_model, max_wrap_cols);
-                    let max_st = visual.total_rows().saturating_sub(1) as f32;
-                    let clamped_scroll_top = safe_scroll_top.clamp(0.0, max_st);
-                    let row = ((mouse.position.y - bounds.min_y()) / font.line_height
-                        + clamped_scroll_top)
-                        .floor()
-                        .max(0.0) as usize;
-                    if row < visual.total_rows() {
-                        let text_area_x = bounds.min_x() + gutter_w + 8.0;
-                        let char_col = ((mouse.position.x - text_area_x + eff_scroll_left * font.char_width)
-                            / font.char_width)
-                            .floor()
-                            .max(0.0) as usize;
-                        let pos = visual.visual_to_buffer_pos(row, char_col, &buf);
-                        drop(buf);
-                        self.scroll_top = clamped_scroll_top;
+                    let pos =
+                        self.point_to_buffer_pos(mouse.position, bounds, gutter_w, &font, false);
+                    self.hover_request_position = Some(pos);
 
-                        if let Some(diag) = self.diagnostic_at_position(pos) {
-                            let diag_cloned = diag.clone();
-                            self.hovered_diagnostic = Some(diag_cloned);
-                            self.hover_position = Some(mouse.position);
-                            return EventResult::Consumed;
-                        }
-                    } else {
-                        drop(buf);
-                        self.scroll_top = clamped_scroll_top;
+                    if let Some(diag) = self.diagnostic_at_position(pos) {
+                        let diag_cloned = diag.clone();
+                        self.hovered_diagnostic = Some(diag_cloned);
+                        self.hover_position = Some(mouse.position);
+                        return EventResult::Consumed;
                     }
+                } else {
+                    self.hover_request_position = None;
                 }
 
                 if self.hovered_diagnostic.is_some() {
@@ -3583,8 +5253,22 @@ impl View for EditorView {
                 }
             }
             InputEvent::MouseUp(_) => {
-                if self.minimap_dragging {
-                    self.minimap_dragging = false;
+                let was_active = self.minimap_dragging
+                    || self.scrollbar_dragging.is_some()
+                    || self.is_selecting;
+                self.minimap_dragging = false;
+                self.scrollbar_dragging = None;
+                self.is_selecting = false;
+                self.drag_mode = DragSelectionMode::None;
+                if was_active {
+                    EventResult::Consumed
+                } else {
+                    EventResult::Ignored
+                }
+            }
+            InputEvent::ImeCommit(text) => {
+                if self.is_focused && !text.is_empty() {
+                    self.insert_text(text);
                     EventResult::Consumed
                 } else {
                     EventResult::Ignored
@@ -3593,58 +5277,6 @@ impl View for EditorView {
             _ => EventResult::Ignored,
         }
     }
-}
-
-fn is_finite_rect(rect: Rect) -> bool {
-    rect.min_x().is_finite()
-        && rect.min_y().is_finite()
-        && rect.width().is_finite()
-        && rect.height().is_finite()
-        && rect.max_x().is_finite()
-        && rect.max_y().is_finite()
-}
-
-fn is_finite_positive_rect(rect: Rect) -> bool {
-    is_finite_rect(rect) && rect.width() > 0.0 && rect.height() > 0.0
-}
-
-fn push_finite_quad(scene: &mut Scene, quad: Quad) {
-    if is_finite_rect(quad.bounds) {
-        scene.push_quad(quad);
-    }
-}
-
-fn push_finite_text(scene: &mut Scene, run: GlyphRun) {
-    if run.origin.x.is_finite()
-        && run.origin.y.is_finite()
-        && is_finite_rect(run.bounds)
-        && run.font_size.is_finite()
-    {
-        scene.push_text(run);
-    }
-}
-
-fn push_finite_shadow(scene: &mut Scene, shadow: Shadow) {
-    if is_finite_rect(shadow.bounds)
-        && shadow.offset.x.is_finite()
-        && shadow.offset.y.is_finite()
-    {
-        scene.push_shadow(shadow);
-    }
-}
-
-fn utf16_col_to_char_count(s: &str, col: usize) -> usize {
-    let mut count = 0;
-    let mut utf16_count = 0;
-    for ch in s.chars() {
-        let ch_utf16 = ch.len_utf16();
-        if utf16_count + ch_utf16 > col {
-            break;
-        }
-        utf16_count += ch_utf16;
-        count += 1;
-    }
-    count
 }
 
 fn clamp_utf16_col(s: &str, desired_col: usize) -> usize {
@@ -3693,7 +5325,7 @@ fn push_clipped_code_glyph_run(
     if text.is_empty()
         || !x.is_finite()
         || !y.is_finite()
-        || !is_finite_positive_rect(clip_rect)
+        || !clip_rect.is_finite_positive()
         || !font.line_height.is_finite()
         || font.line_height <= 0.0
         || !font.font_size.is_finite()
@@ -3706,12 +5338,29 @@ fn push_clipped_code_glyph_run(
     } else {
         1.0
     };
-    let skip_chars = if x < clip_rect.min_x() {
+    let skip_cols = if x < clip_rect.min_x() {
         ((clip_rect.min_x() - x) / char_w).floor().max(0.0) as usize
     } else {
         0
     };
-    let clipped_x = x + skip_chars as f32 * char_w;
+
+    let mut cur_col = 0usize;
+    let mut byte_start = None;
+    let mut start_vis_col = 0usize;
+    for (byte_idx, g) in text.grapheme_indices(true) {
+        let gw = grapheme_display_width(g);
+        if cur_col >= skip_cols {
+            byte_start = Some(byte_idx);
+            start_vis_col = cur_col;
+            break;
+        }
+        cur_col += gw;
+    }
+    let Some(byte_start) = byte_start else {
+        return;
+    };
+
+    let clipped_x = x + start_vis_col as f32 * char_w;
     if !clipped_x.is_finite() || !clip_rect.max_x().is_finite() || clipped_x >= clip_rect.max_x() {
         return;
     }
@@ -3719,17 +5368,28 @@ fn push_clipped_code_glyph_run(
     if !avail_w.is_finite() || avail_w <= 0.0 {
         return;
     }
-    let max_chars = ((avail_w / char_w).ceil() as usize).max(1);
-    let clipped_text: String = text.chars().skip(skip_chars).take(max_chars).collect();
+    let max_cols = ((avail_w / char_w).ceil() as usize).max(1);
+
+    let rest = &text[byte_start..];
+    let mut end_byte = rest.len();
+    let mut taken_cols = 0usize;
+    for (byte_idx, g) in rest.grapheme_indices(true) {
+        if taken_cols >= max_cols {
+            end_byte = byte_idx;
+            break;
+        }
+        taken_cols += grapheme_display_width(g);
+    }
+    let clipped_text = rest[..end_byte].to_string();
     if clipped_text.is_empty() {
         return;
     }
-    let mut clipped_w = (clipped_text.chars().count() as f32 * char_w).min(avail_w);
+    let mut clipped_w = (str_display_width(&clipped_text) as f32 * char_w).min(avail_w);
     while clipped_x + clipped_w > clip_rect.max_x() && clipped_w > 0.0 {
         clipped_w = f32::from_bits(clipped_w.to_bits() - 1);
     }
     let bounds = Rect::from_xywh(clipped_x, y, clipped_w, font.line_height);
-    if !is_finite_rect(bounds) {
+    if !bounds.is_finite() {
         return;
     }
     let mut run = GlyphRun::new(
@@ -3743,6 +5403,144 @@ fn push_clipped_code_glyph_run(
         run = run.with_style(bold, italic, underline);
     }
     scene.push_text(run);
+}
+
+fn compute_code_only_bracket_mask(text: &str, lang: &str) -> Vec<bool> {
+    let bytes = text.as_bytes();
+    let mut mask = vec![true; bytes.len()];
+    let hash_comments = matches!(
+        lang,
+        "python"
+            | "yaml"
+            | "toml"
+            | "shellscript"
+            | "shell"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "ruby"
+            | "perl"
+            | "dockerfile"
+            | "makefile"
+    );
+    let html_comments = matches!(lang, "html" | "xml");
+    let rust_like = lang == "rust";
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if hash_comments && bytes[i] == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                mask[i] = false;
+                i += 1;
+            }
+            continue;
+        }
+        if html_comments && bytes[i..].starts_with(b"<!--") {
+            let end = bytes[i + 4..]
+                .windows(3)
+                .position(|w| w == b"-->")
+                .map_or(bytes.len(), |p| i + 4 + p + 3);
+            for m in &mut mask[i..end] {
+                *m = false;
+            }
+            i = end;
+            continue;
+        }
+        if !hash_comments && !html_comments && bytes[i..].starts_with(b"//") {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                mask[i] = false;
+                i += 1;
+            }
+            continue;
+        }
+        if !hash_comments && !html_comments && bytes[i..].starts_with(b"/*") {
+            let end = bytes[i + 2..]
+                .windows(2)
+                .position(|w| w == b"*/")
+                .map_or(bytes.len(), |p| i + 2 + p + 2);
+            for m in &mut mask[i..end] {
+                *m = false;
+            }
+            i = end;
+            continue;
+        }
+        if bytes[i] == b'"' {
+            mask[i] = false;
+            i += 1;
+            while i < bytes.len() {
+                let b = bytes[i];
+                mask[i] = false;
+                if b == b'\\' && i + 1 < bytes.len() {
+                    i += 1;
+                    mask[i] = false;
+                    i += 1;
+                    continue;
+                }
+                i += 1;
+                if b == b'"' {
+                    break;
+                }
+            }
+            continue;
+        }
+        if bytes[i] == b'\'' {
+            if rust_like {
+                // Only treat `'...'` as char literal if closed quickly on same line
+                let rest = &text[i + 1..];
+                let mut chars = rest.char_indices();
+                let mut char_lit_end = None;
+                if let Some((idx1, c1)) = chars.next() {
+                    if c1 == '\\' {
+                        // Escape sequence up to 12 bytes before closing `'`
+                        for (idxk, ck) in chars.by_ref().take(12) {
+                            if ck == '\n' {
+                                break;
+                            }
+                            if ck == '\'' {
+                                char_lit_end = Some(i + 1 + idxk + 1);
+                                break;
+                            }
+                        }
+                    } else if c1 != '\n' {
+                        let _ = idx1;
+                        if let Some((idx2, '\'')) = chars.next() {
+                            char_lit_end = Some(i + 1 + idx2 + 1);
+                        }
+                    }
+                }
+                if let Some(end) = char_lit_end {
+                    for m in &mut mask[i..end] {
+                        *m = false;
+                    }
+                    i = end;
+                    continue;
+                }
+                // Otherwise Rust lifetime token `'a`
+                i += 1;
+                continue;
+            } else {
+                mask[i] = false;
+                i += 1;
+                while i < bytes.len() {
+                    let b = bytes[i];
+                    mask[i] = false;
+                    if b == b'\\' && i + 1 < bytes.len() {
+                        i += 1;
+                        mask[i] = false;
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                    if b == b'\'' || b == b'\n' {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        i += 1;
+    }
+    mask
 }
 
 fn render_squiggly_wave(scene: &mut Scene, start_x: f32, end_x: f32, y: f32, color: Rgba) {
@@ -3767,7 +5565,7 @@ fn render_squiggly_wave(scene: &mut Scene, start_x: f32, end_x: f32, y: f32, col
         }
         let seg_y = if up { y - 1.2 } else { y + 0.8 };
         let quad_rect = Rect::from_xywh(cur_x, seg_y, seg_w, 1.2);
-        if !is_finite_rect(quad_rect) {
+        if !quad_rect.is_finite() {
             break;
         }
         scene.push_quad(Quad::new(quad_rect).with_background(color));
@@ -5047,14 +6845,23 @@ mod tests {
             .any(|q| q.background == Some(theme.editor_error_foreground));
         assert!(has_error_tick, "Expected diagnostic error tick in minimap");
 
-        // Disabling minimap removes minimap quads and code clip expands to full width
+        // Disabling minimap removes minimap quads (only the right-edge vertical scrollbar remains) and code clip expands to full width
         view.set_minimap_enabled(false);
         let mut disabled_scene = Scene::new();
         view.render(bounds, &theme, &font, &mut disabled_scene);
+        let disabled_has_full_clip = disabled_scene.nodes().iter().any(|n| match n {
+            SceneNode::PushClip(r) => (r.max_x() - bounds.max_x()).abs() < 0.01 && r.min_x() > 0.0,
+            _ => false,
+        });
+        assert!(disabled_has_full_clip, "Expected code PushClip to expand to full width when minimap is disabled");
+        let vtrack = view.vertical_scrollbar_rect(bounds, view.gutter_width(&font));
         let disabled_mm_quads = disabled_scene
             .quads()
             .into_iter()
-            .filter(|q| q.bounds.min_x() >= mm_rect.min_x() - 0.1)
+            .filter(|q| {
+                q.bounds.min_x() >= mm_rect.min_x() - 0.1
+                    && vtrack.is_none_or(|vt| q.bounds.min_x() < vt.min_x() - 0.1)
+            })
             .count();
         assert_eq!(disabled_mm_quads, 0);
     }
@@ -5360,21 +7167,21 @@ mod tests {
                         match node {
                             SceneNode::PushClip(r) => {
                                 clip_depth += 1;
-                                assert!(is_finite_rect(*r), "non-finite clip: {:?}", r);
+                                assert!(r.is_finite(), "non-finite clip: {:?}", r);
                             }
                             SceneNode::PopClip => {
                                 clip_depth -= 1;
                                 assert!(clip_depth >= 0, "clip underflow");
                             }
                             SceneNode::Quad(q) => {
-                                assert!(is_finite_rect(q.bounds), "non-finite quad: {:?}", q.bounds);
+                                assert!(q.bounds.is_finite(), "non-finite quad: {:?}", q.bounds);
                             }
                             SceneNode::GlyphRun(g) => {
                                 assert!(g.origin.x.is_finite() && g.origin.y.is_finite());
-                                assert!(is_finite_rect(g.bounds), "non-finite glyph: {:?}", g.bounds);
+                                assert!(g.bounds.is_finite(), "non-finite glyph: {:?}", g.bounds);
                             }
                             SceneNode::Shadow(s) => {
-                                assert!(is_finite_rect(s.bounds));
+                                assert!(s.bounds.is_finite());
                             }
                         }
                     }
@@ -5385,7 +7192,7 @@ mod tests {
                     assert!(view.minimap_rect_with_gutter(bounds, view.gutter_width(&font)).is_none());
 
                     let acc = view.accessibility_node("ed.bad", bounds, &font);
-                    assert!(is_finite_rect(acc.bounds));
+                    assert!(acc.bounds.is_finite());
 
                     let down = InputEvent::MouseDown(MouseEvent {
                         position: Point::new(10.0, 10.0),
@@ -5420,7 +7227,7 @@ mod tests {
             let mut scene = Scene::new();
             view.render(valid_bounds, &theme, &bad_font, &mut scene);
             for q in scene.quads() {
-                assert!(is_finite_rect(q.bounds));
+                assert!(q.bounds.is_finite());
             }
         }
     }
@@ -5440,14 +7247,14 @@ mod tests {
                 match node {
                     SceneNode::PushClip(r) => {
                         clip_depth += 1;
-                        assert!(is_finite_rect(*r), "{}: non-finite PushClip: {:?}", label, r);
+                        assert!(r.is_finite(), "{}: non-finite PushClip: {:?}", label, r);
                     }
                     SceneNode::PopClip => {
                         clip_depth -= 1;
                         assert!(clip_depth >= 0, "{}: clip stack underflow", label);
                     }
                     SceneNode::Quad(q) => {
-                        assert!(is_finite_rect(q.bounds), "{}: non-finite Quad: {:?}", label, q.bounds);
+                        assert!(q.bounds.is_finite(), "{}: non-finite Quad: {:?}", label, q.bounds);
                     }
                     SceneNode::GlyphRun(g) => {
                         assert!(
@@ -5456,10 +7263,10 @@ mod tests {
                             label,
                             g.origin
                         );
-                        assert!(is_finite_rect(g.bounds), "{}: non-finite GlyphRun bounds: {:?}", label, g.bounds);
+                        assert!(g.bounds.is_finite(), "{}: non-finite GlyphRun bounds: {:?}", label, g.bounds);
                     }
                     SceneNode::Shadow(s) => {
-                        assert!(is_finite_rect(s.bounds), "{}: non-finite Shadow: {:?}", label, s.bounds);
+                        assert!(s.bounds.is_finite(), "{}: non-finite Shadow: {:?}", label, s.bounds);
                     }
                 }
             }
@@ -5564,7 +7371,7 @@ mod tests {
         );
         assert!(mid_scene.quads().len() <= 4096);
         for q in mid_scene.quads() {
-            assert!(is_finite_rect(q.bounds));
+            assert!(q.bounds.is_finite());
         }
 
         let mut direct_scene = Scene::new();
@@ -5577,7 +7384,7 @@ mod tests {
         );
         assert!(direct_scene.quads().len() <= 1);
         for q in direct_scene.quads() {
-            assert!(is_finite_rect(q.bounds));
+            assert!(q.bounds.is_finite());
         }
     }
 
@@ -5619,17 +7426,17 @@ mod tests {
                 match node {
                     SceneNode::PushClip(r) => {
                         clip_depth += 1;
-                        assert!(is_finite_rect(*r), "non-finite PushClip: {:?}", r);
+                        assert!(r.is_finite(), "non-finite PushClip: {:?}", r);
                     }
                     SceneNode::PopClip => {
                         clip_depth -= 1;
                         assert!(clip_depth >= 0, "clip stack underflow");
                     }
                     SceneNode::Quad(q) => {
-                        assert!(is_finite_rect(q.bounds), "non-finite Quad: {:?}", q.bounds);
+                        assert!(q.bounds.is_finite(), "non-finite Quad: {:?}", q.bounds);
                     }
                     SceneNode::Shadow(s) => {
-                        assert!(is_finite_rect(s.bounds), "non-finite Shadow: {:?}", s.bounds);
+                        assert!(s.bounds.is_finite(), "non-finite Shadow: {:?}", s.bounds);
                     }
                     SceneNode::GlyphRun(g) => {
                         assert!(
@@ -5638,7 +7445,7 @@ mod tests {
                             g.origin
                         );
                         assert!(
-                            is_finite_rect(g.bounds),
+                            g.bounds.is_finite(),
                             "non-finite GlyphRun bounds: {:?}",
                             g.bounds
                         );
@@ -6338,6 +8145,13 @@ mod tests {
         });
         assert_eq!(view.handle_event(&click_ev, bounds), EventResult::Consumed);
         assert_eq!(view.primary_position(), Position::new(3, 8));
+        let release_ev = InputEvent::MouseUp(MouseEvent {
+            position: click_pos,
+            button: rustcode_platform::render::MouseButton::Left,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        assert_eq!(view.handle_event(&release_ev, bounds), EventResult::Consumed);
 
         // 2. MouseMove diagnostic hover on line 3, col 15
         let hover_pos = Point::new(
@@ -6698,6 +8512,601 @@ mod tests {
         assert!(mixed_view.undo_stack.can_undo());
         assert!(mixed_view.undo());
         assert_eq!(mixed_view.text(), "aaab");
+    }
+
+    #[test]
+    fn test_editor_view_clipboard_and_empty_selection_line_ops_m3_01() {
+        let external_clip = Arc::new(Mutex::new(String::new()));
+        let r_clip = external_clip.clone();
+        let w_clip = external_clip.clone();
+        let mut view = EditorView::from_str("alpha\nbeta\ngamma\n").with_clipboard_callbacks(
+            Arc::new(move || Some(r_clip.lock().clone())),
+            Arc::new(move |s| *w_clip.lock() = s.to_string()),
+        );
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // 1. Standard selection Copy + Paste
+        *view.cursor_state.primary_mut() =
+            Selection::new(Position::new(0, 0), Position::new(0, 5));
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('c'),
+                Modifiers { ctrl: true, shift: false, alt: false, meta: false },
+            )),
+            bounds,
+        );
+        assert_eq!(*external_clip.lock(), "alpha");
+
+        view.cursor_state.set_primary(Position::new(2, 5));
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('v'),
+                Modifiers { ctrl: true, shift: false, alt: false, meta: false },
+            )),
+            bounds,
+        );
+        assert_eq!(view.text(), "alpha\nbeta\ngammaalpha\n");
+        assert!(view.undo());
+        assert_eq!(view.text(), "alpha\nbeta\ngamma\n");
+
+        // 2. Empty-selection line copy + paste above current line (VS Code style)
+        view.cursor_state.set_primary(Position::new(1, 2));
+        view.copy();
+        assert_eq!(*external_clip.lock(), "beta\n");
+        view.cursor_state.set_primary(Position::new(0, 3));
+        view.paste();
+        assert_eq!(view.text(), "beta\nalpha\nbeta\ngamma\n");
+        assert!(view.undo());
+        assert_eq!(view.text(), "alpha\nbeta\ngamma\n");
+
+        // 3. Empty-selection line cut removes whole line + atomic undo
+        view.cursor_state.set_primary(Position::new(1, 1));
+        view.cut();
+        assert_eq!(*external_clip.lock(), "beta\n");
+        assert_eq!(view.text(), "alpha\ngamma\n");
+        assert!(view.undo());
+        assert_eq!(view.text(), "alpha\nbeta\ngamma\n");
+    }
+
+    #[test]
+    fn test_editor_view_mouse_drag_and_multi_click_m3_02() {
+        use rustcode_platform::render::MouseMoveEvent;
+        let mut view = EditorView::from_str("hello_world second\nthird line\n");
+        let font = FontMetrics::default_monospace();
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let gutter_w = view.gutter_width(&font);
+        let text_x = bounds.min_x() + gutter_w + 8.0;
+
+        // 1. Forward mouse drag selection across columns 0..5 ("hello")
+        let p_start = Point::new(text_x, bounds.min_y() + 4.0);
+        let p_end = Point::new(text_x + 5.0 * font.char_width, bounds.min_y() + 4.0);
+        view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(p_start, MouseButton::Left)),
+            bounds,
+        );
+        view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: p_end }), bounds);
+        view.handle_event(&InputEvent::MouseUp(MouseEvent::new(p_end, MouseButton::Left)), bounds);
+        let sel = view.cursor_state.primary();
+        assert_eq!(sel.start(), Position::new(0, 0));
+        assert_eq!(sel.end(), Position::new(0, 5));
+
+        // 2. Backward mouse drag selection from col 11 to col 6
+        let p_b1 = Point::new(text_x + 11.0 * font.char_width, bounds.min_y() + 4.0);
+        let p_b2 = Point::new(text_x + 6.0 * font.char_width, bounds.min_y() + 4.0);
+        view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(p_b1, MouseButton::Left)),
+            bounds,
+        );
+        view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: p_b2 }), bounds);
+        view.handle_event(&InputEvent::MouseUp(MouseEvent::new(p_b2, MouseButton::Left)), bounds);
+        let sel_back = view.cursor_state.primary();
+        assert_eq!(sel_back.start(), Position::new(0, 6));
+        assert_eq!(sel_back.end(), Position::new(0, 11));
+
+        // 3. Double-click selects whole identifier "hello_world"
+        let p_word = Point::new(text_x + 3.0 * font.char_width, bounds.min_y() + 4.0);
+        view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(p_word, MouseButton::Left).with_click_count(2)),
+            bounds,
+        );
+        view.handle_event(&InputEvent::MouseUp(MouseEvent::new(p_word, MouseButton::Left)), bounds);
+        let wsel = view.cursor_state.primary();
+        assert_eq!(wsel.start(), Position::new(0, 0));
+        assert_eq!(wsel.end(), Position::new(0, 11));
+
+        // 4. Triple-click selects entire line including newline (0,0)..(1,0)
+        view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(p_word, MouseButton::Left).with_click_count(3)),
+            bounds,
+        );
+        view.handle_event(&InputEvent::MouseUp(MouseEvent::new(p_word, MouseButton::Left)), bounds);
+        let lsel = view.cursor_state.primary();
+        assert_eq!(lsel.start(), Position::new(0, 0));
+        assert_eq!(lsel.end(), Position::new(1, 0));
+    }
+
+    #[test]
+    fn test_editor_view_scrollbar_and_minimap_drag_m3_03() {
+        use rustcode_platform::render::MouseMoveEvent;
+        let mut long_text = String::new();
+        for i in 0..200 {
+            long_text.push_str(&format!(
+                "line_{i:03}_with_plenty_of_horizontal_content_to_exceed_viewport_width_easily_1234567890\n"
+            ));
+        }
+        let mut view = EditorView::from_str(&long_text);
+        let font = FontMetrics::default_monospace();
+        let bounds = Rect::from_xywh(0.0, 0.0, 500.0, 300.0);
+        let gutter_w = view.gutter_width(&font);
+
+        // Vertical scrollbar drag moves scroll_top into [0, max_scroll]
+        let vtrack = view.vertical_scrollbar_rect(bounds, gutter_w).unwrap();
+        let v_start = Point::new(vtrack.min_x() + 4.0, vtrack.min_y() + 10.0);
+        let v_end = Point::new(vtrack.min_x() + 4.0, vtrack.max_y() - 10.0);
+        assert_eq!(
+            view.handle_event(&InputEvent::MouseDown(MouseEvent::new(v_start, MouseButton::Left)), bounds),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: v_end }), bounds),
+            EventResult::Consumed
+        );
+        assert!(view.scroll_top > 50.0);
+        assert!(view.scroll_top <= 200.0);
+        view.handle_event(&InputEvent::MouseUp(MouseEvent::new(v_end, MouseButton::Left)), bounds);
+
+        // Horizontal scrollbar drag moves scroll_left cleanly
+        let htrack = view.horizontal_scrollbar_rect(bounds, gutter_w, &font).unwrap();
+        let h_start = Point::new(htrack.min_x() + 8.0, htrack.min_y() + 4.0);
+        let h_end = Point::new(htrack.max_x() - 8.0, htrack.min_y() + 4.0);
+        view.handle_event(&InputEvent::MouseDown(MouseEvent::new(h_start, MouseButton::Left)), bounds);
+        view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: h_end }), bounds);
+        assert!(view.scroll_left > 5.0);
+        view.handle_event(&InputEvent::MouseUp(MouseEvent::new(h_end, MouseButton::Left)), bounds);
+
+        // Minimap continuous drag updates scroll_top
+        let mm_rect = view.minimap_rect_with_gutter(bounds, gutter_w).unwrap();
+        let mm_top = Point::new(mm_rect.min_x() + 10.0, mm_rect.min_y() + 5.0);
+        let mm_mid = Point::new(mm_rect.min_x() + 10.0, mm_rect.min_y() + mm_rect.height() * 0.5);
+        view.handle_event(&InputEvent::MouseDown(MouseEvent::new(mm_top, MouseButton::Left)), bounds);
+        assert!(view.minimap_dragging);
+        view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: mm_mid }), bounds);
+        assert!(view.scroll_top > 10.0);
+        view.handle_event(&InputEvent::MouseUp(MouseEvent::new(mm_mid, MouseButton::Left)), bounds);
+        assert!(!view.minimap_dragging);
+    }
+
+    #[test]
+    fn test_editor_view_toggle_line_comments_across_grammars_m3_04() {
+        let registry = GrammarRegistry::new();
+        let theme = rustcode_platform::theme::ThemeService::default_dark_theme();
+        let ctrl_slash = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Char('/'),
+            Modifiers { ctrl: true, shift: false, alt: false, meta: false },
+        ));
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // All 14 built-in languages respond cleanly to Ctrl+/
+        for (lang, expected_prefix) in [
+            ("rust", "// "),
+            ("javascript", "// "),
+            ("typescript", "// "),
+            ("c", "// "),
+            ("cpp", "// "),
+            ("go", "// "),
+            ("python", "# "),
+            ("toml", "# "),
+            ("yaml", "# "),
+            ("shellscript", "# "),
+            ("html", "<!-- "),
+            ("css", "/* "),
+            ("json", "// "),
+            ("markdown", "<!-- "),
+            ("plaintext", "// "),
+        ] {
+            let mut v = EditorView::from_str("hello\n");
+            v.set_language(lang, theme.clone(), &registry);
+            v.handle_event(&ctrl_slash, bounds);
+            assert!(
+                v.text().starts_with(expected_prefix),
+                "lang={lang} expected prefix {expected_prefix:?}, got {:?}",
+                v.text()
+            );
+            v.handle_event(&ctrl_slash, bounds);
+            assert_eq!(v.text(), "hello\n", "uncomment failed for lang={lang}");
+        }
+
+        // Mixed selection comments ALL lines (uniform rule), preserves common indent, and undo restores
+        let mut mixed = EditorView::from_str("    // line 1\n    line 2\n        line 3\n");
+        mixed.set_language("rust", theme, &registry);
+        *mixed.cursor_state.primary_mut() =
+            Selection::new(Position::new(0, 0), Position::new(2, 10));
+        mixed.handle_event(&ctrl_slash, bounds);
+        assert_eq!(
+            mixed.text(),
+            "    // // line 1\n    // line 2\n    //     line 3\n"
+        );
+        // Second Ctrl+/ uncomments one level from every line
+        mixed.handle_event(&ctrl_slash, bounds);
+        assert_eq!(mixed.text(), "    // line 1\n    line 2\n        line 3\n");
+        // Undo restores commented state cleanly
+        assert!(mixed.undo());
+        assert_eq!(
+            mixed.text(),
+            "    // // line 1\n    // line 2\n    //     line 3\n"
+        );
+    }
+
+    #[test]
+    fn test_editor_view_move_and_duplicate_lines_m3_05() {
+        let mut view = EditorView::from_str("one\ntwo\nthree\nfour\n");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let alt_down = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::ArrowDown,
+            Modifiers { ctrl: false, shift: false, alt: true, meta: false },
+        ));
+        let alt_up = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::ArrowUp,
+            Modifiers { ctrl: false, shift: false, alt: true, meta: false },
+        ));
+        let shift_alt_down = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::ArrowDown,
+            Modifiers { ctrl: false, shift: true, alt: true, meta: false },
+        ));
+
+        view.cursor_state.set_primary(Position::new(0, 2));
+        view.handle_event(&alt_down, bounds);
+        assert_eq!(view.text(), "two\none\nthree\nfour\n");
+        assert_eq!(view.primary_position().line, 1);
+
+        view.handle_event(&alt_up, bounds);
+        assert_eq!(view.text(), "one\ntwo\nthree\nfour\n");
+        assert_eq!(view.primary_position().line, 0);
+
+        // Multi-line block duplicate down
+        *view.cursor_state.primary_mut() =
+            Selection::new(Position::new(0, 1), Position::new(1, 2));
+        view.handle_event(&shift_alt_down, bounds);
+        assert_eq!(view.text(), "one\ntwo\none\ntwo\nthree\nfour\n");
+        assert!(view.undo());
+        assert_eq!(view.text(), "one\ntwo\nthree\nfour\n");
+    }
+
+    #[test]
+    fn test_editor_view_tab_indent_outdent_and_settings_m3_06() {
+        let mut view = EditorView::from_str("alpha\nbeta\ngamma");
+        view.set_tab_size(2);
+        view.set_insert_spaces(true);
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let tab = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Tab,
+            Modifiers::none(),
+        ));
+        let shift_tab = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Tab,
+            Modifiers { ctrl: false, shift: true, alt: false, meta: false },
+        ));
+
+        *view.cursor_state.primary_mut() =
+            Selection::new(Position::new(0, 1), Position::new(2, 2));
+        view.handle_event(&tab, bounds);
+        assert_eq!(view.text(), "  alpha\n  beta\n  gamma");
+
+        view.handle_event(&shift_tab, bounds);
+        assert_eq!(view.text(), "alpha\nbeta\ngamma");
+
+        // Tab-character mode (`insert_spaces = false`)
+        view.set_tab_size(4);
+        view.set_insert_spaces(false);
+        *view.cursor_state.primary_mut() =
+            Selection::new(Position::new(0, 0), Position::new(1, 3));
+        view.handle_event(&tab, bounds);
+        assert_eq!(view.text(), "\talpha\n\tbeta\ngamma");
+        view.handle_event(&shift_tab, bounds);
+        assert_eq!(view.text(), "alpha\nbeta\ngamma");
+    }
+
+    #[test]
+    fn test_editor_view_auto_close_brackets_and_matching_highlight_m3_07() {
+        let mut view = EditorView::from_str("");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Auto-close '(' -> "()", cursor at (0, 1)
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('('),
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(view.text(), "()");
+        assert_eq!(view.primary_position(), Position::new(0, 1));
+
+        // Typing ')' overtypes the auto-closed ')' without duplicating
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char(')'),
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(view.text(), "()");
+        assert_eq!(view.primary_position(), Position::new(0, 2));
+
+        // Empty-pair Backspace deletes both '(' and ')' when inside "()"
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::ArrowLeft,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Backspace,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(view.text(), "");
+
+        // Matching bracket highlight skips brackets inside strings & comments, handles Rust lifetimes
+        let mut mview = EditorView::from_str("fn foo<'a>(s: &str) { let x = \"(\"; /* ) */ }");
+        let registry = GrammarRegistry::new();
+        mview.set_language(
+            "rust",
+            rustcode_platform::theme::ThemeService::default_dark_theme(),
+            &registry,
+        );
+        // Cursor at '(' in `(s: &str)` -> col 10, matches ')' at col 18
+        mview.cursor_state.set_primary(Position::new(0, 10));
+        assert_eq!(
+            mview.matching_bracket_pair(),
+            Some((Position::new(0, 10), Position::new(0, 18)))
+        );
+        // Cursor on '{' at col 20 -> matches '}' at col 43, skipping string "(" and comment ")"
+        mview.cursor_state.set_primary(Position::new(0, 20));
+        assert_eq!(
+            mview.matching_bracket_pair(),
+            Some((Position::new(0, 20), Position::new(0, 43)))
+        );
+        // Cursor inside string at "(" -> col 31: should return None
+        mview.cursor_state.set_primary(Position::new(0, 31));
+        assert_eq!(mview.matching_bracket_pair(), None);
+    }
+
+    #[test]
+    fn test_editor_view_context_menu_m3_08() {
+        let mut view = EditorView::from_str("let alpha = 1;\n");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Right-click opens context menu
+        let rclick = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(120.0, 10.0),
+            MouseButton::Right,
+        ));
+        assert_eq!(view.handle_event(&rclick, bounds), EventResult::Consumed);
+        assert!(view.context_menu.is_visible);
+
+        // Escape closes without mutating document
+        let esc = InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+            KeyCode::Escape,
+            Modifiers::none(),
+        ));
+        assert_eq!(view.handle_event(&esc, bounds), EventResult::Consumed);
+        assert!(!view.context_menu.is_visible);
+        assert_eq!(view.text(), "let alpha = 1;\n");
+
+        // Re-open near right/bottom edge and verify clamped bounds + item click dispatch
+        let rclick_edge = InputEvent::MouseDown(MouseEvent::new(
+            Point::new(790.0, 590.0),
+            MouseButton::Right,
+        ));
+        view.handle_event(&rclick_edge, bounds);
+        let menu_rect = view.context_menu.compute_bounds(bounds).unwrap();
+        assert!(menu_rect.max_x() <= bounds.max_x());
+        assert!(menu_rect.max_y() <= bounds.max_y());
+
+        // Click "Go to Definition" (index 3)
+        let go_def_pt = Point::new(
+            menu_rect.min_x() + 20.0,
+            menu_rect.min_y()
+                + EditorContextMenu::PADDING_Y
+                + 3.5 * EditorContextMenu::ITEM_HEIGHT,
+        );
+        view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(go_def_pt, MouseButton::Left)),
+            bounds,
+        );
+        assert!(!view.context_menu.is_visible);
+        assert!(matches!(view.take_last_action(), Some(EditorAction::GoToDefinition(_))));
+
+        // Outside click dismisses cleanly
+        view.handle_event(&rclick, bounds);
+        assert!(view.context_menu.is_visible);
+        view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(
+                Point::new(600.0, 500.0),
+                MouseButton::Left,
+            )),
+            bounds,
+        );
+        assert!(!view.context_menu.is_visible);
+    }
+
+    #[test]
+    fn test_editor_view_grapheme_navigation_and_deletion_m3_09() {
+        let initial = "e\u{0301}👨‍👩‍👧‍👦🇺🇸z";
+        let mut view = EditorView::from_str(initial);
+
+        // Move right through 4 grapheme clusters without landing mid-cluster
+        view.move_cursor_right(false);
+        assert_eq!(view.primary_position(), Position::new(0, 2)); // after e\u{0301}
+        view.move_cursor_right(false);
+        assert_eq!(view.primary_position(), Position::new(0, 13)); // after 👨‍👩‍👧‍👦 (11 UTF-16 code units)
+        view.move_cursor_right(false);
+        assert_eq!(view.primary_position(), Position::new(0, 17)); // after 🇺🇸 (4 UTF-16 code units)
+        view.move_cursor_right(false);
+        assert_eq!(view.primary_position(), Position::new(0, 18)); // after z
+
+        // Move left back to before 🇺🇸 and delete forward (removes whole flag cluster)
+        view.move_cursor_left(false);
+        view.move_cursor_left(false);
+        assert_eq!(view.primary_position(), Position::new(0, 13));
+        view.delete_forwards();
+        assert_eq!(view.text(), "e\u{0301}👨‍👩‍👧‍👦z");
+
+        // Backspace removes entire ZWJ family emoji cluster cleanly
+        view.delete_backwards();
+        assert_eq!(view.text(), "e\u{0301}z");
+        assert_eq!(view.primary_position(), Position::new(0, 2));
+
+        // Backspace removes combining mark + base letter together
+        view.delete_backwards();
+        assert_eq!(view.text(), "z");
+        assert_eq!(view.primary_position(), Position::new(0, 0));
+    }
+
+    #[test]
+    fn test_editor_view_unicode_width_visual_cols_and_vertical_align_m3_10() {
+        let mut view = EditorView::from_str("中文a\n012345\n");
+        let font = FontMetrics::default_monospace();
+        let theme_styles = WorkbenchThemeStyles::from_theme(
+            &rustcode_platform::theme::ThemeService::default_dark_theme(),
+        );
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+
+        // Place caret after "中文" (UTF-16 col = 2, display col = 4)
+        view.cursor_state.set_primary(Position::new(0, 2));
+        let mut scene = Scene::new();
+        view.render(bounds, &theme_styles, &font, &mut scene);
+
+        // Verify caret quad x matches display column 4, NOT char count 2
+        let gutter_w = view.gutter_width(&font);
+        let expected_caret_x = bounds.min_x() + gutter_w + 8.0 + 4.0 * font.char_width;
+        let has_expected_caret = scene.quads().iter().any(|q| {
+            (q.bounds.width() - 2.0).abs() < 0.1
+                && (q.bounds.min_x() - expected_caret_x).abs() < 0.5
+        });
+        assert!(has_expected_caret, "caret should sit at display column 4");
+
+        // Moving Down from after "中文" (display col 4) lands on '4' (col 4) on ASCII line
+        view.move_cursor_down(false);
+        assert_eq!(view.primary_position(), Position::new(1, 4));
+        // Moving back Up returns to col 2 (after "中文")
+        view.move_cursor_up(false);
+        assert_eq!(view.primary_position(), Position::new(0, 2));
+    }
+
+    #[test]
+    fn test_editor_view_lsp_hooks_hover_goto_completions_format() {
+        let mut view = EditorView::from_str("fn foo() {}\n");
+        let bounds = Rect::from_xywh(0.0, 0.0, 800.0, 600.0);
+        let font = FontMetrics::default_monospace();
+        let theme_styles = WorkbenchThemeStyles::from_theme(
+            &rustcode_platform::theme::ThemeService::default_dark_theme(),
+        );
+
+        // 1. LSP Hover card renders + mouse hover tracks cursor buffer pos
+        view.set_lsp_hover(
+            Some(LspHoverInfo {
+                contents: "fn foo() -> ()".to_string(),
+                range: None,
+                position: Position::new(0, 3),
+            }),
+            Some(Point::new(100.0, 10.0)),
+        );
+        let mut scene = Scene::new();
+        let before_runs = scene.glyph_runs().len();
+        view.render(bounds, &theme_styles, &font, &mut scene);
+        assert!(scene.glyph_runs().len() > before_runs);
+        assert!(scene
+            .glyph_runs()
+            .iter()
+            .any(|r| r.text.contains("fn foo()")));
+
+        // 2. F12 & Ctrl+Click trigger GoToDefinition action
+        view.cursor_state.set_primary(Position::new(0, 4));
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::F12,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(
+            view.take_last_action(),
+            Some(EditorAction::GoToDefinition(Position::new(0, 4)))
+        );
+
+        let text_x = bounds.min_x() + view.gutter_width(&font) + 8.0;
+        view.handle_event(
+            &InputEvent::MouseDown(
+                MouseEvent::new(Point::new(text_x + 3.0 * font.char_width, 4.0), MouseButton::Left)
+                    .with_modifiers(Modifiers { ctrl: true, shift: false, alt: false, meta: false }),
+            ),
+            bounds,
+        );
+        assert!(matches!(
+            view.take_last_action(),
+            Some(EditorAction::GoToDefinition(p)) if p.line == 0
+        ));
+
+        // 3. Merge LSP completions alongside existing list
+        view.autocomplete.show(
+            vec![CompletionItem::new("println!").with_kind(CompletionItemKind::Function)],
+            Position::new(0, 0),
+            None,
+        );
+        view.merge_lsp_completions(
+            vec![
+                CompletionItem::new("foo").with_kind(CompletionItemKind::Function),
+                CompletionItem::new("println!").with_kind(CompletionItemKind::Function),
+            ],
+            Position::new(0, 0),
+            None,
+        );
+        assert_eq!(view.autocomplete.all_items.len(), 2);
+
+        // 4. apply_format_edits delegates cleanly with undo
+        view.apply_format_edits(&[RangeEdit {
+            range: Range::new(Position::new(0, 0), Position::new(1, 0)),
+            new_text: "fn foo() {\n}\n".to_string(),
+        }]);
+        assert_eq!(view.text(), "fn foo() {\n}\n");
+        assert!(view.undo());
+        assert_eq!(view.text(), "fn foo() {}\n");
+    }
+
+    #[cfg(feature = "desktop")]
+    #[test]
+    fn test_editor_view_treesitter_incremental_syntax_m3_16() {
+        let mut view = EditorView::from_str("fn main() {\n\n    let val = 10;\n}\n");
+        let registry = GrammarRegistry::new();
+        let theme = rustcode_platform::theme::ThemeService::default_dark_theme();
+        view.set_language("rust", theme, &registry);
+
+        // Open block comment on line 1 before `let val = 10;` on line 2 -> line 2 becomes comment via tree-sitter
+        view.cursor_state.set_primary(Position::new(1, 0));
+        view.insert_text("/* ");
+        let line2 = view.buffer.read().get_line_content(2).unwrap();
+        let mut hl = view.syntax_highlighter.lock();
+        let tokens_comment = hl.as_mut().unwrap().get_line_tokens(2, &line2);
+        assert!(
+            tokens_comment
+                .iter()
+                .all(|t| matches!(t.scope, SyntaxScope::Comment | SyntaxScope::CommentBlock)),
+            "expected comment tokens after opening /*, got {:?}",
+            tokens_comment
+        );
+        drop(hl);
+
+        // Undo removes `/* ` -> line 2 returns to `let val = 10;` tokens incrementally
+        assert!(view.undo());
+        let line2_restored = view.buffer.read().get_line_content(2).unwrap();
+        let mut hl = view.syntax_highlighter.lock();
+        let tokens_code = hl.as_mut().unwrap().get_line_tokens(2, &line2_restored);
+        assert!(tokens_code.iter().any(|t| t.scope == SyntaxScope::Keyword));
     }
 }
 

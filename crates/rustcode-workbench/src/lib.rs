@@ -77,58 +77,37 @@ pub use window::WorkbenchWindow;
 pub use workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchRegions, WorkbenchView};
 pub use workspace::{Workspace, WorkspaceFolder};
 
-pub(crate) fn is_finite_rect(rect: rustcode_platform::render::Rect) -> bool {
-    const MAX_RECT_COORD: f32 = 1.0e15;
-    rect.min_x().is_finite()
-        && rect.min_y().is_finite()
-        && rect.width().is_finite()
-        && rect.height().is_finite()
-        && rect.max_x().is_finite()
-        && rect.max_y().is_finite()
-        && rect.origin.x.abs() <= MAX_RECT_COORD
-        && rect.origin.y.abs() <= MAX_RECT_COORD
-        && rect.size.width.abs() <= MAX_RECT_COORD
-        && rect.size.height.abs() <= MAX_RECT_COORD
-        && (rect.origin.x as f64 + rect.size.width as f64).abs() <= f32::MAX as f64
-        && (rect.origin.y as f64 + rect.size.height as f64).abs() <= f32::MAX as f64
-}
-
-pub(crate) fn is_finite_positive_rect(rect: rustcode_platform::render::Rect) -> bool {
-    is_finite_rect(rect) && rect.width() > 0.0 && rect.height() > 0.0
-}
-
-pub(crate) fn is_finite_font(font: &rustcode_platform::render::FontMetrics) -> bool {
-    const MAX_FONT_METRIC: f32 = 10_000.0;
-    font.line_height.is_finite()
-        && font.line_height > 0.0
-        && font.line_height <= MAX_FONT_METRIC
-        && font.char_width.is_finite()
-        && font.char_width >= 0.0
-        && font.char_width <= MAX_FONT_METRIC
-        && font.font_size.is_finite()
-        && font.font_size >= 0.0
-        && font.font_size <= MAX_FONT_METRIC
-}
-
-pub(crate) fn push_finite_quad(
-    scene: &mut rustcode_platform::render::Scene,
-    quad: rustcode_platform::render::Quad,
-) {
-    if is_finite_rect(quad.bounds) {
-        scene.push_quad(quad);
+/// Case-insensitive subsequence fuzzy matcher shared across workbench search and quick input.
+#[cfg(test)]
+pub(crate) fn fuzzy_match(target: &str, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return true;
     }
+    let target_lower = target.to_lowercase();
+    let pattern_lower = pattern.to_lowercase();
+    let mut pattern_chars = pattern_lower.chars().peekable();
+    for c in target_lower.chars() {
+        if let Some(&pc) = pattern_chars.peek() {
+            if c == pc {
+                pattern_chars.next();
+            }
+        } else {
+            return true;
+        }
+    }
+    pattern_chars.peek().is_none()
 }
 
-pub(crate) fn push_finite_text(
-    scene: &mut rustcode_platform::render::Scene,
-    run: rustcode_platform::render::GlyphRun,
-) {
-    if run.origin.x.is_finite()
-        && run.origin.y.is_finite()
-        && is_finite_rect(run.bounds)
-        && run.font_size.is_finite()
-        && run.font_size >= 0.0
-    {
-        scene.push_text(run);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shared_fuzzy_match_case_insensitive_subsequence() {
+        assert!(fuzzy_match("src/main.rs", ""));
+        assert!(fuzzy_match("CommandPaletteView", "cpv"));
+        assert!(fuzzy_match("src/search/symbols.rs", "sss"));
+        assert!(!fuzzy_match("src/main.rs", "xyz"));
+        assert!(!fuzzy_match("ab", "abc"));
     }
 }

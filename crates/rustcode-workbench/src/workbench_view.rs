@@ -157,6 +157,34 @@ impl WorkbenchView {
         Some(bar)
     }
 
+    pub fn sync_scm_status_bar(&mut self) {
+        let branch = self.scm_view.branch_name().map(str::to_string);
+        let dirty = !self.scm_view.repo.staged.is_empty()
+            || !self.scm_view.repo.changes.is_empty()
+            || !self.scm_view.repo.untracked.is_empty();
+        self.status_bar.model.set_git_branch(branch.as_deref(), dirty);
+    }
+
+    pub fn open_workspace_git(
+        &mut self,
+        workspace_root: &std::path::Path,
+    ) -> Result<bool, rustcode_protocols::git::GitError> {
+        let opened = self.scm_view.open_workspace_git(workspace_root)?;
+        self.sync_scm_status_bar();
+        Ok(opened)
+    }
+
+    pub fn set_git_backend(&mut self, backend: Arc<dyn rustcode_protocols::git::GitBackend>) {
+        self.scm_view.set_git_backend(backend);
+        self.sync_scm_status_bar();
+    }
+
+    pub fn refresh_scm(&mut self) -> Result<(), rustcode_protocols::git::GitError> {
+        self.scm_view.refresh_from_git()?;
+        self.sync_scm_status_bar();
+        Ok(())
+    }
+
     pub fn update_problems(&mut self, uri: &str, diags: Vec<rustcode_editor::viewmodel::EditorDiagnostic>) {
         self.editor_area
             .for_each_editor_for_uri_mut(uri, |editor| editor.set_diagnostics(diags.clone()));
@@ -355,7 +383,7 @@ impl WorkbenchView {
     // --- Layout Region Calculations ---
 
     pub fn compute_regions(&self, bounds: Rect) -> WorkbenchRegions {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             let zero = Rect::zero();
             return WorkbenchRegions {
                 activity_bar: zero,
@@ -367,7 +395,7 @@ impl WorkbenchView {
             };
         }
         let sanitize = |r: Rect| -> Rect {
-            if crate::is_finite_rect(r) {
+            if r.is_finite() {
                 r
             } else {
                 Rect::zero()
@@ -477,7 +505,7 @@ impl WorkbenchView {
         for (idx, tab) in group.tabs.iter().enumerate() {
             let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
             let tab_rect = Rect::from_xywh(cur_x, group_rect.min_y(), tab_w, tab_bar_h);
-            if !crate::is_finite_rect(tab_rect) {
+            if !tab_rect.is_finite() {
                 break;
             }
             let tab_id = if legacy_ids {
@@ -731,13 +759,13 @@ impl WorkbenchView {
     }
 
     pub fn accessibility_tree(&self, bounds: Rect, font: &FontMetrics) -> AccessibilityTree {
-        let safe_bounds = if crate::is_finite_rect(bounds) {
+        let safe_bounds = if bounds.is_finite() {
             Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), bounds.height())
         } else {
             Rect::zero()
         };
         let fallback_font = FontMetrics::default_monospace();
-        let font = if crate::is_finite_font(font) {
+        let font = if font.is_finite() {
             font
         } else {
             &fallback_font
@@ -1333,7 +1361,7 @@ impl View for WorkbenchView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         let regions = self.compute_regions(bounds);
@@ -1377,7 +1405,7 @@ impl View for WorkbenchView {
                 100.0f32.min(regions.editor_area.width()),
                 tab_bar_h,
             );
-            if crate::is_finite_positive_rect(tab_rect) {
+            if tab_rect.is_finite_positive() {
                 scene.push_quad(Quad::new(tab_rect).with_background(theme.tab_active_bg));
                 scene.push_text(GlyphRun::new(
                     "Settings".to_string(),
@@ -1396,7 +1424,7 @@ impl View for WorkbenchView {
                 regions.editor_area.width(),
                 (regions.editor_area.height() - tab_bar_h).max(0.0),
             );
-            if crate::is_finite_positive_rect(content_rect) {
+            if content_rect.is_finite_positive() {
                 let mut settings_view = SettingsUiView::default();
                 settings_view.state.open();
                 if let Some(cfg) = &self.cached_config {
@@ -1485,8 +1513,7 @@ impl View for WorkbenchView {
                 "terminal" => self.terminal_panel.render(content_rect, theme, font, scene),
                 "output" => self.output_panel.render(content_rect, theme, font, scene),
                 _ => {
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(content_rect).with_background(theme.panel_bg),
                     );
                 }
@@ -1650,9 +1677,10 @@ impl View for WorkbenchView {
                     let view_id = self.layout.active_sidebar_view.as_str();
                     if view_id == "scm" || view_id == "workbench.view.scm" {
                         let res = self.scm_view.handle_event(event, regions.sidebar);
+                        self.sync_scm_status_bar();
                         if let Some(scm_act) = self.scm_view.last_action.take() {
                             if let ScmAction::OpenDiff { path, title, original, modified } = &scm_act {
-                                let path_str = path.to_string_lossy().to_string();
+                                let path_str = format!("diff://{}", path.to_string_lossy().replace('\\', "/"));
                                 self.editor_area.open_diff(&path_str, title, original, modified);
                                 self.editor_area.sync_breadcrumbs(Some(&self.workspace));
                                 self.last_action = Some(WorkbenchAction::OpenDiff {
@@ -1760,6 +1788,12 @@ impl View for WorkbenchView {
                                         l.set_panel_tab("problems");
                                     });
                                     self.focused_region = FocusedRegion::Panel;
+                                } else if cmd == "workbench.view.scm" {
+                                    self.layout.mutate(|l| {
+                                        l.sidebar_visible = true;
+                                        l.set_sidebar_view("scm");
+                                    });
+                                    self.focused_region = FocusedRegion::Sidebar;
                                 }
                                 self.last_action = Some(WorkbenchAction::ExecuteCommand(cmd.clone()));
                             }
@@ -1810,12 +1844,23 @@ impl View for WorkbenchView {
                                     let title = path
                                         .file_name()
                                         .map_or("untitled", |n| n.to_str().unwrap_or(""));
-                                    let content = std::fs::read_to_string(&path).unwrap_or_default();
-                                    self.editor_area.open_file(&uri, title, &content, true);
+                                    let target_uri = if !uri.contains("://") && !path.is_absolute() {
+                                        uri.clone()
+                                    } else {
+                                        self.editor_area
+                                            .find_open_tab_uri_for_path(&path)
+                                            .unwrap_or_else(|| uri.clone())
+                                    };
+                                    let content = if self.editor_area.any_editor_for_uri(&target_uri).is_some() {
+                                        String::new()
+                                    } else {
+                                        std::fs::read_to_string(&path).unwrap_or_default()
+                                    };
+                                    self.editor_area.open_file(&target_uri, title, &content, true);
                                     if let Some(active_editor) =
                                         self.editor_area.active_editor_mut()
                                     {
-                                        active_editor.set_primary_position(position);
+                                        active_editor.jump_to_position_and_unfold(position);
                                         if let Some(file_diags) =
                                             self.problems_panel.files.get(&uri)
                                         {
@@ -1908,6 +1953,7 @@ impl View for WorkbenchView {
                         let view_id = self.layout.active_sidebar_view.as_str();
                         if view_id == "scm" || view_id == "workbench.view.scm" {
                             let res = self.scm_view.handle_event(event, regions.sidebar);
+                            self.sync_scm_status_bar();
                             if let Some(act) = self.scm_view.last_action.take() {
                                 self.last_action = Some(WorkbenchAction::ScmAction(act));
                             }
@@ -2040,6 +2086,18 @@ impl View for WorkbenchView {
                     EventResult::Consumed
                 } else {
                     res
+                }
+            }
+            InputEvent::ImePreedit { .. } => EventResult::Ignored,
+            InputEvent::ImeCommit(text) => {
+                if self.focused_region == FocusedRegion::Editor && !text.is_empty() {
+                    let res = self.editor_area.handle_event(event, regions.editor_area);
+                    if res == EventResult::Consumed {
+                        self.editor_area.sync_breadcrumbs(Some(&self.workspace));
+                    }
+                    res
+                } else {
+                    EventResult::Ignored
                 }
             }
         }
@@ -2613,7 +2671,7 @@ mod tests {
             let tree = win.accessibility_tree(bad_bounds);
             for node in tree.to_flat_list() {
                 assert!(
-                    crate::is_finite_rect(node.bounds),
+                    node.bounds.is_finite(),
                     "non-finite accessibility node bounds for {}: {:?}",
                     node.id,
                     node.bounds
@@ -2630,17 +2688,17 @@ mod tests {
             match node {
                 SceneNode::PushClip(r) => {
                     clip_depth += 1;
-                    assert!(crate::is_finite_rect(*r));
+                    assert!(r.is_finite());
                 }
                 SceneNode::PopClip => {
                     clip_depth -= 1;
                     assert!(clip_depth >= 0);
                 }
-                SceneNode::Quad(q) => assert!(crate::is_finite_rect(q.bounds)),
-                SceneNode::Shadow(s) => assert!(crate::is_finite_rect(s.bounds)),
+                SceneNode::Quad(q) => assert!(q.bounds.is_finite()),
+                SceneNode::Shadow(s) => assert!(s.bounds.is_finite()),
                 SceneNode::GlyphRun(g) => {
                     assert!(g.origin.x.is_finite() && g.origin.y.is_finite());
-                    assert!(crate::is_finite_rect(g.bounds));
+                    assert!(g.bounds.is_finite());
                 }
             }
         }
@@ -2659,17 +2717,17 @@ mod tests {
                 match node {
                     SceneNode::PushClip(r) => {
                         clip_depth += 1;
-                        assert!(crate::is_finite_rect(*r), "{}: non-finite PushClip {:?}", label, r);
+                        assert!(r.is_finite(), "{}: non-finite PushClip {:?}", label, r);
                     }
                     SceneNode::PopClip => {
                         clip_depth -= 1;
                         assert!(clip_depth >= 0, "{}: clip stack underflow", label);
                     }
                     SceneNode::Quad(q) => {
-                        assert!(crate::is_finite_rect(q.bounds), "{}: non-finite Quad {:?}", label, q.bounds);
+                        assert!(q.bounds.is_finite(), "{}: non-finite Quad {:?}", label, q.bounds);
                     }
                     SceneNode::Shadow(s) => {
-                        assert!(crate::is_finite_rect(s.bounds), "{}: non-finite Shadow {:?}", label, s.bounds);
+                        assert!(s.bounds.is_finite(), "{}: non-finite Shadow {:?}", label, s.bounds);
                     }
                     SceneNode::GlyphRun(g) => {
                         assert!(
@@ -2679,7 +2737,7 @@ mod tests {
                             g.origin
                         );
                         assert!(
-                            crate::is_finite_rect(g.bounds),
+                            g.bounds.is_finite(),
                             "{}: non-finite GlyphRun bounds {:?}",
                             label,
                             g.bounds
@@ -2738,7 +2796,7 @@ mod tests {
             ascent: f32::MAX,
             descent: 0.0,
         };
-        assert!(!crate::is_finite_font(&max_font));
+        assert!(!max_font.is_finite());
 
         let mut ext_view = crate::extensions_view::ExtensionsSidebarView::new();
         let mut ext_scene = Scene::new();
@@ -3085,5 +3143,123 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_workbench_view_no_sample_defaults_and_idle_debug_toolbar() {
+        let wb = WorkbenchView::new();
+        assert!(!wb.debug_toolbar.is_visible);
+        assert!(!wb.debug_toolbar.is_running());
+        assert!(!wb.debug_sidebar.session.is_active);
+        assert!(wb.debug_sidebar.session.threads.is_empty());
+        assert!(wb.debug_sidebar.session.call_stack.is_empty());
+        assert!(wb.debug_sidebar.session.scopes.is_empty());
+        assert!(wb.debug_sidebar.session.variables.is_empty());
+        assert!(wb.debug_sidebar.session.breakpoints.is_empty());
+
+        assert!(wb.scm_view.git_backend.is_none());
+        assert!(wb.scm_view.branch_name().is_none());
+        assert!(wb.scm_view.repo.staged.is_empty());
+        assert!(wb.scm_view.repo.changes.is_empty());
+        assert!(wb.scm_view.repo.untracked.is_empty());
+        assert!(wb.scm_view.repo.commits.is_empty());
+        assert!(wb
+            .status_bar
+            .model
+            .item(crate::statusbar::STATUS_GIT_BRANCH_ID)
+            .is_none());
+    }
+
+    #[test]
+    fn test_workbench_scm_git_cli_and_statusbar_branch_readout() {
+        let tmp =
+            std::env::temp_dir().join(format!("rc_wb_git_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args(args)
+                .output()
+                .expect("git should run");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        run_git(&["init", "-b", "feature/ui-wire"]);
+        run_git(&["config", "user.name", "RustCode Test"]);
+        run_git(&["config", "user.email", "test@rustcode.local"]);
+
+        let file_path = tmp.join("lib.rs");
+        std::fs::write(&file_path, "pub fn one() -> i32 { 1 }\n").unwrap();
+        run_git(&["add", "lib.rs"]);
+        run_git(&["commit", "-m", "initial"]);
+
+        std::fs::write(&file_path, "pub fn one() -> i32 { 2 }\n").unwrap();
+
+        let mut wb = WorkbenchView::new();
+        assert!(wb.open_workspace_git(&tmp).unwrap());
+        let branch_item = wb
+            .status_bar
+            .model
+            .item(crate::statusbar::STATUS_GIT_BRANCH_ID)
+            .unwrap();
+        assert_eq!(branch_item.text, "$(git-branch) feature/ui-wire*");
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+        let mut scene = Scene::new();
+        wb.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.contains_text("$(git-branch) feature/ui-wire*"));
+
+        wb.scm_view.stage_all().unwrap();
+        wb.scm_view.commit_with_message("update lib").unwrap();
+        wb.sync_scm_status_bar();
+
+        let clean_item = wb
+            .status_bar
+            .model
+            .item(crate::statusbar::STATUS_GIT_BRANCH_ID)
+            .unwrap();
+        assert_eq!(clean_item.text, "$(git-branch) feature/ui-wire");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_workbench_ime_commit_forwards_to_active_editor() {
+        let mut wb = WorkbenchView::new();
+        wb.editor_area
+            .open_file("file:///workspace/ime.txt", "ime.txt", "hello ", false);
+        if let Some(ed) = wb.editor_area.active_editor_mut() {
+            ed.set_primary_position(rustcode_editor::Position::new(0, 6));
+        }
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1024.0, 768.0);
+        let preedit = InputEvent::ImePreedit {
+            text: "ni".to_string(),
+            cursor: Some((0, 2)),
+        };
+        assert_eq!(wb.handle_event(&preedit, bounds), EventResult::Ignored);
+
+        let commit = InputEvent::ImeCommit("你好".to_string());
+        assert_eq!(wb.handle_event(&commit, bounds), EventResult::Consumed);
+        assert_eq!(
+            wb.editor_area.active_editor().unwrap().text(),
+            "hello 你好"
+        );
+        assert!(wb
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .unwrap()
+            .is_dirty);
     }
 }

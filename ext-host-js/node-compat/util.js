@@ -2,6 +2,8 @@
 
 // Pure-JS Node.js util compatibility shim (no dependency on Node built-in 'util').
 
+const { utf8ToBytes, utf8EncodeInto, bytesToUtf8 } = require('./buffer');
+
 const customInspectSymbol = Symbol.for('nodejs.util.inspect.custom');
 const customPromisifySymbol = Symbol.for('nodejs.util.promisify.custom');
 const customPromisifyArgsSymbol = Symbol.for('nodejs.util.promisify.customArgs');
@@ -559,6 +561,38 @@ function inherits(ctor, superCtor) {
   Object.setPrototypeOf(ctor.prototype, superCtor.prototype);
 }
 
+function matchBipartite(remA, remB, eqFn) {
+  const n = remA.length;
+  if (n !== remB.length) return false;
+  if (n === 0) return true;
+  const matchB = new Int32Array(n).fill(-1);
+  const edgeCache = new Int8Array(n * n).fill(-1);
+  function canMatch(i, j) {
+    const idx = i * n + j;
+    const cached = edgeCache[idx];
+    if (cached !== -1) return cached === 1;
+    const ok = eqFn(remA[i], remB[j]);
+    edgeCache[idx] = ok ? 1 : 0;
+    return ok;
+  }
+  function tryAugment(i, seen) {
+    for (let j = 0; j < n; j++) {
+      if (seen[j] || !canMatch(i, j)) continue;
+      seen[j] = 1;
+      if (matchB[j] === -1 || tryAugment(matchB[j], seen)) {
+        matchB[j] = i;
+        return true;
+      }
+    }
+    return false;
+  }
+  for (let i = 0; i < n; i++) {
+    const seen = new Uint8Array(n);
+    if (!tryAugment(i, seen)) return false;
+  }
+  return true;
+}
+
 function innerDeepStrictEqual(a, b, memos) {
   if (Object.is(a, b)) {
     return true;
@@ -583,16 +617,22 @@ function innerDeepStrictEqual(a, b, memos) {
     if (a.source !== b.source || a.flags !== b.flags || a.lastIndex !== b.lastIndex) return false;
   }
   if (types.isBoxedPrimitive(a)) {
-    return Object.is(a.valueOf(), b.valueOf());
+    if (!Object.is(a.valueOf(), b.valueOf())) return false;
   }
   if (ArrayBuffer.isView(a)) {
     if (a.byteLength !== b.byteLength) return false;
-    const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
-    const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
-    for (let i = 0; i < ua.length; i++) {
-      if (ua[i] !== ub[i]) return false;
+    if (tagA === '[object Float32Array]' || tagA === '[object Float64Array]') {
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        if (!Object.is(a[i], b[i])) return false;
+      }
+    } else {
+      const ua = new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+      const ub = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+      for (let i = 0; i < ua.length; i++) {
+        if (ua[i] !== ub[i]) return false;
+      }
     }
-    return true;
   }
   if (tagA === '[object ArrayBuffer]' || tagA === '[object SharedArrayBuffer]') {
     if (a.byteLength !== b.byteLength) return false;
@@ -601,7 +641,6 @@ function innerDeepStrictEqual(a, b, memos) {
     for (let i = 0; i < ua.length; i++) {
       if (ua[i] !== ub[i]) return false;
     }
-    return true;
   }
 
   // Active-path 1-to-1 circular pair memoization
@@ -622,10 +661,10 @@ function innerDeepStrictEqual(a, b, memos) {
     if (Array.isArray(a)) {
       if (a.length !== b.length) return false;
       for (let i = 0; i < a.length; i++) {
-        if (
-          Object.prototype.hasOwnProperty.call(a, i) !== Object.prototype.hasOwnProperty.call(b, i) ||
-          !innerDeepStrictEqual(a[i], b[i], memos)
-        ) {
+        const hasA = Object.prototype.hasOwnProperty.call(a, i);
+        const hasB = Object.prototype.hasOwnProperty.call(b, i);
+        if (hasA !== hasB) return false;
+        if (hasA && !innerDeepStrictEqual(a[i], b[i], memos)) {
           return false;
         }
       }
@@ -633,41 +672,60 @@ function innerDeepStrictEqual(a, b, memos) {
 
     if (tagA === '[object Set]') {
       if (a.size !== b.size) return false;
-      const bVals = Array.from(b.values());
+      const remA = [];
+      const remB = [];
       for (const av of a.values()) {
-        let matched = false;
-        for (let i = 0; i < bVals.length; i++) {
-          if (innerDeepStrictEqual(av, bVals[i], memos)) {
-            bVals.splice(i, 1);
-            matched = true;
-            break;
-          }
+        if (av === null || (typeof av !== 'object' && typeof av !== 'function')) {
+          if (!b.has(av)) return false;
+        } else {
+          remA.push(av);
         }
-        if (!matched) return false;
+      }
+      for (const bv of b.values()) {
+        if (bv !== null && (typeof bv === 'object' || typeof bv === 'function')) {
+          remB.push(bv);
+        }
+      }
+      if (!matchBipartite(remA, remB, (x, y) => innerDeepStrictEqual(x, y, memos))) {
+        return false;
       }
     }
 
     if (tagA === '[object Map]') {
       if (a.size !== b.size) return false;
-      const bEntries = Array.from(b.entries());
+      const remA = [];
+      const remB = [];
       for (const [ak, av] of a.entries()) {
-        let matched = false;
-        for (let i = 0; i < bEntries.length; i++) {
-          if (
-            innerDeepStrictEqual(ak, bEntries[i][0], memos) &&
-            innerDeepStrictEqual(av, bEntries[i][1], memos)
-          ) {
-            bEntries.splice(i, 1);
-            matched = true;
-            break;
-          }
+        if (ak === null || (typeof ak !== 'object' && typeof ak !== 'function')) {
+          if (!b.has(ak)) return false;
+          if (!innerDeepStrictEqual(av, b.get(ak), memos)) return false;
+        } else {
+          remA.push([ak, av]);
         }
-        if (!matched) return false;
+      }
+      for (const [bk, bv] of b.entries()) {
+        if (bk !== null && (typeof bk === 'object' || typeof bk === 'function')) {
+          remB.push([bk, bv]);
+        }
+      }
+      if (
+        !matchBipartite(
+          remA,
+          remB,
+          ([ak, av], [bk, bv]) =>
+            innerDeepStrictEqual(ak, bk, memos) && innerDeepStrictEqual(av, bv, memos)
+        )
+      ) {
+        return false;
       }
     }
 
     if (types.isNativeError(a)) {
       if (a.name !== b.name || a.message !== b.message) return false;
+      const hasCauseA = 'cause' in a;
+      const hasCauseB = 'cause' in b;
+      if (hasCauseA !== hasCauseB) return false;
+      if (hasCauseA && !innerDeepStrictEqual(a.cause, b.cause, memos)) return false;
     }
 
     const keysA = Object.keys(a);
@@ -717,83 +775,14 @@ class TextEncoder {
   }
 
   encode(input = '') {
-    const str = String(input);
-    const bytes = [];
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      if (code < 0x80) {
-        bytes.push(code);
-      } else if (code < 0x800) {
-        bytes.push(0xc0 | (code >> 6), 0x80 | (code & 0x3f));
-      } else if (code >= 0xd800 && code <= 0xdbff) {
-        if (i + 1 < str.length) {
-          const low = str.charCodeAt(i + 1);
-          if (low >= 0xdc00 && low <= 0xdfff) {
-            const cp = 0x10000 + (((code - 0xd800) << 10) | (low - 0xdc00));
-            bytes.push(
-              0xf0 | (cp >> 18),
-              0x80 | ((cp >> 12) & 0x3f),
-              0x80 | ((cp >> 6) & 0x3f),
-              0x80 | (cp & 0x3f)
-            );
-            i++;
-            continue;
-          }
-        }
-        bytes.push(0xef, 0xbf, 0xbd);
-      } else if (code >= 0xdc00 && code <= 0xdfff) {
-        bytes.push(0xef, 0xbf, 0xbd);
-      } else {
-        bytes.push(0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f));
-      }
-    }
-    return new Uint8Array(bytes);
+    return new Uint8Array(utf8ToBytes(String(input)));
   }
 
   encodeInto(source, destination) {
     if (!(destination instanceof Uint8Array)) {
       throw new TypeError('The "destination" argument must be an instance of Uint8Array.');
     }
-    const str = String(source);
-    let read = 0;
-    let written = 0;
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      let seq;
-      let units = 1;
-      if (code < 0x80) {
-        seq = [code];
-      } else if (code < 0x800) {
-        seq = [0xc0 | (code >> 6), 0x80 | (code & 0x3f)];
-      } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
-        const low = str.charCodeAt(i + 1);
-        if (low >= 0xdc00 && low <= 0xdfff) {
-          const cp = 0x10000 + (((code - 0xd800) << 10) | (low - 0xdc00));
-          seq = [
-            0xf0 | (cp >> 18),
-            0x80 | ((cp >> 12) & 0x3f),
-            0x80 | ((cp >> 6) & 0x3f),
-            0x80 | (cp & 0x3f),
-          ];
-          units = 2;
-        } else {
-          seq = [0xef, 0xbf, 0xbd];
-        }
-      } else if (code >= 0xd800 && code <= 0xdfff) {
-        seq = [0xef, 0xbf, 0xbd];
-      } else {
-        seq = [0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)];
-      }
-      if (written + seq.length > destination.length) {
-        break;
-      }
-      for (let j = 0; j < seq.length; j++) {
-        destination[written++] = seq[j];
-      }
-      read += units;
-      if (units === 2) i++;
-    }
-    return { read, written };
+    return utf8EncodeInto(String(source), destination, 0, destination.length);
   }
 }
 
@@ -864,98 +853,10 @@ class TextDecoder {
       return out;
     }
 
-    let i = 0;
-    if (!this._ignoreBOM && bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-      i = 3;
-    }
-    const chunks = [];
-    while (i < bytes.length) {
-      const b0 = bytes[i];
-      if (b0 < 0x80) {
-        chunks.push(String.fromCharCode(b0));
-        i += 1;
-      } else if (b0 >= 0xc2 && b0 <= 0xdf) {
-        if (i + 1 < bytes.length) {
-          const b1 = bytes[i + 1];
-          if (b1 >= 0x80 && b1 <= 0xbf) {
-            const cp = ((b0 & 0x1f) << 6) | (b1 & 0x3f);
-            chunks.push(String.fromCharCode(cp));
-            i += 2;
-            continue;
-          }
-        }
-        if (this._fatal) throw new TypeError('The encoded data was not valid.');
-        chunks.push('\ufffd');
-        i += 1;
-      } else if (b0 >= 0xe0 && b0 <= 0xef) {
-        const lower = b0 === 0xe0 ? 0xa0 : 0x80;
-        const upper = b0 === 0xed ? 0x9f : 0xbf;
-        if (i + 1 < bytes.length) {
-          const b1 = bytes[i + 1];
-          if (b1 >= lower && b1 <= upper) {
-            if (i + 2 < bytes.length) {
-              const b2 = bytes[i + 2];
-              if (b2 >= 0x80 && b2 <= 0xbf) {
-                const cp = ((b0 & 0x0f) << 12) | ((b1 & 0x3f) << 6) | (b2 & 0x3f);
-                chunks.push(String.fromCharCode(cp));
-                i += 3;
-                continue;
-              }
-            }
-            if (this._fatal) throw new TypeError('The encoded data was not valid.');
-            chunks.push('\ufffd');
-            i += 2;
-            continue;
-          }
-        }
-        if (this._fatal) throw new TypeError('The encoded data was not valid.');
-        chunks.push('\ufffd');
-        i += 1;
-      } else if (b0 >= 0xf0 && b0 <= 0xf4) {
-        const lower = b0 === 0xf0 ? 0x90 : 0x80;
-        const upper = b0 === 0xf4 ? 0x8f : 0xbf;
-        if (i + 1 < bytes.length) {
-          const b1 = bytes[i + 1];
-          if (b1 >= lower && b1 <= upper) {
-            if (i + 2 < bytes.length) {
-              const b2 = bytes[i + 2];
-              if (b2 >= 0x80 && b2 <= 0xbf) {
-                if (i + 3 < bytes.length) {
-                  const b3 = bytes[i + 3];
-                  if (b3 >= 0x80 && b3 <= 0xbf) {
-                    const cp =
-                      ((b0 & 0x07) << 18) |
-                      ((b1 & 0x3f) << 12) |
-                      ((b2 & 0x3f) << 6) |
-                      (b3 & 0x3f);
-                    const adj = cp - 0x10000;
-                    chunks.push(String.fromCharCode(0xd800 + (adj >> 10), 0xdc00 + (adj & 0x3ff)));
-                    i += 4;
-                    continue;
-                  }
-                }
-                if (this._fatal) throw new TypeError('The encoded data was not valid.');
-                chunks.push('\ufffd');
-                i += 3;
-                continue;
-              }
-            }
-            if (this._fatal) throw new TypeError('The encoded data was not valid.');
-            chunks.push('\ufffd');
-            i += 2;
-            continue;
-          }
-        }
-        if (this._fatal) throw new TypeError('The encoded data was not valid.');
-        chunks.push('\ufffd');
-        i += 1;
-      } else {
-        if (this._fatal) throw new TypeError('The encoded data was not valid.');
-        chunks.push('\ufffd');
-        i += 1;
-      }
-    }
-    return chunks.join('');
+    return bytesToUtf8(bytes, 0, bytes.length, {
+      fatal: this._fatal,
+      ignoreBOM: this._ignoreBOM,
+    });
   }
 }
 

@@ -233,7 +233,7 @@ impl BreadcrumbsBar {
 
     pub fn compute_item_rects(&self, bounds: Rect, font: &FontMetrics) -> Vec<(usize, Rect)> {
         let mut rects = Vec::new();
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return rects;
         }
         let mut cur_x = bounds.min_x() + 10.0;
@@ -248,7 +248,7 @@ impl BreadcrumbsBar {
             let label_w = font.text_width(&item.label).max(8.0);
             let clamped_w = label_w.min((bounds.max_x() - cur_x).max(0.0));
             let rect = Rect::from_xywh(cur_x, bounds.min_y(), clamped_w, bounds.height());
-            if !crate::is_finite_rect(rect) {
+            if !rect.is_finite() {
                 break;
             }
             rects.push((idx, rect));
@@ -266,7 +266,7 @@ impl View for BreadcrumbsBar {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
 
@@ -321,7 +321,7 @@ impl View for BreadcrumbsBar {
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
         match event {
             InputEvent::MouseDown(mouse) => {
-                if !crate::is_finite_positive_rect(bounds)
+                if !bounds.is_finite_positive()
                     || !mouse.position.x.is_finite()
                     || !mouse.position.y.is_finite()
                     || !bounds.contains(mouse.position)

@@ -2,6 +2,8 @@
 
 use crate::syntax::registry::GrammarRegistry;
 use crate::syntax::scope::{Grammar, GrammarState, SyntaxScope, TokenSpan};
+#[cfg(feature = "desktop")]
+use crate::syntax::treesitter::TreeSitterDocument;
 use rustcode_platform::fs::hash_content;
 use rustcode_platform::render::Rgba;
 use rustcode_platform::theme::ColorTheme;
@@ -18,6 +20,8 @@ pub struct SyntaxHighlighter {
     grammar: Arc<dyn Grammar>,
     theme: ColorTheme,
     cache: Vec<Option<LineCacheEntry>>,
+    #[cfg(feature = "desktop")]
+    tree_sitter: Option<TreeSitterDocument>,
 }
 
 impl SyntaxHighlighter {
@@ -26,6 +30,8 @@ impl SyntaxHighlighter {
             grammar,
             theme,
             cache: Vec::new(),
+            #[cfg(feature = "desktop")]
+            tree_sitter: None,
         }
     }
 
@@ -36,6 +42,52 @@ impl SyntaxHighlighter {
         Self::new(grammar, theme)
     }
 
+    #[cfg(feature = "desktop")]
+    pub fn enable_tree_sitter(&mut self, lang_id: &str, initial_text: &str) -> bool {
+        if let Ok(doc) = TreeSitterDocument::new(lang_id, initial_text) {
+            self.tree_sitter = Some(doc);
+            self.cache.clear();
+            true
+        } else {
+            self.tree_sitter = None;
+            false
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    pub fn has_tree_sitter(&self) -> bool {
+        self.tree_sitter.is_some()
+    }
+
+    #[cfg(feature = "desktop")]
+    pub fn sync_tree_sitter_text(&mut self, new_text: &str) {
+        if let Some(ts) = self.tree_sitter.as_mut() {
+            if ts.text() != new_text {
+                ts.sync_text(new_text);
+                self.cache.clear();
+            }
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    pub fn apply_tree_sitter_edit(
+        &mut self,
+        start_byte: usize,
+        deleted_len: usize,
+        inserted_text: &str,
+        new_full_text: &str,
+    ) {
+        if let Some(ts) = self.tree_sitter.as_mut() {
+            ts.apply_byte_edit(start_byte, deleted_len, inserted_text, new_full_text);
+            self.cache.clear();
+        }
+    }
+
+    #[cfg(feature = "desktop")]
+    pub fn tree_sitter_document(&self) -> Option<&TreeSitterDocument> {
+        self.tree_sitter.as_ref()
+    }
+
     pub fn grammar(&self) -> &Arc<dyn Grammar> {
         &self.grammar
     }
@@ -43,6 +95,10 @@ impl SyntaxHighlighter {
     pub fn set_grammar(&mut self, grammar: Arc<dyn Grammar>) {
         self.grammar = grammar;
         self.cache.clear();
+        #[cfg(feature = "desktop")]
+        {
+            self.tree_sitter = None;
+        }
     }
 
     pub fn theme(&self) -> &ColorTheme {
@@ -54,7 +110,7 @@ impl SyntaxHighlighter {
         self.theme = theme;
         for entry in self.cache.iter_mut().flatten() {
             for span in &mut entry.tokens {
-                span.color = Some(Self::resolve_color(&self.theme, span.scope));
+                span.color = Some(Self::resolve_span_color(&self.theme, span));
             }
         }
     }
@@ -88,20 +144,35 @@ impl SyntaxHighlighter {
             }
         }
 
-        // Determine starting grammar state from previous line
-        let prev_state = if line_idx > 0 && line_idx - 1 < self.cache.len() {
-            self.cache[line_idx - 1]
-                .as_ref()
-                .and_then(|e| e.end_state.as_ref())
+        #[cfg(feature = "desktop")]
+        let (mut tokens, end_state) = if let Some(ts) = &self.tree_sitter {
+            (ts.line_tokens(line_idx, line_text), None)
         } else {
-            None
+            let prev_state = if line_idx > 0 && line_idx - 1 < self.cache.len() {
+                self.cache[line_idx - 1]
+                    .as_ref()
+                    .and_then(|e| e.end_state.as_ref())
+            } else {
+                None
+            };
+            self.grammar.tokenize_line(line_text, prev_state)
         };
 
-        let (mut tokens, end_state) = self.grammar.tokenize_line(line_text, prev_state);
+        #[cfg(not(feature = "desktop"))]
+        let (mut tokens, end_state) = {
+            let prev_state = if line_idx > 0 && line_idx - 1 < self.cache.len() {
+                self.cache[line_idx - 1]
+                    .as_ref()
+                    .and_then(|e| e.end_state.as_ref())
+            } else {
+                None
+            };
+            self.grammar.tokenize_line(line_text, prev_state)
+        };
 
         // Resolve colors for each token span using active theme
         for span in &mut tokens {
-            span.color = Some(Self::resolve_color(&self.theme, span.scope));
+            span.color = Some(Self::resolve_span_color(&self.theme, span));
         }
 
         // Ensure cache capacity
@@ -116,6 +187,34 @@ impl SyntaxHighlighter {
         });
 
         &self.cache[line_idx].as_ref().unwrap().tokens
+    }
+
+    /// Resolve a `TokenSpan`'s foreground color using its exact TextMate scope (if present)
+    /// and falling back to `SyntaxScope`.
+    pub fn resolve_span_color(theme: &ColorTheme, span: &TokenSpan) -> Rgba {
+        if let Some(tm_scope) = &span.tm_scope {
+            let mut best_score = 0;
+            let mut best_color_hex: Option<&str> = None;
+            for tok_part in tm_scope.split_whitespace() {
+                for rule in &theme.token_colors {
+                    if let Some(hex) = &rule.foreground {
+                        for rule_scope in &rule.scope {
+                            let score = compute_scope_match_score(tok_part, rule_scope);
+                            if score > best_score {
+                                best_score = score;
+                                best_color_hex = Some(hex);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(hex) = best_color_hex {
+                if let Some(color) = Rgba::from_hex(hex) {
+                    return color;
+                }
+            }
+        }
+        Self::resolve_color(theme, span.scope)
     }
 
     /// Resolve a `SyntaxScope` to an `Rgba` foreground color using the theme's `token_colors` rules.

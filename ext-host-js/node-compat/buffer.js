@@ -133,9 +133,58 @@ function utf8ByteLength(str) {
   return len;
 }
 
-function bytesToUtf8(buf, start, end) {
+function utf8EncodeInto(str, destination, offset = 0, maxBytes = destination.length - offset) {
+  let read = 0;
+  let written = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    let charBytes;
+    let units = 1;
+    if (code < 0x80) {
+      charBytes = [code];
+    } else if (code < 0x800) {
+      charBytes = [0xc0 | (code >> 6), 0x80 | (code & 0x3f)];
+    } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < str.length) {
+      const low = str.charCodeAt(i + 1);
+      if (low >= 0xdc00 && low <= 0xdfff) {
+        const cp = 0x10000 + (((code - 0xd800) << 10) | (low - 0xdc00));
+        charBytes = [
+          0xf0 | (cp >> 18),
+          0x80 | ((cp >> 12) & 0x3f),
+          0x80 | ((cp >> 6) & 0x3f),
+          0x80 | (cp & 0x3f),
+        ];
+        units = 2;
+      } else {
+        charBytes = [0xef, 0xbf, 0xbd];
+      }
+    } else if (code >= 0xd800 && code <= 0xdfff) {
+      charBytes = [0xef, 0xbf, 0xbd];
+    } else {
+      charBytes = [0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)];
+    }
+    if (written + charBytes.length > maxBytes) {
+      break;
+    }
+    for (let j = 0; j < charBytes.length; j++) {
+      destination[offset + written++] = charBytes[j];
+    }
+    read += units;
+    if (units === 2) {
+      i++;
+    }
+  }
+  return { read, written };
+}
+
+function bytesToUtf8(buf, start = 0, end = buf.length, options = {}) {
+  const fatal = Boolean(options && options.fatal);
+  const ignoreBOM = options && options.ignoreBOM !== undefined ? Boolean(options.ignoreBOM) : true;
   const chunks = [];
   let i = start;
+  if (!ignoreBOM && end - i >= 3 && buf[i] === 0xef && buf[i + 1] === 0xbb && buf[i + 2] === 0xbf) {
+    i += 3;
+  }
   while (i < end) {
     const b0 = buf[i];
     if (b0 < 0x80) {
@@ -150,6 +199,9 @@ function bytesToUtf8(buf, start, end) {
           i += 2;
           continue;
         }
+      }
+      if (fatal) {
+        throw new TypeError('The encoded data was not valid.');
       }
       chunks.push('\ufffd');
       i += 1;
@@ -169,10 +221,16 @@ function bytesToUtf8(buf, start, end) {
             }
           }
           // Maximal subpart is [b0, b1]
+          if (fatal) {
+            throw new TypeError('The encoded data was not valid.');
+          }
           chunks.push('\ufffd');
           i += 2;
           continue;
         }
+      }
+      if (fatal) {
+        throw new TypeError('The encoded data was not valid.');
       }
       chunks.push('\ufffd');
       i += 1;
@@ -197,20 +255,32 @@ function bytesToUtf8(buf, start, end) {
                 }
               }
               // Maximal subpart is [b0, b1, b2]
+              if (fatal) {
+                throw new TypeError('The encoded data was not valid.');
+              }
               chunks.push('\ufffd');
               i += 3;
               continue;
             }
           }
           // Maximal subpart is [b0, b1]
+          if (fatal) {
+            throw new TypeError('The encoded data was not valid.');
+          }
           chunks.push('\ufffd');
           i += 2;
           continue;
         }
       }
+      if (fatal) {
+        throw new TypeError('The encoded data was not valid.');
+      }
       chunks.push('\ufffd');
       i += 1;
     } else {
+      if (fatal) {
+        throw new TypeError('The encoded data was not valid.');
+      }
       chunks.push('\ufffd');
       i += 1;
     }
@@ -265,7 +335,7 @@ function base64ToBytes(str) {
   return out;
 }
 
-function bytesToBase64(buf, start, end, urlSafe) {
+function bytesToBase64(buf, start = 0, end = buf.length, urlSafe = false) {
   const alphabet = urlSafe ? BASE64URL_CHARS : BASE64_CHARS;
   const parts = [];
   for (let i = start; i < end; i += 3) {
@@ -283,6 +353,53 @@ function bytesToBase64(buf, start, end, urlSafe) {
     );
   }
   return parts.join('');
+}
+
+function decodeBytes(buf, encoding = 'utf8', start = 0, end = buf.length) {
+  const enc = normalizeEncoding(encoding);
+  const s = start === undefined ? 0 : Math.max(0, Math.trunc(Number(start) || 0));
+  const e = end === undefined ? buf.length : Math.min(buf.length, Math.trunc(Number(end) || 0));
+  if (e <= s) {
+    return '';
+  }
+  switch (enc) {
+    case 'utf8':
+      return bytesToUtf8(buf, s, e);
+    case 'ascii': {
+      let out = '';
+      for (let i = s; i < e; i++) {
+        out += String.fromCharCode(buf[i] & 0x7f);
+      }
+      return out;
+    }
+    case 'latin1': {
+      let out = '';
+      for (let i = s; i < e; i++) {
+        out += String.fromCharCode(buf[i]);
+      }
+      return out;
+    }
+    case 'utf16le': {
+      let out = '';
+      for (let i = s; i + 1 < e; i += 2) {
+        out += String.fromCharCode(buf[i] | (buf[i + 1] << 8));
+      }
+      return out;
+    }
+    case 'hex': {
+      let out = '';
+      for (let i = s; i < e; i++) {
+        out += buf[i].toString(16).padStart(2, '0');
+      }
+      return out;
+    }
+    case 'base64':
+      return bytesToBase64(buf, s, e, false);
+    case 'base64url':
+      return bytesToBase64(buf, s, e, true);
+    default:
+      return bytesToUtf8(buf, s, e);
+  }
 }
 
 function encodeString(str, encoding) {
@@ -531,50 +648,7 @@ class Buffer extends Uint8Array {
   }
 
   toString(encoding = 'utf8', start = 0, end = this.length) {
-    const enc = normalizeEncoding(encoding);
-    const s = start === undefined ? 0 : Math.max(0, Math.trunc(Number(start) || 0));
-    const e = end === undefined ? this.length : Math.min(this.length, Math.trunc(Number(end) || 0));
-    if (e <= s) {
-      return '';
-    }
-    switch (enc) {
-      case 'utf8':
-        return bytesToUtf8(this, s, e);
-      case 'ascii': {
-        let out = '';
-        for (let i = s; i < e; i++) {
-          out += String.fromCharCode(this[i] & 0x7f);
-        }
-        return out;
-      }
-      case 'latin1': {
-        let out = '';
-        for (let i = s; i < e; i++) {
-          out += String.fromCharCode(this[i]);
-        }
-        return out;
-      }
-      case 'utf16le': {
-        let out = '';
-        for (let i = s; i + 1 < e; i += 2) {
-          out += String.fromCharCode(this[i] | (this[i + 1] << 8));
-        }
-        return out;
-      }
-      case 'hex': {
-        let out = '';
-        for (let i = s; i < e; i++) {
-          out += this[i].toString(16).padStart(2, '0');
-        }
-        return out;
-      }
-      case 'base64':
-        return bytesToBase64(this, s, e, false);
-      case 'base64url':
-        return bytesToBase64(this, s, e, true);
-      default:
-        return bytesToUtf8(this, s, e);
-    }
+    return decodeBytes(this, encoding, start, end);
   }
 
   write(string, offset, length, encoding) {
@@ -626,42 +700,7 @@ class Buffer extends Uint8Array {
 
     const enc = normalizeEncoding(encoding);
     if (enc === 'utf8') {
-      // Write whole UTF-8 characters without splitting multi-byte sequences
-      let written = 0;
-      for (let i = 0; i < string.length; i++) {
-        let code = string.charCodeAt(i);
-        let charBytes;
-        if (code < 0x80) {
-          charBytes = [code];
-        } else if (code < 0x800) {
-          charBytes = [0xc0 | (code >> 6), 0x80 | (code & 0x3f)];
-        } else if (code >= 0xd800 && code <= 0xdbff && i + 1 < string.length) {
-          const low = string.charCodeAt(i + 1);
-          if (low >= 0xdc00 && low <= 0xdfff) {
-            const cp = 0x10000 + (((code - 0xd800) << 10) | (low - 0xdc00));
-            charBytes = [
-              0xf0 | (cp >> 18),
-              0x80 | ((cp >> 12) & 0x3f),
-              0x80 | ((cp >> 6) & 0x3f),
-              0x80 | (cp & 0x3f),
-            ];
-            i++;
-          } else {
-            charBytes = [0xef, 0xbf, 0xbd];
-          }
-        } else if (code >= 0xd800 && code <= 0xdfff) {
-          charBytes = [0xef, 0xbf, 0xbd];
-        } else {
-          charBytes = [0xe0 | (code >> 12), 0x80 | ((code >> 6) & 0x3f), 0x80 | (code & 0x3f)];
-        }
-        if (written + charBytes.length > maxBytes) {
-          break;
-        }
-        for (let j = 0; j < charBytes.length; j++) {
-          this[offset + written++] = charBytes[j];
-        }
-      }
-      return written;
+      return utf8EncodeInto(string, this, offset, maxBytes).written;
     }
 
     const bytes = encodeString(string, enc);
@@ -1174,4 +1213,11 @@ module.exports = {
   kMaxLength,
   INSPECT_MAX_BYTES,
   constants,
+  utf8ToBytes,
+  utf8EncodeInto,
+  bytesToUtf8,
+  base64ToBytes,
+  bytesToBase64,
+  encodeString,
+  decodeBytes,
 };

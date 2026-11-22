@@ -14,6 +14,7 @@ const nodeUtil = typeof require === 'function'
   })()
   : null;
 
+const MAX_HEADER_BYTES = 64 * 1024;
 const MAX_RPC_FRAME_BYTES = 64 * 1024 * 1024;
 const BRIDGE_STATE_SYMBOL = Symbol.for('rustcode.rpcBridgeState');
 const rootGlobal = typeof globalThis !== 'undefined'
@@ -85,6 +86,7 @@ function encodeRpcFrame(msg, format) {
 
 function parseContentLengthHeader(headerStr) {
   const lines = headerStr.split('\n');
+  let contentLength = null;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (!line) {
@@ -96,6 +98,9 @@ function parseContentLengthHeader(headerStr) {
     }
     const key = line.slice(0, colonIdx).trim().toLowerCase();
     if (key === 'content-length') {
+      if (contentLength !== null) {
+        throw new Error('Duplicate Content-Length header');
+      }
       const valStr = line.slice(colonIdx + 1).trim();
       if (!valStr) {
         throw new Error('Invalid empty Content-Length header');
@@ -110,10 +115,13 @@ function parseContentLengthHeader(headerStr) {
       if (!Number.isSafeInteger(len) || len < 0 || len > MAX_RPC_FRAME_BYTES) {
         throw new Error('Out-of-range Content-Length header: ' + valStr);
       }
-      return len;
+      contentLength = len;
     }
   }
-  throw new Error('Missing Content-Length header');
+  if (contentLength === null) {
+    throw new Error('Missing Content-Length header');
+  }
+  return contentLength;
 }
 
 function sendStdioFrame(msg) {
@@ -130,6 +138,9 @@ function drainStdioBuffer(transport, onMessage) {
     while (true) {
       const nlIdx = transport.buffer.indexOf(0x0a);
       if (nlIdx === -1) {
+        if (transport.buffer.length > MAX_RPC_FRAME_BYTES) {
+          throw new Error('RPC line exceeds maximum size');
+        }
         break;
       }
       const lineStr = transport.buffer.subarray(0, nlIdx).toString('utf8').trim();
@@ -159,8 +170,10 @@ function drainStdioBuffer(transport, onMessage) {
       transport.buffer = transport.buffer.subarray(lead);
     }
 
-    const crlfIdx = transport.buffer.indexOf('\r\n\r\n');
-    const lfIdx = transport.buffer.indexOf('\n\n');
+    const searchEnd = Math.min(transport.buffer.length, MAX_HEADER_BYTES);
+    const searchSlice = transport.buffer.subarray(0, searchEnd);
+    const crlfIdx = searchSlice.indexOf('\r\n\r\n');
+    const lfIdx = searchSlice.indexOf('\n\n');
     let headerEnd = -1;
     let bodyStart = -1;
     if (crlfIdx !== -1 && (lfIdx === -1 || crlfIdx <= lfIdx)) {
@@ -170,6 +183,9 @@ function drainStdioBuffer(transport, onMessage) {
       headerEnd = lfIdx;
       bodyStart = lfIdx + 2;
     } else {
+      if (transport.buffer.length >= MAX_HEADER_BYTES) {
+        throw new Error('RPC header exceeds maximum size of ' + MAX_HEADER_BYTES + ' bytes');
+      }
       break;
     }
 
@@ -578,6 +594,7 @@ const rpc = {
       try {
         drainStdioBuffer(transport, dispatchIncomingStdioMessage);
       } catch (err) {
+        transport.buffer = Buffer.alloc(0);
         if (process.stderr) {
           process.stderr.write('[RustCode ExtHost] Stdio frame error: ' + err.message + '\n');
         }
@@ -616,6 +633,7 @@ const rpc = {
       return;
     }
     transport.active = false;
+    transport.buffer = Buffer.alloc(0);
     bridgeState.stdioTransport = null;
 
     if (transport.input) {

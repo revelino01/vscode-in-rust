@@ -943,7 +943,7 @@ impl LanguageFeatureBridge {
                     OpenDocumentSnapshot::from_parts(
                         target_uri.to_string(),
                         path.to_string_lossy().into_owned(),
-                        map_ext_to_lang_id(ext),
+                        rustcode_base::map_ext_to_lang_id(ext),
                         1,
                         String::new(),
                         false,
@@ -2134,7 +2134,7 @@ impl LanguageFeatureBridge {
             let snap = OpenDocumentSnapshot::from_parts(
                 uri.to_string(),
                 path.to_string_lossy().into_owned(),
-                map_ext_to_lang_id(ext),
+                rustcode_base::map_ext_to_lang_id(ext),
                 1,
                 String::new(),
                 false,
@@ -2625,7 +2625,7 @@ impl LanguageFeatureBridge {
             .await
             .map_err(|e| RpcError::from_prefixed_string(map_fs_error(e)))?;
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        let language_id = map_ext_to_lang_id(ext);
+        let language_id = rustcode_base::map_ext_to_lang_id(ext);
         let snap = OpenDocumentSnapshot::from_parts(
             canonical_uri.clone(),
             path.to_string_lossy().into_owned(),
@@ -2688,7 +2688,7 @@ impl LanguageFeatureBridge {
                 let s = OpenDocumentSnapshot::from_parts(
                     uri_str.clone(),
                     path.to_string_lossy().into_owned(),
-                    map_ext_to_lang_id(ext),
+                    rustcode_base::map_ext_to_lang_id(ext),
                     1,
                     text,
                     false,
@@ -3987,27 +3987,6 @@ fn traverse_config_parts(cur: &Value, parts: &[&str]) -> Option<Value> {
         }
     }
     None
-}
-
-fn map_ext_to_lang_id(ext: &str) -> String {
-    match ext.to_ascii_lowercase().as_str() {
-        "rs" => "rust".to_string(),
-        "js" | "jsx" | "mjs" | "cjs" => "javascript".to_string(),
-        "ts" | "tsx" | "mts" | "cts" => "typescript".to_string(),
-        "py" | "pyw" | "pyi" => "python".to_string(),
-        "json" | "jsonc" => "json".to_string(),
-        "md" | "markdown" => "markdown".to_string(),
-        "go" => "go".to_string(),
-        "c" | "h" => "c".to_string(),
-        "cpp" | "cc" | "cxx" | "hpp" => "cpp".to_string(),
-        "html" | "htm" => "html".to_string(),
-        "css" | "scss" | "less" => "css".to_string(),
-        "toml" => "toml".to_string(),
-        "yaml" | "yml" => "yaml".to_string(),
-        "sh" | "bash" => "shellscript".to_string(),
-        "" => "plaintext".to_string(),
-        other => other.to_string(),
-    }
 }
 
 fn map_manager_error(method: &str, err: String) -> RpcError {

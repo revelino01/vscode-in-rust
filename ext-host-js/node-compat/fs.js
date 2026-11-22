@@ -1,6 +1,7 @@
 // Node.js fs shim wrapping Rust ops / Deno ops / live stdio RPC
 
 const rpc = require('../rpc-bridge');
+const { base64ToBytes, bytesToBase64, encodeString, decodeBytes } = require('./buffer');
 
 const constants = {
   F_OK: 0,
@@ -169,51 +170,6 @@ function normalizeEncodingName(enc) {
   }
 }
 
-function decodeBase64Pure(str) {
-  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  const cleaned = str.replace(/[\r\n\s]/g, '').replace(/-/g, '+').replace(/_/g, '/');
-  const out = [];
-  let buffer = 0;
-  let bits = 0;
-  for (let i = 0; i < cleaned.length; i++) {
-    const ch = cleaned[i];
-    if (ch === '=') {
-      break;
-    }
-    const val = alphabet.indexOf(ch);
-    if (val === -1) {
-      continue;
-    }
-    buffer = (buffer << 6) | val;
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out.push((buffer >> bits) & 0xff);
-    }
-  }
-  return out;
-}
-
-function encodeBase64Pure(bytes, urlSafe) {
-  const alphabet = urlSafe
-    ? 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
-    : 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
-  let out = '';
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b0 = bytes[i];
-    const has1 = i + 1 < bytes.length;
-    const has2 = i + 2 < bytes.length;
-    const b1 = has1 ? bytes[i + 1] : 0;
-    const b2 = has2 ? bytes[i + 2] : 0;
-    const triple = (b0 << 16) | (b1 << 8) | b2;
-    out += alphabet[(triple >> 18) & 0x3f];
-    out += alphabet[(triple >> 12) & 0x3f];
-    out += has1 ? alphabet[(triple >> 6) & 0x3f] : (urlSafe ? '' : '=');
-    out += has2 ? alphabet[triple & 0x3f] : (urlSafe ? '' : '=');
-  }
-  return out;
-}
-
 function encodeWriteData(data, options) {
   if (data instanceof Uint8Array) {
     return Array.from(data);
@@ -232,43 +188,10 @@ function encodeWriteData(data, options) {
   if (typeof Buffer === 'function') {
     return Array.from(Buffer.from(str, enc));
   }
-  if (enc === 'ascii') {
-    const out = new Array(str.length);
-    for (let i = 0; i < str.length; i++) {
-      out[i] = str.charCodeAt(i) & 0x7f;
-    }
-    return out;
-  }
-  if (enc === 'latin1') {
-    const out = new Array(str.length);
-    for (let i = 0; i < str.length; i++) {
-      out[i] = str.charCodeAt(i) & 0xff;
-    }
-    return out;
-  }
-  if (enc === 'utf16le') {
-    const out = [];
-    for (let i = 0; i < str.length; i++) {
-      const code = str.charCodeAt(i);
-      out.push(code & 0xff, (code >> 8) & 0xff);
-    }
-    return out;
-  }
-  if (enc === 'hex') {
-    const out = [];
-    for (let i = 0; i + 1 < str.length; i += 2) {
-      const byte = Number.parseInt(str.slice(i, i + 2), 16);
-      if (Number.isNaN(byte)) {
-        break;
-      }
-      out.push(byte);
-    }
-    return out;
-  }
   if (enc === 'base64' || enc === 'base64url') {
-    return decodeBase64Pure(str);
+    return base64ToBytes(str);
   }
-  return str;
+  return encodeString(str, enc);
 }
 
 function decodeReadResult(res, enc) {
@@ -294,29 +217,13 @@ function decodeReadResult(res, enc) {
   if (typeof Buffer === 'function') {
     return Buffer.from(bytes).toString(enc);
   }
-  if (enc === 'ascii') {
-    return bytes.map((b) => String.fromCharCode(b & 0x7f)).join('');
-  }
-  if (enc === 'latin1') {
-    return bytes.map((b) => String.fromCharCode(b & 0xff)).join('');
-  }
-  if (enc === 'utf16le') {
-    let out = '';
-    for (let i = 0; i + 1 < bytes.length; i += 2) {
-      out += String.fromCharCode(bytes[i] | (bytes[i + 1] << 8));
-    }
-    return out;
-  }
-  if (enc === 'hex') {
-    return bytes.map((b) => b.toString(16).padStart(2, '0')).join('');
-  }
   if (enc === 'base64') {
-    return encodeBase64Pure(bytes, false);
+    return bytesToBase64(bytes, 0, bytes.length, false);
   }
   if (enc === 'base64url') {
-    return encodeBase64Pure(bytes, true);
+    return bytesToBase64(bytes, 0, bytes.length, true);
   }
-  return res;
+  return decodeBytes(bytes, enc, 0, bytes.length);
 }
 
 function normalizeMkdirOptions(options) {

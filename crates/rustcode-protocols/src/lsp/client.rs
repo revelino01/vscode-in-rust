@@ -1,7 +1,7 @@
 //! LSP client process lifecycle and request/notification routing.
 
-use super::codec::{read_framed_message, write_framed_message};
 use super::types::*;
+use crate::codec::{read_framed_message, write_framed_message, CodecError};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -17,7 +17,7 @@ pub enum LspError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("Codec error: {0}")]
-    Codec(#[from] super::codec::LspCodecError),
+    Codec(#[from] CodecError),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
     #[error("LSP server error: code {code}: {message}")]
@@ -42,6 +42,7 @@ pub struct LspClient {
     is_running: Arc<AtomicBool>,
     diagnostics: Arc<Mutex<HashMap<String, Vec<LspDiagnostic>>>>,
     diagnostics_listeners: Arc<Mutex<Vec<DiagnosticsListener>>>,
+    child: Arc<Mutex<Option<tokio::process::Child>>>,
 }
 
 impl LspClient {
@@ -56,7 +57,8 @@ impl LspClient {
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
 
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
@@ -72,7 +74,9 @@ impl LspClient {
             .take()
             .ok_or_else(|| std::io::Error::other("Failed to open child stdin"))?;
 
-        Ok(Self::from_io(stdout, stdin))
+        let client = Self::from_io(stdout, stdin);
+        *client.child.lock() = Some(child);
+        Ok(client)
     }
 
     /// Creates an LSP client connected to custom async reader/writer streams.
@@ -171,6 +175,7 @@ impl LspClient {
             is_running,
             diagnostics,
             diagnostics_listeners,
+            child: Arc::new(Mutex::new(None)),
         }
     }
 

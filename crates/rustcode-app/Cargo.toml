@@ -14,21 +14,23 @@ path = "src/main.rs"
 
 [features]
 default = []
-gpui = ["rustcode-workbench/gpui", "rustcode-platform/gpui"]
+desktop = ["rustcode-workbench/desktop", "rustcode-platform/desktop", "dep:winit", "dep:raw-window-handle"]
 
 [dependencies]
 rustcode-base = { path = "../rustcode-base" }
 rustcode-platform = { path = "../rustcode-platform" }
 rustcode-editor = { path = "../rustcode-editor" }
-rustcode-terminal = { path = "../rustcode-terminal" }
 rustcode-protocols = { path = "../rustcode-protocols" }
 rustcode-ext-host = { path = "../rustcode-ext-host" }
 rustcode-workbench = { path = "../rustcode-workbench" }
 parking_lot = "0.12"
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "macros", "time", "sync"] }
+winit = { version = "0.30", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
 
 [dev-dependencies]
+rustcode-terminal = { path = "../rustcode-terminal" }
 tokio = { version = "1", features = ["macros", "rt", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
 zip = { version = "9.6.1", default-features = false, features = ["deflate"] }

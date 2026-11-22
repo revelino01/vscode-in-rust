@@ -4,7 +4,9 @@ pub mod engine;
 pub mod symbols;
 
 pub use engine::{
-    search_files, search_text, FileSearchResult, SearchQuery, SearchResults, TextSearchMatch,
+    replace_in_text, replace_in_workspace, search_files, search_text, try_search_text,
+    FileSearchResult, ReplaceFileOutcome, SearchQuery, SearchResults, TextSearchMatch,
+    WorkspaceReplaceResult,
 };
 pub use symbols::{search_document_symbols, search_workspace_symbols};
 
@@ -24,6 +26,7 @@ pub enum SearchAction {
         col: usize,
     },
     ExecuteSearch,
+    ExecuteReplace,
     ClearSearch,
     ToggleMatchCase,
     ToggleWholeWord,
@@ -46,6 +49,8 @@ pub struct SearchView {
     pub selected_item: Option<usize>, // flat index across visible result rows
     pub focused_input: SearchInputFocus,
     pub last_action: Option<SearchAction>,
+    pub last_error: Option<String>,
+    pub last_replace_result: Option<WorkspaceReplaceResult>,
 }
 
 impl Default for SearchView {
@@ -65,17 +70,48 @@ impl SearchView {
             selected_item: None,
             focused_input: SearchInputFocus::Query,
             last_action: None,
+            last_error: None,
+            last_replace_result: None,
         }
     }
 
     /// Execute the current search across the given workspace folders.
     pub fn execute_search(&mut self, folders: &[WorkspaceFolder]) {
-        self.results = search_text(folders, &self.query);
-        self.selected_item = if self.results.total_matches > 0 {
-            Some(1) // first match line
-        } else {
-            None
-        };
+        match try_search_text(folders, &self.query) {
+            Ok(results) => {
+                self.results = results;
+                self.last_error = None;
+                self.selected_item = if self.results.total_matches > 0 {
+                    Some(1) // first match line
+                } else {
+                    None
+                };
+            }
+            Err(err) => {
+                self.results = SearchResults::default();
+                self.last_error = Some(err);
+                self.selected_item = None;
+            }
+        }
+    }
+
+    /// Replace all matches across the workspace and refresh results.
+    pub fn execute_replace(
+        &mut self,
+        folders: &[WorkspaceFolder],
+    ) -> Result<WorkspaceReplaceResult, String> {
+        match replace_in_workspace(folders, &self.query, &self.replace_text) {
+            Ok(outcome) => {
+                self.last_error = None;
+                self.last_replace_result = Some(outcome.clone());
+                self.execute_search(folders);
+                Ok(outcome)
+            }
+            Err(err) => {
+                self.last_error = Some(err.clone());
+                Err(err)
+            }
+        }
     }
 
     /// Clear results and query.
@@ -83,6 +119,8 @@ impl SearchView {
         self.query.query.clear();
         self.results = SearchResults::default();
         self.selected_item = None;
+        self.last_error = None;
+        self.last_replace_result = None;
     }
 
     pub fn set_query(&mut self, q: &str) {
@@ -226,17 +264,22 @@ impl View for SearchView {
 
         cur_y += input_h + 6.0;
 
-        // 3. Results Summary (height 20.0)
-        let summary_text = if self.results.total_matches > 0 {
-            format!(
-                "{} results in {} files",
-                self.results.total_matches,
-                self.results.file_results.len()
+        // 3. Results Summary / Error (height 20.0)
+        let (summary_text, summary_color) = if let Some(err) = &self.last_error {
+            (err.clone(), theme.editor_error_foreground)
+        } else if self.results.total_matches > 0 {
+            (
+                format!(
+                    "{} results in {} files",
+                    self.results.total_matches,
+                    self.results.file_results.len()
+                ),
+                theme.sidebar_header_fg,
             )
         } else if !self.query.query.is_empty() {
-            "No results found".to_string()
+            ("No results found".to_string(), theme.sidebar_header_fg)
         } else {
-            "".to_string()
+            (String::new(), theme.sidebar_header_fg)
         };
 
         if !summary_text.is_empty() {
@@ -245,7 +288,7 @@ impl View for SearchView {
                 summary_text,
                 Point::new(bounds.min_x() + pad_x, cur_y),
                 summary_rect,
-                theme.sidebar_header_fg,
+                summary_color,
                 font.font_size * 0.8,
             ));
             cur_y += 20.0;
@@ -554,5 +597,41 @@ mod tests {
                 col: 4,
             })
         );
+    }
+
+    #[test]
+    fn test_search_view_invalid_regex_error_and_replace() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustcode_sview_m3_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file = temp_dir.join("main.rs");
+        std::fs::write(&file, "let value_1 = 10;\n").unwrap();
+        let folders = vec![WorkspaceFolder::new(temp_dir.clone(), None, 0)];
+
+        let mut view = SearchView::new();
+        view.set_query("[bad_regex");
+        view.query.is_regex = true;
+        view.execute_search(&folders);
+        assert!(view.last_error.is_some());
+        assert_eq!(view.results.total_matches, 0);
+
+        let mut scene = Scene::new();
+        view.render(
+            Rect::from_xywh(0.0, 0.0, 260.0, 400.0),
+            &WorkbenchThemeStyles::dark_default(),
+            &FontMetrics::default_monospace(),
+            &mut scene,
+        );
+        assert!(scene.contains_text("Invalid search pattern"));
+
+        view.set_query(r"value_(\d+)");
+        view.replace_text = "item_$1".to_string();
+        let rep = view.execute_replace(&folders).unwrap();
+        assert_eq!(rep.files_modified, 1);
+        assert_eq!(rep.total_replacements, 1);
+        assert!(view.last_error.is_none());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "let item_1 = 10;\n");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

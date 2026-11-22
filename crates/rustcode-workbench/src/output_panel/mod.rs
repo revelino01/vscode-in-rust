@@ -378,7 +378,7 @@ impl OutputPanelView {
     }
 
     pub fn accessibility_node(&self, bounds: Rect, font: &FontMetrics) -> AccessibleNode {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return AccessibleNode::new(
                 "workbench.panel.output",
                 AccessibleRole::Panel,
@@ -503,7 +503,7 @@ impl View for OutputPanelView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         *self.last_font.write() = font.clone();
@@ -513,11 +513,10 @@ impl View for OutputPanelView {
         *self.last_line_height.write() = row_h;
         *self.last_content_height.write() = layout.log_rect.height();
 
-        crate::push_finite_quad(scene, Quad::new(bounds).with_background(theme.panel_bg));
+        scene.push_finite_quad(Quad::new(bounds).with_background(theme.panel_bg));
 
         // Toolbar
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(layout.toolbar_rect)
                 .with_background(theme.sidebar_bg)
                 .with_border_edges(theme.panel_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
@@ -527,15 +526,13 @@ impl View for OutputPanelView {
             .active_channel()
             .map(|c| format!("{} ▾", c.name))
             .unwrap_or_else(|| "No Channels ▾".to_string());
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(layout.selector_rect)
                 .with_background(theme.tab_inactive_bg)
                 .with_border(theme.panel_border, 1.0)
                 .with_corner_radius(3.0),
         );
-        crate::push_finite_text(
-            scene,
+        scene.push_finite_text(
             GlyphRun::new(
                 selector_label,
                 Point::new(layout.selector_rect.min_x() + 6.0, layout.selector_rect.min_y() + 3.0),
@@ -545,15 +542,13 @@ impl View for OutputPanelView {
             ),
         );
 
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(layout.clear_rect)
                 .with_background(theme.tab_inactive_bg)
                 .with_border(theme.panel_border, 1.0)
                 .with_corner_radius(3.0),
         );
-        crate::push_finite_text(
-            scene,
+        scene.push_finite_text(
             GlyphRun::new(
                 "Clear".to_string(),
                 Point::new(layout.clear_rect.min_x() + 8.0, layout.clear_rect.min_y() + 3.0),
@@ -568,8 +563,7 @@ impl View for OutputPanelView {
         } else {
             "Auto-Scroll: OFF"
         };
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(layout.auto_scroll_rect)
                 .with_background(if self.auto_scroll {
                     theme.list_active_selection_bg
@@ -579,8 +573,7 @@ impl View for OutputPanelView {
                 .with_border(theme.panel_border, 1.0)
                 .with_corner_radius(3.0),
         );
-        crate::push_finite_text(
-            scene,
+        scene.push_finite_text(
             GlyphRun::new(
                 auto_label.to_string(),
                 Point::new(
@@ -597,8 +590,7 @@ impl View for OutputPanelView {
         scene.push_clip(layout.log_rect);
         let lines = self.display_lines();
         if self.channels.is_empty() {
-            crate::push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     "No output channels.".to_string(),
                     Point::new(layout.log_rect.min_x() + 12.0, layout.log_rect.min_y() + 10.0),
@@ -613,8 +605,7 @@ impl View for OutputPanelView {
                 ),
             );
         } else if lines.is_empty() {
-            crate::push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     "Output channel is empty.".to_string(),
                     Point::new(layout.log_rect.min_x() + 12.0, layout.log_rect.min_y() + 10.0),
@@ -658,8 +649,7 @@ impl View for OutputPanelView {
                 } else {
                     theme.editor_foreground
                 };
-                crate::push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         (*line).to_string(),
                         Point::new(layout.log_rect.min_x() + 10.0, y),
@@ -679,8 +669,7 @@ impl View for OutputPanelView {
 
         // Dropdown overlay rendered after log area
         if self.dropdown_open && !layout.option_rects.is_empty() {
-            crate::push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(layout.dropdown_rect)
                     .with_background(theme.command_palette_bg)
                     .with_border(theme.command_palette_border, 1.0),
@@ -688,14 +677,12 @@ impl View for OutputPanelView {
             for (id, rect) in &layout.option_rects {
                 let is_active = self.active_channel_id.as_deref() == Some(id.as_str());
                 if is_active {
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(*rect).with_background(theme.list_active_selection_bg),
                     );
                 }
                 if let Some(ch) = self.channels.iter().find(|c| &c.id == id) {
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             ch.name.clone(),
                             Point::new(rect.min_x() + 8.0, rect.min_y() + 3.0),
@@ -712,7 +699,7 @@ impl View for OutputPanelView {
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return EventResult::Ignored;
         }
 

@@ -288,7 +288,7 @@ impl EditorArea {
     }
 
     pub fn compute_group_rects(&self, bounds: Rect) -> Vec<(usize, Rect)> {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return Vec::new();
         }
         let mut rects = Vec::new();
@@ -297,7 +297,7 @@ impl EditorArea {
     }
 
     pub fn compute_sashes(&self, bounds: Rect) -> Vec<EditorSash> {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return Vec::new();
         }
         let mut sashes = Vec::new();
@@ -314,7 +314,7 @@ impl EditorArea {
     ) -> bool {
         if !pointer.x.is_finite()
             || !pointer.y.is_finite()
-            || !crate::is_finite_positive_rect(parent_bounds)
+            || !parent_bounds.is_finite_positive()
         {
             return false;
         }
@@ -969,7 +969,7 @@ impl EditorAreaView {
             .group_by_id(group_id)
             .and_then(|g| g.active_tab())
             .is_some();
-        if !crate::is_finite_positive_rect(bounds)
+        if !bounds.is_finite_positive()
             || !(bounds.min_y() + tab_bar_h).is_finite()
             || !self.breadcrumbs_enabled
             || !has_active_tab
@@ -987,7 +987,7 @@ impl EditorAreaView {
             bounds.width(),
             bc_h,
         );
-        if crate::is_finite_positive_rect(rect) {
+        if rect.is_finite_positive() {
             Some(rect)
         } else {
             None
@@ -995,7 +995,7 @@ impl EditorAreaView {
     }
 
     pub fn content_rect_for_group(&self, group_id: usize, bounds: Rect) -> Rect {
-        if !crate::is_finite_rect(bounds) {
+        if !bounds.is_finite() {
             return Rect::zero();
         }
         let tab_bar_h = 35.0;
@@ -1009,7 +1009,7 @@ impl EditorAreaView {
             bounds.width(),
             (bounds.height() - top_offset).max(0.0),
         );
-        if crate::is_finite_rect(rect) {
+        if rect.is_finite() {
             rect
         } else {
             Rect::zero()
@@ -1476,16 +1476,30 @@ impl EditorAreaView {
         options: WebviewOptions,
         ext_host_manager: Option<ExtHostWebviewManager>,
     ) {
+        self.open_webview_with_key(id, id, title, view_type, html, options, ext_host_manager);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_webview_with_key(
+        &mut self,
+        uri: &str,
+        panel_id: &str,
+        title: &str,
+        view_type: &str,
+        html: &str,
+        options: WebviewOptions,
+        ext_host_manager: Option<ExtHostWebviewManager>,
+    ) {
         let gid = self.model.active_group_id();
         let group = self.model.current_group();
-        group.open_tab(id, title, false);
-        let view = WebviewEditorView::new(id, view_type, title, html, options, ext_host_manager);
-        let primary_gid = self.primary_webview_group.get(id).copied();
-        if !self.webviews.contains_key(id) || primary_gid.is_none_or(|pg| pg == gid) {
-            self.webviews.insert(id.to_string(), view);
-            self.primary_webview_group.insert(id.to_string(), gid);
+        group.open_tab(uri, title, false);
+        let view = WebviewEditorView::new(panel_id, view_type, title, html, options, ext_host_manager);
+        let primary_gid = self.primary_webview_group.get(uri).copied();
+        if !self.webviews.contains_key(uri) || primary_gid.is_none_or(|pg| pg == gid) {
+            self.webviews.insert(uri.to_string(), view);
+            self.primary_webview_group.insert(uri.to_string(), gid);
         } else {
-            self.split_webviews.insert((gid, id.to_string()), view);
+            self.split_webviews.insert((gid, uri.to_string()), view);
         }
         self.retain_open_resources();
         self.sync_editor_focus();
@@ -1850,8 +1864,8 @@ impl View for EditorAreaView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds)
-            || !crate::is_finite_font(font)
+        if !bounds.is_finite_positive()
+            || !font.is_finite()
             || !(bounds.min_y() + 35.0).is_finite()
         {
             return;
@@ -1864,7 +1878,7 @@ impl View for EditorAreaView {
         let multi_group = self.model.groups.len() > 1;
 
         for (group_id, group_rect) in group_rects {
-            if !crate::is_finite_positive_rect(group_rect)
+            if !group_rect.is_finite_positive()
                 || !(group_rect.min_y() + tab_bar_h).is_finite()
             {
                 continue;
@@ -1878,8 +1892,7 @@ impl View for EditorAreaView {
 
             let tab_bar_rect =
                 Rect::from_xywh(group_rect.min_x(), group_rect.min_y(), group_rect.width(), tab_bar_h);
-            crate::push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(tab_bar_rect)
                     .with_background(theme.tab_inactive_bg)
                     .with_border_edges(theme.tab_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
@@ -1890,7 +1903,7 @@ impl View for EditorAreaView {
                 let is_active = group.active_tab_index == Some(idx);
                 let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
                 let tab_rect = Rect::from_xywh(cur_x, group_rect.min_y(), tab_w, tab_bar_h);
-                if !crate::is_finite_rect(tab_rect) {
+                if !tab_rect.is_finite() {
                     break;
                 }
 
@@ -1979,14 +1992,12 @@ impl View for EditorAreaView {
                 } else if let Some(editor) = self.editor_for_group(group_id, &tab.uri) {
                     editor.render(content_rect, theme, font, scene);
                 } else {
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(content_rect).with_background(theme.editor_background),
                     );
                 }
             } else {
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(content_rect).with_background(theme.editor_background),
                 );
             }
@@ -1997,8 +2008,7 @@ impl View for EditorAreaView {
                 } else {
                     theme.tab_border
                 };
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(group_rect).with_border_edges(border_color, Edges::all(1.0)),
                 );
             }
@@ -2016,7 +2026,7 @@ impl View for EditorAreaView {
             } else {
                 theme.panel_border
             };
-            crate::push_finite_quad(scene, Quad::new(sash.rect).with_background(color));
+            scene.push_finite_quad(Quad::new(sash.rect).with_background(color));
         }
     }
 
@@ -2242,6 +2252,41 @@ impl View for EditorAreaView {
                     .unwrap_or(bounds);
                 let content_rect = self.content_rect_for_group(gid, rect);
                 self.route_event_to_group_content(gid, event, content_rect)
+            }
+            InputEvent::ImePreedit { .. } => EventResult::Ignored,
+            InputEvent::ImeCommit(text) => {
+                if text.is_empty() {
+                    return EventResult::Ignored;
+                }
+                let gid = self.model.active_group_id();
+                let rect = self
+                    .model
+                    .compute_group_rects(bounds)
+                    .into_iter()
+                    .find(|(id, _)| *id == gid)
+                    .map(|(_, r)| r)
+                    .unwrap_or(bounds);
+                let content_rect = self.content_rect_for_group(gid, rect);
+                let res = if let Some(editor) = self.active_editor_mut() {
+                    editor.handle_event(event, content_rect)
+                } else {
+                    EventResult::Ignored
+                };
+                if res == EventResult::Consumed {
+                    self.sync_dirty_states();
+                    if let Some(uri) = self
+                        .model
+                        .current_group_ref()
+                        .active_tab()
+                        .map(|t| t.uri.clone())
+                    {
+                        self.for_each_editor_for_uri_mut(&uri, |ed| {
+                            ed.recompute_folding();
+                        });
+                    }
+                    self.sync_breadcrumbs(None);
+                }
+                res
             }
         }
     }

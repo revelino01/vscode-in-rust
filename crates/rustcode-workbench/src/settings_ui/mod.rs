@@ -825,8 +825,8 @@ impl View for SettingsUiView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds)
-            || !crate::is_finite_font(font)
+        if !bounds.is_finite_positive()
+            || !font.is_finite()
             || !(bounds.min_y() + 40.0).is_finite()
         {
             return;
@@ -1343,7 +1343,7 @@ impl View for SettingsUiView {
                 SettingsFocus::None => EventResult::Ignored,
             },
             InputEvent::ScrollWheel(scroll) => {
-                if !crate::is_finite_positive_rect(bounds)
+                if !bounds.is_finite_positive()
                     || !scroll.position.x.is_finite()
                     || !scroll.position.y.is_finite()
                     || !bounds.contains(scroll.position)

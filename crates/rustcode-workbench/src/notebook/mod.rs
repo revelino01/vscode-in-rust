@@ -1885,8 +1885,8 @@ impl View for NotebookEditorView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds)
-            || !crate::is_finite_font(font)
+        if !bounds.is_finite_positive()
+            || !font.is_finite()
             || !(bounds.min_y() + 36.0).is_finite()
         {
             return;
@@ -2315,7 +2315,7 @@ impl View for NotebookEditorView {
                 EventResult::Consumed
             }
             InputEvent::ScrollWheel(scroll) => {
-                if !crate::is_finite_positive_rect(bounds)
+                if !bounds.is_finite_positive()
                     || !scroll.position.x.is_finite()
                     || !scroll.position.y.is_finite()
                     || !bounds.contains(scroll.position)

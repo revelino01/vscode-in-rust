@@ -6,6 +6,9 @@ use rustcode_platform::render::{
 };
 use serde::{Deserialize, Serialize};
 
+pub const STATUS_GIT_BRANCH_ID: &str = "workbench.status.gitBranch";
+pub const STATUS_PROBLEMS_ID: &str = "workbench.status.problems";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StatusBarAlignment {
     Left,
@@ -42,6 +45,27 @@ impl StatusBar {
 
     pub fn remove_item(&mut self, id: &str) {
         self.items.retain(|i| i.id != id);
+    }
+
+    pub fn item(&self, id: &str) -> Option<&StatusBarItem> {
+        self.items.iter().find(|i| i.id == id)
+    }
+
+    /// Updates or removes the built-in Git branch status bar item (`"workbench.status.gitBranch"`).
+    pub fn set_git_branch(&mut self, branch: Option<&str>, dirty: bool) {
+        if let Some(name) = branch.map(str::trim).filter(|s| !s.is_empty()) {
+            let suffix = if dirty { "*" } else { "" };
+            self.set_item(StatusBarItem {
+                id: STATUS_GIT_BRANCH_ID.to_string(),
+                text: format!("$(git-branch) {}{}", name, suffix),
+                tooltip: Some(format!("Git Branch: {}", name)),
+                command: Some("workbench.view.scm".to_string()),
+                alignment: StatusBarAlignment::Left,
+                priority: 200,
+            });
+        } else {
+            self.remove_item(STATUS_GIT_BRANCH_ID);
+        }
     }
 
     /// Returns left-aligned items sorted by priority (higher priority first).
@@ -237,5 +261,23 @@ mod tests {
             view.last_action,
             Some(StatusBarAction::ExecuteCommand("git.checkout".to_string()))
         );
+    }
+
+    #[test]
+    fn test_status_bar_git_branch_helper() {
+        let mut bar = StatusBar::new();
+        assert!(bar.item(STATUS_GIT_BRANCH_ID).is_none());
+
+        bar.set_git_branch(Some("main"), false);
+        let item = bar.item(STATUS_GIT_BRANCH_ID).unwrap();
+        assert_eq!(item.text, "$(git-branch) main");
+        assert_eq!(item.alignment, StatusBarAlignment::Left);
+        assert_eq!(item.command.as_deref(), Some("workbench.view.scm"));
+
+        bar.set_git_branch(Some("feature/m5"), true);
+        assert_eq!(bar.item(STATUS_GIT_BRANCH_ID).unwrap().text, "$(git-branch) feature/m5*");
+
+        bar.set_git_branch(None, false);
+        assert!(bar.item(STATUS_GIT_BRANCH_ID).is_none());
     }
 }

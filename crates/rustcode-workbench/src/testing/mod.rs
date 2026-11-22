@@ -76,43 +76,6 @@ struct TestingLayout {
     rows: Vec<RenderedRowLayout>,
 }
 
-fn clamp_rect(rect: Rect, bounds: Rect) -> Rect {
-    if !crate::is_finite_rect(bounds) || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return Rect::zero();
-    }
-    let rx = if rect.origin.x.is_finite() {
-        rect.origin.x
-    } else {
-        bounds.min_x()
-    };
-    let ry = if rect.origin.y.is_finite() {
-        rect.origin.y
-    } else {
-        bounds.min_y()
-    };
-    let rw = if rect.size.width.is_finite() && rect.size.width >= 0.0 {
-        rect.size.width
-    } else {
-        0.0
-    };
-    let rh = if rect.size.height.is_finite() && rect.size.height >= 0.0 {
-        rect.size.height
-    } else {
-        0.0
-    };
-
-    let min_x = rx.clamp(bounds.min_x(), bounds.max_x());
-    let min_y = ry.clamp(bounds.min_y(), bounds.max_y());
-    let max_x = (rx + rw).clamp(min_x, bounds.max_x());
-    let max_y = (ry + rh).clamp(min_y, bounds.max_y());
-    Rect::from_xywh(
-        min_x,
-        min_y,
-        (max_x - min_x).max(0.0),
-        (max_y - min_y).max(0.0),
-    )
-}
-
 fn extract_test_message(val: &Value) -> Option<String> {
     match val {
         Value::String(s) if !s.trim().is_empty() => Some(s.clone()),
@@ -328,35 +291,30 @@ impl TestingSidebarView {
 
     fn compute_layout(&self, bounds: Rect, font: &FontMetrics) -> TestingLayout {
         let header_h = 28.0f32.min(bounds.height().max(0.0));
-        let header_rect = clamp_rect(
-            Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), header_h),
-            bounds,
-        );
+        let header_rect =
+            Rect::from_xywh(bounds.min_x(), bounds.min_y(), bounds.width(), header_h)
+                .clamp_to_bounds(bounds);
 
         let run_label = "Run All";
         let run_w = (font.text_width(run_label) + 12.0)
             .max(52.0)
             .min((bounds.width() * 0.45).max(0.0));
         let run_h = 20.0f32.min(header_h);
-        let run_all_rect = clamp_rect(
-            Rect::from_xywh(
-                (header_rect.max_x() - run_w - 8.0).max(header_rect.min_x()),
-                header_rect.min_y() + ((header_h - run_h) * 0.5).max(0.0),
-                run_w,
-                run_h,
-            ),
-            header_rect,
-        );
+        let run_all_rect = Rect::from_xywh(
+            (header_rect.max_x() - run_w - 8.0).max(header_rect.min_x()),
+            header_rect.min_y() + ((header_h - run_h) * 0.5).max(0.0),
+            run_w,
+            run_h,
+        )
+        .clamp_to_bounds(header_rect);
 
-        let body_rect = clamp_rect(
-            Rect::from_xywh(
-                bounds.min_x(),
-                bounds.min_y() + header_h,
-                bounds.width(),
-                (bounds.height() - header_h).max(0.0),
-            ),
-            bounds,
-        );
+        let body_rect = Rect::from_xywh(
+            bounds.min_x(),
+            bounds.min_y() + header_h,
+            bounds.width(),
+            (bounds.height() - header_h).max(0.0),
+        )
+        .clamp_to_bounds(bounds);
 
         let rows_data = self.flattened_rows();
         let scroll_top = self.state.read().scroll_top;
@@ -379,25 +337,23 @@ impl TestingSidebarView {
 
             let max_indent = (body_rect.width() - 72.0).max(0.0);
             let indent = (8.0 + row.depth as f32 * 12.0).min(max_indent);
-            let row_rect = clamp_rect(
-                Rect::from_xywh(
-                    body_rect.min_x(),
-                    cur_y,
-                    body_rect.width(),
-                    base_row_h.min((body_rect.max_y() - cur_y).max(0.0)),
-                ),
-                body_rect,
-            );
+            let row_rect = Rect::from_xywh(
+                body_rect.min_x(),
+                cur_y,
+                body_rect.width(),
+                base_row_h.min((body_rect.max_y() - cur_y).max(0.0)),
+            )
+            .clamp_to_bounds(body_rect);
             let detail_rect = if has_detail && cur_y + base_row_h < body_rect.max_y() {
-                Some(clamp_rect(
+                Some(
                     Rect::from_xywh(
                         body_rect.min_x(),
                         cur_y + base_row_h,
                         body_rect.width(),
                         detail_h.min((body_rect.max_y() - (cur_y + base_row_h)).max(0.0)),
-                    ),
-                    body_rect,
-                ))
+                    )
+                    .clamp_to_bounds(body_rect),
+                )
             } else {
                 None
             };
@@ -487,12 +443,12 @@ impl View for TestingSidebarView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         *self.last_font.write() = font.clone();
 
-        crate::push_finite_quad(scene, Quad::new(bounds).with_background(theme.sidebar_bg));
+        scene.push_finite_quad(Quad::new(bounds).with_background(theme.sidebar_bg));
 
         let layout = self.compute_layout(bounds, font);
         let selected_id = self.selected_item_id();
@@ -504,17 +460,14 @@ impl View for TestingSidebarView {
                 + ((layout.header_rect.height() - font.line_height) * 0.5).max(0.0);
             let title_w = (layout.run_all_rect.min_x() - title_x - 6.0).max(0.0);
             if title_w > 0.0 {
-                let tr = clamp_rect(
-                    Rect::from_xywh(
-                        title_x,
-                        title_y,
-                        title_w,
-                        font.line_height.min(layout.header_rect.height()),
-                    ),
-                    layout.header_rect,
-                );
-                crate::push_finite_text(
-                    scene,
+                let tr = Rect::from_xywh(
+                    title_x,
+                    title_y,
+                    title_w,
+                    font.line_height.min(layout.header_rect.height()),
+                )
+                .clamp_to_bounds(layout.header_rect);
+                scene.push_finite_text(
                     GlyphRun::new(
                         "TESTING".to_string(),
                         Point::new(title_x, title_y),
@@ -526,8 +479,7 @@ impl View for TestingSidebarView {
             }
 
             if layout.run_all_rect.width() > 4.0 && layout.run_all_rect.height() > 4.0 {
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(layout.run_all_rect)
                         .with_background(theme.command_palette_selected_bg)
                         .with_corner_radius(3.0),
@@ -535,17 +487,14 @@ impl View for TestingSidebarView {
                 let btn_x = (layout.run_all_rect.min_x() + 6.0).min(layout.run_all_rect.max_x());
                 let btn_y = layout.run_all_rect.min_y()
                     + ((layout.run_all_rect.height() - font.line_height) * 0.5).max(0.0);
-                let br = clamp_rect(
-                    Rect::from_xywh(
-                        btn_x,
-                        btn_y,
-                        (layout.run_all_rect.max_x() - btn_x).max(0.0),
-                        font.line_height.min(layout.run_all_rect.height()),
-                    ),
-                    layout.run_all_rect,
-                );
-                crate::push_finite_text(
-                    scene,
+                let br = Rect::from_xywh(
+                    btn_x,
+                    btn_y,
+                    (layout.run_all_rect.max_x() - btn_x).max(0.0),
+                    font.line_height.min(layout.run_all_rect.height()),
+                )
+                .clamp_to_bounds(layout.run_all_rect);
+                scene.push_finite_text(
                     GlyphRun::new(
                         "Run All".to_string(),
                         Point::new(btn_x, btn_y),
@@ -561,17 +510,14 @@ impl View for TestingSidebarView {
             if layout.body_rect.height() > 0.0 && layout.body_rect.width() > 0.0 {
                 let empty_x = (layout.body_rect.min_x() + 12.0).min(layout.body_rect.max_x());
                 let empty_y = (layout.body_rect.min_y() + 12.0).min(layout.body_rect.max_y());
-                let er = clamp_rect(
-                    Rect::from_xywh(
-                        empty_x,
-                        empty_y,
-                        (layout.body_rect.max_x() - empty_x - 8.0).max(0.0),
-                        font.line_height.min((layout.body_rect.max_y() - empty_y).max(0.0)),
-                    ),
-                    layout.body_rect,
-                );
-                crate::push_finite_text(
-                    scene,
+                let er = Rect::from_xywh(
+                    empty_x,
+                    empty_y,
+                    (layout.body_rect.max_x() - empty_x - 8.0).max(0.0),
+                    font.line_height.min((layout.body_rect.max_y() - empty_y).max(0.0)),
+                )
+                .clamp_to_bounds(layout.body_rect);
+                scene.push_finite_text(
                     GlyphRun::new(
                         "No tests found".to_string(),
                         Point::new(empty_x, empty_y),
@@ -590,8 +536,7 @@ impl View for TestingSidebarView {
                 continue;
             }
             if selected_id.as_deref() == Some(row.item_id.as_str()) {
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(item_layout.rect).with_background(theme.list_active_selection_bg),
                 );
             }
@@ -610,17 +555,14 @@ impl View for TestingSidebarView {
                 };
                 let bw = font.text_width(badge).min((item_layout.rect.max_x() - cur_x).max(0.0));
                 if bw > 0.0 {
-                    let br = clamp_rect(
-                        Rect::from_xywh(
-                            cur_x,
-                            text_y,
-                            bw,
-                            font.line_height.min(item_layout.rect.height()),
-                        ),
-                        item_layout.rect,
-                    );
-                    crate::push_finite_text(
-                        scene,
+                    let br = Rect::from_xywh(
+                        cur_x,
+                        text_y,
+                        bw,
+                        font.line_height.min(item_layout.rect.height()),
+                    )
+                    .clamp_to_bounds(item_layout.rect);
+                    scene.push_finite_text(
                         GlyphRun::new(
                             badge.to_string(),
                             Point::new(cur_x, text_y),
@@ -641,22 +583,19 @@ impl View for TestingSidebarView {
 
             let label_w = (item_layout.rect.max_x() - cur_x - dur_w - 4.0).max(0.0);
             if label_w > 0.0 {
-                let lr = clamp_rect(
-                    Rect::from_xywh(
-                        cur_x,
-                        text_y,
-                        label_w,
-                        font.line_height.min(item_layout.rect.height()),
-                    ),
-                    item_layout.rect,
-                );
+                let lr = Rect::from_xywh(
+                    cur_x,
+                    text_y,
+                    label_w,
+                    font.line_height.min(item_layout.rect.height()),
+                )
+                .clamp_to_bounds(item_layout.rect);
                 let fg = if row.is_controller {
                     theme.sidebar_header_fg
                 } else {
                     theme.sidebar_fg
                 };
-                crate::push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         row.label.clone(),
                         Point::new(cur_x, text_y),
@@ -672,17 +611,14 @@ impl View for TestingSidebarView {
                 let dx = (item_layout.rect.max_x() - raw_dw - 6.0).max(cur_x);
                 let dw = raw_dw.min((item_layout.rect.max_x() - dx).max(0.0));
                 if dw > 0.0 {
-                    let dr = clamp_rect(
-                        Rect::from_xywh(
-                            dx,
-                            text_y,
-                            dw,
-                            font.line_height.min(item_layout.rect.height()),
-                        ),
-                        item_layout.rect,
-                    );
-                    crate::push_finite_text(
-                        scene,
+                    let dr = Rect::from_xywh(
+                        dx,
+                        text_y,
+                        dw,
+                        font.line_height.min(item_layout.rect.height()),
+                    )
+                    .clamp_to_bounds(item_layout.rect);
+                    scene.push_finite_text(
                         GlyphRun::new(
                             d_text,
                             Point::new(dx, text_y),
@@ -698,17 +634,14 @@ impl View for TestingSidebarView {
                 if d_rect.width() > 0.0 && d_rect.height() > 0.0 {
                     let mx = (item_layout.indent_x + 12.0).min(d_rect.max_x());
                     let my = d_rect.min_y() + ((d_rect.height() - font.line_height) * 0.5).max(0.0);
-                    let mr = clamp_rect(
-                        Rect::from_xywh(
-                            mx,
-                            my,
-                            (d_rect.max_x() - mx - 4.0).max(0.0),
-                            font.line_height.min(d_rect.height()),
-                        ),
-                        d_rect,
-                    );
-                    crate::push_finite_text(
-                        scene,
+                    let mr = Rect::from_xywh(
+                        mx,
+                        my,
+                        (d_rect.max_x() - mx - 4.0).max(0.0),
+                        font.line_height.min(d_rect.height()),
+                    )
+                    .clamp_to_bounds(d_rect);
+                    scene.push_finite_text(
                         GlyphRun::new(
                             msg.clone(),
                             Point::new(mx, my),

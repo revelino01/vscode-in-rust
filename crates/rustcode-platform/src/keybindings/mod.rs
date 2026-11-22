@@ -4,6 +4,7 @@ use parking_lot::RwLock;
 use rustcode_base::context_key::{ContextKeyExpr, ContextKeyService};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -207,6 +208,23 @@ impl KeybindingService {
         Ok(())
     }
 
+    /// Load user keybindings from a `keybindings.json` file on disk (JSONC-tolerant).
+    /// Gracefully ignores missing files by returning `Ok(false)`.
+    pub fn load_user_keybindings_from_disk(&self, path: &Path) -> Result<bool, String> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                self.load_keybindings_json(&content)?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(format!(
+                "Failed to read user keybindings '{}': {}",
+                path.display(),
+                err
+            )),
+        }
+    }
+
     /// Process a key press event. Returns Some(command_id) if a binding triggered,
     /// or None if no match or if awaiting the second key of a chord.
     pub fn handle_key(&self, key: &KeyCombo, context: &ContextKeyService) -> Option<String> {
@@ -347,5 +365,45 @@ mod tests {
             Some("Ctrl+K Ctrl+C".to_string())
         );
         assert_eq!(service.lookup_keybinding("unknown.command"), None);
+    }
+
+    #[test]
+    fn test_load_user_keybindings_from_disk_and_missing_file() {
+        let dir = std::env::temp_dir().join(format!("rustcode_kb_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("missing_keybindings.json");
+        let valid = dir.join("keybindings.json");
+        let malformed = dir.join("bad_keybindings.json");
+
+        let service = KeybindingService::new();
+        assert!(!service.load_user_keybindings_from_disk(&missing).unwrap());
+
+        std::fs::write(
+            &valid,
+            r#"[
+                // User custom shortcut
+                {
+                    "key": "ctrl+alt+r",
+                    "command": "workbench.action.reloadWindow",
+                    "when": "editorTextFocus",
+                },
+            ]"#,
+        )
+        .unwrap();
+        assert!(service.load_user_keybindings_from_disk(&valid).unwrap());
+
+        let ctx = ContextKeyService::new();
+        let combo = KeyCombo::parse("ctrl+alt+r").unwrap();
+        assert_eq!(service.handle_key(&combo, &ctx), None);
+        ctx.set_bool("editorTextFocus", true);
+        assert_eq!(
+            service.handle_key(&combo, &ctx),
+            Some("workbench.action.reloadWindow".to_string())
+        );
+
+        std::fs::write(&malformed, "[ { \"key\": ").unwrap();
+        assert!(service.load_user_keybindings_from_disk(&malformed).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

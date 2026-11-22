@@ -1,5 +1,6 @@
 //! GPUI WorkbenchWindow host managing rendering surfaces, theme updates, and input routing.
 
+use crate::debug::{DebugToolbarAction, DebugViewAction};
 use crate::editor_area::SplitDirection;
 use crate::explorer::{ContributedViewDescriptor, ExplorerAction};
 use crate::extensions_view::ExtensionsViewAction;
@@ -7,33 +8,50 @@ use crate::layout::LayoutHandle;
 use crate::notifications::{NotificationUiAction, PromptUiAction};
 use crate::output_panel::OutputAction;
 use crate::quickinput::{CommandPalette, CommandPaletteView, PaletteItem};
+use crate::scm::ScmAction;
+use crate::search::{SearchAction, SearchInputFocus, WorkspaceReplaceResult};
+use crate::terminal_panel::TerminalAction;
 use crate::testing::TestingAction;
 use crate::workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchView};
 use parking_lot::Mutex;
 use rustcode_base::context_key::ContextKeyService;
 use rustcode_base::disposable::DisposableStore;
-use rustcode_editor::WordWrapMode;
+use rustcode_editor::{
+    CompletionItem, CompletionItemKind as EditorCompletionKind, EditorAction, LspHoverInfo,
+    Position, Range, RangeEdit, TextDocument, WordWrapMode,
+};
 use rustcode_ext_host::manifest::{CustomEditorContribution, ViewContribution};
 use rustcode_ext_host::marketplace::ExtensionInstaller;
 use rustcode_ext_host::output::OutputChannelEvent;
 use rustcode_ext_host::provider::{LanguageFeatureBridge, ProviderType};
-use rustcode_ext_host::terminal::ExtTerminalEvent;
+use rustcode_ext_host::terminal::{ExtTerminalEvent, ExtTerminalLifecycleEvent};
 use rustcode_ext_host::webview::{CustomEditorEvent, WebviewEvent, WebviewOptions};
 use rustcode_platform::accessibility::AccessibilityTree;
 use rustcode_platform::commands::CommandRegistry;
 use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::fs::FileSystemService;
 use rustcode_platform::keybindings::KeybindingService;
+use rustcode_platform::os_ux::{
+    ClipboardBackend, FileDialogBackend, FileDialogOptions, InMemoryClipboardBackend,
+    MockFileDialogBackend,
+};
 use rustcode_platform::render::{
     EventResult, FontMetrics, InputEvent, Rect, RenderSurface, Scene, View,
     WorkbenchThemeStyles,
 };
+use rustcode_platform::storage::{InMemoryStorageBackend, StorageBackend};
 use rustcode_platform::theme::ThemeService;
+use rustcode_protocols::dap::{
+    DapClient, DapError, DapMessage, InitializeRequestArguments, LaunchRequestKind,
+    LaunchVariableContext, Scope, StackFrame, StoppedEventBody, Thread, Variable,
+};
 use rustcode_protocols::lsp::{
-    CodeAction, CodeActionContext, FormattingOptions, LspPosition, LspRange, WorkspaceEdit,
+    CodeAction, CodeActionContext, CompletionItemKind as LspCompletionKind, FormattingOptions,
+    Hover, LspCompletionItem, LspDiagnostic, LspLocation, LspPosition, LspRange, LspTextEdit,
+    WorkspaceEdit,
 };
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -55,6 +73,36 @@ impl Drop for SuppressCommandGuard<'_> {
     }
 }
 
+enum PendingLspResult {
+    Hover {
+        uri: String,
+        position: Position,
+        hover: Option<Hover>,
+    },
+    Definition {
+        locations: Vec<LspLocation>,
+    },
+    Completions {
+        uri: String,
+        position: Position,
+        trigger_char: Option<char>,
+        items: Vec<LspCompletionItem>,
+    },
+    Formatting {
+        uri: String,
+        edits: Vec<LspTextEdit>,
+        save_after: bool,
+    },
+}
+
+struct PendingDapSnapshot {
+    threads: Vec<Thread>,
+    frames: Vec<StackFrame>,
+    scopes: Vec<Scope>,
+    variables: Vec<(u32, Vec<Variable>)>,
+    stopped_thread_id: Option<i64>,
+}
+
 pub struct WorkbenchWindow {
     pub view: WorkbenchView,
     pub config: ConfigurationService,
@@ -64,7 +112,11 @@ pub struct WorkbenchWindow {
     pub context_keys: ContextKeyService,
     pub font_metrics: FontMetrics,
     pub file_system: Arc<FileSystemService>,
+    pub clipboard_backend: Arc<dyn ClipboardBackend>,
+    pub file_dialog_backend: Arc<dyn FileDialogBackend>,
+    pub storage_backend: Arc<dyn StorageBackend>,
     pub language_bridge: Option<Arc<LanguageFeatureBridge>>,
+    pub dap_client: Option<Arc<DapClient>>,
     pub command_sink: Arc<WindowCommandSink>,
     pub pending_code_actions: Vec<CodeAction>,
     pub extension_disposables: HashMap<String, DisposableStore>,
@@ -85,6 +137,14 @@ pub struct WorkbenchWindow {
     tracked_documents: HashMap<String, (String, u64)>,
     tracked_active_uri: Option<String>,
     ext_terminal_map: HashMap<String, String>,
+    synced_diagnostics: HashMap<String, Vec<LspDiagnostic>>,
+    lsp_spawn_attempted: HashSet<(String, PathBuf)>,
+    pending_lsp_results: Arc<Mutex<Vec<PendingLspResult>>>,
+    pending_dap_events: Arc<Mutex<Vec<DapMessage>>>,
+    pending_dap_snapshots: Arc<Mutex<Vec<PendingDapSnapshot>>>,
+    last_hover_request: Option<(String, Position)>,
+    synced_debug_console_len: usize,
+    last_synced_color_theme: Option<String>,
 }
 
 impl Default for WorkbenchWindow {
@@ -113,17 +173,23 @@ impl WorkbenchWindow {
             pending_settings_open: Arc::clone(&view.pending_settings_open),
             suppress_command: Mutex::new(None),
         });
+        let config = ConfigurationService::new();
+        let initial_theme = config.get::<String>("workbench.colorTheme");
 
         let mut win = Self {
             view,
-            config: ConfigurationService::new(),
+            config,
             theme,
             keybindings,
             commands,
             context_keys,
             font_metrics,
             file_system: Arc::new(FileSystemService::new()),
+            clipboard_backend: Arc::new(InMemoryClipboardBackend::new()),
+            file_dialog_backend: Arc::new(MockFileDialogBackend::new()),
+            storage_backend: Arc::new(InMemoryStorageBackend::new()),
             language_bridge: None,
+            dap_client: None,
             command_sink,
             pending_code_actions: Vec::new(),
             extension_disposables: HashMap::new(),
@@ -144,6 +210,14 @@ impl WorkbenchWindow {
             tracked_documents: HashMap::new(),
             tracked_active_uri: None,
             ext_terminal_map: HashMap::new(),
+            synced_diagnostics: HashMap::new(),
+            lsp_spawn_attempted: HashSet::new(),
+            pending_lsp_results: Arc::new(Mutex::new(Vec::new())),
+            pending_dap_events: Arc::new(Mutex::new(Vec::new())),
+            pending_dap_snapshots: Arc::new(Mutex::new(Vec::new())),
+            last_hover_request: None,
+            synced_debug_console_len: 0,
+            last_synced_color_theme: initial_theme,
         };
         win.sync_configuration();
         win.sync_focus_context_keys();
@@ -159,6 +233,47 @@ impl WorkbenchWindow {
     pub fn with_file_system(mut self, file_system: Arc<FileSystemService>) -> Self {
         self.file_system = file_system;
         self
+    }
+
+    pub fn with_clipboard_backend(mut self, backend: Arc<dyn ClipboardBackend>) -> Self {
+        self.set_clipboard_backend(backend);
+        self
+    }
+
+    pub fn set_clipboard_backend(&mut self, backend: Arc<dyn ClipboardBackend>) {
+        self.clipboard_backend = backend;
+        self.wire_clipboard_on_open_editors();
+    }
+
+    pub fn with_file_dialog_backend(mut self, backend: Arc<dyn FileDialogBackend>) -> Self {
+        self.set_file_dialog_backend(backend);
+        self
+    }
+
+    pub fn set_file_dialog_backend(&mut self, backend: Arc<dyn FileDialogBackend>) {
+        self.file_dialog_backend = backend;
+    }
+
+    pub fn with_storage_backend(mut self, backend: Arc<dyn StorageBackend>) -> Self {
+        self.set_storage_backend(backend);
+        self
+    }
+
+    pub fn set_storage_backend(&mut self, backend: Arc<dyn StorageBackend>) {
+        self.storage_backend = backend;
+    }
+
+    pub fn with_dap_client(mut self, client: Arc<DapClient>) -> Self {
+        self.attach_dap_client(client);
+        self
+    }
+
+    pub fn attach_dap_client(&mut self, client: Arc<DapClient>) {
+        let queue = Arc::clone(&self.pending_dap_events);
+        client.add_event_listener(move |msg| {
+            queue.lock().push(msg.clone());
+        });
+        self.dap_client = Some(client);
     }
 
     pub fn command_sink(&self) -> Arc<WindowCommandSink> {
@@ -177,6 +292,16 @@ impl WorkbenchWindow {
 
     pub fn sync_configuration(&mut self) {
         self.view.cached_config = Some(self.config.clone());
+        let configured_theme = self.config.get::<String>("workbench.colorTheme");
+        if configured_theme != self.last_synced_color_theme {
+            self.last_synced_color_theme = configured_theme;
+            if matches!(self.theme.sync_with_configuration(&self.config), Ok(true)) {
+                let active_theme = self.theme.current().clone();
+                self.view.editor_area.for_each_editor_mut(|_, editor| {
+                    editor.set_theme(active_theme.clone());
+                });
+            }
+        }
         let default_minimap = self
             .config
             .get::<bool>("editor.minimap.enabled")
@@ -191,6 +316,15 @@ impl WorkbenchWindow {
             .get::<usize>("editor.wordWrapColumn")
             .unwrap_or(80)
             .max(1);
+        let default_tab_size = self
+            .config
+            .get::<usize>("editor.tabSize")
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let default_insert_spaces = self
+            .config
+            .get::<bool>("editor.insertSpaces")
+            .unwrap_or(true);
         let active_path: Option<PathBuf> = self
             .view
             .editor_area
@@ -232,6 +366,15 @@ impl WorkbenchWindow {
                 .unwrap_or(default_wrap_col)
                 .max(1);
             editor.set_word_wrap_column(wrap_col);
+            let tab_size = config
+                .get_for_resource::<usize>("editor.tabSize", doc_path.as_deref())
+                .unwrap_or(default_tab_size)
+                .clamp(1, 16);
+            editor.set_tab_size(tab_size);
+            let insert_spaces = config
+                .get_for_resource::<bool>("editor.insertSpaces", doc_path.as_deref())
+                .unwrap_or(default_insert_spaces);
+            editor.set_insert_spaces(insert_spaces);
         });
         self.view
             .editor_area
@@ -412,6 +555,15 @@ impl WorkbenchWindow {
                         shell_path.as_deref(),
                         cwd.map(PathBuf::from),
                     );
+                    if let Some(ext_state) = bridge.terminal_manager.get_terminal(&id) {
+                        if let (Some(rows), Some(cols)) = (ext_state.rows, ext_state.cols) {
+                            if let Some(term) =
+                                self.view.terminal_panel.manager.terminal_mut(&local_id)
+                            {
+                                let _ = term.resize(rows.max(1), cols.max(1));
+                            }
+                        }
+                    }
                     self.ext_terminal_map.insert(id, local_id);
                 }
                 ExtTerminalEvent::Shown { id, preserve_focus } => {
@@ -430,18 +582,39 @@ impl WorkbenchWindow {
                     add_new_line,
                 } => {
                     if let Some(local_id) = self.ext_terminal_map.get(&id).cloned() {
-                        if let Some(term) = self.view.terminal_panel.manager.terminal_mut(&local_id)
-                        {
-                            term.insert_str(&text);
-                            if add_new_line {
-                                term.submit_input();
-                            }
-                        }
+                        let _ = self.view.terminal_panel.send_text_to_terminal(
+                            &local_id,
+                            &text,
+                            add_new_line,
+                        );
                     }
                 }
                 ExtTerminalEvent::Disposed { id } => {
                     if let Some(local_id) = self.ext_terminal_map.remove(&id) {
                         self.view.terminal_panel.manager.close_terminal(&local_id);
+                    }
+                }
+            }
+        }
+
+        for lifecycle in bridge.terminal_manager.take_pending_lifecycle_events() {
+            match lifecycle {
+                ExtTerminalLifecycleEvent::Resized { id, rows, cols } => {
+                    if let Some(local_id) = self.ext_terminal_map.get(&id).cloned() {
+                        if let Some(term) = self.view.terminal_panel.manager.terminal_mut(&local_id)
+                        {
+                            let _ = term.resize(rows.max(1), cols.max(1));
+                        }
+                    }
+                }
+                ExtTerminalLifecycleEvent::Exited { id, exit_code } => {
+                    if let Some(local_id) = self.ext_terminal_map.get(&id).cloned() {
+                        if let Some(term) = self.view.terminal_panel.manager.terminal_mut(&local_id)
+                        {
+                            term.exited = true;
+                            term.exit_code = exit_code;
+                            term.last_exit_code = exit_code;
+                        }
                     }
                 }
             }
@@ -661,10 +834,12 @@ impl WorkbenchWindow {
         self.sync_closed_webview_panels();
         self.sync_custom_editors();
         let Some(bridge) = self.language_bridge.clone() else {
+            self.sync_webview_outbound_messages();
             return;
         };
         let rev = bridge.webview_manager.revision();
         if rev == self.synced_webview_revision {
+            self.sync_webview_outbound_messages();
             return;
         }
 
@@ -679,7 +854,13 @@ impl WorkbenchWindow {
                             .find_session_by_panel_id(panel_id)
                             .map(|s| s.uri)
                     })
-                    .unwrap_or_else(|| panel_id.to_string())
+                    .unwrap_or_else(|| {
+                        if panel_id.starts_with("webview://") {
+                            panel_id.to_string()
+                        } else {
+                            format!("webview://{panel_id}")
+                        }
+                    })
             };
 
         let events = bridge.webview_manager.take_pending_events();
@@ -698,7 +879,8 @@ impl WorkbenchWindow {
                         .find_session_by_panel_id(&panel.id)
                         .is_none()
                 {
-                    self.view.editor_area.open_webview(
+                    self.view.editor_area.open_webview_with_key(
+                        &key,
                         &panel.id,
                         &panel.title,
                         &panel.view_type,
@@ -726,13 +908,15 @@ impl WorkbenchWindow {
                                 .custom_editor_manager
                                 .find_session_by_panel_id(&id)
                                 .is_some();
-                        if !is_custom && self.view.editor_area.any_webview_for_uri(&id).is_none() {
+                        let key = resolve_key(&self.view.editor_area.custom_editor_panels, &id);
+                        if !is_custom && self.view.editor_area.any_webview_for_uri(&key).is_none() {
                             let (html, options) = bridge
                                 .webview_manager
                                 .get_panel(&id)
                                 .map(|p| (p.html, p.options))
                                 .unwrap_or_default();
-                            self.view.editor_area.open_webview(
+                            self.view.editor_area.open_webview_with_key(
+                                &key,
                                 &id,
                                 &title,
                                 &view_type,
@@ -772,7 +956,13 @@ impl WorkbenchWindow {
                                     .find_session_by_panel_id(&id)
                                     .map(|s| s.uri)
                             })
-                            .unwrap_or_else(|| id.clone());
+                            .unwrap_or_else(|| {
+                                if id.starts_with("webview://") {
+                                    id.clone()
+                                } else {
+                                    format!("webview://{id}")
+                                }
+                            });
                         self.close_webview_tab_by_key(&key);
                         if let Some(session) =
                             bridge.custom_editor_manager.find_session_by_panel_id(&id)
@@ -787,6 +977,7 @@ impl WorkbenchWindow {
         }
 
         self.synced_webview_revision = rev;
+        self.sync_webview_outbound_messages();
     }
 
     pub async fn resolve_custom_editor(
@@ -850,6 +1041,41 @@ impl WorkbenchWindow {
         Ok(session.panel_id)
     }
 
+    fn project_ext_status_items(bridge: &LanguageFeatureBridge) -> Vec<crate::statusbar::StatusBarItem> {
+        bridge
+            .status_bar_manager
+            .get_visible_items()
+            .into_iter()
+            .filter(|i| i.id != "workbench.status.problems")
+            .map(|item| crate::statusbar::StatusBarItem {
+                id: item.id,
+                text: item.text,
+                tooltip: item.tooltip,
+                command: item.command,
+                alignment: if item.alignment == 2 {
+                    crate::statusbar::StatusBarAlignment::Right
+                } else {
+                    crate::statusbar::StatusBarAlignment::Left
+                },
+                priority: item.priority,
+            })
+            .collect()
+    }
+
+    fn sync_window_overlays(&self, bridge: &LanguageFeatureBridge) -> u64 {
+        let active_notifs = bridge.window_manager.active_notifications();
+        self.view.notifications.sync_notifications(&active_notifs);
+        let active_prompts = bridge.window_manager.active_prompts();
+        self.view.prompt_overlay.sync_prompts(&active_prompts);
+        bridge.window_manager.revision()
+    }
+
+    fn sync_testing_view_from_bridge(&self, bridge: &LanguageFeatureBridge) -> (u64, usize) {
+        let rev = bridge.test_manager.revision();
+        let failed = self.view.testing_view.sync_from_manager(&bridge.test_manager);
+        (rev, failed)
+    }
+
     pub fn sync_status_bar(&mut self) {
         let Some(bridge) = self.language_bridge.clone() else {
             return;
@@ -858,31 +1084,17 @@ impl WorkbenchWindow {
         if rev == self.synced_status_bar_revision.load(Ordering::SeqCst) {
             return;
         }
-        let items = bridge.status_bar_manager.get_visible_items();
-        let active_ids: HashSet<String> = items.iter().map(|i| i.id.clone()).collect();
+        let projected = Self::project_ext_status_items(&bridge);
+        let active_ids: HashSet<String> = projected.iter().map(|i| i.id.clone()).collect();
         for old_id in self.synced_ext_status_ids.drain() {
             if !active_ids.contains(&old_id) && old_id != "workbench.status.problems" {
                 self.view.status_bar.model.remove_item(&old_id);
             }
         }
-        for item in items {
-            if item.id == "workbench.status.problems" {
-                continue;
-            }
-            let alignment = if item.alignment == 2 {
-                crate::statusbar::StatusBarAlignment::Right
-            } else {
-                crate::statusbar::StatusBarAlignment::Left
-            };
-            self.view.status_bar.model.set_item(crate::statusbar::StatusBarItem {
-                id: item.id.clone(),
-                text: item.text,
-                tooltip: item.tooltip,
-                command: item.command,
-                alignment,
-                priority: item.priority,
-            });
-            self.synced_ext_status_ids.insert(item.id);
+        for item in projected {
+            let id = item.id.clone();
+            self.view.status_bar.model.set_item(item);
+            self.synced_ext_status_ids.insert(id);
         }
         *self.view.pending_ext_status_bar.write() = None;
         self.synced_status_bar_revision.store(rev, Ordering::SeqCst);
@@ -924,12 +1136,7 @@ impl WorkbenchWindow {
                 self.sync_focus_context_keys();
             }
         }
-        let active_notifs = bridge.window_manager.active_notifications();
-        self.view.notifications.sync_notifications(&active_notifs);
-        let active_prompts = bridge.window_manager.active_prompts();
-        self.view.prompt_overlay.sync_prompts(&active_prompts);
-
-        let rev = bridge.window_manager.revision();
+        let rev = self.sync_window_overlays(&bridge);
         self.synced_window_revision.store(rev, Ordering::SeqCst);
         self.render_window_revision.store(rev, Ordering::SeqCst);
     }
@@ -938,8 +1145,7 @@ impl WorkbenchWindow {
         let Some(bridge) = self.language_bridge.clone() else {
             return;
         };
-        let rev = bridge.test_manager.revision();
-        let failed = self.view.testing_view.sync_from_manager(&bridge.test_manager);
+        let (rev, failed) = self.sync_testing_view_from_bridge(&bridge);
         let badge = if failed > 0 {
             Some(failed as u32)
         } else {
@@ -1258,24 +1464,7 @@ impl WorkbenchWindow {
         if sb_rev != self.synced_status_bar_revision.load(Ordering::SeqCst)
             && sb_rev != self.render_status_bar_revision.load(Ordering::SeqCst)
         {
-            let items: Vec<crate::statusbar::StatusBarItem> = bridge
-                .status_bar_manager
-                .get_visible_items()
-                .into_iter()
-                .filter(|i| i.id != "workbench.status.problems")
-                .map(|item| crate::statusbar::StatusBarItem {
-                    id: item.id,
-                    text: item.text,
-                    tooltip: item.tooltip,
-                    command: item.command,
-                    alignment: if item.alignment == 2 {
-                        crate::statusbar::StatusBarAlignment::Right
-                    } else {
-                        crate::statusbar::StatusBarAlignment::Left
-                    },
-                    priority: item.priority,
-                })
-                .collect();
+            let items = Self::project_ext_status_items(bridge);
             *self.view.pending_ext_status_bar.write() = Some(items);
             self.render_status_bar_revision
                 .store(sb_rev, Ordering::SeqCst);
@@ -1284,22 +1473,17 @@ impl WorkbenchWindow {
         if win_rev != self.synced_window_revision.load(Ordering::SeqCst)
             && win_rev != self.render_window_revision.load(Ordering::SeqCst)
         {
-            self.view
-                .notifications
-                .sync_notifications(&bridge.window_manager.active_notifications());
-            self.view
-                .prompt_overlay
-                .sync_prompts(&bridge.window_manager.active_prompts());
-            self.render_window_revision.store(win_rev, Ordering::SeqCst);
+            let synced_rev = self.sync_window_overlays(bridge);
+            self.render_window_revision
+                .store(synced_rev, Ordering::SeqCst);
         }
         let test_rev = bridge.test_manager.revision();
         if test_rev != self.synced_test_revision.load(Ordering::SeqCst)
             && test_rev != self.render_test_revision.load(Ordering::SeqCst)
         {
-            self.view
-                .testing_view
-                .sync_from_manager(&bridge.test_manager);
-            self.render_test_revision.store(test_rev, Ordering::SeqCst);
+            let (synced_rev, _) = self.sync_testing_view_from_bridge(bridge);
+            self.render_test_revision
+                .store(synced_rev, Ordering::SeqCst);
         }
         self.sync_contributed_views_state();
     }
@@ -1323,10 +1507,11 @@ impl WorkbenchWindow {
         }
         self.tracked_documents.clear();
         self.tracked_active_uri = None;
+        self.synced_diagnostics.clear();
+        self.lsp_spawn_attempted.clear();
     }
 
-    pub fn sync_all(&mut self) {
-        self.drain_pending_command_effects();
+    fn sync_bridge_state(&mut self) {
         self.sync_output_channels();
         self.sync_ext_terminals();
         self.sync_custom_editors();
@@ -1336,8 +1521,1742 @@ impl WorkbenchWindow {
         self.sync_test_manager();
         self.sync_tree_views();
         self.sync_document_lifecycle();
+        self.sync_diagnostics();
+    }
+
+    pub fn sync_all(&mut self) {
+        self.drain_pending_command_effects();
+        self.drain_pending_lsp_results();
+        self.drain_pending_dap_events();
+        self.sync_bridge_state();
         self.sync_focus_context_keys();
         self.sync_configuration();
+        self.wire_clipboard_on_open_editors();
+    }
+
+    pub fn poll_runtime_events(&mut self) {
+        self.poll_terminal_ptys();
+        self.sync_webview_outbound_messages();
+        self.sync_all();
+    }
+
+    pub fn poll_terminal_ptys(&mut self) -> Vec<String> {
+        let updated = self.view.terminal_panel.poll_all_ptys();
+        if let Some(bridge) = self.language_bridge.clone() {
+            let pairs: Vec<(String, String)> = self
+                .ext_terminal_map
+                .iter()
+                .map(|(ext_id, local_id)| (ext_id.clone(), local_id.clone()))
+                .collect();
+            let mut changed_ext = false;
+            for (ext_id, local_id) in pairs {
+                let Some(term) = self.view.terminal_panel.manager.terminal(&local_id) else {
+                    continue;
+                };
+                if let Some(ext_state) = bridge.terminal_manager.get_terminal(&ext_id) {
+                    if (ext_state.rows != Some(term.rows) || ext_state.cols != Some(term.cols))
+                        && bridge
+                            .terminal_manager
+                            .resize_terminal(&ext_id, term.rows, term.cols)
+                            .is_ok()
+                    {
+                        changed_ext = true;
+                    }
+                    if term.exited
+                        && !ext_state.has_exited
+                        && bridge
+                            .terminal_manager
+                            .notify_terminal_exit(&ext_id, term.exit_code)
+                            .is_ok()
+                    {
+                        changed_ext = true;
+                    }
+                }
+            }
+            if changed_ext {
+                let _ = bridge.terminal_manager.take_pending_lifecycle_events();
+                self.synced_terminal_revision = bridge.terminal_manager.revision();
+            }
+        }
+        updated
+    }
+
+    pub fn sync_webview_outbound_messages(&mut self) {
+        let bridge = self.language_bridge.clone();
+        for wv in self.view.editor_area.webviews.values_mut() {
+            let msgs = wv.drain_messages_to_host();
+            if wv.ext_host_manager.is_none() && !msgs.is_empty() {
+                if let Some(b) = &bridge {
+                    for msg in msgs {
+                        let _ = b.webview_manager.receive_message_from_webview(&wv.id, msg);
+                    }
+                }
+            }
+        }
+        for wv in self.view.editor_area.split_webviews.values_mut() {
+            let msgs = wv.drain_messages_to_host();
+            if wv.ext_host_manager.is_none() && !msgs.is_empty() {
+                if let Some(b) = &bridge {
+                    for msg in msgs {
+                        let _ = b.webview_manager.receive_message_from_webview(&wv.id, msg);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn sync_diagnostics(&mut self) {
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let all_diags = bridge.get_all_diagnostics();
+        let prev_uris: Vec<String> = self.synced_diagnostics.keys().cloned().collect();
+        for uri in prev_uris {
+            if !all_diags.contains_key(&uri) {
+                self.view.update_lsp_problems(&uri, &[]);
+            }
+        }
+        for (uri, diags) in &all_diags {
+            if self.synced_diagnostics.get(uri) != Some(diags) {
+                self.view.update_lsp_problems(uri, diags);
+            }
+        }
+        self.synced_diagnostics = all_diags;
+    }
+
+    fn wire_clipboard_on_open_editors(&mut self) {
+        let read_cb = Arc::clone(&self.clipboard_backend);
+        let write_cb = Arc::clone(&self.clipboard_backend);
+        let read_fn: rustcode_editor::ClipboardReadFn =
+            Arc::new(move || read_cb.read_text().ok());
+        let write_fn: rustcode_editor::ClipboardWriteFn = Arc::new(move |text: &str| {
+            let _ = write_cb.write_text(text);
+        });
+        self.view.editor_area.for_each_editor_mut(|_, editor| {
+            editor.set_clipboard_callbacks(Arc::clone(&read_fn), Arc::clone(&write_fn));
+        });
+    }
+
+    fn workspace_root_for_uri(&self, uri: Option<&str>) -> PathBuf {
+        if let Some(u) = uri {
+            let p = rustcode_platform::file_uri_to_path(u);
+            if let Some(folder) = self.view.workspace.get_folder_for_path(&p) {
+                return folder.path.clone();
+            }
+            if let Some(parent) = p.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                return parent.to_path_buf();
+            }
+        }
+        self.view
+            .workspace
+            .folders()
+            .first()
+            .map(|f| f.path.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    fn ensure_lsp_for_language_and_open(&mut self, uri: &str, lang_id: &str) {
+        if lang_id.is_empty() || lang_id == "plaintext" || lang_id == "*" {
+            return;
+        }
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        if bridge.lsp_manager.get_config(lang_id).is_none() {
+            return;
+        }
+        if bridge.lsp_manager.get_client(lang_id).is_some()
+            || bridge.lsp_manager.is_language_failed(lang_id)
+        {
+            return;
+        }
+        let ws_root = self.workspace_root_for_uri(Some(uri));
+        let key = (lang_id.to_string(), ws_root.clone());
+        if !self.lsp_spawn_attempted.insert(key) {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let docs_for_lang: Vec<(String, String, i32, String)> = self
+            .view
+            .editor_area
+            .editors
+            .iter()
+            .filter_map(|(u, ed)| {
+                let (d_lang, d_ver, d_text) = if let Some(doc) = &ed.document {
+                    let d = doc.read();
+                    (d.language_id.clone(), d.version_id as i32, d.text())
+                } else {
+                    ("plaintext".to_string(), 1, ed.text())
+                };
+                if d_lang == lang_id {
+                    Some((u.clone(), d_lang, d_ver, d_text))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let lang = lang_id.to_string();
+        handle.spawn(async move {
+            if let Ok(Some(client)) = bridge
+                .lsp_manager
+                .ensure_server_for_language(&lang, &ws_root)
+                .await
+            {
+                if client.is_running() {
+                    for (doc_uri, doc_lang, doc_ver, doc_text) in docs_for_lang {
+                        let _ = client.did_open(&doc_uri, &doc_lang, doc_ver, &doc_text).await;
+                    }
+                }
+            }
+        });
+    }
+
+    fn ensure_lsp_for_open_documents(&mut self) {
+        let docs: Vec<(String, String)> = self
+            .view
+            .editor_area
+            .editors
+            .iter()
+            .filter_map(|(uri, ed)| {
+                ed.document
+                    .as_ref()
+                    .map(|d| (uri.clone(), d.read().language_id.clone()))
+            })
+            .collect();
+        for (uri, lang_id) in docs {
+            self.ensure_lsp_for_language_and_open(&uri, &lang_id);
+        }
+    }
+
+    pub fn open_workspace(&mut self, root: &Path) {
+        let root_buf = rustcode_platform::strip_windows_verbatim_prefix(root.to_path_buf());
+        self.view.workspace = crate::workspace::Workspace::from_folder(root_buf.clone());
+        self.view
+            .explorer
+            .model
+            .sync_from_workspace(&self.view.workspace);
+        self.view
+            .explorer
+            .model
+            .expanded_paths
+            .insert(root_buf.clone());
+        self.view.terminal_panel.default_cwd = Some(root_buf.clone());
+        if let Some(bridge) = &self.language_bridge {
+            bridge.set_workspace_folders(vec![rustcode_ext_host::ExtWorkspaceFolder::from_path(
+                0,
+                &root_buf,
+            )]);
+        }
+        let _ = self.view.open_workspace_git(&root_buf);
+        let _ = self.view.debug_sidebar.load_launch_json(&root_buf);
+        let _ = self.storage_backend.add_recent_workspace(&root_buf);
+        self.sync_configuration();
+        self.sync_focus_context_keys();
+    }
+
+    pub fn open_path(&mut self, path: &Path, is_preview: bool) -> bool {
+        let cleaned = rustcode_platform::strip_windows_verbatim_prefix(path.to_path_buf());
+        let uri = self
+            .view
+            .editor_area
+            .find_open_tab_uri_for_path(&cleaned)
+            .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&cleaned));
+        let title = cleaned
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("untitled")
+            .to_string();
+
+        if self.view.editor_area.any_editor_for_uri(&uri).is_some() {
+            self.open_file(&uri, &title, "", is_preview);
+            return true;
+        }
+
+        match TextDocument::open_sync(&self.file_system, &cleaned) {
+            Ok(decoded_doc) => {
+                let content = decoded_doc.text();
+                let encoding = decoded_doc.encoding();
+                let meta = decoded_doc.metadata.clone();
+                self.open_file(&uri, &title, &content, is_preview);
+                self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                    if let Some(doc) = &ed.document {
+                        let mut d = doc.write();
+                        d.encoding = encoding;
+                        if let Some(m) = meta.clone() {
+                            d.metadata = Some(m);
+                            d.is_dirty = false;
+                            d.saved_version_id = d.version_id;
+                        }
+                    }
+                });
+                true
+            }
+            Err(_) => {
+                let content = std::fs::read_to_string(&cleaned).unwrap_or_default();
+                self.open_file(&uri, &title, &content, is_preview);
+                cleaned.exists()
+            }
+        }
+    }
+
+    pub fn open_file_dialog(&mut self) -> bool {
+        let opts = FileDialogOptions {
+            title: Some("Open File".to_string()),
+            default_directory: self
+                .view
+                .workspace
+                .folders()
+                .first()
+                .map(|f| f.path.clone()),
+            ..Default::default()
+        };
+        if let Some(path) = self.file_dialog_backend.pick_open_file(&opts) {
+            self.open_path(&path, false);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn open_folder_dialog(&mut self) -> bool {
+        let opts = FileDialogOptions {
+            title: Some("Open Folder".to_string()),
+            default_directory: self
+                .view
+                .workspace
+                .folders()
+                .first()
+                .map(|f| f.path.clone()),
+            ..Default::default()
+        };
+        if let Some(path) = self.file_dialog_backend.pick_open_folder(&opts) {
+            self.open_workspace(&path);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn save_active_file_as(&mut self) -> bool {
+        let Some(active_tab) = self
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .cloned()
+        else {
+            return false;
+        };
+        let active_uri = active_tab.uri.clone();
+        let Some(editor) = self.view.editor_area.active_editor() else {
+            return false;
+        };
+        let content = editor.text();
+        let encoding = editor
+            .document
+            .as_ref()
+            .map(|d| d.read().encoding())
+            .unwrap_or_default();
+        let existing_path = editor
+            .document
+            .as_ref()
+            .and_then(|d| d.read().path.clone())
+            .or_else(|| {
+                if rustcode_platform::is_file_uri(&active_uri) || !active_uri.contains("://") {
+                    Some(rustcode_platform::file_uri_to_path(&active_uri))
+                } else {
+                    None
+                }
+            });
+
+        let opts = FileDialogOptions {
+            title: Some("Save As".to_string()),
+            default_directory: existing_path
+                .as_ref()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+                .or_else(|| self.view.workspace.folders().first().map(|f| f.path.clone())),
+            default_file_name: existing_path
+                .as_ref()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .or_else(|| Some(active_tab.title.clone())),
+            ..Default::default()
+        };
+        let Some(picked_path) = self.file_dialog_backend.pick_save_file(&opts) else {
+            return false;
+        };
+        let target_path = rustcode_platform::strip_windows_verbatim_prefix(picked_path);
+        let mut temp_doc = TextDocument::new(&content, Some(target_path.clone()), None);
+        if temp_doc.save_with_encoding_sync(&self.file_system, encoding).is_err() {
+            return false;
+        }
+        let saved_meta = temp_doc.metadata.clone();
+
+        let mut renamed = false;
+        if let Some(old_path) = &existing_path {
+            renamed = self.view.editor_area.rename_tab(old_path, &target_path);
+        }
+        let new_uri = self
+            .view
+            .editor_area
+            .find_open_tab_uri_for_path(&target_path)
+            .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&target_path));
+
+        if renamed {
+            self.view
+                .editor_area
+                .for_each_editor_for_uri_mut(&new_uri, |ed| {
+                    if let Some(doc) = &ed.document {
+                        let mut d = doc.write();
+                        d.path = Some(target_path.clone());
+                        d.encoding = encoding;
+                        if let Some(meta) = saved_meta.clone() {
+                            d.mark_saved(meta);
+                        }
+                    }
+                });
+            for group in &mut self.view.editor_area.model.groups {
+                for tab in &mut group.tabs {
+                    if tab.uri == new_uri {
+                        tab.is_dirty = false;
+                    }
+                }
+            }
+        } else {
+            if let Some(idx) = self
+                .view
+                .editor_area
+                .model
+                .current_group_ref()
+                .active_tab_index
+            {
+                self.view.editor_area.close_tab(idx);
+            }
+            self.open_path(&target_path, false);
+        }
+
+        if let Some(bridge) = &self.language_bridge {
+            bridge.did_save_document_sync(&new_uri);
+        }
+        self.view.editor_area.sync_dirty_states();
+        self.sync_document_lifecycle();
+        self.sync_configuration();
+        self.wire_clipboard_on_open_editors();
+        true
+    }
+
+    pub fn refresh_open_file_from_disk(&mut self, path: &Path) -> bool {
+        let Some(uri) = self.view.editor_area.find_open_tab_uri_for_path(path) else {
+            return false;
+        };
+        let mut refreshed = false;
+        let doc_opt = self
+            .view
+            .editor_area
+            .any_editor_for_uri(&uri)
+            .and_then(|ed| ed.document.clone());
+        if let Some(doc) = doc_opt {
+            let mut d = doc.write();
+            d.mark_edited();
+            if d.revert_sync(&self.file_system).is_ok() {
+                refreshed = true;
+            }
+        } else if let Ok(disk_text) = std::fs::read_to_string(path) {
+            self.view
+                .editor_area
+                .for_each_editor_for_uri_mut(&uri, |ed| {
+                    *ed.buffer.write() = rustcode_editor::PieceTable::from_str(&disk_text);
+                });
+            refreshed = true;
+        }
+        if refreshed {
+            let registry = Arc::clone(&self.view.editor_area.grammar_registry);
+            let theme = self.theme.current().clone();
+            self.view
+                .editor_area
+                .for_each_editor_for_uri_mut(&uri, |ed| {
+                    let pos = ed.primary_position();
+                    let line_count = ed.buffer.read().line_count().max(1);
+                    let clamped_line = pos.line.min(line_count - 1);
+                    let line_utf16_len = ed
+                        .buffer
+                        .read()
+                        .get_line_content(clamped_line)
+                        .map_or(0, |l| l.chars().map(|c| c.len_utf16()).sum());
+                    ed.set_primary_position(Position::new(
+                        clamped_line,
+                        pos.column.min(line_utf16_len),
+                    ));
+                    if let Some(doc) = &ed.document {
+                        let lang = doc.read().language_id.clone();
+                        ed.set_language(&lang, theme.clone(), &registry);
+                    }
+                    ed.recompute_folding();
+                });
+            self.view.editor_area.sync_dirty_states();
+            self.view
+                .editor_area
+                .sync_breadcrumbs(Some(&self.view.workspace));
+            self.sync_document_lifecycle();
+        }
+        refreshed
+    }
+
+    pub fn execute_workspace_replace(&mut self) -> Result<WorkspaceReplaceResult, String> {
+        let outcome = self
+            .view
+            .search_view
+            .execute_replace(self.view.workspace.folders())?;
+        for modified in &outcome.modified_files {
+            self.refresh_open_file_from_disk(&modified.file_path);
+        }
+        let _ = self.view.refresh_scm();
+        Ok(outcome)
+    }
+
+    pub fn handle_search_action(&mut self, action: &SearchAction) {
+        match action {
+            SearchAction::OpenMatch { path, line, col } => {
+                self.open_path(path, true);
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.jump_to_position_and_unfold(Position::new(
+                        line.saturating_sub(1),
+                        *col,
+                    ));
+                }
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+            }
+            SearchAction::ExecuteSearch => {
+                self.view
+                    .search_view
+                    .execute_search(self.view.workspace.folders());
+            }
+            SearchAction::ExecuteReplace => {
+                let _ = self.execute_workspace_replace();
+            }
+            SearchAction::ClearSearch => {
+                self.view.search_view.clear();
+            }
+            SearchAction::ToggleMatchCase
+            | SearchAction::ToggleWholeWord
+            | SearchAction::ToggleRegex => {}
+        }
+    }
+
+    pub fn open_scm_diff(&mut self, path: &Path, staged: bool) -> Result<(), String> {
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else if let Some(backend) = &self.view.scm_view.git_backend {
+            backend.root().join(path)
+        } else {
+            self.view.scm_view.repo.root.join(path)
+        };
+        let (original, modified) = if let Some(backend) = &self.view.scm_view.git_backend {
+            let orig = backend.show_head(path).ok().flatten().unwrap_or_default();
+            let modif = if staged {
+                backend
+                    .diff(path, true)
+                    .ok()
+                    .filter(|d| !d.is_empty())
+                    .or_else(|| std::fs::read_to_string(&full_path).ok())
+                    .unwrap_or_default()
+            } else {
+                std::fs::read_to_string(&full_path).unwrap_or_default()
+            };
+            (orig, modif)
+        } else if let Some((orig, modif)) = self.view.scm_view.repo.get_file_diff(path) {
+            (orig.to_string(), modif.to_string())
+        } else {
+            let modif = std::fs::read_to_string(&full_path).unwrap_or_default();
+            (String::new(), modif)
+        };
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "diff".to_string());
+        let title = if staged {
+            format!("{} (Index)", file_name)
+        } else {
+            format!("{} (Working Tree)", file_name)
+        };
+        let norm_path = path.to_string_lossy().replace('\\', "/");
+        let diff_uri = if staged {
+            format!("diff://staged/{norm_path}")
+        } else {
+            format!("diff://{norm_path}")
+        };
+        self.view
+            .editor_area
+            .open_diff(&diff_uri, &title, &original, &modified);
+        self.view
+            .editor_area
+            .sync_breadcrumbs(Some(&self.view.workspace));
+        self.view.focused_region = FocusedRegion::Editor;
+        self.sync_focus_context_keys();
+        self.view.sync_scm_status_bar();
+        Ok(())
+    }
+
+    pub fn handle_scm_action(&mut self, action: &ScmAction) -> Result<(), String> {
+        match action {
+            ScmAction::StageFile(path) => {
+                self.view
+                    .scm_view
+                    .stage_file(path)
+                    .map_err(|e| e.to_string())?;
+            }
+            ScmAction::UnstageFile(path) => {
+                self.view
+                    .scm_view
+                    .unstage_file(path)
+                    .map_err(|e| e.to_string())?;
+            }
+            ScmAction::StageAll => {
+                self.view
+                    .scm_view
+                    .stage_all()
+                    .map_err(|e| e.to_string())?;
+            }
+            ScmAction::UnstageAll => {
+                self.view
+                    .scm_view
+                    .unstage_all()
+                    .map_err(|e| e.to_string())?;
+            }
+            ScmAction::DiscardChanges(path) => {
+                self.view
+                    .scm_view
+                    .discard_file(path)
+                    .map_err(|e| e.to_string())?;
+                self.refresh_open_file_from_disk(path);
+            }
+            ScmAction::Commit { message } => {
+                self.view.scm_view.commit_with_message(message)?;
+            }
+            ScmAction::OpenDiff {
+                path,
+                title,
+                original,
+                modified,
+            } => {
+                let path_str = format!("diff://{}", path.to_string_lossy().replace('\\', "/"));
+                self.view
+                    .editor_area
+                    .open_diff(&path_str, title, original, modified);
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+                self.view.focused_region = FocusedRegion::Editor;
+                self.sync_focus_context_keys();
+            }
+        }
+        self.view.scm_view.last_action = None;
+        self.view.sync_scm_status_bar();
+        Ok(())
+    }
+
+    pub fn handle_terminal_action(&mut self, action: &TerminalAction) -> bool {
+        let ok = self.view.terminal_panel.handle_terminal_action(action);
+        self.view.terminal_panel.last_action = None;
+        self.poll_terminal_ptys();
+        if matches!(action, TerminalAction::CloseTerminal { .. })
+            && !self.view.terminal_panel.has_active_terminal()
+        {
+            self.view.layout.mutate(|l| l.panel_visible = false);
+            if self.view.focused_region == FocusedRegion::Panel {
+                self.view.focused_region = FocusedRegion::Editor;
+            }
+        }
+        self.sync_focus_context_keys();
+        ok
+    }
+
+    fn mirror_debug_console_from_session(&mut self) {
+        let session_len = self.view.debug_sidebar.session.console_output.len();
+        if session_len > self.synced_debug_console_len {
+            let new_entries =
+                self.view.debug_sidebar.session.console_output[self.synced_debug_console_len..]
+                    .to_vec();
+            for entry in new_entries {
+                self.view
+                    .debug_console
+                    .append_output(&entry.category, &entry.text);
+            }
+            self.synced_debug_console_len = session_len;
+        }
+    }
+
+    fn sync_active_debug_frame_in_editor(&mut self) {
+        if !self.view.debug_sidebar.session.is_active {
+            self.view
+                .editor_area
+                .for_each_editor_mut(|_, ed| ed.set_execution_line(None));
+            return;
+        }
+        let frame_opt = self
+            .view
+            .debug_sidebar
+            .session
+            .active_frame_id
+            .and_then(|fid| {
+                self.view
+                    .debug_sidebar
+                    .session
+                    .call_stack
+                    .iter()
+                    .find(|f| f.id == fid)
+                    .cloned()
+            })
+            .or_else(|| self.view.debug_sidebar.session.call_stack.first().cloned());
+
+        if let Some(frame) = frame_opt {
+            if let Some(path_str) = frame.source.as_ref().and_then(|s| s.path.as_deref()) {
+                let path = PathBuf::from(path_str);
+                self.open_path(&path, true);
+                if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                    ed.jump_to_position_and_unfold(Position::new(
+                        (frame.line as usize).saturating_sub(1),
+                        (frame.column as usize).saturating_sub(1),
+                    ));
+                    ed.set_execution_line(Some(frame.line as usize));
+                }
+            }
+        }
+    }
+
+    fn spawn_dap_state_sync(&self, client: Arc<DapClient>, stopped_thread_id: Option<i64>) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let snapshots = Arc::clone(&self.pending_dap_snapshots);
+        handle.spawn(async move {
+            let Ok(threads) = client.threads().await else {
+                return;
+            };
+            let tid = stopped_thread_id.or_else(|| threads.first().map(|t| t.id));
+            let frames = if let Some(id) = tid {
+                client.stack_trace(id).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let first_fid = frames.first().map(|f| f.id);
+            let scopes = if let Some(fid) = first_fid {
+                client.scopes(fid).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut variables = Vec::new();
+            for scope in &scopes {
+                if scope.variables_reference > 0 && !scope.expensive {
+                    if let Ok(vars) = client.variables(scope.variables_reference).await {
+                        variables.push((scope.variables_reference, vars));
+                    }
+                }
+            }
+            snapshots.lock().push(PendingDapSnapshot {
+                threads,
+                frames,
+                scopes,
+                variables,
+                stopped_thread_id: tid,
+            });
+        });
+    }
+
+    pub async fn sync_debug_from_dap(
+        &mut self,
+        stopped_thread_id: Option<i64>,
+    ) -> Result<(), DapError> {
+        let Some(client) = self.dap_client.clone() else {
+            return Err(DapError::NotRunning);
+        };
+        self.view
+            .debug_sidebar
+            .sync_from_dap_client(&client, stopped_thread_id)
+            .await?;
+        self.view
+            .debug_toolbar
+            .on_session_started(self.view.debug_sidebar.session.is_paused);
+        self.mirror_debug_console_from_session();
+        self.sync_active_debug_frame_in_editor();
+        Ok(())
+    }
+
+    pub async fn start_debug_session(&mut self, config_index: Option<usize>) -> Result<(), String> {
+        if let Some(idx) = config_index {
+            self.view.debug_sidebar.select_launch_configuration(idx);
+        }
+        let ws_root = self
+            .view
+            .workspace
+            .folders()
+            .first()
+            .map(|f| f.path.clone())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let active_file = self
+            .view
+            .editor_area
+            .active_editor()
+            .and_then(|ed| ed.document.as_ref())
+            .and_then(|d| d.read().path.clone());
+        let mut var_ctx = LaunchVariableContext::new(&ws_root);
+        if let Some(af) = active_file {
+            var_ctx = var_ctx.with_active_file(af);
+        }
+
+        let resolved_cfg = if let Some(cfg) = self.view.debug_sidebar.active_launch_configuration() {
+            cfg.resolve(&var_ctx)
+        } else if self.dap_client.is_some() {
+            rustcode_protocols::dap::LaunchConfiguration {
+                name: "Attached Adapter".to_string(),
+                adapter_type: "rustcode".to_string(),
+                request: "launch".to_string(),
+                program: None,
+                args: Vec::new(),
+                cwd: Some(ws_root.to_string_lossy().into_owned()),
+                env: HashMap::new(),
+                stop_on_entry: None,
+                pre_launch_task: None,
+                extra: serde_json::Map::new(),
+            }
+        } else {
+            return Err("No launch configuration available in .vscode/launch.json".to_string());
+        };
+
+        let client = if let Some(existing) = self
+            .dap_client
+            .as_ref()
+            .filter(|c| c.is_running())
+            .cloned()
+        {
+            existing
+        } else {
+            let adapter_cmd = resolved_cfg
+                .extra
+                .get("adapterCommand")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+                .unwrap_or_else(|| match resolved_cfg.adapter_type.as_str() {
+                    "lldb" | "codelldb" => "codelldb".to_string(),
+                    "cppdbg" | "gdb" => "gdb".to_string(),
+                    "python" | "debugpy" => "python".to_string(),
+                    "node" | "pwa-node" => "node".to_string(),
+                    other => other.to_string(),
+                });
+            let adapter_args: Vec<String> = resolved_cfg
+                .extra
+                .get("adapterArgs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(ToString::to_string))
+                        .collect()
+                })
+                .unwrap_or_else(|| match resolved_cfg.adapter_type.as_str() {
+                    "cppdbg" | "gdb" => vec!["-i".to_string(), "dap".to_string()],
+                    "python" | "debugpy" => vec!["-m".to_string(), "debugpy.adapter".to_string()],
+                    _ => Vec::new(),
+                });
+            let arg_refs: Vec<&str> = adapter_args.iter().map(|s| s.as_str()).collect();
+            let cwd = resolved_cfg
+                .cwd
+                .as_deref()
+                .map(PathBuf::from)
+                .or_else(|| Some(ws_root.clone()));
+            let spawned = DapClient::spawn_process(&adapter_cmd, &arg_refs, cwd).map_err(|e| {
+                let msg = format!("Failed to start debug adapter '{}': {}", adapter_cmd, e);
+                self.view.debug_console.append_output("stderr", &format!("{}\n", msg));
+                msg
+            })?;
+            let arc_client = Arc::new(spawned);
+            self.attach_dap_client(Arc::clone(&arc_client));
+            arc_client
+        };
+
+        client
+            .initialize(InitializeRequestArguments {
+                client_id: Some("rustcode".to_string()),
+                client_name: Some("RustCode".to_string()),
+                adapter_id: resolved_cfg.adapter_type.clone(),
+                lines_start_at1: Some(true),
+                columns_start_at1: Some(true),
+                path_format: Some("path".to_string()),
+                supports_variable_type: Some(true),
+            })
+            .await
+            .map_err(|e| format!("DAP initialize failed: {}", e))?;
+
+        let launch_val =
+            serde_json::to_value(&resolved_cfg).map_err(|e| format!("DAP config error: {}", e))?;
+        match resolved_cfg.request_kind() {
+            Some(LaunchRequestKind::Attach) => client
+                .attach(launch_val)
+                .await
+                .map_err(|e| format!("DAP attach failed: {}", e))?,
+            _ => client
+                .launch(launch_val)
+                .await
+                .map_err(|e| format!("DAP launch failed: {}", e))?,
+        }
+
+        let bp_entries: Vec<(String, Vec<rustcode_protocols::dap::SourceBreakpoint>)> = self
+            .view
+            .debug_sidebar
+            .session
+            .breakpoints
+            .iter()
+            .map(|(p, bps)| (p.clone(), bps.clone()))
+            .collect();
+        for (bp_path, bps) in bp_entries {
+            let resolved_bp_path = if rustcode_platform::is_file_uri(&bp_path) {
+                rustcode_platform::file_uri_to_path(&bp_path)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                bp_path
+            };
+            let _ = client.set_breakpoints(&resolved_bp_path, &bps).await;
+        }
+
+        client
+            .configuration_done()
+            .await
+            .map_err(|e| format!("DAP configurationDone failed: {}", e))?;
+
+        self.view.debug_sidebar.on_session_started();
+        self.view.debug_toolbar.on_session_started(false);
+        self.view
+            .debug_console
+            .append_output("console", &format!("Started debug session: {}\n", resolved_cfg.name));
+        self.drain_pending_dap_events();
+        Ok(())
+    }
+
+    pub async fn handle_debug_toolbar_action_async(
+        &mut self,
+        action: &DebugToolbarAction,
+    ) -> Result<(), DapError> {
+        if let Some(client) = self.dap_client.clone() {
+            let res = self
+                .view
+                .debug_sidebar
+                .dispatch_toolbar_action(action, &client)
+                .await;
+            if matches!(action, DebugToolbarAction::Stop) {
+                self.view.debug_sidebar.on_session_terminated();
+                self.view.debug_toolbar.on_session_stopped();
+                self.view
+                    .editor_area
+                    .for_each_editor_mut(|_, ed| ed.set_execution_line(None));
+            } else {
+                self.view
+                    .debug_toolbar
+                    .set_paused(self.view.debug_sidebar.session.is_paused);
+                self.drain_pending_dap_events();
+            }
+            res
+        } else {
+            if matches!(action, DebugToolbarAction::Stop) {
+                self.view.debug_sidebar.on_session_terminated();
+                self.view.debug_toolbar.on_session_stopped();
+                self.view
+                    .editor_area
+                    .for_each_editor_mut(|_, ed| ed.set_execution_line(None));
+            }
+            Ok(())
+        }
+    }
+
+    pub fn handle_debug_toolbar_action(&mut self, action: &DebugToolbarAction) {
+        if matches!(action, DebugToolbarAction::Stop) {
+            if let Some(client) = self.dap_client.clone() {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = client.disconnect(false).await;
+                    });
+                }
+            }
+            self.view.debug_sidebar.on_session_terminated();
+            self.view.debug_toolbar.on_session_stopped();
+            self.view
+                .editor_area
+                .for_each_editor_mut(|_, ed| ed.set_execution_line(None));
+            return;
+        }
+        let Some(client) = self.dap_client.clone() else {
+            return;
+        };
+        if matches!(action, DebugToolbarAction::Continue) {
+            self.view.debug_sidebar.session.is_paused = false;
+            self.view.debug_toolbar.set_paused(false);
+        } else if matches!(action, DebugToolbarAction::Pause) {
+            self.view.debug_sidebar.session.is_paused = true;
+            self.view.debug_toolbar.set_paused(true);
+        }
+        let tid = self
+            .view
+            .debug_sidebar
+            .session
+            .active_thread_id
+            .or_else(|| {
+                self.view
+                    .debug_sidebar
+                    .session
+                    .threads
+                    .first()
+                    .map(|t| t.id)
+            });
+        let act = action.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                match act {
+                    DebugToolbarAction::Continue => {
+                        if let Some(thread_id) = tid {
+                            let _ = client.continue_execution(thread_id).await;
+                        }
+                    }
+                    DebugToolbarAction::Pause => {
+                        if let Some(thread_id) = tid {
+                            let _ = client
+                                .send_request(
+                                    "pause",
+                                    Some(serde_json::json!({ "threadId": thread_id })),
+                                )
+                                .await;
+                        }
+                    }
+                    DebugToolbarAction::StepOver => {
+                        if let Some(thread_id) = tid {
+                            let _ = client.next(thread_id).await;
+                        }
+                    }
+                    DebugToolbarAction::StepInto => {
+                        if let Some(thread_id) = tid {
+                            let _ = client.step_in(thread_id).await;
+                        }
+                    }
+                    DebugToolbarAction::StepOut => {
+                        if let Some(thread_id) = tid {
+                            let _ = client.step_out(thread_id).await;
+                        }
+                    }
+                    DebugToolbarAction::Restart => {
+                        let _ = client.restart().await;
+                    }
+                    DebugToolbarAction::Stop => {}
+                }
+            });
+        }
+    }
+
+    pub async fn handle_debug_view_action_async(
+        &mut self,
+        action: &DebugViewAction,
+    ) -> Result<(), String> {
+        match action {
+            DebugViewAction::Toolbar(tb) => self
+                .handle_debug_toolbar_action_async(tb)
+                .await
+                .map_err(|e| e.to_string()),
+            DebugViewAction::StartDebugging { config_index } => {
+                self.start_debug_session(*config_index).await
+            }
+            DebugViewAction::SelectLaunchConfig(idx) => {
+                self.view.debug_sidebar.select_launch_configuration(*idx);
+                Ok(())
+            }
+            DebugViewAction::SelectFrame { path, line, .. } => {
+                if let Some(p) = path {
+                    self.open_path(&PathBuf::from(p), true);
+                    if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                        ed.jump_to_position_and_unfold(Position::new(
+                            (*line as usize).saturating_sub(1),
+                            0,
+                        ));
+                        ed.set_execution_line(Some(*line as usize));
+                    }
+                }
+                if let Some(client) = self.dap_client.clone() {
+                    self.view
+                        .debug_sidebar
+                        .dispatch_view_action(action, &client)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            }
+            DebugViewAction::JumpToBreakpoint { path, line } => {
+                self.open_path(&PathBuf::from(path), true);
+                if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                    ed.jump_to_position_and_unfold(Position::new(
+                        (*line as usize).saturating_sub(1),
+                        0,
+                    ));
+                }
+                Ok(())
+            }
+            DebugViewAction::ToggleBreakpoint { .. }
+            | DebugViewAction::EvaluateExpression { .. } => {
+                if let Some(client) = self.dap_client.clone() {
+                    self.view
+                        .debug_sidebar
+                        .dispatch_view_action(action, &client)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    self.mirror_debug_console_from_session();
+                }
+                Ok(())
+            }
+            DebugViewAction::ToggleVariables
+            | DebugViewAction::ToggleCallStack
+            | DebugViewAction::ToggleBreakpoints => Ok(()),
+        }
+    }
+
+    pub fn handle_debug_view_action(&mut self, action: &DebugViewAction) {
+        match action {
+            DebugViewAction::Toolbar(tb) => self.handle_debug_toolbar_action(tb),
+            DebugViewAction::SelectLaunchConfig(idx) => {
+                self.view.debug_sidebar.select_launch_configuration(*idx);
+            }
+            DebugViewAction::SelectFrame {
+                frame_id,
+                path,
+                line,
+            } => {
+                if let Some(p) = path {
+                    self.open_path(&PathBuf::from(p), true);
+                    if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                        ed.jump_to_position_and_unfold(Position::new(
+                            (*line as usize).saturating_sub(1),
+                            0,
+                        ));
+                        ed.set_execution_line(Some(*line as usize));
+                    }
+                }
+                self.view.debug_sidebar.session.active_frame_id = Some(*frame_id);
+                if let Some(client) = self.dap_client.clone() {
+                    let fid = *frame_id;
+                    let snapshots = Arc::clone(&self.pending_dap_snapshots);
+                    let threads = self.view.debug_sidebar.session.threads.clone();
+                    let frames = self.view.debug_sidebar.session.call_stack.clone();
+                    let tid = self.view.debug_sidebar.session.active_thread_id;
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Ok(scopes) = client.scopes(fid).await {
+                                let mut variables = Vec::new();
+                                for scope in &scopes {
+                                    if scope.variables_reference > 0 && !scope.expensive {
+                                        if let Ok(vars) =
+                                            client.variables(scope.variables_reference).await
+                                        {
+                                            variables.push((scope.variables_reference, vars));
+                                        }
+                                    }
+                                }
+                                snapshots.lock().push(PendingDapSnapshot {
+                                    threads,
+                                    frames,
+                                    scopes,
+                                    variables,
+                                    stopped_thread_id: tid,
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+            DebugViewAction::JumpToBreakpoint { path, line } => {
+                self.open_path(&PathBuf::from(path), true);
+                if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                    ed.jump_to_position_and_unfold(Position::new(
+                        (*line as usize).saturating_sub(1),
+                        0,
+                    ));
+                }
+            }
+            DebugViewAction::ToggleBreakpoint { path, .. } => {
+                if let Some(client) = self.dap_client.clone() {
+                    let bps = self
+                        .view
+                        .debug_sidebar
+                        .session
+                        .breakpoints
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_default();
+                    let resolved = if rustcode_platform::is_file_uri(path) {
+                        rustcode_platform::file_uri_to_path(path)
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        path.clone()
+                    };
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            let _ = client.set_breakpoints(&resolved, &bps).await;
+                        });
+                    }
+                }
+            }
+            DebugViewAction::EvaluateExpression { expression } => {
+                if let Some(client) = self.dap_client.clone() {
+                    let expr = expression.clone();
+                    let frame_id = self.view.debug_sidebar.session.active_frame_id;
+                    let events = Arc::clone(&self.pending_dap_events);
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            if let Ok(body) = client.evaluate(&expr, frame_id).await {
+                                events.lock().push(DapMessage::Event {
+                                    seq: 0,
+                                    event: "output".to_string(),
+                                    body: Some(serde_json::json!({
+                                        "category": "console",
+                                        "output": format!("{}\n", body.result),
+                                    })),
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+            DebugViewAction::StartDebugging { config_index } => {
+                if let Some(idx) = config_index {
+                    self.view.debug_sidebar.select_launch_configuration(*idx);
+                }
+            }
+            DebugViewAction::ToggleVariables
+            | DebugViewAction::ToggleCallStack
+            | DebugViewAction::ToggleBreakpoints => {}
+        }
+    }
+
+    fn drain_pending_dap_events(&mut self) {
+        let events: Vec<DapMessage> = {
+            let mut guard = self.pending_dap_events.lock();
+            std::mem::take(&mut *guard)
+        };
+        for msg in events {
+            let event_name = match &msg {
+                DapMessage::Event { event, .. } => event.as_str(),
+                _ => "",
+            };
+            self.view.debug_sidebar.apply_dap_event(&msg);
+            match event_name {
+                "stopped" => {
+                    self.view.debug_toolbar.on_session_started(true);
+                    let tid = match &msg {
+                        DapMessage::Event {
+                            body: Some(val), ..
+                        } => serde_json::from_value::<StoppedEventBody>(val.clone())
+                            .ok()
+                            .and_then(|b| b.thread_id),
+                        _ => None,
+                    };
+                    if let Some(client) = self.dap_client.clone() {
+                        self.spawn_dap_state_sync(client, tid);
+                    }
+                }
+                "continued" => {
+                    self.view
+                        .debug_toolbar
+                        .set_paused(self.view.debug_sidebar.session.is_paused);
+                    if !self.view.debug_sidebar.session.is_paused {
+                        self.view
+                            .editor_area
+                            .for_each_editor_mut(|_, ed| ed.set_execution_line(None));
+                    }
+                }
+                "terminated" | "exited" => {
+                    self.view.debug_toolbar.on_session_stopped();
+                    self.view
+                        .editor_area
+                        .for_each_editor_mut(|_, ed| ed.set_execution_line(None));
+                }
+                _ => {}
+            }
+        }
+
+        let snapshots: Vec<PendingDapSnapshot> = {
+            let mut guard = self.pending_dap_snapshots.lock();
+            std::mem::take(&mut *guard)
+        };
+        for snap in snapshots {
+            self.view.debug_sidebar.apply_threads(snap.threads);
+            self.view.debug_sidebar.session.is_active = true;
+            self.view.debug_sidebar.session.is_paused = true;
+            if snap.stopped_thread_id.is_some() {
+                self.view.debug_sidebar.session.active_thread_id = snap.stopped_thread_id;
+            }
+            self.view.debug_sidebar.apply_stack_frames(snap.frames);
+            self.view.debug_sidebar.apply_scopes(snap.scopes);
+            self.view.debug_sidebar.session.variables.clear();
+            for (vref, vars) in snap.variables {
+                self.view.debug_sidebar.apply_variables(vref, vars);
+            }
+            self.view.debug_toolbar.on_session_started(true);
+            self.sync_active_debug_frame_in_editor();
+        }
+        self.mirror_debug_console_from_session();
+    }
+
+    fn active_editor_uri_and_lang(&self) -> Option<(String, String)> {
+        let tab = self
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()?;
+        let uri = tab.uri.clone();
+        let lang = self
+            .view
+            .editor_area
+            .active_editor()
+            .and_then(|ed| ed.document.as_ref())
+            .map(|doc| doc.read().language_id.clone())
+            .unwrap_or_else(|| "plaintext".to_string());
+        Some((uri, lang))
+    }
+
+    fn convert_lsp_completion_item(item: LspCompletionItem) -> CompletionItem {
+        let kind = item.kind.map(|k| match k {
+            LspCompletionKind::Text => EditorCompletionKind::Text,
+            LspCompletionKind::Method => EditorCompletionKind::Method,
+            LspCompletionKind::Function => EditorCompletionKind::Function,
+            LspCompletionKind::Constructor => EditorCompletionKind::Constructor,
+            LspCompletionKind::Field => EditorCompletionKind::Field,
+            LspCompletionKind::Variable => EditorCompletionKind::Variable,
+            LspCompletionKind::Class => EditorCompletionKind::Class,
+            LspCompletionKind::Interface | LspCompletionKind::TypeParameter => {
+                EditorCompletionKind::Interface
+            }
+            LspCompletionKind::Module => EditorCompletionKind::Module,
+            LspCompletionKind::Property => EditorCompletionKind::Property,
+            LspCompletionKind::Keyword | LspCompletionKind::Operator => EditorCompletionKind::Keyword,
+            LspCompletionKind::Snippet => EditorCompletionKind::Snippet,
+            LspCompletionKind::Struct => EditorCompletionKind::Struct,
+            LspCompletionKind::Enum | LspCompletionKind::EnumMember => EditorCompletionKind::Enum,
+            LspCompletionKind::Constant | LspCompletionKind::Value => EditorCompletionKind::Constant,
+            LspCompletionKind::File | LspCompletionKind::Folder => EditorCompletionKind::File,
+            LspCompletionKind::Reference => EditorCompletionKind::Reference,
+            LspCompletionKind::Unit | LspCompletionKind::Color | LspCompletionKind::Event => {
+                EditorCompletionKind::Text
+            }
+        });
+        CompletionItem {
+            label: item.label,
+            kind,
+            detail: item.detail,
+            documentation: item.documentation,
+            insert_text: item.insert_text,
+            filter_text: item.filter_text,
+            sort_text: item.sort_text,
+        }
+    }
+
+    fn apply_lsp_hover_to_editor(
+        &mut self,
+        uri: &str,
+        position: Position,
+        hover: Option<Hover>,
+    ) -> bool {
+        let mut applied = false;
+        self.view.editor_area.for_each_editor_for_uri_mut(uri, |ed| {
+            if let Some(h) = &hover {
+                if h.contents.value.trim().is_empty() {
+                    ed.clear_lsp_hover();
+                } else {
+                    let range = h
+                        .range
+                        .map(|r| {
+                            Range::new(
+                                Position::new(r.start.line as usize, r.start.character as usize),
+                                Position::new(r.end.line as usize, r.end.character as usize),
+                            )
+                        })
+                        .or(Some(Range::new(position, position)));
+                    ed.set_lsp_hover(
+                        Some(LspHoverInfo {
+                            contents: h.contents.value.clone(),
+                            range,
+                            position,
+                        }),
+                        None,
+                    );
+                    applied = true;
+                }
+            } else {
+                ed.clear_lsp_hover();
+            }
+        });
+        applied
+    }
+
+    pub fn navigate_to_definition_locations(&mut self, locations: &[LspLocation]) -> bool {
+        let Some(loc) = locations.first() else {
+            return false;
+        };
+        let target_pos = Position::new(
+            loc.range.start.line as usize,
+            loc.range.start.character as usize,
+        );
+        let target_path = rustcode_platform::file_uri_to_path(&loc.uri);
+        let active_uri = self
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .map(|t| t.uri.clone());
+        let same_file = active_uri.as_deref().is_some_and(|cur| {
+            cur == loc.uri
+                || rustcode_platform::paths_equivalent(
+                    &rustcode_platform::file_uri_to_path(cur),
+                    &target_path,
+                )
+        });
+
+        if !same_file {
+            if let Some(existing_uri) = self
+                .view
+                .editor_area
+                .find_open_tab_uri_for_path(&target_path)
+            {
+                let title = target_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled")
+                    .to_string();
+                self.open_file(&existing_uri, &title, "", false);
+            } else if target_path.exists() {
+                self.open_path(&target_path, false);
+            } else {
+                let title = target_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("untitled")
+                    .to_string();
+                self.open_file(&loc.uri, &title, "", false);
+            }
+        }
+
+        if let Some(editor) = self.view.editor_area.active_editor_mut() {
+            editor.jump_to_position_and_unfold(target_pos);
+        }
+        self.view
+            .editor_area
+            .sync_breadcrumbs(Some(&self.view.workspace));
+        self.view.focused_region = FocusedRegion::Editor;
+        self.sync_focus_context_keys();
+        true
+    }
+
+    pub async fn request_hover_at(&mut self, pos: Position) -> bool {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return false;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return false;
+        };
+        let hover = bridge
+            .request_hover(
+                &uri,
+                &lang_id,
+                LspPosition::new(pos.line as u32, pos.column as u32),
+            )
+            .await;
+        self.apply_lsp_hover_to_editor(&uri, pos, hover)
+    }
+
+    pub async fn go_to_definition_at(&mut self, pos: Position) -> bool {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return false;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return false;
+        };
+        let locs = bridge
+            .request_definition(
+                &uri,
+                &lang_id,
+                LspPosition::new(pos.line as u32, pos.column as u32),
+            )
+            .await;
+        self.navigate_to_definition_locations(&locs)
+    }
+
+    pub async fn request_completions_at(
+        &mut self,
+        pos: Position,
+        trigger_char: Option<char>,
+    ) -> usize {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return 0;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return 0;
+        };
+        let items = bridge
+            .request_completions(
+                &uri,
+                &lang_id,
+                LspPosition::new(pos.line as u32, pos.column as u32),
+                trigger_char,
+            )
+            .await;
+        let count = items.len();
+        if count > 0 {
+            let converted: Vec<CompletionItem> = items
+                .into_iter()
+                .map(Self::convert_lsp_completion_item)
+                .collect();
+            self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                ed.merge_lsp_completions(converted.clone(), pos, trigger_char);
+            });
+        }
+        count
+    }
+
+    fn trigger_hover_at(&self, uri: String, lang_id: String, pos: Position) {
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let hover = bridge
+                .request_hover(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            queue.lock().push(PendingLspResult::Hover {
+                uri,
+                position: pos,
+                hover,
+            });
+        });
+    }
+
+    fn trigger_go_to_definition_at(&self, pos: Position) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let locations = bridge
+                .request_definition(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            if !locations.is_empty() {
+                queue
+                    .lock()
+                    .push(PendingLspResult::Definition { locations });
+            }
+        });
+    }
+
+    fn trigger_completions_at(&self, pos: Position, trigger_char: Option<char>) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let items = bridge
+                .request_completions(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                    trigger_char,
+                )
+                .await;
+            if !items.is_empty() {
+                queue.lock().push(PendingLspResult::Completions {
+                    uri,
+                    position: pos,
+                    trigger_char,
+                    items,
+                });
+            }
+        });
+    }
+
+    fn formatting_options_for_uri(&self, uri: &str) -> FormattingOptions {
+        let path_opt = if rustcode_platform::is_file_uri(uri) || !uri.contains("://") {
+            Some(rustcode_platform::file_uri_to_path(uri))
+        } else {
+            None
+        };
+        let tab_size = self
+            .config
+            .get_for_resource::<u32>("editor.tabSize", path_opt.as_deref())
+            .unwrap_or(4);
+        let insert_spaces = self
+            .config
+            .get_for_resource::<bool>("editor.insertSpaces", path_opt.as_deref())
+            .unwrap_or(true);
+        FormattingOptions::new(tab_size, insert_spaces)
+    }
+
+    fn trigger_format_active_document(&self, save_after: bool) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let options = self.formatting_options_for_uri(&uri);
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let edits = bridge.request_formatting(&uri, &lang_id, options).await;
+            if !edits.is_empty() || save_after {
+                queue.lock().push(PendingLspResult::Formatting {
+                    uri,
+                    edits,
+                    save_after,
+                });
+            }
+        });
+    }
+
+    fn apply_lsp_text_edits_to_uri(&mut self, uri: &str, edits: Vec<LspTextEdit>) -> bool {
+        if edits.is_empty() {
+            return false;
+        }
+        let range_edits: Vec<RangeEdit> = edits
+            .into_iter()
+            .map(|e| RangeEdit {
+                range: Range::new(
+                    Position::new(e.range.start.line as usize, e.range.start.character as usize),
+                    Position::new(e.range.end.line as usize, e.range.end.character as usize),
+                ),
+                new_text: e.new_text,
+            })
+            .collect();
+        let applied = self.view.editor_area.apply_text_edits(uri, &range_edits);
+        if applied {
+            self.sync_document_lifecycle();
+            self.sync_configuration();
+        }
+        applied
+    }
+
+    fn drain_pending_lsp_results(&mut self) {
+        let results: Vec<PendingLspResult> = {
+            let mut guard = self.pending_lsp_results.lock();
+            std::mem::take(&mut *guard)
+        };
+        for item in results {
+            match item {
+                PendingLspResult::Hover {
+                    uri,
+                    position,
+                    hover,
+                } => {
+                    self.apply_lsp_hover_to_editor(&uri, position, hover);
+                }
+                PendingLspResult::Definition { locations } => {
+                    self.navigate_to_definition_locations(&locations);
+                }
+                PendingLspResult::Completions {
+                    uri,
+                    position,
+                    trigger_char,
+                    items,
+                } => {
+                    let converted: Vec<CompletionItem> = items
+                        .into_iter()
+                        .map(Self::convert_lsp_completion_item)
+                        .collect();
+                    self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.merge_lsp_completions(converted.clone(), position, trigger_char);
+                    });
+                }
+                PendingLspResult::Formatting {
+                    uri,
+                    edits,
+                    save_after,
+                } => {
+                    self.apply_lsp_text_edits_to_uri(&uri, edits);
+                    if save_after {
+                        let _ = self.save_active_file_without_format();
+                    }
+                }
+            }
+        }
+    }
+
+    fn save_active_file_without_format(&mut self) -> bool {
+        let active_uri = self
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .map(|t| t.uri.clone());
+        let saved = self
+            .view
+            .editor_area
+            .save_active_file(&self.file_system)
+            .is_ok();
+        if saved {
+            if let Some(uri) = active_uri {
+                let lang_opt = self
+                    .view
+                    .editor_area
+                    .any_editor_for_uri(&uri)
+                    .and_then(|ed| ed.document.as_ref())
+                    .map(|d| d.read().language_id.clone());
+                if let Some(bridge) = &self.language_bridge {
+                    bridge.did_save_document_sync(&uri);
+                    if let Some(lang) = lang_opt {
+                        if let Some(client) = bridge.lsp_manager.get_client(&lang) {
+                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                let uri_owned = uri.clone();
+                                handle.spawn(async move {
+                                    let _ = client
+                                        .send_notification(
+                                            "textDocument/didSave",
+                                            serde_json::json!({
+                                                "textDocument": { "uri": uri_owned }
+                                            }),
+                                        )
+                                        .await;
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            self.sync_document_lifecycle();
+        }
+        saved
     }
 
     pub fn with_language_bridge(mut self, bridge: Arc<LanguageFeatureBridge>) -> Self {
@@ -1348,15 +3267,8 @@ impl WorkbenchWindow {
     pub fn set_language_bridge(&mut self, bridge: Arc<LanguageFeatureBridge>) {
         self.language_bridge = Some(bridge);
         self.reset_bridge_sync_state();
-        self.sync_output_channels();
-        self.sync_ext_terminals();
-        self.sync_custom_editors();
-        self.sync_webviews();
-        self.sync_status_bar();
-        self.sync_window_manager();
-        self.sync_test_manager();
-        self.sync_tree_views();
-        self.sync_document_lifecycle();
+        self.sync_bridge_state();
+        self.ensure_lsp_for_open_documents();
     }
 
     fn execute_command_from_dispatch(&self, cmd_id: &str) {
@@ -1403,6 +3315,10 @@ impl WorkbenchWindow {
             .iter()
             .any(|c| c.starts_with("workbench.view."));
 
+        if let Some(pending_action) = self.view.last_action.take() {
+            self.handle_workbench_action(pending_action, event, bounds);
+        }
+
         // 1. If key down, check keybindings evaluation first (unless modal overlay or explorer inline input is open)
         if !self.view.is_command_palette_open
             && !self.view.is_prompt_open()
@@ -1414,18 +3330,7 @@ impl WorkbenchWindow {
                 if let Some(cmd_id) = self.keybindings.handle_key(&combo, &self.context_keys) {
                     self.execute_command_from_dispatch(&cmd_id);
                     self.handle_builtin_command_effects(&cmd_id);
-                    self.drain_pending_command_effects();
-                    self.sync_output_channels();
-                    self.sync_ext_terminals();
-                    self.sync_custom_editors();
-                    self.sync_webviews();
-                    self.sync_status_bar();
-                    self.sync_window_manager();
-                    self.sync_test_manager();
-                    self.sync_tree_views();
-                    self.sync_document_lifecycle();
-                    self.sync_focus_context_keys();
-                    self.sync_configuration();
+                    self.sync_all();
                     return EventResult::Consumed;
                 }
             }
@@ -1450,228 +3355,460 @@ impl WorkbenchWindow {
         // 3. Update context keys from focused region
         self.sync_focus_context_keys();
 
+        // 3b. Poll EditorView actions (GoToDefinition, FormatDocument, OpenCommandPalette, Hover)
+        let editor_action = self
+            .view
+            .editor_area
+            .active_editor_mut()
+            .and_then(|ed| ed.take_last_action());
+        if let Some(ed_act) = editor_action {
+            match ed_act {
+                EditorAction::GoToDefinition(pos) => {
+                    self.trigger_go_to_definition_at(pos);
+                }
+                EditorAction::FormatDocument => {
+                    self.trigger_format_active_document(false);
+                }
+                EditorAction::OpenCommandPalette => {
+                    self.open_command_palette();
+                }
+                EditorAction::HoverRequested(pos) => {
+                    if let Some((uri, lang)) = self.active_editor_uri_and_lang() {
+                        self.trigger_hover_at(uri, lang, pos);
+                    }
+                }
+            }
+        }
+
+        if matches!(event, InputEvent::MouseMove(_)) {
+            let hover_pos = self
+                .view
+                .editor_area
+                .active_editor()
+                .and_then(|ed| ed.hover_request_position());
+            match (self.active_editor_uri_and_lang(), hover_pos) {
+                (Some((uri, lang)), Some(pos)) => {
+                    if self.last_hover_request.as_ref() != Some(&(uri.clone(), pos)) {
+                        self.last_hover_request = Some((uri.clone(), pos));
+                        self.trigger_hover_at(uri, lang, pos);
+                    }
+                }
+                _ => {
+                    if self.last_hover_request.is_some() {
+                        self.last_hover_request = None;
+                        if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                            ed.clear_lsp_hover();
+                        }
+                    }
+                }
+            }
+        } else if let InputEvent::KeyDown(key_ev) = event {
+            if self.view.focused_region == FocusedRegion::Editor
+                && !key_ev.modifiers.ctrl
+                && !key_ev.modifiers.alt
+                && !key_ev.modifiers.meta
+            {
+                if let crate::workbench_view::FocusedRegion::Editor = self.view.focused_region {
+                    if let Some((_uri, lang)) = self.active_editor_uri_and_lang() {
+                        let typed_char = match key_ev.key {
+                            rustcode_platform::render::KeyCode::Char(c) => Some(c),
+                            _ => key_ev
+                                .text
+                                .as_deref()
+                                .and_then(|t| t.chars().next()),
+                        };
+                        let is_trigger = typed_char.is_some_and(|ch| {
+                            self.language_bridge.as_ref().is_some_and(|b| {
+                                b.lsp_manager.get_trigger_characters(&lang).contains(&ch)
+                            })
+                        });
+                        if is_trigger {
+                            if let Some(pos) = self
+                                .view
+                                .editor_area
+                                .active_editor()
+                                .map(|ed| ed.primary_position())
+                            {
+                                self.trigger_completions_at(pos, typed_char);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(search_act) = self.view.search_view.last_action.take() {
+            if matches!(search_act, SearchAction::ExecuteReplace) {
+                let _ = self.execute_workspace_replace();
+            }
+        }
+
         // 4. Process any actions emitted by views
         if let Some(action) = self.view.last_action.take() {
-            match action {
-                WorkbenchAction::ExecuteCommand(cmd) => {
-                    self.execute_command_from_dispatch(&cmd);
-                    self.handle_builtin_command_effects(&cmd);
-                    self.sync_focus_context_keys();
+            self.handle_workbench_action(action, event, bounds);
+        }
+
+        if !matches!(event, InputEvent::MouseMove(_)) {
+            if bounds.is_finite_positive() {
+                let regions = self.view.compute_regions(bounds);
+                if self.view.layout.panel_visible && self.view.layout.active_panel_tab == "terminal"
+                {
+                    let panel_content = WorkbenchView::panel_content_rect(regions.panel);
+                    self.view.terminal_panel.resize_to_bounds(panel_content);
                 }
-                WorkbenchAction::OpenFile(path) => {
-                    let keep_sidebar_focus = self.view.focused_region
-                        == crate::workbench_view::FocusedRegion::Sidebar
-                        && matches!(event, InputEvent::MouseDown(_))
-                        && !matches!(
-                            self.view.layout.active_sidebar_view.as_str(),
-                            "search" | "workbench.view.search"
-                        );
-                    let uri = self
+                if !self.view.editor_area.webviews.is_empty()
+                    || !self.view.editor_area.split_webviews.is_empty()
+                {
+                    let group_rects = self
                         .view
                         .editor_area
+                        .model
+                        .compute_group_rects(regions.editor_area);
+                    for (gid, grect) in group_rects {
+                        if let Some(uri) = self
+                            .view
+                            .editor_area
+                            .model
+                            .group_by_id(gid)
+                            .and_then(|g| g.active_tab())
+                            .map(|t| t.uri.clone())
+                        {
+                            let content_rect =
+                                self.view.editor_area.content_rect_for_group(gid, grect);
+                            if let Some(wv) =
+                                self.view.editor_area.webview_for_group_mut(gid, &uri)
+                            {
+                                wv.sync_backend_bounds(content_rect);
+                            }
+                        }
+                    }
+                }
+            }
+            self.poll_runtime_events();
+        }
+
+        res
+    }
+
+    fn handle_workbench_action(
+        &mut self,
+        action: WorkbenchAction,
+        event: &InputEvent,
+        bounds: Rect,
+    ) {
+        match action {
+            WorkbenchAction::ExecuteCommand(cmd) => {
+                self.execute_command_from_dispatch(&cmd);
+                self.handle_builtin_command_effects(&cmd);
+                self.sync_focus_context_keys();
+            }
+            WorkbenchAction::OpenFile(path) => {
+                let keep_sidebar_focus = self.view.focused_region
+                    == crate::workbench_view::FocusedRegion::Sidebar
+                    && matches!(event, InputEvent::MouseDown(_))
+                    && !matches!(
+                        self.view.layout.active_sidebar_view.as_str(),
+                        "search" | "workbench.view.search"
+                    );
+                let uri = self
+                    .view
+                    .editor_area
+                    .find_open_tab_uri_for_path(&path)
+                    .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&path));
+                let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
+                let content = if self.view.editor_area.any_editor_for_uri(&uri).is_some() {
+                    String::new()
+                } else {
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                };
+                self.open_file(&uri, title, &content, false);
+                if keep_sidebar_focus {
+                    self.view.focused_region =
+                        crate::workbench_view::FocusedRegion::Sidebar;
+                }
+                self.sync_focus_context_keys();
+            }
+            WorkbenchAction::JumpToDiagnostic { uri, line, column } => {
+                let path = rustcode_platform::file_uri_to_path(&uri);
+                let target_uri = if !uri.contains("://") && !path.is_absolute() {
+                    uri.clone()
+                } else {
+                    self.view
+                        .editor_area
                         .find_open_tab_uri_for_path(&path)
-                        .unwrap_or_else(|| rustcode_platform::path_to_file_uri(&path));
-                    let title = path.file_name().map_or("untitled", |n| n.to_str().unwrap_or(""));
-                    let content = if self.view.editor_area.any_editor_for_uri(&uri).is_some() {
-                        String::new()
-                    } else {
-                        std::fs::read_to_string(&path).unwrap_or_default()
-                    };
-                    self.open_file(&uri, title, &content, false);
-                    if keep_sidebar_focus {
-                        self.view.focused_region =
-                            crate::workbench_view::FocusedRegion::Sidebar;
+                        .unwrap_or_else(|| uri.clone())
+                };
+                let title = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("untitled");
+                let content = if self.view.editor_area.any_editor_for_uri(&target_uri).is_some() {
+                    String::new()
+                } else {
+                    std::fs::read_to_string(&path).unwrap_or_default()
+                };
+                self.open_file(&target_uri, title, &content, true);
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.jump_to_position_and_unfold(Position::new(line, column));
+                    if let Some(diags) = self
+                        .view
+                        .problems_panel
+                        .files
+                        .get(&uri)
+                        .or_else(|| self.view.problems_panel.files.get(&target_uri))
+                    {
+                        editor.set_diagnostics(diags.clone());
                     }
-                    self.sync_focus_context_keys();
                 }
-                WorkbenchAction::JumpToDiagnostic { .. } => {}
-                WorkbenchAction::SidebarToggled(_) => {}
-                WorkbenchAction::PanelToggled(_) => {}
-                WorkbenchAction::OpenDiff { .. } => {}
-                WorkbenchAction::DebugToolbar(_) => {}
-                WorkbenchAction::DebugAction(_) => {}
-                WorkbenchAction::ScmAction(_) => {}
-                WorkbenchAction::ExtensionsAction(act) => {
-                    self.handle_extensions_action(&act);
+                self.view
+                    .editor_area
+                    .sync_breadcrumbs(Some(&self.view.workspace));
+                self.view.focused_region = FocusedRegion::Editor;
+                self.sync_focus_context_keys();
+            }
+            WorkbenchAction::SidebarToggled(_) => {}
+            WorkbenchAction::PanelToggled(_) => {}
+            WorkbenchAction::OpenDiff {
+                path,
+                title,
+                original,
+                modified,
+            } => {
+                let path_str = format!("diff://{}", path.to_string_lossy().replace('\\', "/"));
+                if !self.view.editor_area.diff_editors.contains_key(&path_str) {
+                    self.view
+                        .editor_area
+                        .open_diff(&path_str, &title, &original, &modified);
+                    self.view
+                        .editor_area
+                        .sync_breadcrumbs(Some(&self.view.workspace));
                 }
-                WorkbenchAction::OutputAction(act) => {
-                    if let OutputAction::ClearChannel(id) = act {
-                        self.sync_output_channels();
-                        self.view.output_panel.clear_channel(&id);
+                self.view.sync_scm_status_bar();
+                self.view.focused_region = FocusedRegion::Editor;
+                self.sync_focus_context_keys();
+            }
+            WorkbenchAction::DebugToolbar(tb) => {
+                self.handle_debug_toolbar_action(&tb);
+            }
+            WorkbenchAction::DebugAction(act) => {
+                self.handle_debug_view_action(&act);
+            }
+            WorkbenchAction::ScmAction(act) => {
+                if let ScmAction::DiscardChanges(ref p) = act {
+                    self.refresh_open_file_from_disk(p);
+                }
+                self.view.sync_scm_status_bar();
+            }
+            WorkbenchAction::ExtensionsAction(act) => {
+                self.handle_extensions_action(&act);
+            }
+            WorkbenchAction::OutputAction(act) => {
+                if let OutputAction::ClearChannel(id) = act {
+                    self.sync_output_channels();
+                    self.view.output_panel.clear_channel(&id);
+                    if let Some(bridge) = &self.language_bridge {
+                        if bridge.output_manager.clear(&id).is_ok() {
+                            let _ = bridge.output_manager.take_pending_events();
+                            self.synced_output_revision = bridge.output_manager.revision();
+                        }
+                    }
+                }
+            }
+            WorkbenchAction::TerminalAction(act) => {
+                let needs_exec = match &act {
+                    TerminalAction::NewTerminal { id } | TerminalAction::SplitTerminal { id } => {
+                        id.is_empty() || self.view.terminal_panel.manager.terminal(id).is_none()
+                    }
+                    TerminalAction::CloseTerminal { id } => {
+                        id.is_empty() || self.view.terminal_panel.manager.terminal(id).is_some()
+                    }
+                    TerminalAction::SelectTab { .. }
+                    | TerminalAction::FocusPane { .. }
+                    | TerminalAction::ClearTerminal { .. } => true,
+                    TerminalAction::CommandExecuted { .. } => false,
+                };
+                if needs_exec {
+                    self.view.terminal_panel.handle_terminal_action(&act);
+                    self.view.terminal_panel.last_action = None;
+                }
+                if let TerminalAction::CloseTerminal { ref id } = act {
+                    if let Some(ext_id) = self
+                        .ext_terminal_map
+                        .iter()
+                        .find(|(_, lid)| *lid == id)
+                        .map(|(eid, _)| eid.clone())
+                    {
+                        self.ext_terminal_map.remove(&ext_id);
                         if let Some(bridge) = &self.language_bridge {
-                            if bridge.output_manager.clear(&id).is_ok() {
-                                let _ = bridge.output_manager.take_pending_events();
-                                self.synced_output_revision = bridge.output_manager.revision();
-                            }
+                            bridge.terminal_manager.dispose_terminal(&ext_id);
+                        }
+                    }
+                    if !self.view.terminal_panel.has_active_terminal() {
+                        self.view.layout.mutate(|l| l.panel_visible = false);
+                        if self.view.focused_region == FocusedRegion::Panel {
+                            self.view.focused_region = FocusedRegion::Editor;
                         }
                     }
                 }
-                WorkbenchAction::TerminalAction(_) => {}
-                WorkbenchAction::NotificationAction(act) => {
-                    if let Some(bridge) = &self.language_bridge {
-                        match act {
-                            NotificationUiAction::SelectAction { id, action_title } => {
-                                let _ = bridge.window_manager.respond_notification(
-                                    &id,
-                                    Some(serde_json::Value::String(action_title)),
-                                );
-                            }
-                            NotificationUiAction::Dismiss { id } => {
-                                let _ = bridge.window_manager.dismiss_notification(&id);
-                            }
+                if self.view.layout.panel_visible
+                    && self.view.layout.active_panel_tab == "terminal"
+                    && bounds.is_finite_positive()
+                {
+                    let regions = self.view.compute_regions(bounds);
+                    let panel_content = WorkbenchView::panel_content_rect(regions.panel);
+                    self.view.terminal_panel.resize_to_bounds(panel_content);
+                }
+                self.poll_terminal_ptys();
+                self.sync_focus_context_keys();
+            }
+            WorkbenchAction::NotificationAction(act) => {
+                if let Some(bridge) = &self.language_bridge {
+                    match act {
+                        NotificationUiAction::SelectAction { id, action_title } => {
+                            let _ = bridge.window_manager.respond_notification(
+                                &id,
+                                Some(serde_json::Value::String(action_title)),
+                            );
+                        }
+                        NotificationUiAction::Dismiss { id } => {
+                            let _ = bridge.window_manager.dismiss_notification(&id);
                         }
                     }
                 }
-                WorkbenchAction::PromptAction(act) => {
-                    if let Some(bridge) = &self.language_bridge {
-                        match act {
-                            PromptUiAction::SubmitQuickPick { id, value } => {
-                                let _ = bridge.window_manager.respond_prompt(&id, Some(value));
+            }
+            WorkbenchAction::PromptAction(act) => {
+                if let Some(bridge) = &self.language_bridge {
+                    match act {
+                        PromptUiAction::SubmitQuickPick { id, value } => {
+                            let _ = bridge.window_manager.respond_prompt(&id, Some(value));
+                        }
+                        PromptUiAction::SelectQuickPickItem {
+                            client_id, item, ..
+                        } => {
+                            if let Some(cid) = client_id {
+                                bridge.notify_quick_pick_item_selected(&cid, item);
                             }
-                            PromptUiAction::SelectQuickPickItem {
-                                client_id, item, ..
-                            } => {
-                                if let Some(cid) = client_id {
-                                    bridge.notify_quick_pick_item_selected(&cid, item);
-                                }
-                            }
-                            PromptUiAction::SubmitInputBox { id, value } => {
-                                let _ = bridge
-                                    .window_manager
-                                    .respond_prompt(&id, Some(serde_json::Value::String(value)));
-                            }
-                            PromptUiAction::ValidateInput {
-                                id,
-                                client_id,
-                                value,
-                            } => {
-                                if let Some(cid) = client_id {
-                                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                                        let bridge_clone = Arc::clone(bridge);
-                                        let overlay_weak = self.view.prompt_overlay.weak_state();
-                                        handle.spawn(async move {
-                                            if let Ok(val_opt) =
-                                                bridge_clone.request_validate_input(&cid, &value).await
-                                            {
-                                                let msg = val_opt.and_then(|v| match v {
-                                                    serde_json::Value::String(s)
-                                                        if !s.is_empty() =>
-                                                    {
-                                                        Some(s)
-                                                    }
-                                                    serde_json::Value::Object(obj) => obj
-                                                        .get("message")
-                                                        .and_then(|m| m.as_str())
-                                                        .filter(|s| !s.is_empty())
-                                                        .map(ToString::to_string),
-                                                    _ => None,
-                                                });
-                                                if let Some(state_arc) = overlay_weak.upgrade() {
-                                                    let mut guard = state_arc.write();
-                                                    if let Some(active) = guard.as_mut() {
-                                                        if active.id == id {
-                                                            active.set_validation_message(msg);
-                                                        }
+                        }
+                        PromptUiAction::SubmitInputBox { id, value } => {
+                            let _ = bridge
+                                .window_manager
+                                .respond_prompt(&id, Some(serde_json::Value::String(value)));
+                        }
+                        PromptUiAction::ValidateInput {
+                            id,
+                            client_id,
+                            value,
+                        } => {
+                            if let Some(cid) = client_id {
+                                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                    let bridge_clone = Arc::clone(bridge);
+                                    let overlay_weak = self.view.prompt_overlay.weak_state();
+                                    handle.spawn(async move {
+                                        if let Ok(val_opt) =
+                                            bridge_clone.request_validate_input(&cid, &value).await
+                                        {
+                                            let msg = val_opt.and_then(|v| match v {
+                                                serde_json::Value::String(s)
+                                                    if !s.is_empty() =>
+                                                {
+                                                    Some(s)
+                                                }
+                                                serde_json::Value::Object(obj) => obj
+                                                    .get("message")
+                                                    .and_then(|m| m.as_str())
+                                                    .filter(|s| !s.is_empty())
+                                                    .map(ToString::to_string),
+                                                _ => None,
+                                            });
+                                            if let Some(state_arc) = overlay_weak.upgrade() {
+                                                let mut guard = state_arc.write();
+                                                if let Some(active) = guard.as_mut() {
+                                                    if active.id == id {
+                                                        active.set_validation_message(msg);
                                                     }
                                                 }
                                             }
-                                        });
-                                    }
-                                }
-                            }
-                            PromptUiAction::Cancel { id } => {
-                                let _ = bridge.window_manager.cancel_prompt(&id);
-                            }
-                        }
-                    }
-                }
-                WorkbenchAction::TestingAction(act) => match act {
-                    TestingAction::RunAll => {
-                        if let Some(bridge) = &self.language_bridge {
-                            let controllers = bridge.test_manager.list_controllers();
-                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                                for ctrl in controllers {
-                                    let b = Arc::clone(bridge);
-                                    let cid = ctrl.id;
-                                    handle.spawn(async move {
-                                        let _ = b
-                                            .request_run_tests(&cid, serde_json::json!({}))
-                                            .await;
+                                        }
                                     });
                                 }
                             }
                         }
+                        PromptUiAction::Cancel { id } => {
+                            let _ = bridge.window_manager.cancel_prompt(&id);
+                        }
                     }
-                    TestingAction::RunController(controller_id) => {
-                        if let Some(bridge) = &self.language_bridge {
-                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                }
+            }
+            WorkbenchAction::TestingAction(act) => match act {
+                TestingAction::RunAll => {
+                    if let Some(bridge) = &self.language_bridge {
+                        let controllers = bridge.test_manager.list_controllers();
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            for ctrl in controllers {
                                 let b = Arc::clone(bridge);
+                                let cid = ctrl.id;
                                 handle.spawn(async move {
                                     let _ = b
-                                        .request_run_tests(&controller_id, serde_json::json!({}))
+                                        .request_run_tests(&cid, serde_json::json!({}))
                                         .await;
                                 });
                             }
                         }
                     }
-                    TestingAction::OpenUri(_) | TestingAction::SelectItem(_) => {}
-                },
-                WorkbenchAction::ExplorerAction(act) => match act {
-                    ExplorerAction::ExpandContributedItem {
-                        view_id,
-                        element_id,
-                    } => {
-                        self.fetch_contributed_tree_children(&view_id, Some(element_id));
+                }
+                TestingAction::RunController(controller_id) => {
+                    if let Some(bridge) = &self.language_bridge {
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            let b = Arc::clone(bridge);
+                            handle.spawn(async move {
+                                let _ = b
+                                    .request_run_tests(&controller_id, serde_json::json!({}))
+                                    .await;
+                            });
+                        }
                     }
-                    ExplorerAction::ExecuteContributedCommand { command, arguments } => {
-                        let arg_val = if arguments.is_empty() {
-                            None
-                        } else {
-                            Some(serde_json::Value::Array(arguments.clone()))
-                        };
-                        if let Some(bridge) = &self.language_bridge {
-                            if bridge.is_js_command(&command) {
-                                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                                    let b = Arc::clone(bridge);
-                                    handle.spawn(async move {
-                                        let _ = b.request_execute_command(&command, arguments).await;
-                                    });
-                                }
-                            } else {
-                                let _ = self.commands.execute(&command, arg_val);
-                                self.handle_builtin_command_effects(&command);
+                }
+                TestingAction::OpenUri(_) | TestingAction::SelectItem(_) => {}
+            },
+            WorkbenchAction::ExplorerAction(act) => match act {
+                ExplorerAction::ExpandContributedItem {
+                    view_id,
+                    element_id,
+                } => {
+                    self.fetch_contributed_tree_children(&view_id, Some(element_id));
+                }
+                ExplorerAction::ExecuteContributedCommand { command, arguments } => {
+                    let arg_val = if arguments.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::Value::Array(arguments.clone()))
+                    };
+                    if let Some(bridge) = &self.language_bridge {
+                        if bridge.is_js_command(&command) {
+                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                let b = Arc::clone(bridge);
+                                handle.spawn(async move {
+                                    let _ = b.request_execute_command(&command, arguments).await;
+                                });
                             }
                         } else {
                             let _ = self.commands.execute(&command, arg_val);
                             self.handle_builtin_command_effects(&command);
                         }
+                    } else {
+                        let _ = self.commands.execute(&command, arg_val);
+                        self.handle_builtin_command_effects(&command);
                     }
-                    ExplorerAction::OpenFile(_)
-                    | ExplorerAction::ToggleDir(_)
-                    | ExplorerAction::CreateFile(_)
-                    | ExplorerAction::CreateFolder(_)
-                    | ExplorerAction::Renamed { .. }
-                    | ExplorerAction::Deleted(_) => {}
-                },
-            }
+                }
+                ExplorerAction::OpenFile(_)
+                | ExplorerAction::ToggleDir(_)
+                | ExplorerAction::CreateFile(_)
+                | ExplorerAction::CreateFolder(_)
+                | ExplorerAction::Renamed { .. }
+                | ExplorerAction::Deleted(_) => {}
+            },
         }
-
-        if !matches!(event, InputEvent::MouseMove(_)) {
-            self.drain_pending_command_effects();
-            self.sync_output_channels();
-            self.sync_ext_terminals();
-            self.sync_custom_editors();
-            self.sync_webviews();
-            self.sync_status_bar();
-            self.sync_window_manager();
-            self.sync_test_manager();
-            self.sync_tree_views();
-            self.sync_document_lifecycle();
-            self.sync_focus_context_keys();
-            self.sync_configuration();
-        }
-
-        res
     }
 
     fn handle_extensions_action(&mut self, action: &ExtensionsViewAction) {
@@ -1859,9 +3996,27 @@ impl WorkbenchWindow {
             }
             "workbench.action.findInFiles" => {
                 self.view.layout.mutate(|l| {
+                    l.active_sidebar_view = "search".to_string();
                     l.sidebar_visible = true;
-                    l.set_sidebar_view("search");
                 });
+                self.view.activity_bar.set_active_index(1);
+                self.view.search_view.is_replace_expanded = false;
+                self.view.search_view.focused_input = SearchInputFocus::Query;
+                self.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
+            }
+            "workbench.action.replaceInFiles" => {
+                self.view.layout.mutate(|l| {
+                    l.active_sidebar_view = "search".to_string();
+                    l.sidebar_visible = true;
+                });
+                self.view.activity_bar.set_active_index(1);
+                self.view.search_view.is_replace_expanded = true;
+                self.view.search_view.focused_input = if self.view.search_view.query.query.is_empty()
+                {
+                    SearchInputFocus::Query
+                } else {
+                    SearchInputFocus::Replace
+                };
                 self.view.focused_region = crate::workbench_view::FocusedRegion::Sidebar;
             }
             "workbench.view.explorer" => {
@@ -1925,8 +4080,17 @@ impl WorkbenchWindow {
                     self.view.activity_bar.set_active_index(5);
                 }
             }
+            "workbench.action.files.openFile" | "workbench.action.openFile" => {
+                self.open_file_dialog();
+            }
+            "workbench.action.files.openFolder" | "workbench.action.openFolder" => {
+                self.open_folder_dialog();
+            }
             "workbench.action.files.save" => {
                 self.save_active_file();
+            }
+            "workbench.action.files.saveAs" | "workbench.action.saveAs" => {
+                self.save_active_file_as();
             }
             "workbench.action.openSettings" => {
                 self.open_settings();
@@ -1961,6 +4125,7 @@ impl WorkbenchWindow {
                 self.view
                     .editor_area
                     .sync_breadcrumbs(Some(&self.view.workspace));
+                self.wire_clipboard_on_open_editors();
             }
             "workbench.action.splitEditorDown" => {
                 self.view
@@ -1970,6 +4135,7 @@ impl WorkbenchWindow {
                 self.view
                     .editor_area
                     .sync_breadcrumbs(Some(&self.view.workspace));
+                self.wire_clipboard_on_open_editors();
             }
             "workbench.action.focusPreviousGroup" => {
                 self.view.editor_area.focus_previous_group();
@@ -2025,6 +4191,31 @@ impl WorkbenchWindow {
                 if let Some(editor) = self.view.editor_area.active_editor_mut() {
                     editor.trigger_suggest(None);
                 }
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_completions_at(pos, None);
+                }
+            }
+            "editor.action.commentLine" => {
+                if let Some(editor) = self.view.editor_area.active_editor_mut() {
+                    editor.toggle_line_comment();
+                }
+                self.view.editor_area.sync_dirty_states();
+                self.sync_document_lifecycle();
+            }
+            "editor.action.revealDefinition" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_go_to_definition_at(pos);
+                }
             }
             "editor.action.insertCursorAbove" => {
                 if let Some(editor) = self.view.editor_area.active_editor_mut() {
@@ -2062,7 +4253,7 @@ impl WorkbenchWindow {
                 }
             }
             "editor.action.formatDocument" => {
-                // Formatting is triggered asynchronously via format_active_document
+                self.trigger_format_active_document(false);
             }
             "editor.action.quickFix" => {
                 self.show_quick_fixes_palette();
@@ -2302,76 +4493,85 @@ impl WorkbenchWindow {
         self.view.focused_region = crate::workbench_view::FocusedRegion::Editor;
         self.sync_focus_context_keys();
         self.sync_configuration();
+        self.wire_clipboard_on_open_editors();
         self.sync_document_lifecycle();
+        if let Some((opened_uri, opened_lang)) = self.active_editor_uri_and_lang() {
+            self.ensure_lsp_for_language_and_open(&opened_uri, &opened_lang);
+        }
+        self.sync_diagnostics();
     }
 
     pub fn save_active_file(&mut self) -> bool {
-        let active_uri = self
+        let active_path = self
             .view
             .editor_area
             .model
             .current_group_ref()
             .active_tab()
-            .map(|t| t.uri.clone());
-        let saved = self
-            .view
-            .editor_area
-            .save_active_file(&self.file_system)
-            .is_ok();
-        if saved {
-            if let Some(uri) = active_uri {
-                if let Some(bridge) = &self.language_bridge {
-                    bridge.did_save_document_sync(&uri);
+            .and_then(|t| {
+                if rustcode_platform::is_file_uri(&t.uri) || !t.uri.contains("://") {
+                    Some(rustcode_platform::file_uri_to_path(&t.uri))
+                } else {
+                    None
+                }
+            });
+        let format_on_save = self
+            .config
+            .get_for_resource::<bool>("editor.formatOnSave", active_path.as_deref())
+            .unwrap_or(false);
+        if format_on_save && self.language_bridge.is_some() {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                    let handle_clone = handle.clone();
+                    let _ = tokio::task::block_in_place(|| {
+                        handle_clone.block_on(tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            self.format_active_document(),
+                        ))
+                    });
+                } else {
+                    self.trigger_format_active_document(true);
                 }
             }
-            self.sync_document_lifecycle();
         }
-        saved
+        self.save_active_file_without_format()
+    }
+
+    pub async fn save_active_file_async(&mut self) -> bool {
+        let active_path = self
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .and_then(|t| {
+                if rustcode_platform::is_file_uri(&t.uri) || !t.uri.contains("://") {
+                    Some(rustcode_platform::file_uri_to_path(&t.uri))
+                } else {
+                    None
+                }
+            });
+        let format_on_save = self
+            .config
+            .get_for_resource::<bool>("editor.formatOnSave", active_path.as_deref())
+            .unwrap_or(false);
+        if format_on_save && self.language_bridge.is_some() {
+            let _ = self.format_active_document().await;
+        }
+        self.save_active_file_without_format()
     }
 
     pub async fn format_active_document(&mut self) -> bool {
-        let (uri, lang_id) = match self.view.editor_area.model.current_group_ref().active_tab() {
-            Some(tab) => {
-                let uri = tab.uri.clone();
-                let lang = self
-                    .view
-                    .editor_area
-                    .active_editor()
-                    .and_then(|ed| ed.document.as_ref())
-                    .map(|doc| doc.read().language_id.clone())
-                    .unwrap_or_else(|| "*".to_string());
-                (uri, lang)
-            }
-            None => return false,
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return false;
         };
 
         if let Some(bridge) = self.language_bridge.clone() {
-            let options = FormattingOptions::new(4, true);
+            let options = self.formatting_options_for_uri(&uri);
             let edits = bridge.request_formatting(&uri, &lang_id, options).await;
 
             if !edits.is_empty() {
-                let range_edits: Vec<rustcode_editor::RangeEdit> = edits
-                    .into_iter()
-                    .map(|e| rustcode_editor::RangeEdit {
-                        range: rustcode_editor::Range::new(
-                            rustcode_editor::Position::new(
-                                e.range.start.line as usize,
-                                e.range.start.character as usize,
-                            ),
-                            rustcode_editor::Position::new(
-                                e.range.end.line as usize,
-                                e.range.end.character as usize,
-                            ),
-                        ),
-                        new_text: e.new_text,
-                    })
-                    .collect();
-                let applied = self.view.editor_area.apply_text_edits(&uri, &range_edits);
-                if applied {
-                    self.sync_document_lifecycle();
-                    self.sync_configuration();
-                }
-                return applied;
+                return self.apply_lsp_text_edits_to_uri(&uri, edits);
             }
         }
         false
@@ -4475,6 +6675,767 @@ mod tests {
         let refreshed_scene = window.render(&mut surface);
         assert!(refreshed_scene.contains_text("RefreshedNode"));
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    fn make_temp_test_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "rustcode_w2c_{}_{}",
+            prefix,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_window_os_ux_clipboard_file_dialogs_and_recent_storage() {
+        use rustcode_platform::{
+            InMemoryClipboardBackend, InMemoryStorageBackend, MockFileDialogBackend, StorageBackend,
+        };
+
+        let tmp = make_temp_test_dir("os_ux");
+        let file_a = tmp.join("hello.rs");
+        let file_save_as = tmp.join("saved_as.rs");
+        std::fs::write(&file_a, "fn hello() {}\n").unwrap();
+
+        let clipboard = Arc::new(InMemoryClipboardBackend::new());
+        let file_dialog = Arc::new(MockFileDialogBackend::new());
+        let storage = Arc::new(InMemoryStorageBackend::new());
+
+        file_dialog.push_open_file(Some(file_a.clone()));
+        file_dialog.push_save_file(Some(file_save_as.clone()));
+        file_dialog.push_open_folder(Some(tmp.clone()));
+
+        let mut window = WorkbenchWindow::default()
+            .with_clipboard_backend(clipboard.clone())
+            .with_file_dialog_backend(file_dialog)
+            .with_storage_backend(storage.clone());
+
+        // 1. Open File via FileDialogBackend
+        window.handle_builtin_command_effects("workbench.action.files.openFile");
+        let active_uri = window
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .unwrap()
+            .uri
+            .clone();
+        assert_eq!(active_uri, rustcode_platform::path_to_file_uri(&file_a));
+
+        // 2. EditorView clipboard callbacks route through ClipboardBackend (Ctrl+A + Ctrl+C / Ctrl+V)
+        let bounds = Rect::from_xywh(0.0, 0.0, 1200.0, 800.0);
+        let ctrl_a = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('a'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        window.dispatch_event(&ctrl_a, bounds);
+        {
+            let ed = window.view.editor_area.active_editor_mut().unwrap();
+            ed.copy();
+        }
+        assert_eq!(clipboard.read_text().unwrap(), "fn hello() {}\n");
+
+        clipboard.write_text("fn replaced() {}\n").unwrap();
+        {
+            let ed = window.view.editor_area.active_editor_mut().unwrap();
+            ed.paste();
+            assert_eq!(ed.text(), "fn replaced() {}\n");
+        }
+
+        // 3. Save As via FileDialogBackend writes disk and updates active tab URI
+        window.handle_builtin_command_effects("workbench.action.files.saveAs");
+        assert_eq!(
+            std::fs::read_to_string(&file_save_as).unwrap(),
+            "fn replaced() {}\n"
+        );
+        let new_uri = window
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .unwrap()
+            .uri
+            .clone();
+        assert_eq!(
+            new_uri,
+            rustcode_platform::path_to_file_uri(&file_save_as)
+        );
+
+        // 4. Open Folder via FileDialogBackend records recent workspace in StorageBackend
+        window.handle_builtin_command_effects("workbench.action.files.openFolder");
+        assert_eq!(window.view.workspace.folders().len(), 1);
+        let recent = storage.recent_workspaces().unwrap();
+        assert!(recent.contains(&tmp));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_window_search_replace_and_comment_line_keymap() {
+        let tmp = make_temp_test_dir("search_replace");
+        let file_a = tmp.join("alpha.rs");
+        let file_b = tmp.join("beta.rs");
+        std::fs::write(&file_a, "let old_token = 1;\n").unwrap();
+        std::fs::write(&file_b, "let old_token = 2;\n").unwrap();
+
+        let mut window = WorkbenchWindow::default();
+        let default_linux_keymap = include_str!("../../../resources/default-keymaps/linux.json");
+        window
+            .keybindings
+            .load_keybindings_json(default_linux_keymap)
+            .unwrap();
+        window.open_workspace(&tmp);
+        window.open_path(&file_a, true);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 1200.0, 800.0);
+
+        // 1. Ctrl+/ comments the active line via default keymap + editor.action.commentLine
+        let ctrl_slash = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('/'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        assert_eq!(window.dispatch_event(&ctrl_slash, bounds), EventResult::Consumed);
+        let ed_text_after_comment = window.view.editor_area.active_editor().unwrap().text();
+        assert!(
+            ed_text_after_comment.contains("// let old_token = 1;"),
+            "expected commented line, got: {:?}",
+            ed_text_after_comment
+        );
+
+        // Toggle back with Ctrl+/ so old_token matches clean text, save to disk
+        assert_eq!(window.dispatch_event(&ctrl_slash, bounds), EventResult::Consumed);
+        assert!(window.save_active_file());
+
+        // 2. Ctrl+Shift+F opens Search sidebar (find mode)
+        let ctrl_shift_f = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('f'),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: false,
+                meta: false,
+            },
+        ));
+        assert_eq!(window.dispatch_event(&ctrl_shift_f, bounds), EventResult::Consumed);
+        assert!(window.view.layout.sidebar_visible);
+        assert_eq!(window.view.layout.active_sidebar_view, "search");
+
+        // 3. Ctrl+Shift+H opens Search sidebar in Replace mode
+        let ctrl_shift_h = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('h'),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: false,
+                meta: false,
+            },
+        ));
+        assert_eq!(window.dispatch_event(&ctrl_shift_h, bounds), EventResult::Consumed);
+        assert!(window.view.layout.sidebar_visible);
+        assert_eq!(window.view.layout.active_sidebar_view, "search");
+        assert!(window.view.search_view.is_replace_expanded);
+
+        // 4. Execute workspace Search & Replace and verify open EditorArea buffer refreshes
+        window.view.search_view.query.query = "old_token".to_string();
+        window.view.search_view.replace_text = "new_token".to_string();
+        window.handle_search_action(&SearchAction::ExecuteSearch);
+        assert!(window.view.search_view.results.total_matches >= 2);
+
+        window.handle_search_action(&SearchAction::ExecuteReplace);
+        assert_eq!(
+            std::fs::read_to_string(&file_a).unwrap(),
+            "let new_token = 1;\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file_b).unwrap(),
+            "let new_token = 2;\n"
+        );
+        assert_eq!(
+            window.view.editor_area.active_editor().unwrap().text(),
+            "let new_token = 1;\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_window_format_on_save_and_format_document_command() {
+        use rustcode_ext_host::provider::{ProviderRegistration, ProviderRegistry, ProviderType};
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_protocols::lsp::LspClientManager;
+        use serde_json::json;
+
+        let tmp = make_temp_test_dir("format_on_save");
+        let file_a = tmp.join("fmt.rs");
+        std::fs::write(&file_a, "fn   bad( ) {}\n").unwrap();
+
+        let rpc = Arc::new(RpcBridge::new());
+        let registry = Arc::new(ProviderRegistry::new());
+        let lsp_mgr = Arc::new(LspClientManager::new());
+        registry.register(ProviderRegistration {
+            id: "fmt-ext".to_string(),
+            provider_type: ProviderType::DocumentFormatting,
+            language_selector: Some("rust".to_string()),
+        });
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc.clone(), lsp_mgr));
+
+        let mut window = WorkbenchWindow::default().with_language_bridge(bridge);
+        window.open_workspace(&tmp);
+        window
+            .config
+            .load_workspace_settings(r#"{"editor.formatOnSave": true}"#)
+            .unwrap();
+        window.open_path(&file_a, true);
+
+        // Save async formats BEFORE writing to disk
+        let mut saved = false;
+        {
+            let save_fut = window.save_active_file_async();
+            tokio::pin!(save_fut);
+
+            let mut responded = false;
+            for _ in 0..40 {
+                tokio::select! {
+                    res = &mut save_fut => {
+                        saved = res;
+                        break;
+                    }
+                    _ = tokio::task::yield_now() => {
+                        if !responded && rpc.pending_count() > 0 {
+                            let _ = rpc.handle_incoming_response(
+                                1,
+                                Some(json!([{
+                                    "range": {
+                                        "start": { "line": 0, "character": 0 },
+                                        "end": { "line": 0, "character": 14 }
+                                    },
+                                    "newText": "fn good() {}"
+                                }])),
+                                None,
+                            );
+                            responded = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saved);
+        assert_eq!(
+            std::fs::read_to_string(&file_a).unwrap(),
+            "fn good() {}\n"
+        );
+        assert_eq!(
+            window.view.editor_area.active_editor().unwrap().text(),
+            "fn good() {}\n"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_window_scm_actions_open_diff_and_status_bar() {
+        use crate::scm::ScmAction;
+        use crate::statusbar::STATUS_GIT_BRANCH_ID;
+        use rustcode_protocols::git::{
+            GitStatusEntry, GitStatusKind, InMemoryGitBackend, ScmRepository,
+        };
+
+        let tmp = make_temp_test_dir("scm_wire");
+        let file_foo = tmp.join("foo.rs");
+        std::fs::write(&file_foo, "fn v2() {}\n").unwrap();
+
+        let mut repo = ScmRepository::new(tmp.clone());
+        repo.current_branch.name = "feature/wave2c".to_string();
+        repo.changes.push(GitStatusEntry {
+            path: PathBuf::from("foo.rs"),
+            status: GitStatusKind::Modified,
+            is_staged: false,
+        });
+        repo.set_file_diff("foo.rs", "fn v1() {}\n", "fn v2() {}\n");
+
+        let backend = InMemoryGitBackend::new(repo);
+        let mut window = WorkbenchWindow::default();
+        window.view.set_git_backend(Arc::new(backend));
+
+        assert_eq!(window.view.scm_view.repo.changes.len(), 1);
+        assert_eq!(window.view.scm_view.repo.current_branch.name, "feature/wave2c");
+        assert!(window
+            .view
+            .status_bar
+            .model
+            .item(STATUS_GIT_BRANCH_ID)
+            .is_some_and(|it| it.text.contains("feature/wave2c")));
+
+        // Stage all via ScmAction handler
+        window.handle_scm_action(&ScmAction::StageAll).unwrap();
+        assert!(window.view.scm_view.repo.changes.is_empty());
+        assert_eq!(window.view.scm_view.repo.staged.len(), 1);
+
+        // OpenDiff opens diff tab in EditorAreaView
+        window.open_scm_diff(&PathBuf::from("foo.rs"), false).unwrap();
+        let active_tab = window
+            .view
+            .editor_area
+            .model
+            .current_group_ref()
+            .active_tab()
+            .unwrap();
+        assert!(active_tab.uri.starts_with("diff://"));
+
+        // Commit staged changes
+        window
+            .handle_scm_action(&ScmAction::Commit {
+                message: "Wave 2C commit".to_string(),
+            })
+            .unwrap();
+        assert!(window.view.scm_view.repo.staged.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_window_terminal_pty_action_and_webview_ipc() {
+        use crate::terminal_panel::TerminalAction;
+        use crate::webview::HeadlessWebviewBackend;
+        use rustcode_ext_host::provider::ProviderRegistry;
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_ext_host::webview::WebviewOptions;
+        use rustcode_protocols::lsp::LspClientManager;
+        use rustcode_terminal::pty::HeadlessPtyBackend;
+        use serde_json::json;
+
+        let rpc = Arc::new(RpcBridge::new());
+        let registry = Arc::new(ProviderRegistry::new());
+        let lsp_mgr = Arc::new(LspClientManager::new());
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp_mgr));
+
+        // 1. ExtHost terminal -> local PTY terminal + lifecycle sync
+        bridge
+            .terminal_manager
+            .create_terminal("ext_term_1", "PTY Task", None, vec![], None);
+        bridge
+            .terminal_manager
+            .send_text("ext_term_1", "echo hi\n", false)
+            .unwrap();
+
+        let mut window = WorkbenchWindow::default().with_language_bridge(bridge.clone());
+        window.sync_ext_terminals();
+        let local_id = window.ext_terminal_map.get("ext_term_1").unwrap().clone();
+
+        // Attach HeadlessPtyBackend and drive TerminalAction + poll_runtime_events
+        let pty = HeadlessPtyBackend::new(24, 80);
+        pty.push_output_str("Hello PTY\r\n");
+        {
+            let term = window
+                .view
+                .terminal_panel
+                .manager
+                .terminal_mut(&local_id)
+                .unwrap();
+            term.attach_pty(Box::new(pty.clone()));
+            term.resize(30, 100).unwrap();
+        }
+        window.poll_runtime_events();
+        assert_eq!(
+            bridge
+                .terminal_manager
+                .get_terminal("ext_term_1")
+                .unwrap()
+                .rows,
+            Some(30)
+        );
+        assert_eq!(
+            bridge
+                .terminal_manager
+                .get_terminal("ext_term_1")
+                .unwrap()
+                .cols,
+            Some(100)
+        );
+        assert!(window
+            .view
+            .terminal_panel
+            .manager
+            .terminal(&local_id)
+            .unwrap()
+            .lines
+            .iter()
+            .any(|l| l.contains("Hello PTY")));
+
+        // New terminal via TerminalAction
+        let before_count = window.view.terminal_panel.manager.terminals().len();
+        window.handle_terminal_action(&TerminalAction::NewTerminal { id: String::new() });
+        assert_eq!(
+            window.view.terminal_panel.manager.terminals().len(),
+            before_count + 1
+        );
+
+        // 2. Webview IPC outbound drain -> ExtHostWebviewManager
+        bridge.webview_manager.create_panel(
+            "panel_1",
+            "test.view",
+            "Test Panel",
+            WebviewOptions::default(),
+        );
+        assert!(bridge.webview_manager.set_html("panel_1", "<p>Loaded</p>"));
+        window.sync_webviews();
+
+        let webview_uri = "webview://panel_1";
+        let mut backend = HeadlessWebviewBackend::with_html("<p>Loaded</p>");
+        backend.inject_outbound_message(json!({ "command": "ping", "value": 7 }));
+        let wv = window
+            .view
+            .editor_area
+            .webviews
+            .get_mut(webview_uri)
+            .unwrap();
+        wv.set_backend(Box::new(backend));
+
+        window.sync_webview_outbound_messages();
+        let inbound = bridge.webview_manager.take_inbound_messages("panel_1");
+        assert_eq!(inbound.len(), 1);
+        assert_eq!(inbound[0]["command"], "ping");
+        assert_eq!(inbound[0]["value"], 7);
+    }
+
+    #[tokio::test]
+    async fn test_window_lsp_goto_definition_hover_completions_diagnostics_and_jump() {
+        use rustcode_ext_host::provider::ProviderRegistry;
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_platform::render::{MouseButton, MouseEvent, Point};
+        use rustcode_protocols::codec::{read_framed_message, write_framed_message};
+        use rustcode_protocols::lsp::{LspClient, LspClientManager};
+        use serde_json::json;
+
+        let tmp = make_temp_test_dir("lsp_wire");
+        let main_rs = tmp.join("main.rs");
+        let lib_rs = tmp.join("lib.rs");
+        std::fs::write(&main_rs, "fn main() { foo(); }\n").unwrap();
+        std::fs::write(&lib_rs, "pub fn bar() {}\npub fn foo() {}\n").unwrap();
+
+        let lib_uri = rustcode_platform::path_to_file_uri(&lib_rs);
+        let main_uri = rustcode_platform::path_to_file_uri(&main_rs);
+
+        let (client_read, server_write) = tokio::io::duplex(8192);
+        let (server_read, client_write) = tokio::io::duplex(8192);
+
+        let lib_uri_srv = lib_uri.clone();
+        let main_uri_srv = main_uri.clone();
+        let server_task = tokio::spawn(async move {
+            let mut reader = server_read;
+            let mut writer = server_write;
+            let mut msg_buf = Vec::new();
+            while let Ok(Some(bytes)) = read_framed_message(&mut reader, &mut msg_buf).await {
+                let msg: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let id = msg.get("id").cloned();
+                let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                if let Some(req_id) = id {
+                    let result = match method {
+                        "textDocument/definition" => json!({
+                            "uri": lib_uri_srv,
+                            "range": {
+                                "start": { "line": 1, "character": 7 },
+                                "end": { "line": 1, "character": 10 }
+                            }
+                        }),
+                        "textDocument/hover" => json!({
+                            "contents": { "kind": "markdown", "value": "```rust\npub fn foo()\n```" }
+                        }),
+                        "textDocument/completion" => json!([
+                            { "label": "foo_lsp", "kind": 3, "detail": "fn foo_lsp()" }
+                        ]),
+                        _ => json!(null),
+                    };
+                    let resp = json!({ "jsonrpc": "2.0", "id": req_id, "result": result });
+                    let _ = write_framed_message(&mut writer, resp.to_string().as_bytes()).await;
+
+                    if method == "textDocument/definition" {
+                        let diag_notif = json!({
+                            "jsonrpc": "2.0",
+                            "method": "textDocument/publishDiagnostics",
+                            "params": {
+                                "uri": main_uri_srv,
+                                "diagnostics": [{
+                                    "range": {
+                                        "start": { "line": 0, "character": 12 },
+                                        "end": { "line": 0, "character": 15 }
+                                    },
+                                    "severity": 1,
+                                    "source": "rustc",
+                                    "message": "unresolved foo"
+                                }]
+                            }
+                        });
+                        let _ =
+                            write_framed_message(&mut writer, diag_notif.to_string().as_bytes())
+                                .await;
+                    }
+                }
+            }
+        });
+
+        let client = Arc::new(LspClient::from_io(client_read, client_write));
+        let rpc = Arc::new(RpcBridge::new());
+        let registry = Arc::new(ProviderRegistry::new());
+        let lsp_mgr = Arc::new(LspClientManager::new());
+        lsp_mgr.attach_client("rust", client);
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp_mgr));
+
+        let mut window = WorkbenchWindow::default().with_language_bridge(bridge);
+        window.open_workspace(&tmp);
+        window.open_path(&main_rs, true);
+
+        let mut surface = MockRenderSurface::new(1200.0, 800.0);
+
+        // 1. Hover + Completions on main.rs rendered in Scene
+        assert!(window.request_hover_at(Position::new(0, 13)).await);
+        assert!(window.request_completions_at(Position::new(0, 13), Some('.')).await > 0);
+        let hover_comp_scene = window.render(&mut surface);
+        assert!(hover_comp_scene.contains_text("foo_lsp"));
+
+        // 2. GoToDefinition jumps cross-file to lib.rs line 1 col 7
+        assert!(window.go_to_definition_at(Position::new(0, 13)).await);
+
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            window.poll_runtime_events();
+            if window.view.problems_panel.total_errors() > 0 {
+                break;
+            }
+        }
+
+        // Verify cross-file GoToDefinition jumped to lib.rs line 1 col 7
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .model
+                .current_group_ref()
+                .active_tab()
+                .unwrap()
+                .uri,
+            lib_uri
+        );
+        assert_eq!(
+            window.view.editor_area.active_editor().unwrap().primary_position(),
+            Position::new(1, 7)
+        );
+
+        // Verify diagnostics populated ProblemsPanel & JumpToDiagnostic navigates back to main.rs
+        assert_eq!(window.view.problems_panel.total_errors(), 1);
+        window.view.last_action = Some(WorkbenchAction::JumpToDiagnostic {
+            uri: main_uri.clone(),
+            line: 0,
+            column: 12,
+        });
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(Point::new(10.0, 10.0), MouseButton::Left)),
+            Rect::from_xywh(0.0, 0.0, 1200.0, 800.0),
+        );
+        assert_eq!(
+            window
+                .view
+                .editor_area
+                .model
+                .current_group_ref()
+                .active_tab()
+                .unwrap()
+                .uri,
+            main_uri
+        );
+        assert_eq!(
+            window.view.editor_area.active_editor().unwrap().primary_position(),
+            Position::new(0, 12)
+        );
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_window_dap_launch_json_toolbar_and_debug_actions() {
+        use crate::debug::{DebugToolbarAction, DebugViewAction};
+        use rustcode_protocols::codec::{read_framed_message, write_framed_message};
+        use rustcode_protocols::dap::DapClient;
+        use serde_json::json;
+
+        let tmp = make_temp_test_dir("dap_wire");
+        let vscode_dir = tmp.join(".vscode");
+        std::fs::create_dir_all(&vscode_dir).unwrap();
+        let main_rs = tmp.join("main.rs");
+        std::fs::write(&main_rs, "fn main() {\n    let x = 1;\n}\n").unwrap();
+        std::fs::write(
+            vscode_dir.join("launch.json"),
+            json!({
+                "version": "0.2.0",
+                "configurations": [{
+                    "name": "Debug Main",
+                    "type": "lldb",
+                    "request": "launch",
+                    "program": "${workspaceFolder}/target/debug/app"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (client_read, server_write) = tokio::io::duplex(8192);
+        let (server_read, client_write) = tokio::io::duplex(8192);
+        let main_path_str = main_rs.to_string_lossy().into_owned();
+
+        let server_task = tokio::spawn(async move {
+            let mut reader = server_read;
+            let mut writer = server_write;
+            let mut seq = 1i64;
+            let mut msg_buf = Vec::new();
+            while let Ok(Some(bytes)) = read_framed_message(&mut reader, &mut msg_buf).await {
+                let req: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let req_seq = req.get("seq").and_then(|v| v.as_i64()).unwrap_or(1);
+                let cmd = req.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let body = match cmd {
+                    "initialize" => json!({ "supportsConfigurationDoneRequest": true }),
+                    "threads" => json!({ "threads": [{ "id": 1, "name": "main" }] }),
+                    "stackTrace" => json!({
+                        "stackFrames": [{
+                            "id": 100,
+                            "name": "main",
+                            "source": { "name": "main.rs", "path": main_path_str },
+                            "line": 2,
+                            "column": 5
+                        }],
+                        "totalFrames": 1
+                    }),
+                    "scopes" => json!({
+                        "scopes": [{
+                            "name": "Locals",
+                            "variablesReference": 200,
+                            "expensive": false
+                        }]
+                    }),
+                    "variables" => json!({
+                        "variables": [{
+                            "name": "x",
+                            "value": "42",
+                            "type": "i32",
+                            "variablesReference": 0
+                        }]
+                    }),
+                    "evaluate" => json!({
+                        "result": "42",
+                        "type": "i32",
+                        "variablesReference": 0
+                    }),
+                    _ => json!({}),
+                };
+                let resp = json!({
+                    "seq": seq,
+                    "type": "response",
+                    "request_seq": req_seq,
+                    "success": true,
+                    "command": cmd,
+                    "body": body
+                });
+                seq += 1;
+                let _ = write_framed_message(&mut writer, resp.to_string().as_bytes()).await;
+
+                if cmd == "configurationDone" {
+                    let stopped = json!({
+                        "seq": seq,
+                        "type": "event",
+                        "event": "stopped",
+                        "body": { "reason": "breakpoint", "threadId": 1 }
+                    });
+                    seq += 1;
+                    let _ = write_framed_message(&mut writer, stopped.to_string().as_bytes()).await;
+                }
+            }
+        });
+
+        let dap = Arc::new(DapClient::from_io(client_read, client_write));
+        let mut window = WorkbenchWindow::default().with_dap_client(dap);
+        window.open_workspace(&tmp);
+
+        assert_eq!(window.view.debug_sidebar.launch_configurations.len(), 1);
+        assert_eq!(
+            window.view.debug_sidebar.launch_configurations[0].name,
+            "Debug Main"
+        );
+
+        window.start_debug_session(Some(0)).await.unwrap();
+        assert!(window.view.debug_sidebar.session.is_active);
+        assert!(window.view.debug_toolbar.is_visible);
+
+        // Wait briefly for stopped event + async snapshot sync
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            window.poll_runtime_events();
+            if window.view.debug_sidebar.session.is_paused
+                && !window.view.debug_sidebar.session.call_stack.is_empty()
+            {
+                break;
+            }
+        }
+        assert!(window.view.debug_sidebar.session.is_paused);
+        assert_eq!(window.view.debug_sidebar.session.call_stack[0].name, "main");
+        assert_eq!(
+            window
+                .view
+                .debug_sidebar
+                .session
+                .variables
+                .get(&200)
+                .unwrap()[0]
+                .name,
+            "x"
+        );
+
+        // Evaluate expression in Debug Console
+        window
+            .handle_debug_view_action_async(&DebugViewAction::EvaluateExpression {
+                expression: "x".to_string(),
+            })
+            .await
+            .unwrap();
+        window.poll_runtime_events();
+        assert!(window
+            .view
+            .debug_sidebar
+            .session
+            .console_output
+            .iter()
+            .any(|entry| entry.text.contains("42")));
+
+        // StepOver & Stop via DebugToolbarAction
+        window
+            .handle_debug_toolbar_action_async(&DebugToolbarAction::StepOver)
+            .await
+            .unwrap();
+        window
+            .handle_debug_toolbar_action_async(&DebugToolbarAction::Stop)
+            .await
+            .unwrap();
+        assert!(!window.view.debug_sidebar.session.is_active);
+        assert!(!window.view.debug_toolbar.is_visible);
+
+        server_task.abort();
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

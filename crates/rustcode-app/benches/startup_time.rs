@@ -10,6 +10,7 @@
 //! - End-to-end cold start pipeline (verifies < 500 ms target)
 
 use rustcode_app::RustCodeContext;
+use rustcode_platform::bench_support::BenchmarkStats;
 use rustcode_platform::commands::CommandRegistry;
 use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::keybindings::{KeyChord, KeybindingService, ResolvedKeybinding};
@@ -17,55 +18,6 @@ use rustcode_platform::render::MockRenderSurface;
 use rustcode_platform::theme::ThemeService;
 use serde_json::json;
 use std::time::{Duration, Instant};
-
-struct BenchmarkStats {
-    name: &'static str,
-    samples: Vec<Duration>,
-}
-
-impl BenchmarkStats {
-    fn new(name: &'static str, mut samples: Vec<Duration>) -> Self {
-        samples.sort();
-        Self { name, samples }
-    }
-
-    fn min(&self) -> Duration {
-        *self.samples.first().unwrap_or(&Duration::ZERO)
-    }
-
-    fn max(&self) -> Duration {
-        *self.samples.last().unwrap_or(&Duration::ZERO)
-    }
-
-    fn mean(&self) -> Duration {
-        if self.samples.is_empty() {
-            return Duration::ZERO;
-        }
-        let total: Duration = self.samples.iter().sum();
-        total / self.samples.len() as u32
-    }
-
-    fn percentile(&self, p: f64) -> Duration {
-        if self.samples.is_empty() {
-            return Duration::ZERO;
-        }
-        let idx = ((self.samples.len() as f64 - 1.0) * (p / 100.0)).round() as usize;
-        self.samples[idx]
-    }
-
-    fn print(&self) {
-        println!(
-            "{:<40} | Min: {:>8.2?} | Mean: {:>8.2?} | P50: {:>8.2?} | P95: {:>8.2?} | P99: {:>8.2?} | Max: {:>8.2?}",
-            self.name,
-            self.min(),
-            self.mean(),
-            self.percentile(50.0),
-            self.percentile(95.0),
-            self.percentile(99.0),
-            self.max(),
-        );
-    }
-}
 
 fn generate_100_command_ids() -> Vec<String> {
     let categories = [

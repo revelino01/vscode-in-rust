@@ -13,43 +13,6 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::sync::{Arc, Weak};
 
-fn clamp_rect_to_bounds(rect: Rect, bounds: Rect) -> Rect {
-    if !crate::is_finite_rect(bounds) || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return Rect::zero();
-    }
-    let rx = if rect.origin.x.is_finite() {
-        rect.origin.x
-    } else {
-        bounds.min_x()
-    };
-    let ry = if rect.origin.y.is_finite() {
-        rect.origin.y
-    } else {
-        bounds.min_y()
-    };
-    let rw = if rect.size.width.is_finite() && rect.size.width >= 0.0 {
-        rect.size.width
-    } else {
-        0.0
-    };
-    let rh = if rect.size.height.is_finite() && rect.size.height >= 0.0 {
-        rect.size.height
-    } else {
-        0.0
-    };
-
-    let min_x = rx.clamp(bounds.min_x(), bounds.max_x());
-    let min_y = ry.clamp(bounds.min_y(), bounds.max_y());
-    let max_x = (rx + rw).clamp(min_x, bounds.max_x());
-    let max_y = (ry + rh).clamp(min_y, bounds.max_y());
-    Rect::from_xywh(
-        min_x,
-        min_y,
-        (max_x - min_x).max(0.0),
-        (max_y - min_y).max(0.0),
-    )
-}
-
 fn truncate_utf8_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
@@ -142,7 +105,7 @@ impl NotificationsOverlay {
     }
 
     fn compute_layouts(&self, bounds: Rect, font: &FontMetrics) -> Vec<NotificationCardLayout> {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return Vec::new();
         }
         let list = self.notifications.read();
@@ -172,36 +135,29 @@ impl NotificationsOverlay {
                 break;
             }
             let toast_y = (cursor_bottom - toast_h).max(bounds.min_y());
-            let card_rect = clamp_rect_to_bounds(
-                Rect::from_xywh(toast_x, toast_y, toast_w, toast_h),
-                bounds,
-            );
+            let card_rect = Rect::from_xywh(toast_x, toast_y, toast_w, toast_h).clamp_to_bounds(bounds);
             if card_rect.width() <= 0.0 || card_rect.height() <= 0.0 {
                 continue;
             }
 
             let dismiss_size = 20.0f32.min(card_rect.width()).min(card_rect.height());
-            let dismiss_rect = clamp_rect_to_bounds(
-                Rect::from_xywh(
-                    (card_rect.max_x() - dismiss_size - 4.0).max(card_rect.min_x()),
-                    card_rect.min_y() + 4.0f32.min(card_rect.height() * 0.25),
-                    dismiss_size,
-                    dismiss_size,
-                ),
-                card_rect,
-            );
+            let dismiss_rect = Rect::from_xywh(
+                (card_rect.max_x() - dismiss_size - 4.0).max(card_rect.min_x()),
+                card_rect.min_y() + 4.0f32.min(card_rect.height() * 0.25),
+                dismiss_size,
+                dismiss_size,
+            )
+            .clamp_to_bounds(card_rect);
 
             let msg_x = (card_rect.min_x() + pad).min(dismiss_rect.min_x());
             let msg_w = (dismiss_rect.min_x() - msg_x - 4.0).max(0.0);
-            let msg_rect = clamp_rect_to_bounds(
-                Rect::from_xywh(
-                    msg_x,
-                    card_rect.min_y() + pad.min(card_rect.height() * 0.25),
-                    msg_w,
-                    line_h.min(card_rect.height()),
-                ),
-                card_rect,
-            );
+            let msg_rect = Rect::from_xywh(
+                msg_x,
+                card_rect.min_y() + pad.min(card_rect.height() * 0.25),
+                msg_w,
+                line_h.min(card_rect.height()),
+            )
+            .clamp_to_bounds(card_rect);
 
             let mut action_buttons = Vec::new();
             if has_buttons {
@@ -216,10 +172,8 @@ impl NotificationsOverlay {
                         if bw <= 4.0 {
                             break;
                         }
-                        let br = clamp_rect_to_bounds(
-                            Rect::from_xywh(cur_bx, btn_y, bw, actual_btn_h),
-                            card_rect,
-                        );
+                        let br = Rect::from_xywh(cur_bx, btn_y, bw, actual_btn_h)
+                            .clamp_to_bounds(card_rect);
                         action_buttons.push((item.title.clone(), br));
                         cur_bx = br.max_x() + 6.0;
                     }
@@ -251,45 +205,38 @@ impl NotificationsOverlay {
             let modal_h = raw_modal_h.min((bounds.height() - 16.0).max(bounds.height().min(90.0)));
             let modal_x = bounds.min_x() + ((bounds.width() - modal_w) * 0.5).max(0.0);
             let modal_y = bounds.min_y() + ((bounds.height() - modal_h) * 0.5).max(0.0);
-            let card_rect = clamp_rect_to_bounds(
-                Rect::from_xywh(modal_x, modal_y, modal_w, modal_h),
-                bounds,
-            );
+            let card_rect = Rect::from_xywh(modal_x, modal_y, modal_w, modal_h).clamp_to_bounds(bounds);
 
             let dismiss_size = 20.0f32.min(card_rect.width()).min(card_rect.height());
-            let dismiss_rect = clamp_rect_to_bounds(
-                Rect::from_xywh(
-                    (card_rect.max_x() - dismiss_size - 6.0).max(card_rect.min_x()),
-                    card_rect.min_y() + 6.0f32.min(card_rect.height() * 0.2),
-                    dismiss_size,
-                    dismiss_size,
-                ),
-                card_rect,
-            );
+            let dismiss_rect = Rect::from_xywh(
+                (card_rect.max_x() - dismiss_size - 6.0).max(card_rect.min_x()),
+                card_rect.min_y() + 6.0f32.min(card_rect.height() * 0.2),
+                dismiss_size,
+                dismiss_size,
+            )
+            .clamp_to_bounds(card_rect);
 
             let msg_x = (card_rect.min_x() + pad).min(dismiss_rect.min_x());
             let msg_w = (dismiss_rect.min_x() - msg_x - 6.0).max(0.0);
-            let msg_rect = clamp_rect_to_bounds(
-                Rect::from_xywh(
-                    msg_x,
-                    card_rect.min_y() + pad.min(card_rect.height() * 0.2),
-                    msg_w,
-                    line_h.min(card_rect.height()),
-                ),
-                card_rect,
-            );
+            let msg_rect = Rect::from_xywh(
+                msg_x,
+                card_rect.min_y() + pad.min(card_rect.height() * 0.2),
+                msg_w,
+                line_h.min(card_rect.height()),
+            )
+            .clamp_to_bounds(card_rect);
 
             let detail_rect = if has_detail {
                 let dy = (msg_rect.max_y() + 6.0).min(card_rect.max_y());
-                Some(clamp_rect_to_bounds(
+                Some(
                     Rect::from_xywh(
                         msg_x,
                         dy,
                         (card_rect.max_x() - msg_x - pad).max(0.0),
                         line_h.min((card_rect.max_y() - dy).max(0.0)),
-                    ),
-                    card_rect,
-                ))
+                    )
+                    .clamp_to_bounds(card_rect),
+                )
             } else {
                 None
             };
@@ -307,10 +254,8 @@ impl NotificationsOverlay {
                     if bw <= 4.0 {
                         break;
                     }
-                    let br = clamp_rect_to_bounds(
-                        Rect::from_xywh(cur_bx, btn_y, bw, actual_btn_h),
-                        card_rect,
-                    );
+                    let br = Rect::from_xywh(cur_bx, btn_y, bw, actual_btn_h)
+                        .clamp_to_bounds(card_rect);
                     action_buttons.push((item.title.clone(), br));
                     cur_bx = br.max_x() + 8.0;
                 }
@@ -435,7 +380,7 @@ impl View for NotificationsOverlay {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         *self.last_font.write() = font.clone();
@@ -445,8 +390,7 @@ impl View for NotificationsOverlay {
         }
 
         if layouts.iter().any(|l| l.modal) {
-            crate::push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(bounds).with_background(Rgba::new(0.0, 0.0, 0.0, 0.45)),
             );
         }
@@ -466,8 +410,7 @@ impl View for NotificationsOverlay {
                 color: Rgba::new(0.0, 0.0, 0.0, 0.35),
             });
 
-            crate::push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(card.card_rect)
                     .with_background(theme.command_palette_bg)
                     .with_border(theme.command_palette_border, 1.0)
@@ -475,21 +418,18 @@ impl View for NotificationsOverlay {
             );
 
             // Severity left accent stripe
-            let stripe_rect = clamp_rect_to_bounds(
-                Rect::from_xywh(
-                    card.card_rect.min_x(),
-                    card.card_rect.min_y(),
-                    3.0f32.min(card.card_rect.width()),
-                    card.card_rect.height(),
-                ),
-                card.card_rect,
-            );
-            crate::push_finite_quad(scene, Quad::new(stripe_rect).with_background(accent));
+            let stripe_rect = Rect::from_xywh(
+                card.card_rect.min_x(),
+                card.card_rect.min_y(),
+                3.0f32.min(card.card_rect.width()),
+                card.card_rect.height(),
+            )
+            .clamp_to_bounds(card.card_rect);
+            scene.push_finite_quad(Quad::new(stripe_rect).with_background(accent));
 
             // Message
             if card.message_rect.width() > 0.0 && card.message_rect.height() > 0.0 {
-                crate::push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         card.message.clone(),
                         card.message_rect.origin,
@@ -503,8 +443,7 @@ impl View for NotificationsOverlay {
             // Modal detail
             if let (Some(detail), Some(d_rect)) = (&card.detail, card.detail_rect) {
                 if d_rect.width() > 0.0 && d_rect.height() > 0.0 {
-                    crate::push_finite_text(
-                        scene,
+                    scene.push_finite_text(
                         GlyphRun::new(
                             detail.clone(),
                             d_rect.origin,
@@ -520,8 +459,7 @@ impl View for NotificationsOverlay {
             if card.dismiss_rect.width() > 0.0 && card.dismiss_rect.height() > 0.0 {
                 let tx = (card.dismiss_rect.min_x() + 4.0).min(card.dismiss_rect.max_x());
                 let ty = (card.dismiss_rect.min_y() + 2.0).min(card.dismiss_rect.max_y());
-                crate::push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         "✕".to_string(),
                         Point::new(tx, ty),
@@ -537,25 +475,21 @@ impl View for NotificationsOverlay {
                 if btn_rect.width() <= 0.0 || btn_rect.height() <= 0.0 {
                     continue;
                 }
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(*btn_rect)
                         .with_background(theme.command_palette_selected_bg)
                         .with_corner_radius(3.0),
                 );
                 let tx = (btn_rect.min_x() + 7.0).min(btn_rect.max_x());
                 let ty = btn_rect.min_y() + ((btn_rect.height() - font.line_height) * 0.5).max(0.0);
-                let text_rect = clamp_rect_to_bounds(
-                    Rect::from_xywh(
-                        tx,
-                        ty,
-                        (btn_rect.max_x() - tx).max(0.0),
-                        font.line_height.min(btn_rect.height()),
-                    ),
-                    *btn_rect,
-                );
-                crate::push_finite_text(
-                    scene,
+                let text_rect = Rect::from_xywh(
+                    tx,
+                    ty,
+                    (btn_rect.max_x() - tx).max(0.0),
+                    font.line_height.min(btn_rect.height()),
+                )
+                .clamp_to_bounds(*btn_rect);
+                scene.push_finite_text(
                     GlyphRun::new(
                         title.clone(),
                         Point::new(tx, ty),
@@ -841,7 +775,7 @@ impl PromptOverlay {
     }
 
     pub fn compute_dialog_bounds(bounds: Rect) -> Rect {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return Rect::zero();
         }
         let margin_x = 40.0f32.min(bounds.width() * 0.15);
@@ -849,7 +783,7 @@ impl PromptOverlay {
         let h = (300.0f32).min((bounds.height() - 48.0).max(bounds.height().min(120.0)));
         let x = bounds.min_x() + ((bounds.width() - w) * 0.5).max(0.0);
         let y = bounds.min_y() + (36.0f32).min((bounds.height() - h).max(0.0));
-        clamp_rect_to_bounds(Rect::from_xywh(x, y, w, h), bounds)
+        Rect::from_xywh(x, y, w, h).clamp_to_bounds(bounds)
     }
 
     pub fn accessibility_node(&self, bounds: Rect, font: &FontMetrics) -> Option<AccessibleNode> {
@@ -874,15 +808,13 @@ impl PromptOverlay {
                 };
                 let input_y = dialog_rect.min_y() + 8.0 + header_h;
                 let input_h = 30.0f32.min((dialog_rect.max_y() - input_y).max(0.0));
-                let input_rect = clamp_rect_to_bounds(
-                    Rect::from_xywh(
-                        dialog_rect.min_x() + 10.0,
-                        input_y,
-                        (dialog_rect.width() - 20.0).max(0.0),
-                        input_h,
-                    ),
-                    dialog_rect,
-                );
+                let input_rect = Rect::from_xywh(
+                    dialog_rect.min_x() + 10.0,
+                    input_y,
+                    (dialog_rect.width() - 20.0).max(0.0),
+                    input_h,
+                )
+                .clamp_to_bounds(dialog_rect);
                 let dialog_name = title
                     .as_deref()
                     .or(place_holder.as_deref())
@@ -906,15 +838,13 @@ impl PromptOverlay {
                 );
 
                 let list_y = (input_rect.max_y() + 6.0).min(dialog_rect.max_y());
-                let list_rect = clamp_rect_to_bounds(
-                    Rect::from_xywh(
-                        dialog_rect.min_x(),
-                        list_y,
-                        dialog_rect.width(),
-                        (dialog_rect.max_y() - list_y).max(0.0),
-                    ),
-                    dialog_rect,
-                );
+                let list_rect = Rect::from_xywh(
+                    dialog_rect.min_x(),
+                    list_y,
+                    dialog_rect.width(),
+                    (dialog_rect.max_y() - list_y).max(0.0),
+                )
+                .clamp_to_bounds(dialog_rect);
                 let mut list_node = AccessibleNode::new(
                     "prompt.quickPick.list",
                     AccessibleRole::List,
@@ -927,15 +857,13 @@ impl PromptOverlay {
                     if row_y >= dialog_rect.max_y() {
                         break;
                     }
-                    let row_rect = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 4.0,
-                            row_y,
-                            (dialog_rect.width() - 8.0).max(0.0),
-                            row_h,
-                        ),
-                        dialog_rect,
-                    );
+                    let row_rect = Rect::from_xywh(
+                        dialog_rect.min_x() + 4.0,
+                        row_y,
+                        (dialog_rect.width() - 8.0).max(0.0),
+                        row_h,
+                    )
+                    .clamp_to_bounds(dialog_rect);
                     if let Some(item) = items.get(item_idx) {
                         let label = quick_pick_item_label(item);
                         let mut item_node = AccessibleNode::new(
@@ -971,15 +899,13 @@ impl PromptOverlay {
                 };
                 let input_y = dialog_rect.min_y() + 10.0 + header_h;
                 let input_h = 30.0f32.min((dialog_rect.max_y() - input_y).max(0.0));
-                let input_rect = clamp_rect_to_bounds(
-                    Rect::from_xywh(
-                        dialog_rect.min_x() + 12.0,
-                        input_y,
-                        (dialog_rect.width() - 24.0).max(0.0),
-                        input_h,
-                    ),
-                    dialog_rect,
-                );
+                let input_rect = Rect::from_xywh(
+                    dialog_rect.min_x() + 12.0,
+                    input_y,
+                    (dialog_rect.width() - 24.0).max(0.0),
+                    input_h,
+                )
+                .clamp_to_bounds(dialog_rect);
                 let dialog_name = title
                     .as_deref()
                     .or(prompt_text.as_deref())
@@ -1008,15 +934,13 @@ impl PromptOverlay {
                     .with_action("input"),
                 );
                 if let Some(p_txt) = prompt_text {
-                    let p_rect = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 10.0,
-                            (input_rect.max_y() + 6.0).min(dialog_rect.max_y()),
-                            (dialog_rect.width() - 20.0).max(0.0),
-                            font.line_height,
-                        ),
-                        dialog_rect,
-                    );
+                    let p_rect = Rect::from_xywh(
+                        dialog_rect.min_x() + 10.0,
+                        (input_rect.max_y() + 6.0).min(dialog_rect.max_y()),
+                        (dialog_rect.width() - 20.0).max(0.0),
+                        font.line_height,
+                    )
+                    .clamp_to_bounds(dialog_rect);
                     dialog.add_child(AccessibleNode::new(
                         "prompt.inputBox.prompt",
                         AccessibleRole::StaticText,
@@ -1025,15 +949,13 @@ impl PromptOverlay {
                     ));
                 }
                 if let Some(err) = validation_message {
-                    let e_rect = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 10.0,
-                            (input_rect.max_y() + font.line_height + 10.0).min(dialog_rect.max_y()),
-                            (dialog_rect.width() - 20.0).max(0.0),
-                            font.line_height,
-                        ),
-                        dialog_rect,
-                    );
+                    let e_rect = Rect::from_xywh(
+                        dialog_rect.min_x() + 10.0,
+                        (input_rect.max_y() + font.line_height + 10.0).min(dialog_rect.max_y()),
+                        (dialog_rect.width() - 20.0).max(0.0),
+                        font.line_height,
+                    )
+                    .clamp_to_bounds(dialog_rect);
                     dialog.add_child(AccessibleNode::new(
                         "prompt.inputBox.validation",
                         AccessibleRole::StaticText,
@@ -1055,7 +977,7 @@ impl View for PromptOverlay {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         *self.last_font.write() = font.clone();
@@ -1070,8 +992,7 @@ impl View for PromptOverlay {
         }
 
         // Dim backdrop
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(bounds).with_background(Rgba::new(0.0, 0.0, 0.0, 0.35)),
         );
 
@@ -1083,8 +1004,7 @@ impl View for PromptOverlay {
             color: Rgba::new(0.0, 0.0, 0.0, 0.4),
         });
 
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(dialog_rect)
                 .with_background(theme.command_palette_bg)
                 .with_border(theme.command_palette_border, 1.0)
@@ -1105,18 +1025,15 @@ impl View for PromptOverlay {
             } => {
                 let mut cur_y = dialog_rect.min_y() + 8.0;
                 if let Some(t) = title.as_deref().filter(|s| !s.is_empty()) {
-                    let t_rect = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 12.0,
-                            cur_y,
-                            (dialog_rect.width() - 24.0).max(0.0),
-                            font.line_height,
-                        ),
-                        dialog_rect,
-                    );
+                    let t_rect = Rect::from_xywh(
+                        dialog_rect.min_x() + 12.0,
+                        cur_y,
+                        (dialog_rect.width() - 24.0).max(0.0),
+                        font.line_height,
+                    )
+                    .clamp_to_bounds(dialog_rect);
                     if t_rect.width() > 0.0 && t_rect.height() > 0.0 {
-                        crate::push_finite_text(
-                            scene,
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 t.to_string(),
                                 t_rect.origin,
@@ -1130,17 +1047,14 @@ impl View for PromptOverlay {
                 }
 
                 let input_h = 30.0f32.min((dialog_rect.max_y() - cur_y).max(0.0));
-                let input_rect = clamp_rect_to_bounds(
-                    Rect::from_xywh(
-                        dialog_rect.min_x() + 10.0,
-                        cur_y,
-                        (dialog_rect.width() - 20.0).max(0.0),
-                        input_h,
-                    ),
-                    dialog_rect,
-                );
-                crate::push_finite_quad(
-                    scene,
+                let input_rect = Rect::from_xywh(
+                    dialog_rect.min_x() + 10.0,
+                    cur_y,
+                    (dialog_rect.width() - 20.0).max(0.0),
+                    input_h,
+                )
+                .clamp_to_bounds(dialog_rect);
+                scene.push_finite_quad(
                     Quad::new(input_rect)
                         .with_background(theme.editor_background)
                         .with_border(theme.activity_bar_active_border, 1.0)
@@ -1159,17 +1073,14 @@ impl View for PromptOverlay {
                     let tx = (input_rect.min_x() + 8.0).min(input_rect.max_x());
                     let ty =
                         input_rect.min_y() + ((input_rect.height() - font.line_height) * 0.5).max(0.0);
-                    let tr = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            tx,
-                            ty,
-                            (input_rect.max_x() - tx - 6.0).max(0.0),
-                            font.line_height.min(input_rect.height()),
-                        ),
-                        input_rect,
-                    );
-                    crate::push_finite_text(
-                        scene,
+                    let tr = Rect::from_xywh(
+                        tx,
+                        ty,
+                        (input_rect.max_x() - tx - 6.0).max(0.0),
+                        font.line_height.min(input_rect.height()),
+                    )
+                    .clamp_to_bounds(input_rect);
+                    scene.push_finite_text(
                         GlyphRun::new(display_str, Point::new(tx, ty), tr, display_color, font.font_size),
                     );
                 }
@@ -1181,22 +1092,19 @@ impl View for PromptOverlay {
                     if row_y >= dialog_rect.max_y() {
                         break;
                     }
-                    let row_rect = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 6.0,
-                            row_y,
-                            (dialog_rect.width() - 12.0).max(0.0),
-                            row_h.min((dialog_rect.max_y() - row_y).max(0.0)),
-                        ),
-                        dialog_rect,
-                    );
+                    let row_rect = Rect::from_xywh(
+                        dialog_rect.min_x() + 6.0,
+                        row_y,
+                        (dialog_rect.width() - 12.0).max(0.0),
+                        row_h.min((dialog_rect.max_y() - row_y).max(0.0)),
+                    )
+                    .clamp_to_bounds(dialog_rect);
                     if row_rect.height() <= 0.0 || row_rect.width() <= 0.0 {
                         break;
                     }
                     let is_sel = vis_idx == *selected_index;
                     if is_sel {
-                        crate::push_finite_quad(
-                            scene,
+                        scene.push_finite_quad(
                             Quad::new(row_rect)
                                 .with_background(theme.command_palette_selected_bg)
                                 .with_corner_radius(3.0),
@@ -1217,17 +1125,14 @@ impl View for PromptOverlay {
                         let tx = (row_rect.min_x() + 8.0).min(row_rect.max_x());
                         let ty = row_rect.min_y()
                             + ((row_rect.height() - font.line_height) * 0.5).max(0.0);
-                        let tr = clamp_rect_to_bounds(
-                            Rect::from_xywh(
-                                tx,
-                                ty,
-                                (row_rect.max_x() - tx - 6.0).max(0.0),
-                                font.line_height.min(row_rect.height()),
-                            ),
-                            row_rect,
-                        );
-                        crate::push_finite_text(
-                            scene,
+                        let tr = Rect::from_xywh(
+                            tx,
+                            ty,
+                            (row_rect.max_x() - tx - 6.0).max(0.0),
+                            font.line_height.min(row_rect.height()),
+                        )
+                        .clamp_to_bounds(row_rect);
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 text,
                                 Point::new(tx, ty),
@@ -1250,17 +1155,14 @@ impl View for PromptOverlay {
             } => {
                 let mut cur_y = dialog_rect.min_y() + 10.0;
                 if let Some(t) = title.as_deref().filter(|s| !s.is_empty()) {
-                    let t_rect = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 12.0,
-                            cur_y,
-                            (dialog_rect.width() - 24.0).max(0.0),
-                            font.line_height,
-                        ),
-                        dialog_rect,
-                    );
-                    crate::push_finite_text(
-                        scene,
+                    let t_rect = Rect::from_xywh(
+                        dialog_rect.min_x() + 12.0,
+                        cur_y,
+                        (dialog_rect.width() - 24.0).max(0.0),
+                        font.line_height,
+                    )
+                    .clamp_to_bounds(dialog_rect);
+                    scene.push_finite_text(
                         GlyphRun::new(
                             t.to_string(),
                             t_rect.origin,
@@ -1273,22 +1175,19 @@ impl View for PromptOverlay {
                 }
 
                 let input_h = 30.0f32.min((dialog_rect.max_y() - cur_y).max(0.0));
-                let input_rect = clamp_rect_to_bounds(
-                    Rect::from_xywh(
-                        dialog_rect.min_x() + 12.0,
-                        cur_y,
-                        (dialog_rect.width() - 24.0).max(0.0),
-                        input_h,
-                    ),
-                    dialog_rect,
-                );
+                let input_rect = Rect::from_xywh(
+                    dialog_rect.min_x() + 12.0,
+                    cur_y,
+                    (dialog_rect.width() - 24.0).max(0.0),
+                    input_h,
+                )
+                .clamp_to_bounds(dialog_rect);
                 let border_color = if validation_message.is_some() {
                     theme.editor_error_foreground
                 } else {
                     theme.activity_bar_active_border
                 };
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(input_rect)
                         .with_background(theme.editor_background)
                         .with_border(border_color, 1.0)
@@ -1312,35 +1211,29 @@ impl View for PromptOverlay {
                     let tx = (input_rect.min_x() + 8.0).min(input_rect.max_x());
                     let ty = input_rect.min_y()
                         + ((input_rect.height() - font.line_height) * 0.5).max(0.0);
-                    let tr = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            tx,
-                            ty,
-                            (input_rect.max_x() - tx - 6.0).max(0.0),
-                            font.line_height.min(input_rect.height()),
-                        ),
-                        input_rect,
-                    );
-                    crate::push_finite_text(
-                        scene,
+                    let tr = Rect::from_xywh(
+                        tx,
+                        ty,
+                        (input_rect.max_x() - tx - 6.0).max(0.0),
+                        font.line_height.min(input_rect.height()),
+                    )
+                    .clamp_to_bounds(input_rect);
+                    scene.push_finite_text(
                         GlyphRun::new(shown, Point::new(tx, ty), tr, color, font.font_size),
                     );
                 }
 
                 cur_y = (input_rect.max_y() + 8.0).min(dialog_rect.max_y());
                 if let Some(p_txt) = prompt_text.as_deref().filter(|s| !s.is_empty()) {
-                    let pr = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 12.0,
-                            cur_y,
-                            (dialog_rect.width() - 24.0).max(0.0),
-                            font.line_height.min((dialog_rect.max_y() - cur_y).max(0.0)),
-                        ),
-                        dialog_rect,
-                    );
+                    let pr = Rect::from_xywh(
+                        dialog_rect.min_x() + 12.0,
+                        cur_y,
+                        (dialog_rect.width() - 24.0).max(0.0),
+                        font.line_height.min((dialog_rect.max_y() - cur_y).max(0.0)),
+                    )
+                    .clamp_to_bounds(dialog_rect);
                     if pr.width() > 0.0 && pr.height() > 0.0 {
-                        crate::push_finite_text(
-                            scene,
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 p_txt.to_string(),
                                 pr.origin,
@@ -1354,18 +1247,15 @@ impl View for PromptOverlay {
                 }
 
                 if let Some(err) = validation_message.as_deref().filter(|s| !s.is_empty()) {
-                    let er = clamp_rect_to_bounds(
-                        Rect::from_xywh(
-                            dialog_rect.min_x() + 12.0,
-                            cur_y,
-                            (dialog_rect.width() - 24.0).max(0.0),
-                            font.line_height.min((dialog_rect.max_y() - cur_y).max(0.0)),
-                        ),
-                        dialog_rect,
-                    );
+                    let er = Rect::from_xywh(
+                        dialog_rect.min_x() + 12.0,
+                        cur_y,
+                        (dialog_rect.width() - 24.0).max(0.0),
+                        font.line_height.min((dialog_rect.max_y() - cur_y).max(0.0)),
+                    )
+                    .clamp_to_bounds(dialog_rect);
                     if er.width() > 0.0 && er.height() > 0.0 {
-                        crate::push_finite_text(
-                            scene,
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 err.to_string(),
                                 er.origin,

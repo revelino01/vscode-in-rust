@@ -9,66 +9,8 @@
 //! - Formats statistics and verifies < 3 ms keystroke latency target
 
 use rustcode_editor::PieceTable;
+use rustcode_platform::bench_support::BenchmarkStats;
 use std::time::{Duration, Instant};
-
-struct BenchmarkStats {
-    name: &'static str,
-    samples: Vec<Duration>,
-}
-
-impl BenchmarkStats {
-    fn new(name: &'static str, mut samples: Vec<Duration>) -> Self {
-        samples.sort();
-        Self { name, samples }
-    }
-
-    fn min(&self) -> Duration {
-        *self.samples.first().unwrap_or(&Duration::ZERO)
-    }
-
-    fn max(&self) -> Duration {
-        *self.samples.last().unwrap_or(&Duration::ZERO)
-    }
-
-    fn mean(&self) -> Duration {
-        if self.samples.is_empty() {
-            return Duration::ZERO;
-        }
-        let total: Duration = self.samples.iter().sum();
-        total / self.samples.len() as u32
-    }
-
-    fn percentile(&self, p: f64) -> Duration {
-        if self.samples.is_empty() {
-            return Duration::ZERO;
-        }
-        let idx = ((self.samples.len() as f64 - 1.0) * (p / 100.0)).round() as usize;
-        self.samples[idx]
-    }
-
-    fn ops_per_sec(&self) -> f64 {
-        let mean_secs = self.mean().as_secs_f64();
-        if mean_secs > 0.0 {
-            1.0 / mean_secs
-        } else {
-            0.0
-        }
-    }
-
-    fn print(&self) {
-        println!(
-            "{:<42} | Min: {:>8.2?} | Mean: {:>8.2?} | P50: {:>8.2?} | P95: {:>8.2?} | P99: {:>8.2?} | Max: {:>8.2?} | {:>10.0} ops/s",
-            self.name,
-            self.min(),
-            self.mean(),
-            self.percentile(50.0),
-            self.percentile(95.0),
-            self.percentile(99.0),
-            self.max(),
-            self.ops_per_sec(),
-        );
-    }
-}
 
 // Simple deterministic Pseudo-Random Number Generator (Xorshift64)
 struct SimpleRng {
@@ -117,7 +59,7 @@ fn main() {
     assert_eq!(table.len(), TYPING_KEYSTROKES);
 
     let typing_stats = BenchmarkStats::new("1. Sequential Typing (5,000 keystrokes)", typing_samples);
-    typing_stats.print();
+    typing_stats.print_with_ops();
 
     // 2. Sequential Single-Character Backspace Deletion (1,000 keystrokes)
     const BACKSPACE_KEYSTROKES: usize = 1_000;
@@ -132,7 +74,7 @@ fn main() {
     assert_eq!(table.len(), TYPING_KEYSTROKES - BACKSPACE_KEYSTROKES);
 
     let backspace_stats = BenchmarkStats::new("2. Backspace Deletion (1,000 keystrokes)", backspace_samples);
-    backspace_stats.print();
+    backspace_stats.print_with_ops();
 
     // 3. Chunk Paste (20 KB code block)
     const PASTE_SIZE: usize = 20 * 1024; // 20 KB
@@ -152,7 +94,7 @@ fn main() {
     }
 
     let paste_stats = BenchmarkStats::new("3. Chunk Paste (20 KB insertion)", paste_samples);
-    paste_stats.print();
+    paste_stats.print_with_ops();
 
     // 4. Random Edits Across 10,000 Lines
     let line_template = "    let entry = catalog.find_by_identifier(key_id, &mut query_cache)?;\n";
@@ -182,7 +124,7 @@ fn main() {
     }
 
     let random_edit_stats = BenchmarkStats::new("4. Random Edits (2,000 ops on 10K lines)", random_edit_samples);
-    random_edit_stats.print();
+    random_edit_stats.print_with_ops();
 
     // 5. Line Index & Offset Translation Queries
     const QUERY_COUNT: usize = 5_000;
@@ -198,7 +140,7 @@ fn main() {
     }
 
     let query_stats = BenchmarkStats::new("5. Position/Offset Query (10K lines)", query_samples);
-    query_stats.print();
+    query_stats.print_with_ops();
 
     println!("-------------------------------------------------------------------------------------------------------------");
     let mean_keystroke = typing_stats.mean();

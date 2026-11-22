@@ -4,9 +4,9 @@ use parking_lot::RwLock;
 use rustcode_platform::accessibility::{AccessibleNode, AccessibleRole};
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, KeyEvent, Point, Quad, Rect,
-    Scene, View, WorkbenchThemeStyles,
+    Rgba, Scene, View, WorkbenchThemeStyles,
 };
-use rustcode_terminal::TerminalManager;
+use rustcode_terminal::{TerminalGridSnapshot, TerminalManager};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -166,6 +166,267 @@ impl TerminalPanelView {
         Some(closed)
     }
 
+    pub fn compute_grid_size(pane_bounds: Rect, font: &FontMetrics) -> (u16, u16) {
+        let pad_x = 10.0;
+        let pad_y = 4.0;
+        let char_w = if font.char_width.is_finite() && font.char_width > 0.0 {
+            font.char_width
+        } else {
+            8.0
+        };
+        let line_h = if font.line_height.is_finite() && font.line_height > 0.0 {
+            font.line_height
+        } else {
+            18.0
+        };
+        let usable_w = (pane_bounds.width() - pad_x * 2.0).max(char_w);
+        let usable_h = (pane_bounds.height() - pad_y * 2.0).max(line_h);
+        let cols = (usable_w / char_w).floor().clamp(1.0, u16::MAX as f32) as u16;
+        let rows = (usable_h / line_h).floor().clamp(1.0, u16::MAX as f32) as u16;
+        (rows, cols)
+    }
+
+    pub fn spawn_pty_shell(
+        &mut self,
+        title: Option<&str>,
+        shell: Option<&str>,
+        cwd: Option<PathBuf>,
+    ) -> Result<String, String> {
+        let resolved_cwd = cwd.or_else(|| self.default_cwd.clone());
+        let resolved_shell = shell.or(self.default_shell.as_deref());
+        let font = self.last_font.read().clone();
+        let (rows, cols) = if let Some(bounds) = *self.last_layout_bounds.read() {
+            let layout = self.compute_layout(bounds, &font);
+            Self::compute_grid_size(layout.body_rect, &font)
+        } else {
+            (
+                rustcode_terminal::DEFAULT_TERMINAL_ROWS,
+                rustcode_terminal::DEFAULT_TERMINAL_COLS,
+            )
+        };
+        let id = self
+            .manager
+            .create_pty_terminal(
+                title.or(Some("sh")),
+                resolved_shell,
+                resolved_cwd,
+                rows,
+                cols,
+            )?
+            .id
+            .clone();
+        self.auto_scroll.insert(id.clone(), true);
+        self.is_focused = true;
+        self.last_action = Some(TerminalAction::NewTerminal { id: id.clone() });
+        Ok(id)
+    }
+
+    pub fn split_pty_terminal(&mut self) -> Result<String, String> {
+        let resolved_cwd = self.default_cwd.clone();
+        let resolved_shell = self.default_shell.as_deref();
+        let id = self
+            .manager
+            .split_active_terminal(Some("sh"), resolved_shell, resolved_cwd)
+            .id
+            .clone();
+        let font = self.last_font.read().clone();
+        let (rows, cols) = if let Some(bounds) = *self.last_layout_bounds.read() {
+            let layout = self.compute_layout(bounds, &font);
+            let pane_rect = layout
+                .pane_rects
+                .iter()
+                .find(|(pid, _)| pid == &id)
+                .map(|(_, r)| *r)
+                .unwrap_or(layout.body_rect);
+            Self::compute_grid_size(pane_rect, &font)
+        } else {
+            (
+                rustcode_terminal::DEFAULT_TERMINAL_ROWS,
+                rustcode_terminal::DEFAULT_TERMINAL_COLS,
+            )
+        };
+        let spawn_res = self
+            .manager
+            .terminal_mut(&id)
+            .ok_or_else(|| format!("Split terminal '{}' missing", id))?
+            .spawn_pty_shell(rows, cols);
+        if let Err(err) = spawn_res {
+            self.manager.close_terminal(&id);
+            return Err(err);
+        }
+        let cached_bounds = *self.last_layout_bounds.read();
+        if let Some(bounds) = cached_bounds {
+            self.resize_to_bounds(bounds);
+        }
+        self.auto_scroll.insert(id.clone(), true);
+        self.is_focused = true;
+        self.last_action = Some(TerminalAction::SplitTerminal { id: id.clone() });
+        Ok(id)
+    }
+
+    pub fn poll_all_ptys(&mut self) -> Vec<String> {
+        let updated = self.manager.poll_all_ptys();
+        for id in &updated {
+            if self.auto_scroll.get(id).copied().unwrap_or(true) {
+                if let Some(term) = self.manager.terminal_mut(id) {
+                    term.grid_mut().scroll_to_bottom();
+                }
+            }
+        }
+        updated
+    }
+
+    pub fn resize_to_bounds(&mut self, bounds: Rect) -> usize {
+        if !bounds.is_finite_positive() {
+            return 0;
+        }
+        let font = self.last_font.read().clone();
+        if !font.is_finite() {
+            return 0;
+        }
+        let layout = self.compute_layout(bounds, &font);
+        *self.last_layout_bounds.write() = Some(bounds);
+        *self.last_body_height.write() = layout.body_rect.height();
+
+        let mut pane_sizes: HashMap<String, (u16, u16)> = HashMap::new();
+        for (term_id, pane_rect) in &layout.pane_rects {
+            pane_sizes.insert(term_id.clone(), Self::compute_grid_size(*pane_rect, &font));
+        }
+        let fallback_size = Self::compute_grid_size(layout.body_rect, &font);
+
+        let term_ids: Vec<String> = self
+            .manager
+            .terminals()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect();
+        let mut resized_count = 0;
+        for term_id in term_ids {
+            let (rows, cols) = pane_sizes.get(&term_id).copied().unwrap_or(fallback_size);
+            if let Some(term) = self.manager.terminal_mut(&term_id) {
+                if term.rows != rows || term.cols != cols {
+                    let _ = term.resize(rows, cols);
+                    resized_count += 1;
+                }
+            }
+        }
+        resized_count
+    }
+
+    pub fn new_terminal(&mut self) -> String {
+        self.create_terminal(Some("sh"), None, None)
+    }
+
+    pub fn close_terminal(&mut self) -> Option<String> {
+        self.kill_active_terminal()
+    }
+
+    pub fn switch_tab(&mut self, tab_index: usize) -> bool {
+        if self.manager.set_active_tab(tab_index) {
+            self.is_focused = true;
+            self.last_action = Some(TerminalAction::SelectTab { tab_index });
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn split_terminal(&mut self) -> String {
+        self.split_active_terminal()
+    }
+
+    pub fn clear_active(&mut self) -> bool {
+        let Some(term) = self.manager.active_terminal_mut() else {
+            return false;
+        };
+        let id = term.id.clone();
+        term.clear();
+        self.scroll_offsets.insert(id.clone(), 0.0);
+        self.auto_scroll.insert(id.clone(), true);
+        self.last_action = Some(TerminalAction::ClearTerminal { id });
+        true
+    }
+
+    pub fn send_text_to_terminal(
+        &mut self,
+        id: &str,
+        text: &str,
+        add_new_line: bool,
+    ) -> Result<(), String> {
+        let Some(term) = self.manager.terminal_mut(id) else {
+            return Err(format!("Terminal '{}' not found", id));
+        };
+        if term.has_pty() {
+            if add_new_line {
+                let trimmed = text.trim_end_matches(['\r', '\n']);
+                term.send_pty_str(&format!("{}\r", trimmed))?;
+            } else {
+                term.send_pty_str(text)?;
+            }
+            let _ = term.poll_pty();
+        } else {
+            term.insert_str(text);
+            if add_new_line {
+                term.submit_input();
+            }
+        }
+        self.auto_scroll.insert(id.to_string(), true);
+        Ok(())
+    }
+
+    pub fn handle_terminal_action(&mut self, action: &TerminalAction) -> bool {
+        match action {
+            TerminalAction::NewTerminal { .. } => {
+                self.new_terminal();
+                true
+            }
+            TerminalAction::SplitTerminal { .. } => {
+                self.split_terminal();
+                true
+            }
+            TerminalAction::CloseTerminal { id } => {
+                if id.is_empty() {
+                    self.close_terminal().is_some()
+                } else if self.manager.close_terminal(id) {
+                    self.scroll_offsets.remove(id);
+                    self.auto_scroll.remove(id);
+                    self.last_action = Some(TerminalAction::CloseTerminal { id: id.clone() });
+                    true
+                } else {
+                    false
+                }
+            }
+            TerminalAction::SelectTab { tab_index } => self.switch_tab(*tab_index),
+            TerminalAction::FocusPane { id } => {
+                if self.manager.set_active_terminal(id) {
+                    self.is_focused = true;
+                    self.last_action = Some(TerminalAction::FocusPane { id: id.clone() });
+                    true
+                } else {
+                    false
+                }
+            }
+            TerminalAction::ClearTerminal { id } => {
+                if id.is_empty() {
+                    self.clear_active()
+                } else if let Some(term) = self.manager.terminal_mut(id) {
+                    term.clear();
+                    self.scroll_offsets.insert(id.clone(), 0.0);
+                    self.auto_scroll.insert(id.clone(), true);
+                    self.last_action = Some(TerminalAction::ClearTerminal { id: id.clone() });
+                    true
+                } else {
+                    false
+                }
+            }
+            TerminalAction::CommandExecuted {
+                terminal_id,
+                command,
+                ..
+            } => self.send_text_to_terminal(terminal_id, command, true).is_ok(),
+        }
+    }
+
     fn tab_label(&self, tab_idx: usize, tab: &rustcode_terminal::TerminalTab) -> String {
         let base_title = tab
             .active_pane_id()
@@ -291,7 +552,7 @@ impl TerminalPanelView {
     }
 
     pub fn accessibility_node(&self, bounds: Rect, panel_focused: bool) -> AccessibleNode {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return AccessibleNode::new(
                 "workbench.panel.terminal",
                 AccessibleRole::Panel,
@@ -391,6 +652,109 @@ impl TerminalPanelView {
     }
 }
 
+fn rgba_from_u8(c: [u8; 4]) -> Rgba {
+    Rgba::new(
+        c[0] as f32 / 255.0,
+        c[1] as f32 / 255.0,
+        c[2] as f32 / 255.0,
+        c[3] as f32 / 255.0,
+    )
+}
+
+fn snapshot_has_vt_formatting(snapshot: &TerminalGridSnapshot) -> bool {
+    if snapshot.alt_screen || snapshot.display_offset > 0 {
+        return true;
+    }
+    snapshot.cells.iter().any(|row| {
+        row.iter().any(|cell| {
+            cell.fg != [212, 212, 212, 255]
+                || cell.bg != [30, 30, 30, 255]
+                || cell.bold
+                || cell.italic
+                || cell.underline
+        })
+    })
+}
+
+fn render_grid_snapshot(
+    snapshot: &TerminalGridSnapshot,
+    pane_rect: Rect,
+    show_cursor: bool,
+    theme: &WorkbenchThemeStyles,
+    font: &FontMetrics,
+    scene: &mut Scene,
+) {
+    let pad_x = 10.0;
+    let pad_y = 4.0;
+    let line_h = font.line_height.max(1.0);
+    let char_w = font.char_width.max(1.0);
+    let start_x = pane_rect.min_x() + pad_x;
+    let start_y = pane_rect.min_y() + pad_y;
+    let default_bg = [30, 30, 30, 255];
+
+    for (row_idx, row_cells) in snapshot.cells.iter().enumerate() {
+        let y = start_y + row_idx as f32 * line_h;
+        if y > pane_rect.max_y() {
+            break;
+        }
+        let mut col = 0usize;
+        while col < row_cells.len() {
+            let first = &row_cells[col];
+            let style = (first.fg, first.bg, first.bold, first.italic, first.underline);
+            let start_col = col;
+            let mut text = String::new();
+            while col < row_cells.len() {
+                let c = &row_cells[col];
+                if (c.fg, c.bg, c.bold, c.italic, c.underline) != style {
+                    break;
+                }
+                text.push(c.ch);
+                col += 1;
+            }
+            let run_len = col - start_col;
+            let run_x = start_x + start_col as f32 * char_w;
+            let run_w = run_len as f32 * char_w;
+
+            if style.1 != default_bg {
+                scene.push_finite_quad(
+                    Quad::new(Rect::from_xywh(run_x, y, run_w, line_h))
+                        .with_background(rgba_from_u8(style.1)),
+                );
+            }
+
+            let emit_text = if style.4 {
+                text
+            } else {
+                text.trim_end_matches(' ').to_string()
+            };
+            if !emit_text.is_empty() {
+                let text_w = (emit_text.chars().count() as f32 * char_w).max(char_w);
+                scene.push_finite_text(
+                    GlyphRun::new(
+                        emit_text,
+                        Point::new(run_x, y),
+                        Rect::from_xywh(run_x, y, text_w, line_h),
+                        rgba_from_u8(style.0),
+                        font.font_size * 0.9,
+                    )
+                    .with_style(style.2, style.3, style.4),
+                );
+            }
+        }
+    }
+
+    if show_cursor && snapshot.cursor_visible {
+        let cx = start_x + snapshot.cursor_col as f32 * char_w;
+        let cy = start_y + snapshot.cursor_row as f32 * line_h;
+        if cy < pane_rect.max_y() {
+            scene.push_finite_quad(
+                Quad::new(Rect::from_xywh(cx, cy, char_w.max(2.0), line_h))
+                    .with_background(theme.editor_cursor),
+            );
+        }
+    }
+}
+
 fn key_event_to_char(key: &KeyEvent) -> Option<char> {
     if key.modifiers.ctrl || key.modifiers.alt || key.modifiers.meta {
         return None;
@@ -422,7 +786,7 @@ impl View for TerminalPanelView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         *self.last_font.write() = font.clone();
@@ -431,11 +795,10 @@ impl View for TerminalPanelView {
         let layout = self.compute_layout(bounds, font);
         *self.last_body_height.write() = layout.body_rect.height();
 
-        crate::push_finite_quad(scene, Quad::new(bounds).with_background(theme.panel_bg));
+        scene.push_finite_quad(Quad::new(bounds).with_background(theme.panel_bg));
 
         // Header toolbar
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(layout.header_rect)
                 .with_background(theme.sidebar_bg)
                 .with_border_edges(theme.panel_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
@@ -445,8 +808,7 @@ impl View for TerminalPanelView {
         for (idx, tab_rect, close_rect) in &layout.tab_rects {
             let is_active = active_tab_idx == Some(*idx);
             if is_active {
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(*tab_rect)
                         .with_background(theme.tab_active_bg)
                         .with_border_edges(
@@ -462,8 +824,7 @@ impl View for TerminalPanelView {
                 } else {
                     theme.tab_inactive_fg
                 };
-                crate::push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         label,
                         Point::new(tab_rect.min_x() + 6.0, tab_rect.min_y() + 5.0),
@@ -478,8 +839,7 @@ impl View for TerminalPanelView {
                     ),
                 );
             }
-            crate::push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     "x".to_string(),
                     Point::new(close_rect.min_x() + 3.0, close_rect.min_y() + 1.0),
@@ -496,15 +856,13 @@ impl View for TerminalPanelView {
             (layout.clear_btn_rect, "Clear"),
             (layout.kill_btn_rect, "Kill"),
         ] {
-            crate::push_finite_quad(
-                scene,
+            scene.push_finite_quad(
                 Quad::new(btn_rect)
                     .with_background(theme.tab_inactive_bg)
                     .with_border(theme.panel_border, 1.0)
                     .with_corner_radius(3.0),
             );
-            crate::push_finite_text(
-                scene,
+            scene.push_finite_text(
                 GlyphRun::new(
                     label.to_string(),
                     Point::new(btn_rect.min_x() + 6.0, btn_rect.min_y() + 3.0),
@@ -519,8 +877,7 @@ impl View for TerminalPanelView {
         if self.manager.active_tab_terminals().is_empty() {
             if layout.body_rect.height() >= font.line_height {
                 scene.push_clip(layout.body_rect);
-                crate::push_finite_text(
-                    scene,
+                scene.push_finite_text(
                     GlyphRun::new(
                         "No active terminal session. Click '+' to create a new terminal.".to_string(),
                         Point::new(layout.body_rect.min_x() + 12.0, layout.body_rect.min_y() + 10.0),
@@ -545,8 +902,7 @@ impl View for TerminalPanelView {
 
             for (pane_idx, (term_id, pane_rect)) in layout.pane_rects.iter().enumerate() {
                 if pane_idx > 0 {
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(Rect::from_xywh(
                             pane_rect.min_x(),
                             pane_rect.min_y(),
@@ -558,8 +914,7 @@ impl View for TerminalPanelView {
                 }
                 let is_active_pane = active_id == Some(term_id.as_str());
                 if multi_pane && is_active_pane {
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(Rect::from_xywh(
                             pane_rect.min_x(),
                             pane_rect.min_y(),
@@ -576,98 +931,115 @@ impl View for TerminalPanelView {
 
                 scene.push_clip(*pane_rect);
 
-                let total_lines = term.lines.len() + if term.exited { 0 } else { 1 };
-                let visible_rows = ((pane_rect.height() - pad_y * 2.0).max(line_h) / line_h)
-                    .ceil()
-                    .max(1.0) as usize;
-                let max_scroll = self.compute_max_scroll_lines(term_id, pane_rect.height(), line_h);
-                let auto = self.auto_scroll.get(term_id).copied().unwrap_or(true);
-                let scroll_top = if auto {
-                    max_scroll
+                let use_vt_grid = if term.has_pty() {
+                    true
+                } else if term.input_buffer.is_empty() {
+                    let snap = term.grid_snapshot();
+                    snapshot_has_vt_formatting(&snap)
                 } else {
-                    self.scroll_offsets
-                        .get(term_id)
-                        .copied()
-                        .unwrap_or(max_scroll)
-                        .clamp(0.0, max_scroll)
+                    false
                 };
-                let start_row = (scroll_top.floor().max(0.0) as usize).min(total_lines);
-                let end_row = (start_row + visible_rows + 1).min(total_lines);
 
-                for row in start_row..end_row {
-                    let visual_idx = row - start_row;
-                    let y = pane_rect.min_y() + pad_y + visual_idx as f32 * line_h;
-                    if y > pane_rect.max_y() {
-                        break;
-                    }
-                    if row < term.lines.len() {
-                        let line_text = &term.lines[row];
-                        let color = if line_text.contains("timed out") || line_text.starts_with("cd: ") {
-                            theme.editor_error_foreground
-                        } else {
-                            theme.editor_foreground
-                        };
-                        crate::push_finite_text(
-                            scene,
-                            GlyphRun::new(
-                                line_text.clone(),
-                                Point::new(pane_rect.min_x() + pad_x, y),
-                                Rect::from_xywh(
-                                    pane_rect.min_x() + pad_x,
-                                    y,
-                                    (pane_rect.width() - pad_x * 2.0).max(0.0),
-                                    line_h,
-                                ),
-                                color,
-                                font.font_size * 0.9,
-                            ),
-                        );
-                    } else if !term.exited {
-                        let prompt = term.prompt_prefix();
-                        let prompt_w = font.text_width(&prompt);
-                        crate::push_finite_text(
-                            scene,
-                            GlyphRun::new(
-                                prompt.clone(),
-                                Point::new(pane_rect.min_x() + pad_x, y),
-                                Rect::from_xywh(
-                                    pane_rect.min_x() + pad_x,
-                                    y,
-                                    prompt_w,
-                                    line_h,
-                                ),
-                                theme.editor_info_foreground,
-                                font.font_size * 0.9,
-                            ),
-                        );
-                        if !term.input_buffer.is_empty() {
-                            let input_w = font.text_width(&term.input_buffer);
-                            crate::push_finite_text(
-                                scene,
+                if use_vt_grid {
+                    let snapshot = term.grid_snapshot();
+                    render_grid_snapshot(
+                        &snapshot,
+                        *pane_rect,
+                        is_active_pane && self.is_focused && !term.exited,
+                        theme,
+                        font,
+                        scene,
+                    );
+                } else {
+                    let total_lines = term.lines.len() + if term.exited { 0 } else { 1 };
+                    let visible_rows = ((pane_rect.height() - pad_y * 2.0).max(line_h) / line_h)
+                        .ceil()
+                        .max(1.0) as usize;
+                    let max_scroll = self.compute_max_scroll_lines(term_id, pane_rect.height(), line_h);
+                    let auto = self.auto_scroll.get(term_id).copied().unwrap_or(true);
+                    let scroll_top = if auto {
+                        max_scroll
+                    } else {
+                        self.scroll_offsets
+                            .get(term_id)
+                            .copied()
+                            .unwrap_or(max_scroll)
+                            .clamp(0.0, max_scroll)
+                    };
+                    let start_row = (scroll_top.floor().max(0.0) as usize).min(total_lines);
+                    let end_row = (start_row + visible_rows + 1).min(total_lines);
+
+                    for row in start_row..end_row {
+                        let visual_idx = row - start_row;
+                        let y = pane_rect.min_y() + pad_y + visual_idx as f32 * line_h;
+                        if y > pane_rect.max_y() {
+                            break;
+                        }
+                        if row < term.lines.len() {
+                            let line_text = &term.lines[row];
+                            let color = if line_text.contains("timed out") || line_text.starts_with("cd: ") {
+                                theme.editor_error_foreground
+                            } else {
+                                theme.editor_foreground
+                            };
+                            scene.push_finite_text(
                                 GlyphRun::new(
-                                    term.input_buffer.clone(),
-                                    Point::new(pane_rect.min_x() + pad_x + prompt_w, y),
+                                    line_text.clone(),
+                                    Point::new(pane_rect.min_x() + pad_x, y),
                                     Rect::from_xywh(
-                                        pane_rect.min_x() + pad_x + prompt_w,
+                                        pane_rect.min_x() + pad_x,
                                         y,
-                                        input_w,
+                                        (pane_rect.width() - pad_x * 2.0).max(0.0),
                                         line_h,
                                     ),
-                                    theme.editor_foreground,
+                                    color,
                                     font.font_size * 0.9,
                                 ),
                             );
-                        }
-                        if is_active_pane && self.is_focused {
-                            let cursor_x = pane_rect.min_x()
-                                + pad_x
-                                + prompt_w
-                                + font.text_width(term.input_before_cursor());
-                            crate::push_finite_quad(
-                                scene,
-                                Quad::new(Rect::from_xywh(cursor_x, y, 2.0, line_h))
-                                    .with_background(theme.editor_cursor),
+                        } else if !term.exited {
+                            let prompt = term.prompt_prefix();
+                            let prompt_w = font.text_width(&prompt);
+                            scene.push_finite_text(
+                                GlyphRun::new(
+                                    prompt.clone(),
+                                    Point::new(pane_rect.min_x() + pad_x, y),
+                                    Rect::from_xywh(
+                                        pane_rect.min_x() + pad_x,
+                                        y,
+                                        prompt_w,
+                                        line_h,
+                                    ),
+                                    theme.editor_info_foreground,
+                                    font.font_size * 0.9,
+                                ),
                             );
+                            if !term.input_buffer.is_empty() {
+                                let input_w = font.text_width(&term.input_buffer);
+                                scene.push_finite_text(
+                                    GlyphRun::new(
+                                        term.input_buffer.clone(),
+                                        Point::new(pane_rect.min_x() + pad_x + prompt_w, y),
+                                        Rect::from_xywh(
+                                            pane_rect.min_x() + pad_x + prompt_w,
+                                            y,
+                                            input_w,
+                                            line_h,
+                                        ),
+                                        theme.editor_foreground,
+                                        font.font_size * 0.9,
+                                    ),
+                                );
+                            }
+                            if is_active_pane && self.is_focused {
+                                let cursor_x = pane_rect.min_x()
+                                    + pad_x
+                                    + prompt_w
+                                    + font.text_width(term.input_before_cursor());
+                                scene.push_finite_quad(
+                                    Quad::new(Rect::from_xywh(cursor_x, y, 2.0, line_h))
+                                        .with_background(theme.editor_cursor),
+                                );
+                            }
                         }
                     }
                 }
@@ -680,7 +1052,7 @@ impl View for TerminalPanelView {
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
-        if !crate::is_finite_positive_rect(bounds) {
+        if !bounds.is_finite_positive() {
             return EventResult::Ignored;
         }
 
@@ -788,6 +1160,25 @@ impl View for TerminalPanelView {
                     return EventResult::Ignored;
                 };
 
+                if self.manager.terminal(&id).is_some_and(|t| t.has_pty()) {
+                    let lines = (scroll.delta_y.abs() / line_h).ceil().max(1.0) as i32;
+                    let delta = if scroll.delta_y > 0.0 {
+                        lines
+                    } else if scroll.delta_y < 0.0 {
+                        -lines
+                    } else {
+                        0
+                    };
+                    if delta != 0 {
+                        if let Some(term) = self.manager.terminal_mut(&id) {
+                            term.scroll_display(delta);
+                            let at_bottom = term.grid().display_offset() == 0;
+                            self.auto_scroll.insert(id, at_bottom);
+                        }
+                    }
+                    return EventResult::Consumed;
+                }
+
                 let max_scroll =
                     self.compute_max_scroll_lines(&id, layout.body_rect.height(), line_h);
                 let auto = self.auto_scroll.get(&id).copied().unwrap_or(true);
@@ -820,6 +1211,80 @@ impl View for TerminalPanelView {
                     return EventResult::Ignored;
                 };
                 let term_id = term.id.clone();
+
+                if term.has_pty() {
+                    if term.exited {
+                        return EventResult::Ignored;
+                    }
+                    if key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta {
+                        match key.key {
+                            KeyCode::Char('c') | KeyCode::Char('C') => {
+                                let _ = term.send_ctrl_c();
+                                self.auto_scroll.insert(term_id, true);
+                                return EventResult::Consumed;
+                            }
+                            KeyCode::Char('l') | KeyCode::Char('L') => {
+                                let _ = term.send_pty_input(&[0x0c]);
+                                term.clear();
+                                self.scroll_offsets.insert(term_id.clone(), 0.0);
+                                self.auto_scroll.insert(term_id.clone(), true);
+                                self.last_action = Some(TerminalAction::ClearTerminal { id: term_id });
+                                return EventResult::Consumed;
+                            }
+                            KeyCode::Char(c) if c.is_ascii_alphabetic() => {
+                                let ctrl_byte = (c.to_ascii_lowercase() as u8) - b'a' + 1;
+                                let _ = term.send_pty_input(&[ctrl_byte]);
+                                self.auto_scroll.insert(term_id, true);
+                                return EventResult::Consumed;
+                            }
+                            _ => return EventResult::Ignored,
+                        }
+                    }
+                    if key.modifiers.alt || key.modifiers.meta {
+                        return EventResult::Ignored;
+                    }
+                    let seq: Option<&[u8]> = match key.key {
+                        KeyCode::Enter => Some(b"\r"),
+                        KeyCode::Backspace => Some(b"\x7f"),
+                        KeyCode::Delete => Some(b"\x1b[3~"),
+                        KeyCode::Tab => Some(b"\t"),
+                        KeyCode::Escape => Some(b"\x1b"),
+                        KeyCode::ArrowUp => Some(b"\x1b[A"),
+                        KeyCode::ArrowDown => Some(b"\x1b[B"),
+                        KeyCode::ArrowRight => Some(b"\x1b[C"),
+                        KeyCode::ArrowLeft => Some(b"\x1b[D"),
+                        KeyCode::Home => Some(b"\x1b[H"),
+                        KeyCode::End => Some(b"\x1b[F"),
+                        KeyCode::PageUp => Some(b"\x1b[5~"),
+                        KeyCode::PageDown => Some(b"\x1b[6~"),
+                        _ => None,
+                    };
+                    if let Some(bytes) = seq {
+                        let _ = term.send_pty_input(bytes);
+                        term.grid_mut().scroll_to_bottom();
+                        let _ = term.poll_pty();
+                        self.auto_scroll.insert(term_id, true);
+                        return EventResult::Consumed;
+                    }
+                    if let Some(ref text) = key.text {
+                        let filtered: String = text.chars().filter(|&c| c != '\0').collect();
+                        if !filtered.is_empty() {
+                            let _ = term.send_pty_str(&filtered);
+                            term.grid_mut().scroll_to_bottom();
+                            self.auto_scroll.insert(term_id, true);
+                            return EventResult::Consumed;
+                        }
+                    }
+                    if let Some(ch) = key_event_to_char(key) {
+                        let mut buf = [0u8; 4];
+                        let s = ch.encode_utf8(&mut buf);
+                        let _ = term.send_pty_str(s);
+                        term.grid_mut().scroll_to_bottom();
+                        self.auto_scroll.insert(term_id, true);
+                        return EventResult::Consumed;
+                    }
+                    return EventResult::Ignored;
+                }
 
                 if key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta {
                     match key.key {
@@ -1373,5 +1838,133 @@ mod tests {
             assert_eq!(bad_a11y.bounds, Rect::zero());
             assert!(bad_a11y.children.is_empty());
         }
+    }
+
+    #[test]
+    fn test_terminal_panel_vt_grid_rendering_colors_styles_and_cursor() {
+        use rustcode_terminal::HeadlessPtyBackend;
+
+        let mut panel = TerminalPanelView::new();
+        let backend = HeadlessPtyBackend::new(24, 80);
+        backend.push_output(b"\x1b[1;4;31;44mALERT\x1b[0m \x1b[38;2;10;20;30mRGB\x1b[0m\r\n");
+
+        {
+            let term = panel.manager.active_terminal_mut().unwrap();
+            term.attach_pty(Box::new(backend));
+        }
+        let updated = panel.poll_all_ptys();
+        assert_eq!(updated.len(), 1);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 700.0, 260.0);
+        let theme = WorkbenchThemeStyles::dark_default();
+        let font = FontMetrics::default_monospace();
+
+        let mut scene = Scene::new();
+        panel.render(bounds, &theme, &font, &mut scene);
+
+        let alert_run = scene
+            .glyph_runs()
+            .into_iter()
+            .find(|g| g.text == "ALERT")
+            .expect("ALERT glyph run should be rendered from VT grid");
+        assert!(alert_run.bold);
+        assert!(alert_run.underline);
+        assert!(alert_run.color.r > 0.7 && alert_run.color.g < 0.3);
+
+        let rgb_run = scene
+            .glyph_runs()
+            .into_iter()
+            .find(|g| g.text == "RGB")
+            .expect("RGB glyph run should be rendered from VT grid");
+        assert!((rgb_run.color.r - 10.0 / 255.0).abs() < 0.02);
+        assert!((rgb_run.color.g - 20.0 / 255.0).abs() < 0.02);
+        assert!((rgb_run.color.b - 30.0 / 255.0).abs() < 0.02);
+
+        // Background quad for SGR 44 (blue) should be emitted
+        assert!(scene.quads().iter().any(|q| {
+            q.background
+                .is_some_and(|bg| bg.b > 0.7 && bg.r < 0.25 && bg.g > 0.35 && bg.g < 0.55)
+        }));
+
+        // Cursor quad on row 1, col 0 should be emitted
+        assert!(scene
+            .quads()
+            .iter()
+            .any(|q| q.background == Some(theme.editor_cursor)));
+    }
+
+    #[test]
+    fn test_terminal_panel_pty_key_forwarding_ctrl_c_resize_and_actions() {
+        use rustcode_terminal::{HeadlessPtyBackend, TerminalSignal};
+
+        let mut panel = TerminalPanelView::new();
+        let backend = HeadlessPtyBackend::new(24, 80);
+        let backend_handle = backend.clone();
+        {
+            let term = panel.manager.active_terminal_mut().unwrap();
+            term.attach_pty(Box::new(backend));
+        }
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 660.0, 240.0);
+        let font = FontMetrics::default_monospace();
+        let mut scene = Scene::new();
+        panel.render(bounds, &WorkbenchThemeStyles::dark_default(), &font, &mut scene);
+
+        // Resize computes rows/cols from FontMetrics & pane Rect and propagates to PTY backend
+        let resized = panel.resize_to_bounds(bounds);
+        assert_eq!(resized, 1);
+        let (expected_rows, expected_cols) =
+            TerminalPanelView::compute_grid_size(Rect::from_xywh(0.0, 26.0, 660.0, 214.0), &font);
+        assert_eq!(backend_handle.size(), (expected_rows, expected_cols));
+
+        // Forward typed chars, ArrowUp, Enter, and Ctrl+C to PTY backend
+        panel.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char('h'), Modifiers::none())),
+            bounds,
+        );
+        panel.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Char('i'), Modifiers::none())),
+            bounds,
+        );
+        panel.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::ArrowUp, Modifiers::none())),
+            bounds,
+        );
+        panel.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(KeyCode::Enter, Modifiers::none())),
+            bounds,
+        );
+        panel.handle_event(
+            &InputEvent::KeyDown(KeyEvent::new(
+                KeyCode::Char('c'),
+                Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    meta: false,
+                },
+            )),
+            bounds,
+        );
+
+        assert_eq!(backend_handle.written_input(), b"hi\x1b[A\r\x03");
+        assert_eq!(backend_handle.signals(), vec![TerminalSignal::Interrupt]);
+
+        // send_text_to_terminal routes to send_pty_str when PTY is attached
+        let first_id = panel.manager.active_terminal().unwrap().id.clone();
+        panel.send_text_to_terminal(&first_id, "pwd", true).unwrap();
+        assert!(backend_handle.written_input().ends_with(b"pwd\r"));
+
+        // Action helpers: new_terminal, split_terminal, switch_tab, clear_active, close_terminal
+        let second_id = panel.new_terminal();
+        assert_eq!(panel.manager.tabs().len(), 2);
+        assert!(panel.switch_tab(0));
+        assert_eq!(panel.manager.active_terminal().unwrap().id, first_id);
+        assert!(panel.clear_active());
+        let split_id = panel.split_terminal();
+        assert_eq!(panel.manager.active_tab_terminals().len(), 2);
+        assert_eq!(panel.close_terminal(), Some(split_id));
+        assert!(panel.switch_tab(1));
+        assert_eq!(panel.close_terminal(), Some(second_id));
     }
 }

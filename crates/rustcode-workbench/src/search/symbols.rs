@@ -1,8 +1,12 @@
 //! Pure-Rust symbol extractor for workspace-wide and document-level symbol indexing.
 
+use crate::search::engine::{parse_nucleo_pattern, score_nucleo_match};
 use crate::workspace::WorkspaceFolder;
+use ignore::WalkBuilder;
+use nucleo_matcher::{Config, Matcher as NucleoMatcher};
 use regex::Regex;
 use rustcode_protocols::lsp::types::{LspLocation, LspPosition, LspRange, SymbolInformation, SymbolKind};
+use std::cmp::Reverse;
 use std::fs;
 use std::path::Path;
 
@@ -25,89 +29,126 @@ pub fn search_document_symbols(content: &str, file_path: &Path) -> Vec<SymbolInf
     }
 }
 
-/// Search for symbols matching `query` across all workspace folders.
+/// Search for symbols matching `query` across all workspace folders, ranked by `nucleo`.
 pub fn search_workspace_symbols(
     folders: &[WorkspaceFolder],
     query: &str,
 ) -> Vec<SymbolInformation> {
-    let mut symbols = Vec::new();
-    let q = query.trim().to_lowercase();
+    let trimmed = query.trim();
+    let mut extracted = Vec::new();
+    let collect_limit = if trimmed.is_empty() { 500 } else { 5000 };
 
     for folder in folders {
-        if symbols.len() >= 500 {
+        if extracted.len() >= collect_limit {
             break;
         }
-
-        walk_and_extract_symbols(&folder.path, &q, &mut symbols);
+        walk_and_extract_symbols(&folder.path, collect_limit, &mut extracted);
     }
 
-    symbols
+    if trimmed.is_empty() {
+        extracted.truncate(500);
+        return extracted;
+    }
+
+    let mut ranked = rank_symbols(extracted, trimmed);
+    ranked.truncate(500);
+    ranked
+}
+
+/// Filter and rank symbols using `nucleo-matcher`. Empty queries preserve original order.
+pub fn rank_symbols(symbols: Vec<SymbolInformation>, query: &str) -> Vec<SymbolInformation> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return symbols;
+    }
+
+    let mut matcher = NucleoMatcher::new(Config::DEFAULT);
+    let pattern = parse_nucleo_pattern(trimmed);
+    let mut buf = Vec::new();
+    let mut indices = Vec::new();
+    let mut scored: Vec<(u32, usize, SymbolInformation)> = Vec::new();
+
+    for (idx, sym) in symbols.into_iter().enumerate() {
+        let name_score = score_nucleo_match(
+            &pattern,
+            trimmed,
+            &sym.name,
+            &mut matcher,
+            &mut buf,
+            &mut indices,
+        );
+        let full_score = sym.container_name.as_ref().and_then(|c| {
+            let qualified = format!("{c}::{}", sym.name);
+            score_nucleo_match(
+                &pattern,
+                trimmed,
+                &qualified,
+                &mut matcher,
+                &mut buf,
+                &mut indices,
+            )
+        });
+        let combined = match (name_score, full_score) {
+            (Some(ns), Some(fs)) => Some(ns.saturating_add(16).max(fs)),
+            (Some(ns), None) => Some(ns.saturating_add(16)),
+            (None, Some(fs)) => Some(fs),
+            (None, None) => None,
+        };
+        if let Some(score) = combined {
+            scored.push((score, idx, sym));
+        }
+    }
+
+    scored.sort_by(|a, b| {
+        Reverse(a.0)
+            .cmp(&Reverse(b.0))
+            .then_with(|| a.2.name.len().cmp(&b.2.name.len()))
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    scored.into_iter().map(|(_, _, sym)| sym).collect()
 }
 
 fn walk_and_extract_symbols(
     dir: &Path,
-    query: &str,
+    limit: usize,
     symbols: &mut Vec<SymbolInformation>,
 ) {
-    let mut dirs_to_visit = vec![dir.to_path_buf()];
+    let walker = WalkBuilder::new(dir)
+        .hidden(true)
+        .git_ignore(true)
+        .git_global(false)
+        .git_exclude(true)
+        .require_git(false)
+        .parents(false)
+        .build();
 
-    while let Some(current_dir) = dirs_to_visit.pop() {
-        if symbols.len() >= 500 {
+    for entry in walker.flatten() {
+        if symbols.len() >= limit {
             break;
         }
-
-        let entries = match fs::read_dir(&current_dir) {
-            Ok(entries) => entries,
-            Err(_) => continue,
-        };
-
-        for entry in entries.flatten() {
-            if symbols.len() >= 500 {
-                break;
-            }
-
-            let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy().to_string();
-
-            if path.is_dir() {
-                if !crate::search::engine::is_ignored_directory(&file_name) {
-                    dirs_to_visit.push(path);
-                }
-            } else if path.is_file() {
-                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-                if matches!(ext, "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go") {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        let doc_symbols = search_document_symbols(&content, &path);
-                        for s in doc_symbols {
-                            if query.is_empty()
-                                || s.name.to_lowercase().contains(query)
-                                || fuzzy_match(&s.name.to_lowercase(), query)
-                            {
-                                symbols.push(s);
-                                if symbols.len() >= 500 {
-                                    break;
-                                }
-                            }
-                        }
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            ext.as_str(),
+            "rs" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "py" | "go"
+        ) {
+            if let Ok(content) = fs::read_to_string(path) {
+                for s in search_document_symbols(&content, path) {
+                    symbols.push(s);
+                    if symbols.len() >= limit {
+                        break;
                     }
                 }
             }
         }
     }
-}
-
-fn fuzzy_match(target: &str, pattern: &str) -> bool {
-    let mut pattern_chars = pattern.chars().peekable();
-    for c in target.chars() {
-        if let Some(&pc) = pattern_chars.peek() {
-            if c == pc {
-                pattern_chars.next();
-            }
-        } else {
-            return true;
-        }
-    }
-    pattern_chars.peek().is_none()
 }
 
 fn extract_rust_symbols(content: &str, uri: &str) -> Vec<SymbolInformation> {
@@ -492,6 +533,57 @@ type ÜberService struct {}
                 query,
                 results.iter().map(|s| &s.name).collect::<Vec<_>>()
             );
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_workspace_symbols_nucleo_ranking_and_gitignore() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("rustcode_sym_nucleo_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&temp_dir).unwrap();
+        fs::write(temp_dir.join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(
+            temp_dir.join("ignored.rs"),
+            "pub fn parse_ignored() {}\n",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.join("lib.rs"),
+            r#"
+pub fn p_a_r_s_e_scattered() {}
+pub fn runParseQuery() {}
+pub fn parse_query() {}
+"#,
+        )
+        .unwrap();
+
+        let folders = vec![WorkspaceFolder::new(
+            temp_dir.clone(),
+            Some("Root".to_string()),
+            0,
+        )];
+
+        // Ignored file symbols are excluded; empty query preserves document order
+        let all = search_workspace_symbols(&folders, "");
+        let all_names: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            all_names,
+            vec!["p_a_r_s_e_scattered", "runParseQuery", "parse_query"]
+        );
+
+        // Nucleo ranks exact prefix > camelCase boundary > scattered
+        let ranked = search_workspace_symbols(&folders, "parse");
+        let ranked_names: Vec<&str> = ranked.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            ranked_names,
+            vec!["parse_query", "runParseQuery", "p_a_r_s_e_scattered"]
+        );
+
+        // Adversarial Unicode/symbol queries never panic
+        for q in ["!", "^", "$", "'", "🚀", "std::foo()", "   "] {
+            let _ = search_workspace_symbols(&folders, q);
         }
 
         let _ = fs::remove_dir_all(&temp_dir);

@@ -144,8 +144,15 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, ContextKeyError> {
         if expect_regex {
             expect_regex = false;
             if ch == '/' {
+                #[derive(Copy, Clone, PartialEq, Eq)]
+                enum CharClassState {
+                    Outside,
+                    AtStart,
+                    AfterNegation,
+                    Inside,
+                }
                 let mut pattern = String::new();
-                let mut in_char_class = false;
+                let mut char_class = CharClassState::Outside;
                 let mut closed = false;
                 let mut j = i + 1;
                 while j < expr.len() {
@@ -169,24 +176,39 @@ fn tokenize(expr: &str) -> Result<Vec<Token>, ContextKeyError> {
                             pattern.push('\\');
                             pattern.push(esc);
                         }
+                        if char_class != CharClassState::Outside {
+                            char_class = CharClassState::Inside;
+                        }
                         continue;
                     }
-                    if rc == '[' && !in_char_class {
-                        in_char_class = true;
-                        pattern.push(rc);
-                        j += 1;
-                        continue;
-                    }
-                    if rc == ']' && in_char_class {
-                        in_char_class = false;
-                        pattern.push(rc);
-                        j += 1;
-                        continue;
-                    }
-                    if rc == '/' && !in_char_class {
-                        closed = true;
-                        j += 1;
-                        break;
+                    if char_class == CharClassState::Outside {
+                        if rc == '[' {
+                            char_class = CharClassState::AtStart;
+                            pattern.push(rc);
+                            j += 1;
+                            continue;
+                        }
+                        if rc == '/' {
+                            closed = true;
+                            j += 1;
+                            break;
+                        }
+                    } else {
+                        match (char_class, rc) {
+                            (CharClassState::AtStart, '^') => {
+                                char_class = CharClassState::AfterNegation;
+                            }
+                            (CharClassState::AtStart | CharClassState::AfterNegation, ']') => {
+                                // A `]` as the very first character of `[...]` or `[^...]` is literal.
+                                char_class = CharClassState::Inside;
+                            }
+                            (_, ']') => {
+                                char_class = CharClassState::Outside;
+                            }
+                            _ => {
+                                char_class = CharClassState::Inside;
+                            }
+                        }
                     }
                     pattern.push(rc);
                     j += rc.len_utf8();
@@ -756,6 +778,59 @@ mod tests {
         let unquoted_5000_nots = format!("{}a", "!".repeat(5000));
         assert!(matches!(
             ContextKeyExpr::parse(&unquoted_5000_nots),
+            Err(ContextKeyError::InvalidSyntax(_))
+        ));
+    }
+
+    #[test]
+    fn test_context_key_regex_char_class_leading_bracket_and_escapes() {
+        let ctx = ContextKeyService::new();
+
+        // Negated char class with leading `]` and `/` inside: `/^[^]/]+$/`
+        ctx.set_string("resourceFilename", "main.rs");
+        assert!(ctx.evaluate_expr("resourceFilename =~ /^[^]/]+$/"));
+        ctx.set_string("resourceFilename", "src/main.rs");
+        assert!(!ctx.evaluate_expr("resourceFilename =~ /^[^]/]+$/"));
+        ctx.set_string("resourceFilename", "a]b");
+        assert!(!ctx.evaluate_expr("resourceFilename =~ /^[^]/]+$/"));
+        ctx.set_string("resourceFilename", "");
+        assert!(!ctx.evaluate_expr("resourceFilename =~ /^[^]/]+$/"));
+
+        // Positive char class with leading `]`: `/[]a]/`
+        ctx.set_string("ch", "]");
+        assert!(ctx.evaluate_expr("ch =~ /[]a]/"));
+        ctx.set_string("ch", "a");
+        assert!(ctx.evaluate_expr("ch =~ /[]a]/"));
+        ctx.set_string("ch", "b");
+        assert!(!ctx.evaluate_expr("ch =~ /[]a]/"));
+
+        // Standard char class: `/^[a-z]$/`
+        ctx.set_string("letter", "m");
+        assert!(ctx.evaluate_expr("letter =~ /^[a-z]$/"));
+        ctx.set_string("letter", "ab");
+        assert!(!ctx.evaluate_expr("letter =~ /^[a-z]$/"));
+        ctx.set_string("letter", "1");
+        assert!(!ctx.evaluate_expr("letter =~ /^[a-z]$/"));
+
+        // Escaped `\/` and `\]` inside char classes
+        ctx.set_string("seg", "a/b");
+        assert!(ctx.evaluate_expr("seg =~ /^[a\\/b]+$/"));
+        ctx.set_string("seg", "a/c");
+        assert!(!ctx.evaluate_expr("seg =~ /^[a\\/b]+$/"));
+        ctx.set_string("seg", "abc");
+        assert!(ctx.evaluate_expr("seg =~ /^[^\\/]+$/"));
+        ctx.set_string("seg", "a/b");
+        assert!(!ctx.evaluate_expr("seg =~ /^[^\\/]+$/"));
+        ctx.set_string("seg", "]]");
+        assert!(ctx.evaluate_expr("seg =~ /^[\\]]+$/"));
+
+        // Unclosed char class where leading `]` is literal must fail parse
+        assert!(matches!(
+            ContextKeyExpr::parse("ch =~ /[]/"),
+            Err(ContextKeyError::InvalidSyntax(_))
+        ));
+        assert!(matches!(
+            ContextKeyExpr::parse("ch =~ /[^]/"),
             Err(ContextKeyError::InvalidSyntax(_))
         ));
     }

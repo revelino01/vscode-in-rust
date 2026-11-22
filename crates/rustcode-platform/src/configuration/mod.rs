@@ -140,6 +140,73 @@ impl ConfigurationService {
         Ok(())
     }
 
+    /// Load user settings from a `settings.json` file on disk (JSONC-tolerant).
+    /// Returns `Ok(false)` when the file does not exist, `Ok(true)` when loaded,
+    /// and `Err(...)` on I/O or parse errors.
+    pub fn load_user_settings_from_disk(&self, path: &Path) -> Result<bool, String> {
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                self.load_user_settings(&content)?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(format!(
+                "Failed to read user settings '{}': {}",
+                path.display(),
+                err
+            )),
+        }
+    }
+
+    /// Persist the current user settings layer to disk as pretty-printed JSON.
+    pub fn save_user_settings_to_disk(&self, path: &Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    format!(
+                        "Failed to create settings directory '{}': {}",
+                        parent.display(),
+                        err
+                    )
+                })?;
+            }
+        }
+
+        let snapshot = self.user.read().clone();
+        let mut serialized = serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?;
+        serialized.push('\n');
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings.json");
+        let temp_path = path.with_file_name(format!(
+            ".{}.tmp-{}",
+            file_name,
+            uuid::Uuid::new_v4()
+        ));
+
+        if let Err(err) = std::fs::write(&temp_path, serialized.as_bytes()) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!(
+                "Failed to write temporary user settings '{}': {}",
+                temp_path.display(),
+                err
+            ));
+        }
+
+        if let Err(err) = std::fs::rename(&temp_path, path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(format!(
+                "Failed to commit user settings '{}': {}",
+                path.display(),
+                err
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Load workspace settings from JSON or JSONC string.
     pub fn load_workspace_settings(&self, content: &str) -> Result<(), String> {
         let stripped = strip_json_comments(content);
@@ -150,6 +217,30 @@ impl ConfigurationService {
         *self.workspace.write() = val;
         self.recompute();
         Ok(())
+    }
+
+    /// Load workspace settings from disk (JSONC-tolerant).
+    /// Accepts either a workspace root directory (resolving `<root>/.vscode/settings.json`)
+    /// or a direct path to `settings.json`. Returns `Ok(false)` when absent.
+    pub fn load_workspace_settings_from_disk(&self, path: &Path) -> Result<bool, String> {
+        let settings_path = if path.is_dir() {
+            path.join(".vscode").join("settings.json")
+        } else {
+            path.to_path_buf()
+        };
+
+        match std::fs::read_to_string(&settings_path) {
+            Ok(content) => {
+                self.load_workspace_settings(&content)?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(format!(
+                "Failed to read workspace settings '{}': {}",
+                settings_path.display(),
+                err
+            )),
+        }
     }
 
     /// Load folder-specific settings from JSON or JSONC string for a workspace folder.
@@ -603,6 +694,7 @@ fn set_nested_value(target_map: &mut serde_json::Map<String, Value>, path: &str,
 
 /// JSONC comment & trailing comma stripper (handles //, /* ... */, and trailing commas).
 pub fn strip_json_comments(s: &str) -> String {
+    let s = s.strip_prefix('\u{FEFF}').unwrap_or(s);
     let mut no_comments = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     let mut in_string = false;
@@ -1312,5 +1404,73 @@ mod tests {
         assert_eq!(captured[4].affected_folders, vec![folder_a.to_path_buf()]);
 
         sub.dispose();
+    }
+
+    #[test]
+    fn test_disk_config_loading_precedence_and_save_roundtrip() {
+        struct TempDirGuard(PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("rustcode_cfg_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("ws").join(".vscode")).unwrap();
+        let _guard = TempDirGuard(root.clone());
+
+        let user_settings_path = root.join("user").join("settings.json");
+        let missing_path = root.join("nonexistent.json");
+
+        let cfg = ConfigurationService::new();
+        // Missing files are gracefully ignored without wiping defaults
+        assert!(!cfg.load_user_settings_from_disk(&missing_path).unwrap());
+        assert!(!cfg.load_workspace_settings_from_disk(&missing_path).unwrap());
+        assert_eq!(cfg.get::<u32>("editor.fontSize"), Some(14));
+
+        // Write JSONC user settings with BOM, comments, and trailing commas
+        std::fs::create_dir_all(user_settings_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &user_settings_path,
+            "\u{FEFF}{\n  // User overrides\n  \"editor.fontSize\": 18,\n  \"editor.tabSize\": 2,\n  \"files.autoSave\": \"afterDelay\",\n}\n",
+        )
+        .unwrap();
+
+        assert!(cfg.load_user_settings_from_disk(&user_settings_path).unwrap());
+
+        // Write workspace settings overriding tabSize only (precedence: Default < User < Workspace)
+        let ws_dir = root.join("ws");
+        std::fs::write(
+            ws_dir.join(".vscode").join("settings.json"),
+            "{\n  /* Workspace override */\n  \"editor.tabSize\": 8,\n}\n",
+        )
+        .unwrap();
+        assert!(cfg.load_workspace_settings_from_disk(&ws_dir).unwrap());
+
+        // Default (14) < User (18) for fontSize; User (2) < Workspace (8) for tabSize; Default kept for wordWrap
+        assert_eq!(cfg.get::<u32>("editor.fontSize"), Some(18));
+        assert_eq!(cfg.get::<u32>("editor.tabSize"), Some(8));
+        assert_eq!(cfg.get::<String>("files.autoSave"), Some("afterDelay".to_string()));
+        assert_eq!(cfg.get::<String>("editor.wordWrap"), Some("off".to_string()));
+
+        // Update user setting and save to disk, then reload into fresh ConfigurationService
+        cfg.update("workbench.colorTheme", json!("Light+ (default light)"), ConfigurationTarget::User)
+            .unwrap();
+        cfg.save_user_settings_to_disk(&user_settings_path).unwrap();
+
+        let reloaded = ConfigurationService::new();
+        assert!(reloaded
+            .load_user_settings_from_disk(&user_settings_path)
+            .unwrap());
+        assert_eq!(reloaded.get::<u32>("editor.fontSize"), Some(18));
+        assert_eq!(
+            reloaded.get::<String>("workbench.colorTheme"),
+            Some("Light+ (default light)".to_string())
+        );
+
+        // Malformed JSONC on disk surfaces structured Err
+        let malformed_path = root.join("bad_settings.json");
+        std::fs::write(&malformed_path, "{ invalid jsonc").unwrap();
+        assert!(cfg.load_user_settings_from_disk(&malformed_path).is_err());
     }
 }

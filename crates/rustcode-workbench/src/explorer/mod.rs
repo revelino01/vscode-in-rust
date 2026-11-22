@@ -101,7 +101,6 @@ impl FileTreeNode {
 #[derive(Debug, Clone)]
 pub struct FileExplorer {
     pub roots: Vec<FileTreeNode>,
-    pub root: Option<FileTreeNode>,
     pub expanded_paths: HashSet<PathBuf>,
     pub selected_path: Option<PathBuf>,
 }
@@ -116,31 +115,23 @@ impl FileExplorer {
     pub fn new() -> Self {
         Self {
             roots: Vec::new(),
-            root: None,
             expanded_paths: HashSet::new(),
             selected_path: None,
         }
     }
 
     pub fn set_roots(&mut self, roots: Vec<FileTreeNode>) {
-        self.root = roots.first().cloned();
         self.roots = roots;
     }
 
     pub fn add_root(&mut self, root: FileTreeNode) {
         if !self.roots.iter().any(|r| r.path == root.path) {
             self.roots.push(root);
-            if self.root.is_none() {
-                self.root = self.roots.first().cloned();
-            }
         }
     }
 
     pub fn remove_root(&mut self, path: &Path) {
         self.roots.retain(|r| r.path != path);
-        if self.root.as_ref().map(|r| &r.path) == Some(&path.to_path_buf()) {
-            self.root = self.roots.first().cloned();
-        }
     }
 
     pub fn sync_from_workspace(&mut self, ws: &crate::workspace::Workspace) {
@@ -165,10 +156,6 @@ impl FileExplorer {
                 })
                 .collect();
             self.set_roots(new_roots);
-        } else if let Some(root) = &self.root {
-            if root.path.exists() {
-                self.root = Some(FileTreeNode::from_path(root.path.clone()));
-            }
         }
     }
 
@@ -184,10 +171,6 @@ impl FileExplorer {
         self.roots
             .iter()
             .any(|r| rustcode_platform::paths_equivalent(&r.path, target))
-            || self
-                .root
-                .as_ref()
-                .is_some_and(|r| rustcode_platform::paths_equivalent(&r.path, target))
     }
 
     pub fn find_node(&self, target: &Path) -> Option<&FileTreeNode> {
@@ -205,14 +188,10 @@ impl FileExplorer {
             None
         }
 
-        if !self.roots.is_empty() {
-            for root in &self.roots {
-                if let Some(found) = find_in_node(root, target) {
-                    return Some(found);
-                }
+        for root in &self.roots {
+            if let Some(found) = find_in_node(root, target) {
+                return Some(found);
             }
-        } else if let Some(root) = &self.root {
-            return find_in_node(root, target);
         }
         None
     }
@@ -658,45 +637,6 @@ impl ContributedTreesState {
 
 pub type SharedContributedTrees = Arc<RwLock<ContributedTreesState>>;
 
-// --- Layout Helpers ---
-
-fn clamp_rect(rect: Rect, bounds: Rect) -> Rect {
-    if !crate::is_finite_rect(bounds) || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        return Rect::zero();
-    }
-    let rx = if rect.origin.x.is_finite() {
-        rect.origin.x
-    } else {
-        bounds.min_x()
-    };
-    let ry = if rect.origin.y.is_finite() {
-        rect.origin.y
-    } else {
-        bounds.min_y()
-    };
-    let rw = if rect.size.width.is_finite() && rect.size.width >= 0.0 {
-        rect.size.width
-    } else {
-        0.0
-    };
-    let rh = if rect.size.height.is_finite() && rect.size.height >= 0.0 {
-        rect.size.height
-    } else {
-        0.0
-    };
-
-    let min_x = rx.clamp(bounds.min_x(), bounds.max_x());
-    let min_y = ry.clamp(bounds.min_y(), bounds.max_y());
-    let max_x = (rx + rw).clamp(min_x, bounds.max_x());
-    let max_y = (ry + rh).clamp(min_y, bounds.max_y());
-    Rect::from_xywh(
-        min_x,
-        min_y,
-        (max_x - min_x).max(0.0),
-        (max_y - min_y).max(0.0),
-    )
-}
-
 #[derive(Debug, Clone)]
 struct ContributedSectionLayout {
     view_id: String,
@@ -756,17 +696,7 @@ impl FileExplorerView {
 
     pub fn flattened_rows(&self) -> Vec<ExplorerRow> {
         let mut rows = Vec::new();
-        if !self.model.roots.is_empty() {
-            for root in &self.model.roots {
-                Self::flatten_node(
-                    root,
-                    0,
-                    &self.model.expanded_paths,
-                    &self.model.selected_path,
-                    &mut rows,
-                );
-            }
-        } else if let Some(root) = &self.model.root {
+        for root in &self.model.roots {
             Self::flatten_node(
                 root,
                 0,
@@ -825,11 +755,7 @@ impl FileExplorerView {
                 return Some(parent.to_path_buf());
             }
         }
-        self.model
-            .roots
-            .first()
-            .map(|r| r.path.clone())
-            .or_else(|| self.model.root.as_ref().map(|r| r.path.clone()))
+        self.model.roots.first().map(|r| r.path.clone())
     }
 
     pub fn start_new_file(&mut self) -> bool {
@@ -1048,7 +974,7 @@ impl FileExplorerView {
     }
 
     fn compute_layout(&self, bounds: Rect, font: &FontMetrics) -> ExplorerLayout {
-        let safe_bounds = if crate::is_finite_positive_rect(bounds) {
+        let safe_bounds = if bounds.is_finite_positive() {
             bounds
         } else {
             return ExplorerLayout {
@@ -1067,15 +993,13 @@ impl FileExplorerView {
         };
 
         let header_h = 28.0f32.min(safe_bounds.height());
-        let header_rect = clamp_rect(
-            Rect::from_xywh(
-                safe_bounds.min_x(),
-                safe_bounds.min_y(),
-                safe_bounds.width(),
-                header_h,
-            ),
-            safe_bounds,
-        );
+        let header_rect = Rect::from_xywh(
+            safe_bounds.min_x(),
+            safe_bounds.min_y(),
+            safe_bounds.width(),
+            header_h,
+        )
+        .clamp_to_bounds(safe_bounds);
 
         let btn_h = 20.0f32.min(header_h);
         let btn_y = header_rect.min_y() + ((header_h - btn_h) * 0.5).max(0.0);
@@ -1084,24 +1008,20 @@ impl FileExplorerView {
         let gap = 4.0f32.min((header_rect.width() * 0.05).max(0.0));
         let right_pad = 4.0f32.min((header_rect.width() * 0.05).max(0.0));
 
-        let new_folder_rect = clamp_rect(
-            Rect::from_xywh(
-                (header_rect.max_x() - right_pad - btn_w).max(header_rect.min_x()),
-                btn_y,
-                btn_w,
-                btn_h,
-            ),
-            header_rect,
-        );
-        let new_file_rect = clamp_rect(
-            Rect::from_xywh(
-                (new_folder_rect.min_x() - gap - btn_w).max(header_rect.min_x()),
-                btn_y,
-                btn_w,
-                btn_h,
-            ),
-            header_rect,
-        );
+        let new_folder_rect = Rect::from_xywh(
+            (header_rect.max_x() - right_pad - btn_w).max(header_rect.min_x()),
+            btn_y,
+            btn_w,
+            btn_h,
+        )
+        .clamp_to_bounds(header_rect);
+        let new_file_rect = Rect::from_xywh(
+            (new_folder_rect.min_x() - gap - btn_w).max(header_rect.min_x()),
+            btn_y,
+            btn_w,
+            btn_h,
+        )
+        .clamp_to_bounds(header_rect);
 
         let mut cur_y = header_rect.max_y();
         let mut inline_input_rect = None;
@@ -1115,40 +1035,30 @@ impl FileExplorerView {
             | ExplorerInputMode::NewFolder { error, .. }
             | ExplorerInputMode::Rename { error, .. } => {
                 let ih = 24.0f32.min((safe_bounds.max_y() - cur_y).max(0.0));
-                let r = clamp_rect(
-                    Rect::from_xywh(safe_bounds.min_x(), cur_y, safe_bounds.width(), ih),
-                    safe_bounds,
-                );
+                let r = Rect::from_xywh(safe_bounds.min_x(), cur_y, safe_bounds.width(), ih)
+                    .clamp_to_bounds(safe_bounds);
                 inline_input_rect = Some(r);
                 cur_y = r.max_y();
 
                 if error.is_some() && cur_y < safe_bounds.max_y() {
                     let eh = 20.0f32.min((safe_bounds.max_y() - cur_y).max(0.0));
-                    let er = clamp_rect(
-                        Rect::from_xywh(safe_bounds.min_x(), cur_y, safe_bounds.width(), eh),
-                        safe_bounds,
-                    );
+                    let er = Rect::from_xywh(safe_bounds.min_x(), cur_y, safe_bounds.width(), eh)
+                        .clamp_to_bounds(safe_bounds);
                     inline_error_rect = Some(er);
                     cur_y = er.max_y();
                 }
             }
             ExplorerInputMode::ConfirmDelete { .. } => {
                 let ch = 44.0f32.min((safe_bounds.max_y() - cur_y).max(0.0));
-                let cr = clamp_rect(
-                    Rect::from_xywh(safe_bounds.min_x(), cur_y, safe_bounds.width(), ch),
-                    safe_bounds,
-                );
+                let cr = Rect::from_xywh(safe_bounds.min_x(), cur_y, safe_bounds.width(), ch)
+                    .clamp_to_bounds(safe_bounds);
                 let btn_row_h = 20.0f32.min((ch * 0.5).max(0.0));
                 let btn_row_y = cr.min_y() + (ch - btn_row_h - 2.0).max(0.0);
                 let bw = ((cr.width() - 18.0) * 0.5).clamp(0.0, 72.0);
-                let del_r = clamp_rect(
-                    Rect::from_xywh(cr.min_x() + 6.0, btn_row_y, bw, btn_row_h),
-                    cr,
-                );
-                let cancel_r = clamp_rect(
-                    Rect::from_xywh(del_r.max_x() + 6.0, btn_row_y, bw, btn_row_h),
-                    cr,
-                );
+                let del_r = Rect::from_xywh(cr.min_x() + 6.0, btn_row_y, bw, btn_row_h)
+                    .clamp_to_bounds(cr);
+                let cancel_r = Rect::from_xywh(del_r.max_x() + 6.0, btn_row_y, bw, btn_row_h)
+                    .clamp_to_bounds(cr);
                 confirm_rect = Some(cr);
                 confirm_delete_btn_rect = Some(del_r);
                 confirm_cancel_btn_rect = Some(cancel_r);
@@ -1157,15 +1067,13 @@ impl FileExplorerView {
             ExplorerInputMode::None => {}
         }
 
-        let body_rect = clamp_rect(
-            Rect::from_xywh(
-                safe_bounds.min_x(),
-                cur_y,
-                safe_bounds.width(),
-                (safe_bounds.max_y() - cur_y).max(0.0),
-            ),
-            safe_bounds,
-        );
+        let body_rect = Rect::from_xywh(
+            safe_bounds.min_x(),
+            cur_y,
+            safe_bounds.width(),
+            (safe_bounds.max_y() - cur_y).max(0.0),
+        )
+        .clamp_to_bounds(safe_bounds);
 
         let all_file_rows = self.flattened_rows();
         let row_h = 22.0;
@@ -1226,27 +1134,23 @@ impl FileExplorerView {
                 (fh, vec![per; contrib_snapshots.len()])
             };
 
-            let ft_rect = clamp_rect(
-                Rect::from_xywh(
-                    body_rect.min_x(),
-                    body_rect.min_y(),
-                    body_rect.width(),
-                    file_h,
-                ),
-                body_rect,
-            );
+            let ft_rect = Rect::from_xywh(
+                body_rect.min_x(),
+                body_rect.min_y(),
+                body_rect.width(),
+                file_h,
+            )
+            .clamp_to_bounds(body_rect);
             let mut sec_y = ft_rect.max_y();
             let mut rects = Vec::with_capacity(sec_heights.len());
             for sh in sec_heights {
-                let sr = clamp_rect(
-                    Rect::from_xywh(
-                        body_rect.min_x(),
-                        sec_y,
-                        body_rect.width(),
-                        sh.min((body_rect.max_y() - sec_y).max(0.0)),
-                    ),
-                    body_rect,
-                );
+                let sr = Rect::from_xywh(
+                    body_rect.min_x(),
+                    sec_y,
+                    body_rect.width(),
+                    sh.min((body_rect.max_y() - sec_y).max(0.0)),
+                )
+                .clamp_to_bounds(body_rect);
                 sec_y = sr.max_y();
                 rects.push(sr);
             }
@@ -1262,15 +1166,13 @@ impl FileExplorerView {
             if row_y >= file_tree_rect.max_y() {
                 break;
             }
-            let rr = clamp_rect(
-                Rect::from_xywh(
-                    file_tree_rect.min_x(),
-                    row_y,
-                    file_tree_rect.width(),
-                    row_h.min((file_tree_rect.max_y() - row_y).max(0.0)),
-                ),
-                file_tree_rect,
-            );
+            let rr = Rect::from_xywh(
+                file_tree_rect.min_x(),
+                row_y,
+                file_tree_rect.width(),
+                row_h.min((file_tree_rect.max_y() - row_y).max(0.0)),
+            )
+            .clamp_to_bounds(file_tree_rect);
             file_rows.push((row, rr));
         }
 
@@ -1279,24 +1181,20 @@ impl FileExplorerView {
             contrib_snapshots.into_iter().zip(contrib_rects)
         {
             let sec_header_h = 24.0f32.min(section_rect.height());
-            let sec_header_rect = clamp_rect(
-                Rect::from_xywh(
-                    section_rect.min_x(),
-                    section_rect.min_y(),
-                    section_rect.width(),
-                    sec_header_h,
-                ),
-                section_rect,
-            );
-            let sec_body_rect = clamp_rect(
-                Rect::from_xywh(
-                    section_rect.min_x(),
-                    sec_header_rect.max_y(),
-                    section_rect.width(),
-                    (section_rect.max_y() - sec_header_rect.max_y()).max(0.0),
-                ),
-                section_rect,
-            );
+            let sec_header_rect = Rect::from_xywh(
+                section_rect.min_x(),
+                section_rect.min_y(),
+                section_rect.width(),
+                sec_header_h,
+            )
+            .clamp_to_bounds(section_rect);
+            let sec_body_rect = Rect::from_xywh(
+                section_rect.min_x(),
+                sec_header_rect.max_y(),
+                section_rect.width(),
+                (section_rect.max_y() - sec_header_rect.max_y()).max(0.0),
+            )
+            .clamp_to_bounds(section_rect);
 
             let mut item_layouts = Vec::new();
             for (idx, (node, depth, is_expanded)) in flat_items.into_iter().enumerate() {
@@ -1304,15 +1202,13 @@ impl FileExplorerView {
                 if iy >= sec_body_rect.max_y() {
                     break;
                 }
-                let ir = clamp_rect(
-                    Rect::from_xywh(
-                        sec_body_rect.min_x(),
-                        iy,
-                        sec_body_rect.width(),
-                        row_h.min((sec_body_rect.max_y() - iy).max(0.0)),
-                    ),
-                    sec_body_rect,
-                );
+                let ir = Rect::from_xywh(
+                    sec_body_rect.min_x(),
+                    iy,
+                    sec_body_rect.width(),
+                    row_h.min((sec_body_rect.max_y() - iy).max(0.0)),
+                )
+                .clamp_to_bounds(sec_body_rect);
                 item_layouts.push((node, depth, is_expanded, ir));
             }
 
@@ -1495,13 +1391,12 @@ impl View for FileExplorerView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         *self.last_font.write() = font.clone();
 
-        crate::push_finite_quad(
-            scene,
+        scene.push_finite_quad(
             Quad::new(bounds)
                 .with_background(theme.sidebar_bg)
                 .with_border_edges(theme.sidebar_border, Edges::new(0.0, 1.0, 0.0, 0.0)),
@@ -1516,17 +1411,14 @@ impl View for FileExplorerView {
                 + ((layout.header_rect.height() - font.line_height) * 0.5).max(0.0);
             let title_w = (layout.new_file_rect.min_x() - title_x - 4.0).max(0.0);
             if title_w > 0.0 {
-                let tr = clamp_rect(
-                    Rect::from_xywh(
-                        title_x,
-                        title_y,
-                        title_w,
-                        font.line_height.min(layout.header_rect.height()),
-                    ),
-                    layout.header_rect,
-                );
-                crate::push_finite_text(
-                    scene,
+                let tr = Rect::from_xywh(
+                    title_x,
+                    title_y,
+                    title_w,
+                    font.line_height.min(layout.header_rect.height()),
+                )
+                .clamp_to_bounds(layout.header_rect);
+                scene.push_finite_text(
                     GlyphRun::new(
                         "EXPLORER".to_string(),
                         Point::new(title_x, title_y),
@@ -1539,8 +1431,7 @@ impl View for FileExplorerView {
 
             for (btn_rect, label) in [(layout.new_file_rect, "+F"), (layout.new_folder_rect, "+D")] {
                 if btn_rect.width() > 2.0 && btn_rect.height() > 2.0 {
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(btn_rect)
                             .with_background(theme.command_palette_selected_bg)
                             .with_corner_radius(3.0),
@@ -1548,17 +1439,14 @@ impl View for FileExplorerView {
                     let lx = (btn_rect.min_x() + 4.0).min(btn_rect.max_x());
                     let ly = btn_rect.min_y()
                         + ((btn_rect.height() - font.line_height) * 0.5).max(0.0);
-                    let lr = clamp_rect(
-                        Rect::from_xywh(
-                            lx,
-                            ly,
-                            (btn_rect.max_x() - lx).max(0.0),
-                            font.line_height.min(btn_rect.height()),
-                        ),
-                        btn_rect,
-                    );
-                    crate::push_finite_text(
-                        scene,
+                    let lr = Rect::from_xywh(
+                        lx,
+                        ly,
+                        (btn_rect.max_x() - lx).max(0.0),
+                        font.line_height.min(btn_rect.height()),
+                    )
+                    .clamp_to_bounds(btn_rect);
+                    scene.push_finite_text(
                         GlyphRun::new(
                             label.to_string(),
                             Point::new(lx, ly),
@@ -1584,25 +1472,21 @@ impl View for FileExplorerView {
                             ExplorerInputMode::Rename { .. } => "Rename: ",
                             _ => "",
                         };
-                        crate::push_finite_quad(
-                            scene,
+                        scene.push_finite_quad(
                             Quad::new(ir)
                                 .with_background(theme.command_palette_bg)
                                 .with_border(theme.activity_bar_active_border, 1.0),
                         );
                         let tx = (ir.min_x() + 8.0).min(ir.max_x());
                         let ty = ir.min_y() + ((ir.height() - font.line_height) * 0.5).max(0.0);
-                        let tr = clamp_rect(
-                            Rect::from_xywh(
-                                tx,
-                                ty,
-                                (ir.max_x() - tx - 4.0).max(0.0),
-                                font.line_height.min(ir.height()),
-                            ),
-                            ir,
-                        );
-                        crate::push_finite_text(
-                            scene,
+                        let tr = Rect::from_xywh(
+                            tx,
+                            ty,
+                            (ir.max_x() - tx - 4.0).max(0.0),
+                            font.line_height.min(ir.height()),
+                        )
+                        .clamp_to_bounds(ir);
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 format!("{}{}", prefix, buffer),
                                 Point::new(tx, ty),
@@ -1615,23 +1499,19 @@ impl View for FileExplorerView {
                 }
                 if let (Some(err), Some(er)) = (error, layout.inline_error_rect) {
                     if er.width() > 0.0 && er.height() > 0.0 {
-                        crate::push_finite_quad(
-                            scene,
+                        scene.push_finite_quad(
                             Quad::new(er).with_background(theme.editor_background),
                         );
                         let ex = (er.min_x() + 8.0).min(er.max_x());
                         let ey = er.min_y() + ((er.height() - font.line_height) * 0.5).max(0.0);
-                        let clamped = clamp_rect(
-                            Rect::from_xywh(
-                                ex,
-                                ey,
-                                (er.max_x() - ex - 4.0).max(0.0),
-                                font.line_height.min(er.height()),
-                            ),
-                            er,
-                        );
-                        crate::push_finite_text(
-                            scene,
+                        let clamped = Rect::from_xywh(
+                            ex,
+                            ey,
+                            (er.max_x() - ex - 4.0).max(0.0),
+                            font.line_height.min(er.height()),
+                        )
+                        .clamp_to_bounds(er);
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 err.clone(),
                                 Point::new(ex, ey),
@@ -1646,8 +1526,7 @@ impl View for FileExplorerView {
             ExplorerInputMode::ConfirmDelete { target_path, .. } => {
                 if let Some(cr) = layout.confirm_rect {
                     if cr.width() > 0.0 && cr.height() > 0.0 {
-                        crate::push_finite_quad(
-                            scene,
+                        scene.push_finite_quad(
                             Quad::new(cr)
                                 .with_background(theme.command_palette_bg)
                                 .with_border(theme.editor_error_foreground, 1.0),
@@ -1656,17 +1535,14 @@ impl View for FileExplorerView {
                         let prompt = format!("Confirm delete {}?", name);
                         let px = (cr.min_x() + 6.0).min(cr.max_x());
                         let py = cr.min_y() + 2.0;
-                        let pr = clamp_rect(
-                            Rect::from_xywh(
-                                px,
-                                py,
-                                (cr.max_x() - px - 4.0).max(0.0),
-                                font.line_height.min(cr.height()),
-                            ),
-                            cr,
-                        );
-                        crate::push_finite_text(
-                            scene,
+                        let pr = Rect::from_xywh(
+                            px,
+                            py,
+                            (cr.max_x() - px - 4.0).max(0.0),
+                            font.line_height.min(cr.height()),
+                        )
+                        .clamp_to_bounds(cr);
+                        scene.push_finite_text(
                             GlyphRun::new(
                                 prompt,
                                 Point::new(px, py),
@@ -1677,8 +1553,7 @@ impl View for FileExplorerView {
                         );
                         if let Some(dr) = layout.confirm_delete_btn_rect {
                             if dr.width() > 2.0 && dr.height() > 2.0 {
-                                crate::push_finite_quad(
-                                    scene,
+                                scene.push_finite_quad(
                                     Quad::new(dr)
                                         .with_background(theme.editor_error_foreground)
                                         .with_corner_radius(3.0),
@@ -1686,17 +1561,14 @@ impl View for FileExplorerView {
                                 let lx = (dr.min_x() + 4.0).min(dr.max_x());
                                 let ly = dr.min_y()
                                     + ((dr.height() - font.line_height) * 0.5).max(0.0);
-                                let lr = clamp_rect(
-                                    Rect::from_xywh(
-                                        lx,
-                                        ly,
-                                        (dr.max_x() - lx).max(0.0),
-                                        font.line_height.min(dr.height()),
-                                    ),
-                                    dr,
-                                );
-                                crate::push_finite_text(
-                                    scene,
+                                let lr = Rect::from_xywh(
+                                    lx,
+                                    ly,
+                                    (dr.max_x() - lx).max(0.0),
+                                    font.line_height.min(dr.height()),
+                                )
+                                .clamp_to_bounds(dr);
+                                scene.push_finite_text(
                                     GlyphRun::new(
                                         "Delete".to_string(),
                                         Point::new(lx, ly),
@@ -1709,8 +1581,7 @@ impl View for FileExplorerView {
                         }
                         if let Some(cancel_r) = layout.confirm_cancel_btn_rect {
                             if cancel_r.width() > 2.0 && cancel_r.height() > 2.0 {
-                                crate::push_finite_quad(
-                                    scene,
+                                scene.push_finite_quad(
                                     Quad::new(cancel_r)
                                         .with_background(theme.tab_inactive_bg)
                                         .with_corner_radius(3.0),
@@ -1718,17 +1589,14 @@ impl View for FileExplorerView {
                                 let lx = (cancel_r.min_x() + 4.0).min(cancel_r.max_x());
                                 let ly = cancel_r.min_y()
                                     + ((cancel_r.height() - font.line_height) * 0.5).max(0.0);
-                                let lr = clamp_rect(
-                                    Rect::from_xywh(
-                                        lx,
-                                        ly,
-                                        (cancel_r.max_x() - lx).max(0.0),
-                                        font.line_height.min(cancel_r.height()),
-                                    ),
-                                    cancel_r,
-                                );
-                                crate::push_finite_text(
-                                    scene,
+                                let lr = Rect::from_xywh(
+                                    lx,
+                                    ly,
+                                    (cancel_r.max_x() - lx).max(0.0),
+                                    font.line_height.min(cancel_r.height()),
+                                )
+                                .clamp_to_bounds(cancel_r);
+                                scene.push_finite_text(
                                     GlyphRun::new(
                                         "Cancel".to_string(),
                                         Point::new(lx, ly),
@@ -1751,8 +1619,7 @@ impl View for FileExplorerView {
                 continue;
             }
             if row.is_selected {
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(row_rect).with_background(theme.list_active_selection_bg),
                 );
             }
@@ -1770,17 +1637,14 @@ impl View for FileExplorerView {
             let label_w = font
                 .text_width(&full_label)
                 .min((row_rect.max_x() - indent_x).max(0.0));
-            let text_rect = clamp_rect(
-                Rect::from_xywh(
-                    indent_x,
-                    row_rect.min_y(),
-                    label_w,
-                    font.line_height.min(row_rect.height()),
-                ),
-                row_rect,
-            );
-            crate::push_finite_text(
-                scene,
+            let text_rect = Rect::from_xywh(
+                indent_x,
+                row_rect.min_y(),
+                label_w,
+                font.line_height.min(row_rect.height()),
+            )
+            .clamp_to_bounds(row_rect);
+            scene.push_finite_text(
                 GlyphRun::new(
                     full_label,
                     Point::new(indent_x, row_rect.min_y()),
@@ -1797,8 +1661,7 @@ impl View for FileExplorerView {
                 continue;
             }
             if sec.header_rect.width() > 0.0 && sec.header_rect.height() > 0.0 {
-                crate::push_finite_quad(
-                    scene,
+                scene.push_finite_quad(
                     Quad::new(sec.header_rect)
                         .with_background(theme.tab_inactive_bg)
                         .with_border_edges(theme.sidebar_border, Edges::new(1.0, 0.0, 1.0, 0.0)),
@@ -1808,17 +1671,14 @@ impl View for FileExplorerView {
                 let hx = (sec.header_rect.min_x() + 8.0).min(sec.header_rect.max_x());
                 let hy = sec.header_rect.min_y()
                     + ((sec.header_rect.height() - font.line_height) * 0.5).max(0.0);
-                let hr = clamp_rect(
-                    Rect::from_xywh(
-                        hx,
-                        hy,
-                        (sec.header_rect.max_x() - hx - 4.0).max(0.0),
-                        font.line_height.min(sec.header_rect.height()),
-                    ),
-                    sec.header_rect,
-                );
-                crate::push_finite_text(
-                    scene,
+                let hr = Rect::from_xywh(
+                    hx,
+                    hy,
+                    (sec.header_rect.max_x() - hx - 4.0).max(0.0),
+                    font.line_height.min(sec.header_rect.height()),
+                )
+                .clamp_to_bounds(sec.header_rect);
+                scene.push_finite_text(
                     GlyphRun::new(
                         header_label,
                         Point::new(hx, hy),
@@ -1837,8 +1697,7 @@ impl View for FileExplorerView {
                     continue;
                 }
                 if sec.selected_item_id.as_deref() == Some(node.node_id.as_str()) {
-                    crate::push_finite_quad(
-                        scene,
+                    scene.push_finite_quad(
                         Quad::new(item_rect).with_background(theme.list_active_selection_bg),
                     );
                 }
@@ -1854,17 +1713,14 @@ impl View for FileExplorerView {
                 let lw = font
                     .text_width(&full_label)
                     .min((item_rect.max_x() - indent_x).max(0.0));
-                let lr = clamp_rect(
-                    Rect::from_xywh(
-                        indent_x,
-                        item_rect.min_y(),
-                        lw,
-                        font.line_height.min(item_rect.height()),
-                    ),
-                    item_rect,
-                );
-                crate::push_finite_text(
-                    scene,
+                let lr = Rect::from_xywh(
+                    indent_x,
+                    item_rect.min_y(),
+                    lw,
+                    font.line_height.min(item_rect.height()),
+                )
+                .clamp_to_bounds(item_rect);
+                scene.push_finite_text(
                     GlyphRun::new(
                         full_label,
                         Point::new(indent_x, item_rect.min_y()),
@@ -2275,7 +2131,7 @@ mod tests {
         ]);
 
         let mut explorer = FileExplorer::new();
-        explorer.root = Some(root);
+        explorer.set_roots(vec![root]);
         explorer.expanded_paths.insert(PathBuf::from("/workspace"));
         explorer
             .expanded_paths

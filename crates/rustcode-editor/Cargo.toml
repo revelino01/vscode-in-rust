@@ -3,19 +3,39 @@ name = "rustcode-editor"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+desktop = [
+    "rustcode-platform/desktop",
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-json",
+]
+
 [dependencies]
 rustcode-base = { path = "../rustcode-base" }
 rustcode-platform = { path = "../rustcode-platform" }
+encoding_rs = "0.8"
+fancy-regex = "0.20"
 parking_lot = "0.12"
+plist = "1"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "2"
+unicode-segmentation = "1"
+unicode-width = "0.2"
 uuid = { version = "1", features = ["v4"] }
+
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-json = { version = "0.24", optional = true }
 
 [[bench]]
 name = "editor_latency"
 harness = false
-
-
-

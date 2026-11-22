@@ -5,7 +5,14 @@ edition = "2021"
 
 [features]
 default = []
-gpui = []
+desktop = [
+    "dep:wgpu",
+    "dep:cosmic-text",
+    "dep:bytemuck",
+    "dep:raw-window-handle",
+    "dep:rusqlite",
+    "dep:rfd",
+]
 
 [dependencies]
 rustcode-base = { path = "../rustcode-base" }
@@ -16,6 +23,14 @@ thiserror = "2"
 tokio = { version = "1", features = ["sync", "fs", "io-util", "time", "macros", "rt"] }
 notify = { version = "7", default-features = false }
 uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+arboard = "3"
+wgpu = { version = "25", optional = true }
+cosmic-text = { version = "0.14", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+rfd = { version = "0.15", optional = true }
 
 
 

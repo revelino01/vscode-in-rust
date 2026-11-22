@@ -62,6 +62,8 @@ pub struct ExtHostWebviewManager {
     panels: Arc<RwLock<HashMap<String, WebviewPanelState>>>,
     // Listeners for messages arriving from webview into ext-host
     inbound_listeners: Arc<RwLock<HashMap<String, Vec<WebviewMessageListener>>>>,
+    // Buffered messages arriving from webview into ext-host (for polling/RPC consumers)
+    inbound_messages: Arc<RwLock<HashMap<String, Vec<Value>>>>,
     // Listeners for messages posted from ext-host out to webview
     outbound_listeners: Arc<RwLock<HashMap<String, Vec<WebviewMessageListener>>>>,
     event_listeners: Arc<RwLock<Vec<WebviewEventListener>>>,
@@ -200,13 +202,27 @@ impl ExtHostWebviewManager {
         }
         drop(guard);
 
-        let listeners = self.inbound_listeners.read();
-        if let Some(cbs) = listeners.get(id) {
+        self.inbound_messages
+            .write()
+            .entry(id.to_string())
+            .or_default()
+            .push(message.clone());
+
+        let listeners = self.inbound_listeners.read().get(id).cloned();
+        if let Some(cbs) = listeners {
             for cb in cbs {
                 cb(message.clone());
             }
         }
         Ok(())
+    }
+
+    /// Drain buffered messages sent from the webview to the extension host.
+    pub fn take_inbound_messages(&self, id: &str) -> Vec<Value> {
+        self.inbound_messages
+            .write()
+            .remove(id)
+            .unwrap_or_default()
     }
 
     /// Subscribe to messages coming from webview to ext-host.
@@ -294,6 +310,18 @@ impl ExtHostWebviewManager {
                     .cloned()
                     .unwrap_or(Value::Null);
                 self.post_message_to_webview(id, message)?;
+                Ok(Value::Bool(true))
+            }
+            "window.receiveMessageFromWebview" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or("Missing id")?;
+                let message = params
+                    .get("message")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                self.receive_message_from_webview(id, message)?;
                 Ok(Value::Bool(true))
             }
             "window.disposeWebviewPanel" => {
@@ -586,6 +614,21 @@ impl ExtHostCustomEditorManager {
             .collect()
     }
 
+    pub fn post_message_to_session(
+        &self,
+        session_id: &str,
+        message: Value,
+        webview_manager: &ExtHostWebviewManager,
+    ) -> Result<(), String> {
+        let session = self
+            .get_session(session_id)
+            .ok_or_else(|| format!("Custom editor session '{}' not found", session_id))?;
+        if session.is_closed {
+            return Err(format!("Custom editor session '{}' is closed", session_id));
+        }
+        webview_manager.post_message_to_webview(&session.panel_id, message)
+    }
+
     pub fn handle_rpc_call(
         &self,
         method: &str,
@@ -644,6 +687,15 @@ impl ExtHostCustomEditorManager {
                 let title = params.get("title").and_then(|v| v.as_str());
                 let session = self.open_session(id, view_type, uri, title, webview_manager);
                 serde_json::to_value(session).map_err(|e| e.to_string())
+            }
+            "window.closeCustomEditor" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("Missing or empty id")?;
+                let closed = self.close_session(id, webview_manager);
+                Ok(json!({ "closed": closed, "id": id }))
             }
             _ => Err(format!("Unknown custom editor RPC method '{}'", method)),
         }
@@ -945,5 +997,45 @@ mod tests {
         let events = wv.take_pending_events();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], WebviewEvent::PanelDisposed { id } if id == "p_guard"));
+    }
+
+    #[test]
+    fn test_custom_editor_post_message_and_inbound_buffer_roundtrip() {
+        let wv = ExtHostWebviewManager::new();
+        let ce = ExtHostCustomEditorManager::new();
+
+        ce.register_provider("catEdit.hex", WebviewOptions { enable_scripts: true, local_resource_roots: vec![] }, false);
+        let session = ce.open_session(Some("ce_hex_1"), "catEdit.hex", "file:///bin.dat", Some("bin.dat"), Some(&wv));
+
+        // Host -> Custom Editor Webview
+        let delivered = Arc::new(RwLock::new(Vec::new()));
+        let delivered_clone = delivered.clone();
+        wv.on_post_message(&session.panel_id, move |msg| {
+            delivered_clone.write().push(msg);
+        });
+        ce.post_message_to_session(&session.id, json!({ "type": "init", "bytes": 16 }), &wv)
+            .unwrap();
+        assert_eq!(delivered.read().len(), 1);
+        assert_eq!(delivered.read()[0]["bytes"], 16);
+
+        // Webview -> Host via RPC + inbound polling buffer
+        wv.handle_rpc_call(
+            "window.receiveMessageFromWebview",
+            json!({ "id": session.panel_id, "message": { "type": "edit", "offset": 4 } }),
+        )
+        .unwrap();
+        let inbound = wv.take_inbound_messages(&session.panel_id);
+        assert_eq!(inbound, vec![json!({ "type": "edit", "offset": 4 })]);
+        assert!(wv.take_inbound_messages(&session.panel_id).is_empty());
+
+        // Close via RPC disposes both session and panel
+        let closed = ce
+            .handle_rpc_call("window.closeCustomEditor", &json!({ "id": session.id }), Some(&wv))
+            .unwrap();
+        assert_eq!(closed["closed"], true);
+        assert!(wv.get_panel(&session.panel_id).unwrap().is_disposed);
+        assert!(ce
+            .post_message_to_session(&session.id, json!({ "type": "fail" }), &wv)
+            .is_err());
     }
 }

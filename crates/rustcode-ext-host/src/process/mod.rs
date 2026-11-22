@@ -16,6 +16,15 @@ use tokio::sync::Notify;
 const DEFAULT_MAX_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 const STREAM_DRAIN_GRACE_MS: u64 = 100;
 
+#[cfg(unix)]
+mod unix_libc {
+    extern "C" {
+        pub(super) fn setsid() -> i32;
+        pub(super) fn setpgid(pid: i32, pgid: i32) -> i32;
+        pub(super) fn kill(pid: i32, sig: i32) -> i32;
+    }
+}
+
 #[derive(Debug, Clone)]
 enum ShellMode {
     None,
@@ -471,6 +480,23 @@ fn build_tokio_command(inv: &ProcessInvocation) -> Command {
         std_cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: `pre_exec` runs in the forked child after `fork()` and before `exec()`.
+        // `setsid` and `setpgid` are async-signal-safe POSIX functions that isolate the child
+        // and any descendants into their own session/process group (PGID == child PID).
+        unsafe {
+            std_cmd.pre_exec(|| {
+                let isolated = unix_libc::setsid() != -1 || unix_libc::setpgid(0, 0) != -1;
+                if !isolated {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
     let mut cmd = Command::from(std_cmd);
     cmd.kill_on_drop(true);
     cmd
@@ -652,6 +678,26 @@ async fn terminate_child_tree(child: &mut Child) {
             .creation_flags(CREATE_NO_WINDOW);
         if let Ok(mut tk_child) = tk.spawn() {
             let _ = tokio::time::timeout(Duration::from_millis(1000), tk_child.wait()).await;
+        }
+    }
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        if let Ok(pgid) = i32::try_from(pid) {
+            if pgid > 0 {
+                const SIGTERM: i32 = 15;
+                const SIGKILL: i32 = 9;
+                // SAFETY: `pgid` is the positive PID of our un-reaped child isolated into its own
+                // session/process group in `pre_exec`, so signaling `-pgid` targets only that tree.
+                unsafe {
+                    unix_libc::kill(-pgid, SIGTERM);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                // SAFETY: `child` has not been waited on yet, so `pgid` has not been recycled;
+                // escalate to `SIGKILL` to terminate any surviving descendants in the group.
+                unsafe {
+                    unix_libc::kill(-pgid, SIGKILL);
+                }
+            }
         }
     }
     let _ = child.start_kill();
@@ -948,5 +994,55 @@ mod tests {
         assert!(res["stdout"]
             .as_str()
             .is_some_and(|s| s.contains("shell-spawn-ok")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_process_group_isolation_and_kill() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let inv = ProcessInvocation {
+            command: "/bin/sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "sleep 30 & child=$!; echo $child; wait".to_string(),
+            ],
+            cwd: None,
+            env_overrides: Vec::new(),
+            timeout_ms: None,
+            max_buffer: DEFAULT_MAX_BUFFER_BYTES,
+            shell: ShellMode::None,
+            stdin_input: None,
+        };
+
+        let mut cmd = build_tokio_command(&inv);
+        let mut child = cmd.spawn().expect("spawn should succeed on unix");
+        let stdout = child.stdout.take().expect("stdout should be piped");
+        let mut line = String::new();
+        let mut reader = BufReader::new(stdout);
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .expect("timed out reading grandchild pid")
+            .expect("failed reading grandchild pid");
+        let grandchild_pid: i32 = line.trim().parse().expect("grandchild pid should be numeric");
+        assert!(grandchild_pid > 0);
+
+        terminate_child_tree(&mut child).await;
+
+        let mut reaped = false;
+        for _ in 0..40 {
+            // SAFETY: `kill(pid, 0)` checks process existence without sending a signal.
+            let alive = unsafe { unix_libc::kill(grandchild_pid, 0) == 0 };
+            if !alive {
+                reaped = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            reaped,
+            "grandchild process {} should be terminated with the process group",
+            grandchild_pid
+        );
     }
 }

@@ -4,6 +4,8 @@
 //! Backed by an original immutable buffer, an append-only add buffer, and a balanced piece tree.
 
 use std::fmt;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PieceSource {
@@ -72,55 +74,6 @@ impl Node {
         self.height = 1 + std::cmp::max(hl, hr);
         self.subtree_length = Self::subtree_length(&self.left) + self.piece.length + Self::subtree_length(&self.right);
         self.subtree_line_feeds = Self::subtree_line_feeds(&self.left) + self.piece.line_feeds + Self::subtree_line_feeds(&self.right);
-    }
-
-    #[allow(dead_code)]
-    fn balance_factor(&self) -> i32 {
-        Self::height(&self.left) - Self::height(&self.right)
-    }
-
-    #[allow(dead_code)]
-    fn rotate_right(mut self: Box<Self>) -> Box<Self> {
-        let mut left = self.left.take().expect("rotate_right requires left child");
-        self.left = left.right.take();
-        self.update();
-        left.right = Some(self);
-        left.update();
-        left
-    }
-
-    #[allow(dead_code)]
-    fn rotate_left(mut self: Box<Self>) -> Box<Self> {
-        let mut right = self.right.take().expect("rotate_left requires right child");
-        self.right = right.left.take();
-        self.update();
-        right.left = Some(self);
-        right.update();
-        right
-    }
-
-    #[allow(dead_code)]
-    fn balance(mut self: Box<Self>) -> Box<Self> {
-        self.update();
-        let bf = self.balance_factor();
-        if bf > 1 {
-            if let Some(ref left) = self.left {
-                if left.balance_factor() < 0 {
-                    let left_box = self.left.take().unwrap();
-                    self.left = Some(left_box.rotate_left());
-                }
-            }
-            return self.rotate_right();
-        } else if bf < -1 {
-            if let Some(ref right) = self.right {
-                if right.balance_factor() > 0 {
-                    let right_box = self.right.take().unwrap();
-                    self.right = Some(right_box.rotate_right());
-                }
-            }
-            return self.rotate_left();
-        }
-        self
     }
 }
 
@@ -253,6 +206,87 @@ impl PieceTable {
             cur = next;
         }
         self.len()
+    }
+
+    /// Return the previous extended grapheme cluster boundary strictly before `offset`
+    /// (or `0` if `offset == 0`).
+    pub fn prev_grapheme_boundary(&self, offset: usize) -> usize {
+        if offset == 0 || self.is_empty() {
+            return 0;
+        }
+        let offset = self.floor_char_boundary(offset.min(self.len()));
+        if offset == 0 {
+            return 0;
+        }
+        let (line_idx, _) = self.offset_to_position(offset);
+        if let Some((line_start, line_end)) = self.get_line_offsets(line_idx) {
+            if offset > line_start {
+                let line_text = self.get_range(line_start, line_end);
+                let rel = offset - line_start;
+                let mut prev = 0;
+                for (g_start, _) in line_text.grapheme_indices(true) {
+                    if g_start < rel {
+                        prev = g_start;
+                    } else {
+                        break;
+                    }
+                }
+                return line_start + prev;
+            }
+        }
+        if line_idx > 0 {
+            if let Some((prev_start, prev_end)) = self.get_line_offsets(line_idx - 1) {
+                let prev_text = self.get_range(prev_start, prev_end);
+                if let Some((g_start, _)) = prev_text.grapheme_indices(true).next_back() {
+                    return prev_start + g_start;
+                }
+                return prev_start;
+            }
+        }
+        self.prev_char_boundary(offset)
+    }
+
+    /// Return the next extended grapheme cluster boundary strictly after `offset`
+    /// (or `self.len()` if at end of buffer).
+    pub fn next_grapheme_boundary(&self, offset: usize) -> usize {
+        let total = self.len();
+        if offset >= total {
+            return total;
+        }
+        let offset = self.floor_char_boundary(offset);
+        let (line_idx, _) = self.offset_to_position(offset);
+        if let Some((line_start, line_end)) = self.get_line_offsets(line_idx) {
+            let line_text = self.get_range(line_start, line_end);
+            let rel = offset - line_start;
+            for (g_start, g) in line_text.grapheme_indices(true) {
+                let g_end = g_start + g.len();
+                if g_end > rel {
+                    return (line_start + g_end).min(total);
+                }
+            }
+        }
+        self.next_char_boundary(offset)
+    }
+
+    /// Snap `offset` to the start of the extended grapheme cluster containing it.
+    pub fn align_to_grapheme_boundary(&self, offset: usize) -> usize {
+        let total = self.len();
+        if offset >= total {
+            return total;
+        }
+        let offset = self.floor_char_boundary(offset);
+        let (line_idx, _) = self.offset_to_position(offset);
+        if let Some((line_start, line_end)) = self.get_line_offsets(line_idx) {
+            let line_text = self.get_range(line_start, line_end);
+            let rel = offset - line_start;
+            for (g_start, g) in line_text.grapheme_indices(true) {
+                let g_end = g_start + g.len();
+                if rel >= g_start && rel < g_end {
+                    return line_start + g_start;
+                }
+            }
+        }
+        offset
     }
 
     /// Insert text at a specific character offset.
@@ -636,6 +670,75 @@ pub fn byte_offset_to_utf16_col(s: &str, byte_offset: usize) -> usize {
     s[..aligned].chars().map(|c| c.len_utf16()).sum()
 }
 
+/// Visual monospace cell width of a single extended grapheme cluster.
+#[inline]
+pub fn grapheme_display_width(grapheme: &str) -> usize {
+    if grapheme == "\t" {
+        1
+    } else {
+        UnicodeWidthStr::width(grapheme)
+    }
+}
+
+/// Visual monospace cell width of a string slice using `unicode-width`.
+pub fn str_display_width(s: &str) -> usize {
+    s.graphemes(true).map(grapheme_display_width).sum()
+}
+
+/// Convert a UTF-16 column within a line slice to its visual monospace display column.
+pub fn utf16_col_to_display_col(s: &str, utf16_col: usize) -> usize {
+    let mut utf16_acc = 0usize;
+    let mut disp_acc = 0usize;
+    for g in s.graphemes(true) {
+        let g_u16: usize = g.chars().map(|c| c.len_utf16()).sum();
+        if utf16_acc + g_u16 > utf16_col {
+            break;
+        }
+        utf16_acc += g_u16;
+        disp_acc += grapheme_display_width(g);
+        if utf16_acc == utf16_col {
+            break;
+        }
+    }
+    disp_acc
+}
+
+/// Convert a visual monospace display column within a line slice to the nearest
+/// non-exceeding UTF-16 column snapped to a grapheme cluster boundary.
+pub fn display_col_to_utf16_col(s: &str, target_display_col: usize) -> usize {
+    let mut disp_acc = 0usize;
+    let mut utf16_acc = 0usize;
+    for g in s.graphemes(true) {
+        let gw = grapheme_display_width(g);
+        if disp_acc + gw > target_display_col {
+            break;
+        }
+        disp_acc += gw;
+        utf16_acc += g.chars().map(|c| c.len_utf16()).sum::<usize>();
+    }
+    utf16_acc
+}
+
+/// Convert a fractional visual display column (e.g. from mouse X coordinate) to the
+/// closest grapheme-aligned UTF-16 column.
+pub fn display_x_col_to_utf16_col(s: &str, target_display_x: f32) -> usize {
+    if !target_display_x.is_finite() || target_display_x <= 0.0 {
+        return 0;
+    }
+    let mut disp_acc = 0usize;
+    let mut utf16_acc = 0usize;
+    for g in s.graphemes(true) {
+        let gw = grapheme_display_width(g);
+        let midpoint = disp_acc as f32 + (gw as f32) * 0.5;
+        if target_display_x < midpoint {
+            break;
+        }
+        disp_acc += gw;
+        utf16_acc += g.chars().map(|c| c.len_utf16()).sum::<usize>();
+    }
+    utf16_acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,5 +935,59 @@ mod tests {
         // "你好世界" is 4 characters (4 UTF-16 code units, 12 UTF-8 bytes)
         assert_eq!(cjk_table.position_to_offset(0, 15), 11 + 12); // = 23 (before '!')
         assert_eq!(cjk_table.offset_to_position(23), (0, 15));
+    }
+
+    #[test]
+    fn test_piece_table_grapheme_boundaries_m3_09() {
+        // e + combining acute accent (3 bytes, 2 code points, 1 grapheme),
+        // ZWJ family emoji (25 bytes, 7 code points, 1 grapheme),
+        // Regional indicator flag (8 bytes, 2 code points, 1 grapheme)
+        let sample = "e\u{0301}👨‍👩‍👧‍👦🇺🇸z";
+        let table = PieceTable::from_str(sample);
+        let b_e_end = "e\u{0301}".len();
+        let b_fam_end = b_e_end + "👨‍👩‍👧‍👦".len();
+        let b_flag_end = b_fam_end + "🇺🇸".len();
+
+        // Forward grapheme traversal jumps whole clusters
+        assert_eq!(table.next_grapheme_boundary(0), b_e_end);
+        assert_eq!(table.next_grapheme_boundary(b_e_end), b_fam_end);
+        assert_eq!(table.next_grapheme_boundary(b_fam_end), b_flag_end);
+        assert_eq!(table.next_grapheme_boundary(b_flag_end), sample.len());
+
+        // Backward grapheme traversal jumps whole clusters
+        assert_eq!(table.prev_grapheme_boundary(sample.len()), b_flag_end);
+        assert_eq!(table.prev_grapheme_boundary(b_flag_end), b_fam_end);
+        assert_eq!(table.prev_grapheme_boundary(b_fam_end), b_e_end);
+        assert_eq!(table.prev_grapheme_boundary(b_e_end), 0);
+
+        // Unaligned offsets inside combining / ZWJ clusters snap cleanly without panic
+        assert_eq!(table.align_to_grapheme_boundary(1), 0);
+        assert_eq!(table.align_to_grapheme_boundary(b_e_end + 4), b_e_end);
+        assert_eq!(table.prev_grapheme_boundary(b_e_end + 4), b_e_end);
+        assert_eq!(table.next_grapheme_boundary(b_e_end + 4), b_fam_end);
+    }
+
+    #[test]
+    fn test_piece_table_unicode_display_width_helpers_m3_10() {
+        let line = "ab中文🦀c";
+        // UTF-16 cols: 'a'=0, 'b'=1, '中'=2, '文'=3, '🦀'=4..6, 'c'=6..7
+        // Display cols: 'a'=0, 'b'=1, '中'=2..4, '文'=4..6, '🦀'=6..8, 'c'=8..9
+        assert_eq!(str_display_width(line), 9);
+        assert_eq!(utf16_col_to_display_col(line, 0), 0);
+        assert_eq!(utf16_col_to_display_col(line, 2), 2);
+        assert_eq!(utf16_col_to_display_col(line, 3), 4);
+        assert_eq!(utf16_col_to_display_col(line, 4), 6);
+        assert_eq!(utf16_col_to_display_col(line, 6), 8);
+        assert_eq!(utf16_col_to_display_col(line, 7), 9);
+
+        assert_eq!(display_col_to_utf16_col(line, 2), 2);
+        assert_eq!(display_col_to_utf16_col(line, 3), 2); // inside '中' clamps to start
+        assert_eq!(display_col_to_utf16_col(line, 4), 3);
+        assert_eq!(display_col_to_utf16_col(line, 6), 4);
+        assert_eq!(display_col_to_utf16_col(line, 8), 6);
+
+        // Rounding click coordinate at right half of '中' ([2, 4)) rounds to after '中'
+        assert_eq!(display_x_col_to_utf16_col(line, 2.3), 2);
+        assert_eq!(display_x_col_to_utf16_col(line, 3.6), 3);
     }
 }

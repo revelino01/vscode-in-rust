@@ -19,6 +19,28 @@ pub struct ExtTerminalState {
     pub is_visible: bool,
     pub preserve_focus: bool,
     pub is_disposed: bool,
+    #[serde(default)]
+    pub rows: Option<u16>,
+    #[serde(default)]
+    pub cols: Option<u16>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub has_exited: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ExtTerminalLifecycleEvent {
+    Resized {
+        id: String,
+        rows: u16,
+        cols: u16,
+    },
+    Exited {
+        id: String,
+        exit_code: Option<i32>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -46,6 +68,7 @@ pub enum ExtTerminalEvent {
 }
 
 pub type TerminalEventListener = Arc<dyn Fn(&ExtTerminalEvent) + Send + Sync>;
+pub type TerminalLifecycleListener = Arc<dyn Fn(&ExtTerminalLifecycleEvent) + Send + Sync>;
 
 #[derive(Clone, Default)]
 pub struct ExtHostTerminalManager {
@@ -53,6 +76,8 @@ pub struct ExtHostTerminalManager {
     order: Arc<RwLock<Vec<String>>>,
     listeners: Arc<RwLock<Vec<TerminalEventListener>>>,
     pending_events: Arc<RwLock<Vec<ExtTerminalEvent>>>,
+    lifecycle_listeners: Arc<RwLock<Vec<TerminalLifecycleListener>>>,
+    pending_lifecycle_events: Arc<RwLock<Vec<ExtTerminalLifecycleEvent>>>,
     revision: Arc<AtomicU64>,
 }
 
@@ -69,6 +94,10 @@ impl ExtHostTerminalManager {
         std::mem::take(&mut *self.pending_events.write())
     }
 
+    pub fn take_pending_lifecycle_events(&self) -> Vec<ExtTerminalLifecycleEvent> {
+        std::mem::take(&mut *self.pending_lifecycle_events.write())
+    }
+
     pub fn on_terminal_event<F>(&self, listener: F)
     where
         F: Fn(&ExtTerminalEvent) + Send + Sync + 'static,
@@ -76,10 +105,26 @@ impl ExtHostTerminalManager {
         self.listeners.write().push(Arc::new(listener));
     }
 
+    pub fn on_lifecycle_event<F>(&self, listener: F)
+    where
+        F: Fn(&ExtTerminalLifecycleEvent) + Send + Sync + 'static,
+    {
+        self.lifecycle_listeners.write().push(Arc::new(listener));
+    }
+
     fn emit(&self, event: ExtTerminalEvent) {
         self.revision.fetch_add(1, Ordering::SeqCst);
         self.pending_events.write().push(event.clone());
         let listeners = self.listeners.read().clone();
+        for listener in listeners {
+            listener(&event);
+        }
+    }
+
+    fn emit_lifecycle(&self, event: ExtTerminalLifecycleEvent) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        self.pending_lifecycle_events.write().push(event.clone());
+        let listeners = self.lifecycle_listeners.read().clone();
         for listener in listeners {
             listener(&event);
         }
@@ -105,6 +150,10 @@ impl ExtHostTerminalManager {
             is_visible: false,
             preserve_focus: false,
             is_disposed: false,
+            rows: None,
+            cols: None,
+            exit_code: None,
+            has_exited: false,
         };
 
         {
@@ -169,6 +218,48 @@ impl ExtHostTerminalManager {
             id: id.to_string(),
             text: text.to_string(),
             add_new_line,
+        });
+        Ok(())
+    }
+
+    pub fn send_stdin(&self, id: &str, data: &str) -> Result<(), String> {
+        self.send_text(id, data, false)
+    }
+
+    pub fn resize_terminal(&self, id: &str, rows: u16, cols: u16) -> Result<(), String> {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        {
+            let mut terminals = self.terminals.write();
+            let term = terminals
+                .get_mut(id)
+                .ok_or_else(|| format!("Terminal '{}' not found", id))?;
+            if term.is_disposed {
+                return Err(format!("Terminal '{}' is disposed", id));
+            }
+            term.rows = Some(rows);
+            term.cols = Some(cols);
+        }
+        self.emit_lifecycle(ExtTerminalLifecycleEvent::Resized {
+            id: id.to_string(),
+            rows,
+            cols,
+        });
+        Ok(())
+    }
+
+    pub fn notify_terminal_exit(&self, id: &str, exit_code: Option<i32>) -> Result<(), String> {
+        {
+            let mut terminals = self.terminals.write();
+            let term = terminals
+                .get_mut(id)
+                .ok_or_else(|| format!("Terminal '{}' not found", id))?;
+            term.has_exited = true;
+            term.exit_code = exit_code;
+        }
+        self.emit_lifecycle(ExtTerminalLifecycleEvent::Exited {
+            id: id.to_string(),
+            exit_code,
         });
         Ok(())
     }
@@ -263,6 +354,39 @@ impl ExtHostTerminalManager {
                 self.send_text(id, text, add_new_line)?;
                 Ok(json!({ "sent": true, "id": id }))
             }
+            "window.resizeTerminal" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing terminal id".to_string())?;
+                let rows = params
+                    .get("rows")
+                    .or_else(|| params.get("dimensions").and_then(|d| d.get("rows")))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(24)
+                    .clamp(1, u16::MAX as u64) as u16;
+                let cols = params
+                    .get("cols")
+                    .or_else(|| params.get("columns"))
+                    .or_else(|| params.get("dimensions").and_then(|d| d.get("columns")))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(80)
+                    .clamp(1, u16::MAX as u64) as u16;
+                self.resize_terminal(id, rows, cols)?;
+                Ok(json!({ "resized": true, "id": id, "rows": rows, "cols": cols }))
+            }
+            "window.exitTerminal" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing terminal id".to_string())?;
+                let exit_code = params
+                    .get("exitCode")
+                    .and_then(|v| v.as_i64())
+                    .map(|c| c as i32);
+                self.notify_terminal_exit(id, exit_code)?;
+                Ok(json!({ "exited": true, "id": id, "exitCode": exit_code }))
+            }
             "window.disposeTerminal" => {
                 let id = params
                     .get("id")
@@ -326,5 +450,45 @@ mod tests {
             .is_err());
         assert_eq!(events.lock().unwrap().len(), 4);
         assert_eq!(mgr.take_pending_events().len(), 4);
+    }
+
+    #[test]
+    fn test_ext_host_terminal_resize_exit_and_stdin() {
+        let mgr = ExtHostTerminalManager::new();
+        mgr.create_terminal("term_pty", "Shell", None, Vec::new(), None);
+        mgr.send_stdin("term_pty", "ls -la").unwrap();
+        mgr.handle_rpc_call(
+            "window.resizeTerminal",
+            &json!({ "id": "term_pty", "rows": 40, "cols": 120 }),
+        )
+        .unwrap();
+        mgr.handle_rpc_call(
+            "window.exitTerminal",
+            &json!({ "id": "term_pty", "exitCode": 0 }),
+        )
+        .unwrap();
+
+        let state = mgr.get_terminal("term_pty").unwrap();
+        assert_eq!(state.sent_texts, vec!["ls -la"]);
+        assert_eq!(state.rows, Some(40));
+        assert_eq!(state.cols, Some(120));
+        assert!(state.has_exited);
+        assert_eq!(state.exit_code, Some(0));
+
+        let lifecycle = mgr.take_pending_lifecycle_events();
+        assert_eq!(
+            lifecycle,
+            vec![
+                ExtTerminalLifecycleEvent::Resized {
+                    id: "term_pty".to_string(),
+                    rows: 40,
+                    cols: 120,
+                },
+                ExtTerminalLifecycleEvent::Exited {
+                    id: "term_pty".to_string(),
+                    exit_code: Some(0),
+                },
+            ]
+        );
     }
 }

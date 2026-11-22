@@ -1,10 +1,13 @@
 //! Quick Input, Command Palette with fuzzy search, and GPUI CommandPaletteView component.
 
+use crate::search::engine::{parse_nucleo_pattern, score_nucleo_match};
+use nucleo_matcher::{Config, Matcher as NucleoMatcher};
 use rustcode_platform::render::{
     EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Scene, Shadow,
     View, WorkbenchThemeStyles,
 };
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -288,15 +291,15 @@ impl CommandPalette {
 
     pub fn refilter(&mut self) {
         let (detected_mode, target_query) = if let Some(stripped) = self.query.strip_prefix('>') {
-            (QuickInputMode::Command, stripped.trim().to_lowercase())
+            (QuickInputMode::Command, stripped.trim())
         } else if let Some(stripped) = self.query.strip_prefix('#') {
-            (QuickInputMode::WorkspaceSymbol, stripped.trim().to_lowercase())
+            (QuickInputMode::WorkspaceSymbol, stripped.trim())
         } else if let Some(stripped) = self.query.strip_prefix('@') {
-            (QuickInputMode::DocumentSymbol, stripped.trim().to_lowercase())
+            (QuickInputMode::DocumentSymbol, stripped.trim())
         } else if let Some(stripped) = self.query.strip_prefix(':') {
-            (QuickInputMode::Line, stripped.trim().to_lowercase())
+            (QuickInputMode::Line, stripped.trim())
         } else {
-            (QuickInputMode::File, self.query.trim().to_lowercase())
+            (QuickInputMode::File, self.query.trim())
         };
 
         self.mode = detected_mode;
@@ -304,59 +307,86 @@ impl CommandPalette {
         self.selected_index = 0;
 
         let has_files = self.items.iter().any(|i| i.item_kind == PaletteItemKind::File);
-
-        for (idx, item) in self.items.iter().enumerate() {
-            // Mode filter
-            let kind_matches = match detected_mode {
-                QuickInputMode::Command => item.item_kind == PaletteItemKind::Command,
-                QuickInputMode::WorkspaceSymbol => item.item_kind == PaletteItemKind::WorkspaceSymbol,
-                QuickInputMode::DocumentSymbol => item.item_kind == PaletteItemKind::DocumentSymbol,
-                QuickInputMode::Line => item.item_kind == PaletteItemKind::Line,
-                QuickInputMode::File => {
-                    if has_files {
-                        item.item_kind == PaletteItemKind::File
-                    } else {
-                        // Fallback for command-only tests; never leak document/workspace symbols
-                        item.item_kind == PaletteItemKind::Command
+        let matching_indices: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, item)| {
+                let kind_matches = match detected_mode {
+                    QuickInputMode::Command => item.item_kind == PaletteItemKind::Command,
+                    QuickInputMode::WorkspaceSymbol => {
+                        item.item_kind == PaletteItemKind::WorkspaceSymbol
                     }
-                }
-            };
+                    QuickInputMode::DocumentSymbol => {
+                        item.item_kind == PaletteItemKind::DocumentSymbol
+                    }
+                    QuickInputMode::Line => item.item_kind == PaletteItemKind::Line,
+                    QuickInputMode::File => {
+                        if has_files {
+                            item.item_kind == PaletteItemKind::File
+                        } else {
+                            // Fallback for command-only tests; never leak document/workspace symbols
+                            item.item_kind == PaletteItemKind::Command
+                        }
+                    }
+                };
+                kind_matches.then_some(idx)
+            })
+            .collect();
 
-            if !kind_matches {
-                continue;
-            }
-
-            if target_query.is_empty() {
-                self.filtered.push(idx);
-                continue;
-            }
-
-            // Fuzzy match against category and label
-            let full_text = match &item.category {
-                Some(cat) => format!("{}: {}", cat, item.label).to_lowercase(),
-                None => item.label.to_lowercase(),
-            };
-
-            if fuzzy_match(&full_text, &target_query) || fuzzy_match(&item.label.to_lowercase(), &target_query) {
-                self.filtered.push(idx);
-            }
+        if target_query.is_empty() {
+            self.filtered = matching_indices;
+            return;
         }
-    }
-}
 
-/// Simple subsequence fuzzy matcher.
-fn fuzzy_match(target: &str, pattern: &str) -> bool {
-    let mut pattern_chars = pattern.chars().peekable();
-    for c in target.chars() {
-        if let Some(&pc) = pattern_chars.peek() {
-            if c == pc {
-                pattern_chars.next();
-            }
+        let config = if detected_mode == QuickInputMode::File {
+            Config::DEFAULT.match_paths()
         } else {
-            return true;
+            Config::DEFAULT
+        };
+        let mut matcher = NucleoMatcher::new(config);
+        let pattern = parse_nucleo_pattern(target_query);
+        let mut char_buf = Vec::new();
+        let mut indices = Vec::new();
+        let mut scored: Vec<(u32, usize)> = Vec::new();
+
+        for idx in matching_indices {
+            let item = &self.items[idx];
+            let label_score = score_nucleo_match(
+                &pattern,
+                target_query,
+                &item.label,
+                &mut matcher,
+                &mut char_buf,
+                &mut indices,
+            );
+            let cat_score = item.category.as_ref().and_then(|cat| {
+                let full_text = format!("{cat}: {}", item.label);
+                score_nucleo_match(
+                    &pattern,
+                    target_query,
+                    &full_text,
+                    &mut matcher,
+                    &mut char_buf,
+                    &mut indices,
+                )
+            });
+
+            let combined = match (label_score, cat_score) {
+                (Some(ls), Some(cs)) => Some(ls.saturating_add(16).max(cs)),
+                (Some(ls), None) => Some(ls.saturating_add(16)),
+                (None, Some(cs)) => Some(cs),
+                (None, None) => None,
+            };
+
+            if let Some(score) = combined {
+                scored.push((score, idx));
+            }
         }
+
+        scored.sort_by(|a, b| Reverse(a.0).cmp(&Reverse(b.0)).then_with(|| a.1.cmp(&b.1)));
+        self.filtered = scored.into_iter().map(|(_, idx)| idx).collect();
     }
-    pattern_chars.peek().is_none()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -402,7 +432,7 @@ impl View for CommandPaletteView {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !crate::is_finite_positive_rect(bounds) || !crate::is_finite_font(font) {
+        if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
         // Shadow behind popup
@@ -1094,6 +1124,75 @@ mod tests {
                     && q.bounds.width() >= 0.0
                     && q.bounds.height() >= 0.0
             );
+        }
+    }
+
+    #[test]
+    fn test_quickinput_nucleo_ranking_mru_and_unicode_safety() {
+        // 1. Command Palette (Ctrl+Shift+P): exact prefix > word/camelCase boundary > scattered
+        let mut cmd_palette = CommandPalette::new();
+        cmd_palette.set_items(vec![
+            PaletteItem::command("c.scattered", "f_x_o_x_o_bar", None, None),
+            PaletteItem::command("c.camel", "openFooBarPanel", None, None),
+            PaletteItem::command("c.prefix", "foobar_action", None, None),
+        ]);
+
+        // Empty query preserves original/MRU ordering
+        cmd_palette.set_query(">");
+        let empty_order: Vec<&str> = cmd_palette
+            .results()
+            .into_iter()
+            .map(|i| i.command_id.as_str())
+            .collect();
+        assert_eq!(empty_order, vec!["c.scattered", "c.camel", "c.prefix"]);
+
+        // Ranked order: prefix > camelCase boundary > scattered
+        cmd_palette.set_query(">foobar");
+        let ranked_cmds: Vec<&str> = cmd_palette
+            .results()
+            .into_iter()
+            .map(|i| i.command_id.as_str())
+            .collect();
+        assert_eq!(ranked_cmds, vec!["c.prefix", "c.camel", "c.scattered"]);
+
+        // 2. Quick Open Files (Ctrl+P): prefix > boundary > scattered
+        let mut file_palette = CommandPalette::new();
+        file_palette.set_items(vec![
+            PaletteItem::file(PathBuf::from("/w/src/m_a_i_n_x.rs"), "src/m_a_i_n_x.rs"),
+            PaletteItem::file(PathBuf::from("/w/src/appMain.rs"), "src/appMain.rs"),
+            PaletteItem::file(PathBuf::from("/w/src/main.rs"), "src/main.rs"),
+        ]);
+        file_palette.set_query("main");
+        let ranked_files: Vec<&str> = file_palette
+            .results()
+            .into_iter()
+            .map(|i| i.label.as_str())
+            .collect();
+        assert_eq!(ranked_files, vec!["main.rs", "appMain.rs", "m_a_i_n_x.rs"]);
+
+        // 3. Document Symbols (Ctrl+Shift+O): prefix > camelCase > scattered
+        let mut sym_palette = CommandPalette::new();
+        sym_palette.set_items(vec![
+            PaletteItem::document_symbol("r_e_n_d_e_r", None, 1, 1),
+            PaletteItem::document_symbol("onRenderFrame", None, 10, 1),
+            PaletteItem::document_symbol("render_scene", None, 20, 1),
+        ]);
+        sym_palette.set_query("@render");
+        let ranked_syms: Vec<&str> = sym_palette
+            .results()
+            .into_iter()
+            .map(|i| i.label.as_str())
+            .collect();
+        assert_eq!(
+            ranked_syms,
+            vec!["render_scene", "onRenderFrame", "r_e_n_d_e_r"]
+        );
+
+        // 4. Unicode & symbol queries never panic
+        for q in [">🚀", ">!", ">^", ">$", ">'", ">äöü", ">(foo)", "@::", "#$"] {
+            cmd_palette.set_query(q);
+            file_palette.set_query(q);
+            sym_palette.set_query(q);
         }
     }
 }

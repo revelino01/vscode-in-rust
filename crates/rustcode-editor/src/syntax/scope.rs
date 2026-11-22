@@ -218,6 +218,8 @@ pub struct TokenSpan {
     pub scope: SyntaxScope,
     pub metadata: TokenMetadata,
     pub color: Option<Rgba>,
+    /// Optional full TextMate scope string (e.g. `"entity.name.function.rust"`).
+    pub tm_scope: Option<String>,
 }
 
 impl TokenSpan {
@@ -229,6 +231,7 @@ impl TokenSpan {
             scope,
             metadata,
             color: None,
+            tm_scope: None,
         }
     }
 
@@ -248,8 +251,35 @@ impl TokenSpan {
             scope,
             metadata,
             color: None,
+            tm_scope: None,
         }
     }
+
+    pub fn with_tm_scope(
+        start: usize,
+        end: usize,
+        scope: SyntaxScope,
+        tm_scope: impl Into<String>,
+        lang_id: u8,
+    ) -> Self {
+        let metadata = TokenMetadata::new(lang_id, scope, false, false, false);
+        Self {
+            start,
+            end,
+            scope,
+            metadata,
+            color: None,
+            tm_scope: Some(tm_scope.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextMateStackFrame {
+    pub rule_id: usize,
+    pub end_pattern: Option<String>,
+    pub while_pattern: Option<String>,
+    pub content_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +293,7 @@ pub enum GrammarState {
     HtmlInTag,
     HtmlScript,
     HtmlStyle,
+    TextMate(Vec<TextMateStackFrame>),
 }
 
 /// Tokenizer grammar trait representing an incremental tokenizer for a programming language.
@@ -270,6 +301,12 @@ pub trait Grammar: Send + Sync {
     fn language_id(&self) -> &'static str;
     fn numeric_id(&self) -> u8;
     fn file_extensions(&self) -> &'static [&'static str];
+    fn dynamic_file_extensions(&self) -> Vec<String> {
+        self.file_extensions()
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
     fn tokenize_line(
         &self,
         line: &str,

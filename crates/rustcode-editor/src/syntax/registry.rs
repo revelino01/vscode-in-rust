@@ -95,6 +95,23 @@ impl GrammarRegistry {
             self.grammars_by_ext
                 .insert(ext.to_ascii_lowercase(), grammar.clone());
         }
+        for ext in grammar.dynamic_file_extensions() {
+            self.grammars_by_ext
+                .insert(ext.to_ascii_lowercase(), grammar.clone());
+        }
+    }
+
+    pub fn register_textmate(
+        &mut self,
+        grammar: Arc<crate::syntax::textmate::TextMateGrammar>,
+    ) {
+        let lang_id = grammar.language_id_str().to_string();
+        let dyn_grammar: Arc<dyn Grammar> = grammar.clone();
+        self.grammars_by_id.insert(lang_id, dyn_grammar.clone());
+        for ext in grammar.extensions() {
+            self.grammars_by_ext
+                .insert(ext.to_ascii_lowercase(), dyn_grammar.clone());
+        }
     }
 
     pub fn get_by_id(&self, lang_id: &str) -> Option<Arc<dyn Grammar>> {

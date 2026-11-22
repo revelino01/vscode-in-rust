@@ -146,6 +146,84 @@ impl MouseEvent {
         self.modifiers = modifiers;
         self
     }
+
+    pub fn is_double_click(&self) -> bool {
+        self.click_count == 2
+    }
+
+    pub fn is_triple_click(&self) -> bool {
+        self.click_count >= 3
+    }
+}
+
+/// Stateful multi-click detector for OS mouse down events (single/double/triple click).
+#[derive(Debug, Clone)]
+pub struct ClickTracker {
+    max_interval: std::time::Duration,
+    max_distance_sq: f32,
+    last_button: Option<MouseButton>,
+    last_position: Option<Point>,
+    last_time_ms: Option<u64>,
+    count: u32,
+}
+
+impl Default for ClickTracker {
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_millis(500), 4.0)
+    }
+}
+
+impl ClickTracker {
+    pub fn new(max_interval: std::time::Duration, max_distance_px: f32) -> Self {
+        let d = if max_distance_px.is_finite() && max_distance_px >= 0.0 {
+            max_distance_px
+        } else {
+            4.0
+        };
+        Self {
+            max_interval,
+            max_distance_sq: d * d,
+            last_button: None,
+            last_position: None,
+            last_time_ms: None,
+            count: 0,
+        }
+    }
+
+    /// Record a mouse press at `timestamp_ms` and return the resulting `click_count` (1, 2, 3, ...).
+    pub fn register_click(&mut self, button: MouseButton, position: Point, timestamp_ms: u64) -> u32 {
+        let within_time = self.last_time_ms.is_some_and(|prev| {
+            timestamp_ms >= prev
+                && (timestamp_ms - prev) <= self.max_interval.as_millis() as u64
+        });
+        let within_dist = self.last_position.is_some_and(|prev| {
+            let dx = position.x - prev.x;
+            let dy = position.y - prev.y;
+            dx.is_finite() && dy.is_finite() && (dx * dx + dy * dy) <= self.max_distance_sq
+        });
+        let same_button = self.last_button == Some(button);
+
+        if same_button && within_time && within_dist {
+            self.count = self.count.saturating_add(1).min(3);
+            if self.count == 0 {
+                self.count = 1;
+            }
+        } else {
+            self.count = 1;
+        }
+
+        self.last_button = Some(button);
+        self.last_position = Some(position);
+        self.last_time_ms = Some(timestamp_ms);
+        self.count
+    }
+
+    pub fn reset(&mut self) {
+        self.last_button = None;
+        self.last_position = None;
+        self.last_time_ms = None;
+        self.count = 0;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +258,11 @@ pub enum InputEvent {
     MouseUp(MouseEvent),
     MouseMove(MouseMoveEvent),
     ScrollWheel(ScrollEvent),
+    ImePreedit {
+        text: String,
+        cursor: Option<(usize, usize)>,
+    },
+    ImeCommit(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,5 +295,41 @@ mod tests {
         let combo = key_ev.to_key_combo();
         assert_eq!(combo.key, "b");
         assert!(combo.modifiers.ctrl);
+    }
+
+    #[test]
+    fn test_click_tracker_multi_click() {
+        let mut tracker = ClickTracker::default();
+        let p = Point::new(100.0, 200.0);
+        assert_eq!(tracker.register_click(MouseButton::Left, p, 1000), 1);
+        assert_eq!(tracker.register_click(MouseButton::Left, Point::new(101.0, 201.0), 1200), 2);
+        assert_eq!(tracker.register_click(MouseButton::Left, Point::new(101.0, 201.0), 1400), 3);
+        // Caps at 3 (triple-click)
+        assert_eq!(tracker.register_click(MouseButton::Left, Point::new(101.0, 201.0), 1500), 3);
+        // Too slow resets to 1
+        assert_eq!(tracker.register_click(MouseButton::Left, p, 2500), 1);
+        // Different button resets to 1
+        assert_eq!(tracker.register_click(MouseButton::Right, p, 2600), 1);
+        // Moved too far resets to 1
+        assert_eq!(tracker.register_click(MouseButton::Right, Point::new(150.0, 200.0), 2700), 1);
+    }
+
+    #[test]
+    fn test_ime_events_and_mouse_click_helpers() {
+        let preedit = InputEvent::ImePreedit {
+            text: "nihao".to_string(),
+            cursor: Some((0, 5)),
+        };
+        let commit = InputEvent::ImeCommit("你好".to_string());
+        assert!(matches!(preedit, InputEvent::ImePreedit { cursor: Some((0, 5)), .. }));
+        assert!(matches!(commit, InputEvent::ImeCommit(ref s) if s == "你好"));
+
+        let dbl = MouseEvent::new(Point::zero(), MouseButton::Left).with_click_count(2);
+        assert!(dbl.is_double_click());
+        assert!(!dbl.is_triple_click());
+
+        let tpl = MouseEvent::new(Point::zero(), MouseButton::Left).with_click_count(3);
+        assert!(!tpl.is_double_click());
+        assert!(tpl.is_triple_click());
     }
 }

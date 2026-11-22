@@ -4,7 +4,7 @@ use super::client::{LspClient, LspError};
 use super::types::*;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -34,6 +34,8 @@ impl LspServerConfig {
 pub struct LspClientManager {
     configs: RwLock<HashMap<String, LspServerConfig>>,
     clients: RwLock<HashMap<String, Arc<LspClient>>>,
+    failed_languages: RwLock<HashMap<String, String>>,
+    start_lock: tokio::sync::Mutex<()>,
 }
 
 impl Default for LspClientManager {
@@ -97,13 +99,26 @@ impl LspClientManager {
             },
         );
 
+        configs.insert(
+            "go".to_string(),
+            LspServerConfig {
+                language_id: "go".to_string(),
+                command: "gopls".to_string(),
+                args: Vec::new(),
+                trigger_characters: vec!['.'],
+            },
+        );
+
         Self {
             configs: RwLock::new(configs),
             clients: RwLock::new(HashMap::new()),
+            failed_languages: RwLock::new(HashMap::new()),
+            start_lock: tokio::sync::Mutex::new(()),
         }
     }
 
     pub fn register_config(&self, config: LspServerConfig) {
+        self.failed_languages.write().remove(&config.language_id);
         self.configs.write().insert(config.language_id.clone(), config);
     }
 
@@ -120,6 +135,7 @@ impl LspClientManager {
     }
 
     pub fn attach_client(&self, language_id: &str, client: Arc<LspClient>) {
+        self.failed_languages.write().remove(language_id);
         self.clients.write().insert(language_id.to_string(), client);
     }
 
@@ -129,6 +145,71 @@ impl LspClientManager {
 
     pub fn remove_client(&self, language_id: &str) -> Option<Arc<LspClient>> {
         self.clients.write().remove(language_id)
+    }
+
+    pub fn is_language_failed(&self, language_id: &str) -> bool {
+        self.failed_languages.read().contains_key(language_id)
+    }
+
+    pub fn get_failure_reason(&self, language_id: &str) -> Option<String> {
+        self.failed_languages.read().get(language_id).cloned()
+    }
+
+    pub fn clear_failure(&self, language_id: &str) {
+        self.failed_languages.write().remove(language_id);
+    }
+
+    /// Ensures a language server is running for `lang_id` in `workspace_root`,
+    /// spawning and handshaking on first open if configured.
+    ///
+    /// Missing binaries or startup failures are cached non-fatally (`Ok(None)`)
+    /// so repeated document opens/edits never crash or spam-spawn processes.
+    pub async fn ensure_server_for_language(
+        &self,
+        lang_id: &str,
+        workspace_root: &Path,
+    ) -> Result<Option<Arc<LspClient>>, LspError> {
+        if let Some(existing) = self.get_client(lang_id) {
+            if existing.is_running() {
+                return Ok(Some(existing));
+            }
+            self.remove_client(lang_id);
+        }
+
+        if self.failed_languages.read().contains_key(lang_id) {
+            return Ok(None);
+        }
+
+        if self.get_config(lang_id).is_none() {
+            return Ok(None);
+        }
+
+        let _guard = self.start_lock.lock().await;
+
+        if let Some(existing) = self.get_client(lang_id) {
+            if existing.is_running() {
+                return Ok(Some(existing));
+            }
+            self.remove_client(lang_id);
+        }
+
+        if self.failed_languages.read().contains_key(lang_id) {
+            return Ok(None);
+        }
+
+        let root_uri = Some(path_to_file_uri(workspace_root));
+        match self
+            .start_server_inner(lang_id, root_uri, Some(workspace_root.to_path_buf()))
+            .await
+        {
+            Ok(client) => Ok(Some(client)),
+            Err(err) => {
+                self.failed_languages
+                    .write()
+                    .insert(lang_id.to_string(), err.to_string());
+                Ok(None)
+            }
+        }
     }
 
     pub async fn start_server(
@@ -141,8 +222,26 @@ impl LspClientManager {
             if existing.is_running() {
                 return Ok(existing);
             }
+            self.remove_client(language_id);
         }
 
+        let _guard = self.start_lock.lock().await;
+        if let Some(existing) = self.get_client(language_id) {
+            if existing.is_running() {
+                return Ok(existing);
+            }
+            self.remove_client(language_id);
+        }
+
+        self.start_server_inner(language_id, root_uri, cwd).await
+    }
+
+    async fn start_server_inner(
+        &self,
+        language_id: &str,
+        root_uri: Option<String>,
+        cwd: Option<PathBuf>,
+    ) -> Result<Arc<LspClient>, LspError> {
         let config = self
             .get_config(language_id)
             .ok_or_else(|| LspError::ServerError {
@@ -154,7 +253,6 @@ impl LspClientManager {
         let client = LspClient::spawn_process(&config.command, &args_refs, cwd)?;
         let arc_client = Arc::new(client);
 
-        // Initialize handshake
         let init_params = InitializeParams {
             root_uri,
             capabilities: ClientCapabilities::default(),
@@ -316,6 +414,7 @@ impl LspClientManager {
     }
 
     pub fn register_client(&self, language_id: &str, client: Arc<LspClient>) {
+        self.failed_languages.write().remove(language_id);
         self.clients.write().insert(language_id.to_string(), client);
     }
 
@@ -348,6 +447,17 @@ impl LspClientManager {
     }
 }
 
+/// Converts a filesystem path into a normalized `file:///` URI.
+pub fn path_to_file_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let without_verbatim = raw
+        .strip_prefix(r"\\?\")
+        .or_else(|| raw.strip_prefix("//?/"))
+        .unwrap_or(&raw);
+    let forward = without_verbatim.replace('\\', "/");
+    format!("file:///{}", forward.trim_start_matches('/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,21 +465,99 @@ mod tests {
     #[test]
     fn test_lsp_client_manager_configs() {
         let manager = LspClientManager::new();
-        assert!(manager.get_config("rust").is_some());
-        assert!(manager.get_config("typescript").is_some());
-        assert!(manager.get_config("python").is_some());
+        assert_eq!(manager.get_config("rust").unwrap().command, "rust-analyzer");
+        assert_eq!(
+            manager.get_config("typescript").unwrap().command,
+            "typescript-language-server"
+        );
+        assert_eq!(
+            manager.get_config("javascript").unwrap().command,
+            "typescript-language-server"
+        );
+        assert_eq!(
+            manager.get_config("python").unwrap().command,
+            "pyright-langserver"
+        );
+        assert_eq!(
+            manager.get_config("json").unwrap().command,
+            "vscode-json-language-server"
+        );
+        assert_eq!(manager.get_config("go").unwrap().command, "gopls");
 
         let rust_triggers = manager.get_trigger_characters("rust");
         assert!(rust_triggers.contains(&'.'));
         assert!(rust_triggers.contains(&':'));
 
-        manager.register_config(LspServerConfig {
-            language_id: "go".to_string(),
-            command: "gopls".to_string(),
-            args: Vec::new(),
-            trigger_characters: vec!['.'],
-        });
-        assert_eq!(manager.get_config("go").unwrap().command, "gopls");
+        assert!(manager.get_trigger_characters("go").contains(&'.'));
+    }
+
+    #[test]
+    fn test_path_to_file_uri_normalization() {
+        assert_eq!(
+            path_to_file_uri(Path::new("/home/dev/project")),
+            "file:///home/dev/project"
+        );
+        assert_eq!(
+            path_to_file_uri(Path::new(r"C:\Users\dev\project")),
+            "file:///C:/Users/dev/project"
+        );
+        assert_eq!(
+            path_to_file_uri(Path::new(r"\\?\C:\Users\dev\project")),
+            "file:///C:/Users/dev/project"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_server_for_language_caches_missing_binary_and_allows_attach() {
+        use tokio::io::duplex;
+
+        let manager = LspClientManager::new();
+        manager.register_config(LspServerConfig::new(
+            "go",
+            "nonexistent-gopls-binary-xyz-99999",
+            Vec::new(),
+            vec!['.'],
+        ));
+
+        let workspace = std::env::temp_dir();
+
+        // Unconfigured language returns Ok(None) without failing
+        let unconfigured = manager
+            .ensure_server_for_language("markdown", &workspace)
+            .await
+            .unwrap();
+        assert!(unconfigured.is_none());
+        assert!(!manager.is_language_failed("markdown"));
+
+        // First open with missing binary fails non-fatally and caches the failure
+        let first = manager
+            .ensure_server_for_language("go", &workspace)
+            .await
+            .unwrap();
+        assert!(first.is_none());
+        assert!(manager.is_language_failed("go"));
+        assert!(manager.get_failure_reason("go").is_some());
+
+        // Second open returns cached Ok(None) without error/panic
+        let second = manager
+            .ensure_server_for_language("go", &workspace)
+            .await
+            .unwrap();
+        assert!(second.is_none());
+
+        // Attaching an existing/mock LspClient clears cached failure and succeeds
+        let (_server_w, client_r) = duplex(1024);
+        let (client_w, _server_r) = duplex(1024);
+        let mock_client = Arc::new(LspClient::from_io(client_r, client_w));
+        manager.attach_client("go", mock_client.clone());
+        assert!(!manager.is_language_failed("go"));
+
+        let attached = manager
+            .ensure_server_for_language("go", &workspace)
+            .await
+            .unwrap();
+        assert!(attached.is_some());
+        assert!(Arc::ptr_eq(&attached.unwrap(), &mock_client));
     }
 
     #[tokio::test]

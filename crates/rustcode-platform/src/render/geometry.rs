@@ -117,6 +117,9 @@ impl Corners {
     }
 }
 
+/// Maximum finite coordinate magnitude accepted by geometry validation helpers.
+pub const MAX_RECT_COORD: f32 = 1.0e15;
+
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Rect {
     pub origin: Point,
@@ -194,6 +197,82 @@ impl Rect {
     pub fn offset(&self, dx: f32, dy: f32) -> Rect {
         Rect::new(self.origin.offset(dx, dy), self.size)
     }
+
+    pub fn is_finite(&self) -> bool {
+        self.min_x().is_finite()
+            && self.min_y().is_finite()
+            && self.width().is_finite()
+            && self.height().is_finite()
+            && self.max_x().is_finite()
+            && self.max_y().is_finite()
+            && self.origin.x.abs() <= MAX_RECT_COORD
+            && self.origin.y.abs() <= MAX_RECT_COORD
+            && self.size.width.abs() <= MAX_RECT_COORD
+            && self.size.height.abs() <= MAX_RECT_COORD
+            && (self.origin.x as f64 + self.size.width as f64).abs() <= f32::MAX as f64
+            && (self.origin.y as f64 + self.size.height as f64).abs() <= f32::MAX as f64
+    }
+
+    pub fn is_finite_positive(&self) -> bool {
+        self.is_finite() && self.size.width > 0.0 && self.size.height > 0.0
+    }
+
+    pub fn clamp_to_bounds(&self, bounds: Rect) -> Rect {
+        if !bounds.is_finite_positive() {
+            return Rect::zero();
+        }
+        let b_min_x = bounds.min_x();
+        let b_max_x = bounds.max_x();
+        let b_min_y = bounds.min_y();
+        let b_max_y = bounds.max_y();
+
+        let rx = if self.origin.x.is_nan() {
+            b_min_x
+        } else {
+            self.origin.x
+        };
+        let ry = if self.origin.y.is_nan() {
+            b_min_y
+        } else {
+            self.origin.y
+        };
+        let rw = if self.size.width.is_nan() || self.size.width <= 0.0 {
+            0.0
+        } else {
+            self.size.width
+        };
+        let rh = if self.size.height.is_nan() || self.size.height <= 0.0 {
+            0.0
+        } else {
+            self.size.height
+        };
+
+        let min_x = rx.clamp(b_min_x, b_max_x);
+        let min_y = ry.clamp(b_min_y, b_max_y);
+
+        let max_x = if rw.is_infinite() {
+            b_max_x
+        } else if rx.is_infinite() {
+            min_x
+        } else {
+            (rx as f64 + rw as f64).clamp(min_x as f64, b_max_x as f64) as f32
+        };
+
+        let max_y = if rh.is_infinite() {
+            b_max_y
+        } else if ry.is_infinite() {
+            min_y
+        } else {
+            (ry as f64 + rh as f64).clamp(min_y as f64, b_max_y as f64) as f32
+        };
+
+        Rect::from_xywh(
+            min_x,
+            min_y,
+            (max_x - min_x).max(0.0),
+            (max_y - min_y).max(0.0),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -224,5 +303,76 @@ mod tests {
 
         let inset = r1.inset(Edges::all(5.0));
         assert_eq!(inset, Rect::from_xywh(5.0, 5.0, 90.0, 90.0));
+    }
+
+    #[test]
+    fn test_rect_is_finite_and_positive() {
+        assert!(Rect::from_xywh(10.0, 20.0, 100.0, 50.0).is_finite());
+        assert!(Rect::from_xywh(10.0, 20.0, 100.0, 50.0).is_finite_positive());
+
+        let zero_w = Rect::from_xywh(0.0, 0.0, 0.0, 10.0);
+        assert!(zero_w.is_finite());
+        assert!(!zero_w.is_finite_positive());
+
+        let neg_dim = Rect::new(Point::zero(), Size::new(-5.0, 10.0));
+        assert!(!neg_dim.is_finite_positive());
+
+        for bad in [
+            Rect::new(Point::new(f32::NAN, 0.0), Size::new(10.0, 10.0)),
+            Rect::new(Point::new(0.0, f32::INFINITY), Size::new(10.0, 10.0)),
+            Rect::new(Point::new(0.0, f32::NEG_INFINITY), Size::new(10.0, 10.0)),
+            Rect::new(Point::new(1.0e16, 0.0), Size::new(10.0, 10.0)),
+            Rect::new(Point::zero(), Size::new(1.0e16, 10.0)),
+        ] {
+            assert!(!bad.is_finite(), "expected !is_finite for {bad:?}");
+            assert!(!bad.is_finite_positive(), "expected !is_finite_positive for {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_rect_clamp_to_bounds_edge_cases() {
+        let bounds = Rect::from_xywh(10.0, 20.0, 100.0, 50.0);
+
+        // Child larger than container clamps cleanly without panic or inverted bounds
+        let larger = Rect::from_xywh(0.0, 0.0, 500.0, 500.0);
+        assert_eq!(larger.clamp_to_bounds(bounds), bounds);
+
+        // Disjoint child beyond max edge clamps to zero-sized edge inside bounds
+        let far = Rect::from_xywh(300.0, 300.0, 40.0, 40.0);
+        let clamped_far = far.clamp_to_bounds(bounds);
+        assert!(clamped_far.is_finite());
+        assert_eq!(clamped_far, Rect::from_xywh(110.0, 70.0, 0.0, 0.0));
+
+        // Non-finite child fields safely clamp inside bounds
+        let non_finite = Rect::new(Point::new(f32::NAN, f32::INFINITY), Size::new(f32::INFINITY, -5.0));
+        let clamped_nf = non_finite.clamp_to_bounds(bounds);
+        assert!(clamped_nf.is_finite());
+        assert_eq!(clamped_nf, Rect::from_xywh(10.0, 70.0, 100.0, 0.0));
+
+        // -INFINITY origin + +INFINITY size spans full bounds; -INFINITY/NaN size clamps to 0.0
+        let span_inf = Rect::new(
+            Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
+            Size::new(f32::INFINITY, f32::INFINITY),
+        );
+        assert_eq!(span_inf.clamp_to_bounds(bounds), bounds);
+
+        let neg_inf_size = Rect::new(
+            Point::new(20.0, 30.0),
+            Size::new(f32::NEG_INFINITY, f32::NAN),
+        );
+        assert_eq!(
+            neg_inf_size.clamp_to_bounds(bounds),
+            Rect::from_xywh(20.0, 30.0, 0.0, 0.0)
+        );
+
+        // Invalid container yields Rect::zero()
+        assert_eq!(
+            larger.clamp_to_bounds(Rect::from_xywh(0.0, 0.0, 0.0, 50.0)),
+            Rect::zero()
+        );
+        assert_eq!(
+            larger.clamp_to_bounds(Rect::new(Point::zero(), Size::new(f32::NAN, 50.0))),
+            Rect::zero()
+        );
     }
 }

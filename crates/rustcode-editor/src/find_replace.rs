@@ -255,7 +255,7 @@ impl FindReplaceWidget {
     }
 
     pub fn compute_layout(&self, editor_bounds: Rect, _font: &FontMetrics) -> FindReplaceLayout {
-        if !is_finite_positive_rect(editor_bounds) {
+        if !editor_bounds.is_finite_positive() {
             let z = Rect::zero();
             return FindReplaceLayout {
                 widget_rect: z,
@@ -292,10 +292,8 @@ impl FindReplaceWidget {
         let widget_h = desired_h.min(editor_bounds.height()).max(0.0);
         let widget_y = (editor_bounds.min_y() + 4.0)
             .min((editor_bounds.max_y() - widget_h).max(editor_bounds.min_y()));
-        let widget_rect = clamp_rect(
-            Rect::from_xywh(widget_x, widget_y, widget_w, widget_h),
-            editor_bounds,
-        );
+        let widget_rect =
+            Rect::from_xywh(widget_x, widget_y, widget_w, widget_h).clamp_to_bounds(editor_bounds);
 
         let content_min_x = widget_rect.min_x() + inner_pad;
         let content_max_x = (widget_rect.max_x() - inner_pad).max(content_min_x);
@@ -313,10 +311,8 @@ impl FindReplaceWidget {
             let r_max = cursor_right;
             let r_min = (r_max - w).max(content_min_x);
             cursor_right = (r_min - gap).max(content_min_x);
-            clamp_rect(
-                Rect::from_xywh(r_min, row1_y, (r_max - r_min).max(0.0), row1_h),
-                widget_rect,
-            )
+            Rect::from_xywh(r_min, row1_y, (r_max - r_min).max(0.0), row1_h)
+                .clamp_to_bounds(widget_rect)
         };
 
         let close_rect = alloc_right(btn_w);
@@ -326,15 +322,13 @@ impl FindReplaceWidget {
         let regex_rect = alloc_right(toggle_w);
         let whole_word_rect = alloc_right(toggle_w);
         let case_rect = alloc_right(toggle_w);
-        let find_input_rect = clamp_rect(
-            Rect::from_xywh(
-                content_min_x,
-                row1_y,
-                (cursor_right - content_min_x).max(0.0),
-                row1_h,
-            ),
-            widget_rect,
-        );
+        let find_input_rect = Rect::from_xywh(
+            content_min_x,
+            row1_y,
+            (cursor_right - content_min_x).max(0.0),
+            row1_h,
+        )
+        .clamp_to_bounds(widget_rect);
 
         let (replace_input_rect, replace_one_rect, replace_all_rect) = if self.show_replace {
             let row2_y = (row1_y + row1_h + row_gap).min(widget_rect.max_y());
@@ -344,22 +338,18 @@ impl FindReplaceWidget {
                 let r_max = r2_right;
                 let r_min = (r_max - w).max(content_min_x);
                 r2_right = (r_min - gap).max(content_min_x);
-                clamp_rect(
-                    Rect::from_xywh(r_min, row2_y, (r_max - r_min).max(0.0), row2_h),
-                    widget_rect,
-                )
+                Rect::from_xywh(r_min, row2_y, (r_max - r_min).max(0.0), row2_h)
+                    .clamp_to_bounds(widget_rect)
             };
             let rep_all = alloc_r2(84.0);
             let rep_one = alloc_r2(64.0);
-            let rep_in = clamp_rect(
-                Rect::from_xywh(
-                    content_min_x,
-                    row2_y,
-                    (r2_right - content_min_x).max(0.0),
-                    row2_h,
-                ),
-                widget_rect,
-            );
+            let rep_in = Rect::from_xywh(
+                content_min_x,
+                row2_y,
+                (r2_right - content_min_x).max(0.0),
+                row2_h,
+            )
+            .clamp_to_bounds(widget_rect);
             (Some(rep_in), Some(rep_one), Some(rep_all))
         } else {
             (None, None, None)
@@ -434,12 +424,12 @@ impl FindReplaceWidget {
         font: &FontMetrics,
         scene: &mut Scene,
     ) {
-        if !self.is_visible || !is_finite_positive_rect(editor_bounds) || !is_finite_font(font) {
+        if !self.is_visible || !editor_bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
 
         let layout = self.compute_layout(editor_bounds, font);
-        if !is_finite_positive_rect(layout.widget_rect) {
+        if !layout.widget_rect.is_finite_positive() {
             return;
         }
 
@@ -459,7 +449,7 @@ impl FindReplaceWidget {
         );
 
         let draw_input = |scene: &mut Scene, rect: Rect, text: &str, focused: bool| {
-            if !is_finite_positive_rect(rect) {
+            if !rect.is_finite_positive() {
                 return;
             }
             let border = if focused {
@@ -492,7 +482,7 @@ impl FindReplaceWidget {
         };
 
         let draw_button = |scene: &mut Scene, rect: Rect, label: &str, active: bool| {
-            if !is_finite_positive_rect(rect) {
+            if !rect.is_finite_positive() {
                 return;
             }
             let bg = if active {
@@ -533,7 +523,7 @@ impl FindReplaceWidget {
         draw_button(scene, layout.whole_word_rect, "ab", self.whole_word);
         draw_button(scene, layout.regex_rect, ".*", self.is_regex);
 
-        if is_finite_positive_rect(layout.status_rect) && layout.status_rect.width() > 4.0 {
+        if layout.status_rect.is_finite_positive() && layout.status_rect.width() > 4.0 {
             let status = self.status_text();
             let status_color = if self.error.is_some() {
                 theme.editor_error_foreground
@@ -755,36 +745,6 @@ fn passes_whole_word(text: &str, start: usize, end: usize) -> bool {
         return false;
     }
     true
-}
-
-fn clamp_rect(r: Rect, container: Rect) -> Rect {
-    let x = r.min_x().clamp(container.min_x(), container.max_x());
-    let y = r.min_y().clamp(container.min_y(), container.max_y());
-    let max_x = r.max_x().clamp(x, container.max_x());
-    let max_y = r.max_y().clamp(y, container.max_y());
-    Rect::from_xywh(x, y, (max_x - x).max(0.0), (max_y - y).max(0.0))
-}
-
-fn is_finite_rect(rect: Rect) -> bool {
-    rect.min_x().is_finite()
-        && rect.min_y().is_finite()
-        && rect.width().is_finite()
-        && rect.height().is_finite()
-        && rect.max_x().is_finite()
-        && rect.max_y().is_finite()
-}
-
-fn is_finite_positive_rect(rect: Rect) -> bool {
-    is_finite_rect(rect) && rect.width() > 0.0 && rect.height() > 0.0
-}
-
-fn is_finite_font(font: &FontMetrics) -> bool {
-    font.line_height.is_finite()
-        && font.line_height > 0.0
-        && font.char_width.is_finite()
-        && font.char_width >= 0.0
-        && font.font_size.is_finite()
-        && font.font_size >= 0.0
 }
 
 #[cfg(test)]

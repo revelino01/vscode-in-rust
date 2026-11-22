@@ -114,7 +114,7 @@ fn test_end_to_end_gpui_presentation_layer() {
         FileTreeNode::new_file(PathBuf::from("/workspace/main.rs")),
         FileTreeNode::new_file(PathBuf::from("/workspace/Cargo.toml")),
     ]);
-    window.view.explorer.model.root = Some(root);
+    window.view.explorer.model.set_roots(vec![root]);
     window.view.explorer.model.expanded_paths.insert(PathBuf::from("/workspace"));
 
     // Open file in editor area

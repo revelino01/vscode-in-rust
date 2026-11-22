@@ -8,8 +8,11 @@ use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect,
     Scene, View, WorkbenchThemeStyles,
 };
-use rustcode_protocols::git::{GitStatusEntry, GitStatusKind, ScmRepository};
-use std::path::PathBuf;
+use rustcode_protocols::git::{
+    GitBackend, GitCliBackend, GitError, GitStatusEntry, GitStatusKind, ScmRepository,
+};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScmAction {
@@ -47,6 +50,7 @@ enum ScmClickTarget {
 
 pub struct ScmView {
     pub repo: ScmRepository,
+    pub git_backend: Option<Arc<dyn GitBackend>>,
     pub commit_message: String,
     pub commit_input_focused: bool,
     pub staged_collapsed: bool,
@@ -60,14 +64,19 @@ pub struct ScmView {
 
 impl Default for ScmView {
     fn default() -> Self {
-        Self::new(ScmRepository::sample_repository())
+        Self::empty()
     }
 }
 
 impl ScmView {
+    pub fn empty() -> Self {
+        Self::new(ScmRepository::empty(PathBuf::from(".")))
+    }
+
     pub fn new(repo: ScmRepository) -> Self {
         Self {
             repo,
+            git_backend: None,
             commit_message: String::new(),
             commit_input_focused: false,
             staged_collapsed: false,
@@ -80,29 +89,170 @@ impl ScmView {
         }
     }
 
+    pub fn set_git_backend(&mut self, backend: Arc<dyn GitBackend>) {
+        self.git_backend = Some(backend);
+        if let Err(err) = self.refresh_from_git() {
+            self.status_message = Some(err.to_string());
+        }
+    }
+
+    pub fn clear_git_backend(&mut self) {
+        self.git_backend = None;
+        self.repo = ScmRepository::empty(PathBuf::from("."));
+        self.status_message = None;
+    }
+
+    pub fn open_workspace_git(&mut self, workspace_root: &Path) -> Result<bool, GitError> {
+        let backend = Arc::new(GitCliBackend::new(workspace_root));
+        if !backend.is_git_repo() {
+            self.git_backend = None;
+            self.repo = ScmRepository::empty(workspace_root);
+            self.status_message = None;
+            return Ok(false);
+        }
+        self.git_backend = Some(backend);
+        self.refresh_from_git()?;
+        Ok(true)
+    }
+
+    pub fn refresh_from_git(&mut self) -> Result<(), GitError> {
+        let Some(backend) = self.git_backend.as_ref().cloned() else {
+            return Ok(());
+        };
+        let mut refreshed = ScmRepository::empty(backend.root());
+        refreshed.refresh_from_backend(backend.as_ref())?;
+        self.repo = refreshed;
+        Ok(())
+    }
+
+    pub fn branch_name(&self) -> Option<&str> {
+        let name = self.repo.current_branch.name.trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    pub fn stage_file(&mut self, path: &Path) -> Result<(), GitError> {
+        if let Some(backend) = self.git_backend.as_ref().cloned() {
+            backend.stage(path)?;
+            self.refresh_from_git()?;
+        } else {
+            self.repo.stage_file(path);
+        }
+        self.last_action = Some(ScmAction::StageFile(path.to_path_buf()));
+        Ok(())
+    }
+
+    pub fn unstage_file(&mut self, path: &Path) -> Result<(), GitError> {
+        if let Some(backend) = self.git_backend.as_ref().cloned() {
+            backend.unstage(path)?;
+            self.refresh_from_git()?;
+        } else {
+            self.repo.unstage_file(path);
+        }
+        self.last_action = Some(ScmAction::UnstageFile(path.to_path_buf()));
+        Ok(())
+    }
+
+    pub fn stage_all(&mut self) -> Result<(), GitError> {
+        if let Some(backend) = self.git_backend.as_ref().cloned() {
+            backend.stage_all()?;
+            self.refresh_from_git()?;
+        } else {
+            self.repo.stage_all();
+        }
+        self.last_action = Some(ScmAction::StageAll);
+        Ok(())
+    }
+
+    pub fn unstage_all(&mut self) -> Result<(), GitError> {
+        if let Some(backend) = self.git_backend.as_ref().cloned() {
+            backend.unstage_all()?;
+            self.refresh_from_git()?;
+        } else {
+            self.repo.unstage_all();
+        }
+        self.last_action = Some(ScmAction::UnstageAll);
+        Ok(())
+    }
+
+    pub fn discard_file(&mut self, path: &Path) -> Result<(), GitError> {
+        if let Some(backend) = self.git_backend.as_ref().cloned() {
+            backend.discard(path)?;
+            self.refresh_from_git()?;
+        } else {
+            self.repo.discard_file(path);
+        }
+        self.last_action = Some(ScmAction::DiscardChanges(path.to_path_buf()));
+        Ok(())
+    }
+
+    pub fn diff_for_file(&self, path: &Path, staged: bool) -> Result<String, GitError> {
+        if let Some(backend) = &self.git_backend {
+            backend.diff(path, staged)
+        } else if let Some((orig, modif)) = self.repo.get_file_diff(path) {
+            Ok(format!(
+                "--- a/{}\n+++ b/{}\n- {}\n+ {}\n",
+                path.display(),
+                path.display(),
+                orig,
+                modif
+            ))
+        } else {
+            Ok(String::new())
+        }
+    }
+
     pub fn set_commit_message(&mut self, msg: &str) {
         self.commit_message = msg.to_string();
     }
 
-    pub fn execute_commit(&mut self) -> Result<String, String> {
-        let msg = self.commit_message.trim().to_string();
+    pub fn commit_with_message(&mut self, message: &str) -> Result<String, String> {
+        let msg = message.trim().to_string();
         if msg.is_empty() {
             let err = "Cannot commit empty message".to_string();
             self.status_message = Some(err.clone());
             return Err(err);
         }
-        match self.repo.commit(&msg) {
-            Ok(commit) => {
-                self.commit_message.clear();
-                self.status_message = Some(format!("Committed: {}", commit.hash));
-                self.last_action = Some(ScmAction::Commit { message: msg });
-                Ok(commit.hash)
+        if let Some(backend) = self.git_backend.as_ref().cloned() {
+            match backend.commit(&msg) {
+                Ok(commit) => {
+                    self.commit_message.clear();
+                    if let Err(err) = self.refresh_from_git() {
+                        self.status_message = Some(err.to_string());
+                    } else {
+                        self.status_message = Some(format!("Committed: {}", commit.hash));
+                    }
+                    self.last_action = Some(ScmAction::Commit { message: msg });
+                    Ok(commit.hash)
+                }
+                Err(e) => {
+                    let err = e.to_string();
+                    self.status_message = Some(err.clone());
+                    Err(err)
+                }
             }
-            Err(e) => {
-                self.status_message = Some(e.clone());
-                Err(e)
+        } else {
+            match self.repo.commit(&msg) {
+                Ok(commit) => {
+                    self.commit_message.clear();
+                    self.status_message = Some(format!("Committed: {}", commit.hash));
+                    self.last_action = Some(ScmAction::Commit { message: msg });
+                    Ok(commit.hash)
+                }
+                Err(e) => {
+                    self.status_message = Some(e.clone());
+                    Err(e)
+                }
             }
         }
+    }
+
+    pub fn execute_commit(&mut self) -> Result<String, String> {
+        let msg = self.commit_message.clone();
+        self.commit_with_message(&msg)
     }
 }
 
@@ -132,8 +282,11 @@ impl View for ScmView {
                 .with_border_edges(theme.panel_border, Edges::new(0.0, 0.0, 1.0, 0.0)),
         );
 
-        // Title: "SOURCE CONTROL: <branch>"
-        let title_text = format!("SOURCE CONTROL: {}", self.repo.current_branch.name);
+        // Title: "SOURCE CONTROL" or "SOURCE CONTROL: <branch>"
+        let title_text = match self.branch_name() {
+            Some(branch) => format!("SOURCE CONTROL: {}", branch),
+            None => "SOURCE CONTROL".to_string(),
+        };
         scene.push_text(GlyphRun::new(
             title_text.clone(),
             Point::new(bounds.min_x() + 12.0, bounds.min_y() + 10.0),
@@ -409,13 +562,15 @@ impl View for ScmView {
                                 return EventResult::Consumed;
                             }
                             ScmClickTarget::StageAllButton => {
-                                self.repo.stage_all();
-                                self.last_action = Some(ScmAction::StageAll);
+                                if let Err(err) = self.stage_all() {
+                                    self.status_message = Some(err.to_string());
+                                }
                                 return EventResult::Consumed;
                             }
                             ScmClickTarget::UnstageAllButton => {
-                                self.repo.unstage_all();
-                                self.last_action = Some(ScmAction::UnstageAll);
+                                if let Err(err) = self.unstage_all() {
+                                    self.status_message = Some(err.to_string());
+                                }
                                 return EventResult::Consumed;
                             }
                             ScmClickTarget::ToggleStaged => {
@@ -432,29 +587,33 @@ impl View for ScmView {
                             }
                             ScmClickTarget::StageItem(idx) => {
                                 if let Some(entry) = self.repo.changes.get(idx).cloned() {
-                                    self.repo.stage_file(&entry.path);
-                                    self.last_action = Some(ScmAction::StageFile(entry.path));
+                                    if let Err(err) = self.stage_file(&entry.path) {
+                                        self.status_message = Some(err.to_string());
+                                    }
                                 }
                                 return EventResult::Consumed;
                             }
                             ScmClickTarget::UnstageItem(idx) => {
                                 if let Some(entry) = self.repo.staged.get(idx).cloned() {
-                                    self.repo.unstage_file(&entry.path);
-                                    self.last_action = Some(ScmAction::UnstageFile(entry.path));
+                                    if let Err(err) = self.unstage_file(&entry.path) {
+                                        self.status_message = Some(err.to_string());
+                                    }
                                 }
                                 return EventResult::Consumed;
                             }
                             ScmClickTarget::StageUntrackedItem(idx) => {
                                 if let Some(entry) = self.repo.untracked.get(idx).cloned() {
-                                    self.repo.stage_file(&entry.path);
-                                    self.last_action = Some(ScmAction::StageFile(entry.path));
+                                    if let Err(err) = self.stage_file(&entry.path) {
+                                        self.status_message = Some(err.to_string());
+                                    }
                                 }
                                 return EventResult::Consumed;
                             }
                             ScmClickTarget::DiscardItem(idx) => {
                                 if let Some(entry) = self.repo.changes.get(idx).cloned() {
-                                    self.repo.discard_file(&entry.path);
-                                    self.last_action = Some(ScmAction::DiscardChanges(entry.path));
+                                    if let Err(err) = self.discard_file(&entry.path) {
+                                        self.status_message = Some(err.to_string());
+                                    }
                                 }
                                 return EventResult::Consumed;
                             }
@@ -585,14 +744,33 @@ impl ScmView {
         ));
     }
 
-    fn open_diff_for_entry(&mut self, entry: &GitStatusEntry) {
-        let (orig, modif) = if let Some((o, m)) = self.repo.get_file_diff(&entry.path) {
-            (o.to_string(), m.to_string())
-        } else if let Ok(content) = std::fs::read_to_string(&entry.path) {
-            (String::new(), content)
+    fn file_diff_contents(&self, path: &Path) -> (String, String) {
+        if let Some((o, m)) = self.repo.get_file_diff(path) {
+            return (o.to_string(), m.to_string());
+        }
+        if let Some(backend) = &self.git_backend {
+            let orig = backend.show_head(path).ok().flatten().unwrap_or_default();
+            let full_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                backend.root().join(path)
+            };
+            let modif = std::fs::read_to_string(&full_path).unwrap_or_default();
+            return (orig, modif);
+        }
+        let full_path = if path.is_absolute() {
+            path.to_path_buf()
         } else {
-            (String::new(), String::new())
+            self.repo.root.join(path)
         };
+        let modif = std::fs::read_to_string(&full_path)
+            .or_else(|_| std::fs::read_to_string(path))
+            .unwrap_or_default();
+        (String::new(), modif)
+    }
+
+    fn open_diff_for_entry(&mut self, entry: &GitStatusEntry) {
+        let (orig, modif) = self.file_diff_contents(&entry.path);
 
         let file_name = entry
             .path
@@ -613,10 +791,29 @@ impl ScmView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustcode_protocols::git::InMemoryGitBackend;
+
+    #[test]
+    fn test_scm_view_default_is_empty_no_sample_data() {
+        let scm = ScmView::default();
+        assert!(scm.git_backend.is_none());
+        assert!(scm.branch_name().is_none());
+        assert!(scm.repo.staged.is_empty());
+        assert!(scm.repo.changes.is_empty());
+        assert!(scm.repo.untracked.is_empty());
+        assert!(scm.repo.commits.is_empty());
+    }
 
     #[test]
     fn test_scm_view_commit_and_staging_actions() {
         let mut scm = ScmView::default();
+        let backend = Arc::new(InMemoryGitBackend::new(ScmRepository::sample_repository()));
+        scm.set_git_backend(backend);
+        assert_eq!(scm.branch_name(), Some("main"));
+        assert_eq!(scm.repo.staged.len(), 1);
+        assert_eq!(scm.repo.changes.len(), 1);
+        assert_eq!(scm.repo.untracked.len(), 1);
+
         let bounds = Rect::from_xywh(0.0, 0.0, 300.0, 600.0);
         let font = FontMetrics::default_monospace();
         let theme = WorkbenchThemeStyles::dark_default();
@@ -624,6 +821,7 @@ mod tests {
         let mut scene = Scene::new();
         scm.render(bounds, &theme, &font, &mut scene);
         assert!(!scene.quads().is_empty());
+        assert!(scene.contains_text("SOURCE CONTROL: main"));
 
         // Focus and type commit message
         scm.commit_input_focused = true;
@@ -648,5 +846,67 @@ mod tests {
         assert!(scm.commit_message.is_empty());
         assert!(scm.repo.staged.is_empty());
         assert_eq!(scm.repo.commits.len(), 1);
+    }
+
+    #[test]
+    fn test_scm_view_git_cli_backend_real_repo() {
+        let tmp = std::env::temp_dir().join(format!("rc_scm_cli_{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&tmp)
+                .args(args)
+                .output()
+                .expect("git should run");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "RustCode Test"]);
+        run_git(&["config", "user.email", "test@rustcode.local"]);
+
+        let tracked = tmp.join("hello.txt");
+        std::fs::write(&tracked, "v1\n").unwrap();
+        run_git(&["add", "hello.txt"]);
+        run_git(&["commit", "-m", "initial"]);
+
+        std::fs::write(&tracked, "v2\n").unwrap();
+        std::fs::write(tmp.join("notes.txt"), "untracked\n").unwrap();
+
+        let mut scm = ScmView::default();
+        assert!(scm.open_workspace_git(&tmp).unwrap());
+        assert_eq!(scm.branch_name(), Some("main"));
+        assert_eq!(scm.repo.changes.len(), 1);
+        assert_eq!(scm.repo.untracked.len(), 1);
+
+        let diff = scm.diff_for_file(Path::new("hello.txt"), false).unwrap();
+        assert!(diff.contains("-v1"));
+        assert!(diff.contains("+v2"));
+
+        scm.stage_file(Path::new("hello.txt")).unwrap();
+        assert_eq!(scm.repo.staged.len(), 1);
+        assert!(scm.repo.changes.is_empty());
+
+        scm.unstage_file(Path::new("hello.txt")).unwrap();
+        assert!(scm.repo.staged.is_empty());
+        assert_eq!(scm.repo.changes.len(), 1);
+
+        scm.stage_all().unwrap();
+        assert_eq!(scm.repo.staged.len(), 2);
+        let commit_hash = scm.commit_with_message("feat: update and add notes").unwrap();
+        assert!(!commit_hash.is_empty());
+        assert!(scm.repo.staged.is_empty());
+        assert!(scm.repo.changes.is_empty());
+        assert!(scm.repo.untracked.is_empty());
+        assert_eq!(scm.repo.commits.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

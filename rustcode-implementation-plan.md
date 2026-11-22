@@ -112,20 +112,51 @@
 
 **Sync Wrappers & Documentation Hygiene**
 - [ ] **Share `WorkbenchWindow::sync_*` & `sync_for_render` mapping helpers & tidy `LanguageFeatureBridge` RPC/doc wrappers**: Factor repeated status-bar/notification/test projection logic in `crates/rustcode-workbench/src/window.rs` and evaluate deprecating legacy `LanguageFeatureBridge::handle_rpc_message` in `crates/rustcode-ext-host/src/provider/bridge.rs`
-- [ ] **Archive/update superseded pre-implementation blueprint notes**: Clarify or update the legacy Phase 0–3 proposal section below in `rustcode-implementation-plan.md` referencing `deno_core`, `alacritty_terminal`, `wry`, and `rust-toolchain.toml`
+- [ ] **Align superseded prototype notes**: Clarify historical Phase 0–3 prototype code snippets below (`deno_core`, Zed `gpui-fork`, `git2`, `rust-toolchain.toml`) against the locked-in 1:1 VS Code Rust Hybrid stack
 
-### Phase 8 (Planned): Native Interactive Desktop Shell, Live Workspace Runtime & Daily-Driver Parity
+### Phase 8 (Planned): 1:1 VS Code Native Desktop & Runtime Parity (Rust Hybrid Stack)
 
-> Open architectural decisions prior to implementation:
-> 1. Desktop renderer choice (`winit` + `softbuffer` + `fontdue` portable CPU rasterizer vs. `winit` + `wgpu` + `cosmic-text` GPU acceleration)
-> 2. Delivery phasing (Interactive Desktop MVP M1–M3 first vs. full M1–M5 together)
-> 3. Default binary launch mode (keep headless default + `--gui` flag vs. GUI-by-default + `--headless` flag)
+> **Locked-In 1:1 VS Code Rust Hybrid Stack (Direction for Phase 8):**
+> - **GUI & Text Rendering:** `winit` + `wgpu` + `cosmic-text` behind `RenderSurface` (`Scene` → GPU, 120 FPS, ligatures, CJK/emoji/complex shaping, Codicons, HiDPI; preserving `MockRenderSurface` for headless tests)
+> - **Extension Host Runtime:** Keep live Node.js `NodeExtHostProcess` (framed stdio + `require('vscode')` hook — matching real VS Code's Node extension host for top-100 extension compatibility)
+> - **Editor Text & Syntax:** Custom Piece Table + `unicode-segmentation` / `unicode-width` / `encoding_rs`; TextMate `.tmLanguage` grammar engine + `tree-sitter` layered over the 14 built-in pure-Rust tokenizers
+> - **Terminal & WebViews:** `alacritty_terminal` + real PTY (`portable-pty` / ConPTY / Unix PTY) and `wry` (WebView2 / WebKitGTK / WKWebView) with headless test fallbacks
+> - **Git, Search & Native OS UX:** Real `git` CLI (`GitCliBackend`), `ignore` + `grep-regex` (`ripgrep`), `nucleo` fuzzy matcher, `rusqlite` SQLite `StorageService`, `arboard`, `rfd`, `dirs`, and live LSP/DAP adapters
 
-- [ ] **Phase 8 M1 — Native OS Window & Live Scene Rasterizer**: Feature-gated desktop backend (`desktop` feature in `rustcode-platform` & `rustcode-app`) rendering `Scene::{Quad, GlyphRun, Shadow, PushClip, PopClip}` with rounded corners, borders, clip stack, glyph atlas caching, HiDPI scaling, and live OS keyboard/mouse/resize/close event loop (preserving `MockRenderSurface` as default headless test backend)
-- [ ] **Phase 8 M2 — CLI Arguments, Disk Config/Session Persistence & Live Background Runtime**: CLI parser (`rustcode [path...]`, `--headless`, `--version`, `--goto file:line[:col]`, `--user-data-dir`, `--extensions-dir`, `--disable-extensions`), disk config & session loading/persistence (`~/.rustcode/{settings.json,keybindings.json}`, `<workspace>/.vscode/settings.json`, `~/.rustcode/extensions/`), and background Tokio loop driving `FileSystemWatcher`, `AutoSaveService`, and live `NodeExtHostProcess` activation/restart recovery
-- [ ] **Phase 8 M3 — Daily-Driver Editor Ergonomics & Live Workspace Search/Replace**: OS clipboard (`Ctrl+C`/`X`/`V` incl. empty-selection full-line copy/cut), mouse drag/double/triple-click selection & scrollbar/Minimap dragging, `Ctrl+/` language-aware line comments across all 14 grammars, `Alt+Up/Down` move & `Shift+Alt+Up/Down` duplicate lines, multi-line `Tab`/`Shift+Tab` indent/outdent, bracket auto-close/matching, right-click context menus, and live multi-file `SearchView` (`Ctrl+Shift+F` / `Ctrl+Shift+H`)
-- [ ] **Phase 8 M4 — Live Git CLI Integration & Real LSP/DAP Process Wiring**: Replace default sample SCM/Debug states with pure-Rust `GitCliBackend` wired to `ScmView`/`DiffEditorView`/Status Bar, auto-attached `LspClientManager` servers (`rust-analyzer`, `typescript-language-server`, `pyright`, `gopls`) for hover/go-to-def/completions/diagnostics/`editor.formatOnSave`, and `.vscode/launch.json` DAP launch
-- [ ] **Phase 8 M5 — Cross-Platform Hardening, Native Linux CI & Phase 8 Verification**: Unix process-group `killpg` termination in `crates/rustcode-ext-host/src/process/mod.rs`, remaining `util.isDeepStrictEqual` & `ContextKey` `[^]/]` edge cases, GitHub Actions CI matrix (`windows-latest` + `ubuntu-latest` running workspace tests, `ext-host-js/test.js`, `phase7-e2e` 286 Win / 287 Unix tests, `clippy -D warnings`, benches, and `package.ps1`/`package.sh`), plus `tests/phase8-e2e/` & doc refresh
+- [ ] **Phase 8 M1 — Hardware GPU Desktop Window & Rich Text Rasterizer (`winit` + `wgpu` + `cosmic-text`)**: Feature-gated `desktop` `RenderSurface` rendering `Scene::{Quad, GlyphRun, Shadow, PushClip, PopClip}` with rounded corners, borders, shadows, clip stacks, `cosmic-text` shaping (ligatures, emoji/CJK/fallback fonts, Codicons), HiDPI scaling, and live OS keyboard/IME/mouse/drag/scroll/resize/close event loop (preserving `MockRenderSurface` as default headless test backend)
+- [ ] **Phase 8 M2 — CLI, SQLite State Persistence (`rusqlite`), Native OS Integration (`rfd`/`arboard`/`dirs`) & Live Runtime Loop**: CLI parser (`rustcode [path...]`, `--headless`, `--version`, `--goto file:line[:col]`, `--user-data-dir`, `--extensions-dir`, `--disable-extensions`), disk loading of `~/.rustcode/` & `<workspace>/.vscode/` configs/keymaps/themes/extensions, SQLite `StorageService` (recent workspaces, tabs, layout, extension `Memento`), native Open/Save dialogs (`rfd`), `arboard` OS clipboard, and background Tokio runtime driving `FileSystemWatcher`, `AutoSaveService`, and live `NodeExtHostProcess` auto-activation/crash recovery with full Node.js runtime compatibility for real-world extensions
+- [ ] **Phase 8 M3 — Daily-Driver Editor, `ripgrep`/`nucleo` Search & TextMate + `tree-sitter` Syntax Engine**: Editor clipboard shortcuts (`Ctrl+C`/`X`/`V` incl. empty-selection line copy/cut), mouse drag/double/triple-click selection, scrollbar/Minimap dragging, `Ctrl+/` comments, line move/duplicate/indent, bracket auto-close/matching, right-click context menus; `unicode-segmentation`/`unicode-width`/`encoding_rs` in `rustcode-editor`; `ignore`/`grep-regex` (`ripgrep`) multi-file search/replace (`Ctrl+Shift+F`/`Ctrl+Shift+H`) + `nucleo` fuzzy matching in QuickInput; and TextMate `.tmLanguage` extension grammar loader + `tree-sitter` incremental highlighting layered over the 14 built-in grammars
+- [ ] **Phase 8 M4 — Real PTY Terminal (`alacritty_terminal`) & System WebViews (`wry`)**: Replace one-shot `std::process::Command` runner with real PTY (`portable-pty` / ConPTY / Unix PTY) + `alacritty_terminal` VT100/xterm grid emulation (ANSI colors, interactive shells, TUIs like `vim`/`htop`, signals, resize); replace simplified HTML tag parser in `WebviewEditorView` with OS WebViews via `wry` (WebView2 / WebKitGTK / WKWebView) wired to `ExtHostWebviewManager` & `ExtHostCustomEditorManager` `postMessage` channels (preserving headless test fallback)
+- [ ] **Phase 8 M5 — Real `git` CLI SCM, Auto-Attached LSP Servers & Live DAP (`launch.json`)**: Replace `ScmRepository::sample_repository()` with pure-Rust `GitCliBackend` (`git status --porcelain=v2 -b`, `diff`, `show HEAD:<path>`, `add`, `restore --staged`, `commit`, Status Bar branch readout); auto-attach configured LSP servers (`rust-analyzer`, `typescript-language-server`, `pyright`, `gopls`) for hover/go-to-def (`F12`/`Ctrl+Click`)/autocomplete/diagnostics/`editor.formatOnSave`; and parse `.vscode/launch.json` to launch real DAP adapters replacing `DebugSessionState::sample_session()`
+- [ ] **Phase 8 M6 — Cross-Platform Hardening, Native Windows/Linux CI & 1:1 Extension Verification**: Close Phase 7 M7 minor caveats (Unix `setsid`/`killpg` in `process/mod.rs`, 4 `util.isDeepStrictEqual` edge cases, `ContextKey` `[^]/]` regex char-class), add `.github/workflows/ci.yml` (`windows-latest` + `ubuntu-latest` running workspace tests, `compat_suite`, `ext-host-js/test.js`, native 286 Win / 287 Unix `phase7-e2e`, `clippy -D warnings`, benches, and `package.ps1`/`package.sh`), add `tests/phase8-e2e/`, and verify real-world VS Code extensions (`One Dark Pro`, `Prettier`, `ESLint`, `rust-analyzer`, `GitLens`)
+
+### Phase 9 (Planned): Deep Editing, Navigation & Language Intelligence Parity
+
+- [ ] **Phase 9 M1 — Advanced LSP & Multi-File Refactoring**: Rich Markdown hover popovers, Signature Help (`Ctrl+Shift+Space`), Peek References / Go to Implementation / Type Definition (`Shift+F12`), Rename Symbol (`F2`) with multi-file `WorkspaceEdit` preview & undo, LSP Semantic Tokens layering over TextMate/`tree-sitter`, Inlay Hints, CodeLens, Document Links, and Call/Type Hierarchy views
+- [ ] **Phase 9 M2 — Snippets Engine, Language Config & Large-File PieceTable**: Full VS Code TextMate snippet engine (nested tabstops, `${1|a,b,c|}` choices, regex transforms, `$TM_*` variables), `contributes.snippets` & `language-configuration.json` loader (auto-indent, on-enter rules, surrounding pairs), Sticky Scroll, bracket-pair colorization, and true O(log n) balanced piece-tree rebalancing + virtualized rendering for 100 MB+ files
+- [ ] **Phase 9 M3 — Full Workbench Chrome, Context Menus & Multi-Window**: Drag-and-drop tabs across split groups & Explorer files, Secondary Sidebar (right panel), Panel position toggle (bottom/left/right), draggable Sash resizing, custom Title Bar & Menu Bar, full `contributes.menus` right-click Context Menus with `when` clauses, Window Zoom (`Ctrl+=`/`-`/`0`), Zen Mode (`Ctrl+K Z`), and Multi-Window orchestration (`Ctrl+Shift+N` + single-instance IPC socket forwarding CLI files into active windows)
+- [ ] **Phase 9 M4 — Phase 9 E2E & Large-File Benchmarks (`tests/phase9-e2e/`)**: Automated verification of Rename Symbol, Peek References, Semantic Tokens, Snippets, Drag-and-Drop layout, Multi-Window IPC, and 100 MB file latency budgets
+
+### Phase 10 (Planned): Real-World Top-100 VS Code Extension Ecosystem & Marketplace Maturity
+
+- [ ] **Phase 10 M1 — Remaining `vscode.*` APIs & Contribution Points**: `workspace.registerFileSystemProvider` (virtual/remote schemes), `TextDocumentContentProvider`, `WebviewViewProvider` (sidebar/panel webviews), `TreeView` drag-and-drop & checkboxes, `SecretStorage` (OS keyring), `LogOutputChannel`, `TerminalShellIntegration`, `CustomExecution` tasks + Problem Matchers, and `contributes.{menus,viewsContainers,viewsWelcome,submenus,jsonValidation,problemMatchers,iconThemes,productIconThemes}`
+- [ ] **Phase 10 M2 — Extension Host Runtime Polish & Profiling**: Managed Node.js discovery/version check, per-extension activation & RPC profiling (`Developer: Show Running Extensions`), unresponsive extension host watchdog + restart banner, and transparent real-Node passthrough alongside `require('vscode')` hook for unmodified Open VSX `.vsix` bundles
+- [ ] **Phase 10 M3 — Rich Marketplace UX & Profiles**: Full Open VSX detail view via `wry` (README, changelog, dependencies), extension packs, pre-release channel toggle, auto-updates, install-from-`.vsix`, `.vscode/extensions.json` workspace recommendations, and VS Code **Profiles** (settings/keybindings/extensions snapshots)
+- [ ] **Phase 10 M4 — Automated Real-`.vsix` Compatibility Harness (`tests/phase10-ext-compat/`)**: Automated CI harness exercising real `.vsix` extensions (`One Dark Pro`, `Tokyo Night`, `Material Icon Theme`, `Prettier`, `ESLint`, `rust-analyzer`, `Python`, `GitLens`, `Tailwind CSS`, `Error Lens`, `Todo Tree`, `YAML`, `TOML`, `Markdown All in One`) and keeping `docs/extension-compat-matrix.md` scores verified
+
+### Phase 11 (Planned): Remote Development, Tasks/Git Merge & Accessibility/I18n
+
+- [ ] **Phase 11 M1 — Remote Development (`rustcode-remote` — SSH & Dev Containers)**: Headless `rustcode-server` binary over SSH (`vscode-remote://ssh-remote+...`) and `devcontainer.json` discovery/attach, multiplexing remote `FileSystemProvider`, remote `NodeExtHostProcess`, remote LSP/DAP, and remote PTY terminal over a single framed tunnel
+- [ ] **Phase 11 M2 — `.vscode/tasks.json`, Git Blame/Branches & 3-Way Merge Editor**: Full `tasks.json` runner with Problem Matchers feeding the Problems panel, Git branch/stash/tag picker & inline blame/timeline annotations, and a 3-way visual Merge Conflict Editor (`Accept Current` / `Accept Incoming` / `Accept Both` / `Compare`)
+- [ ] **Phase 11 M3 — Native OS Accessibility (`accesskit`), IME & Localization (i18n)**: Bridge `AccessibilityTree` (`crates/rustcode-platform/src/accessibility.rs`) to native OS screen readers via **`accesskit`** (Windows UIA, Linux AT-SPI, macOS NSAccessibility), full CJK/dead-key IME composition overlay in `winit` + `cosmic-text`, High Contrast themes, and VS Code `nls.json` localization packs
+- [ ] **Phase 11 M4 — Phase 11 Verification (`tests/phase11-e2e/`)**: Loopback SSH/`rustcode-server` remote workspace E2E, `tasks.json` + 3-way merge conflict tests, and `accesskit` tree parity checks
+
+### Phase 12 (Planned): v1.0 Production Hardening, Performance Budgets, Installers & Release Engineering
+
+- [ ] **Phase 12 M1 — Performance Budget Enforcement & Soak Testing**: Enforce CI performance budgets against real desktop/headless workloads (`< 500 ms` cold start to interactive GPU window, `< 120 MB` idle RAM, `< 350 MB` 20-file RAM, `< 3 ms` keystroke latency, `< 50 ms` 1 MB file open, `< 1 s` 100K-file search, 120 FPS frame pacing, `< 80 MB` binary size) and long-session leak checks
+- [ ] **Phase 12 M2 — Security Audit, Workspace Trust & Crash Recovery**: VS Code **Workspace Trust** (Restricted Mode gating untrusted workspace tasks/extensions/local settings), `.vsix` & path-sandbox security audit, OS keyring secret encryption, and crash-dump/panic recovery with dirty-buffer hot-exit restore
+- [ ] **Phase 12 M3 — macOS Support, Native OS Installers & Signed Auto-Updater**: Add macOS (`aarch64-apple-darwin` & `x86_64-apple-darwin`) to CI; ship signed native installers (Windows MSI/Inno Setup + `winget` + *"Open with RustCode"* context menu, Linux `.deb`/`.rpm`/`AppImage`/`Flatpak`, macOS `.dmg`/`.app`) and delta auto-updater
+- [ ] **Phase 12 M4 — v1.0 GA Audit & Release**: Side-by-side VS Code UX audit, VS Code migration wizard (`settings.json` / `keybindings.json` / extensions import), complete user & extension-author docs, and tagged `v1.0.0` GA release
 
 ---
 
@@ -134,20 +165,37 @@
 Build **RustCode**, a ground-up Rust rewrite of VS Code that:
 
 - **Looks and feels identical** to VS Code (same layout, keybindings, theme format, settings schema)
-- **Runs existing JS/TS extensions** unmodified (plug-and-play via embedded V8)
+- **Runs existing JS/TS extensions** unmodified via a live **Node.js Extension Host** (`NodeExtHostProcess` + `require('vscode')` hook) matching VS Code's real extension runtime without Chromium
 - Achieves **~3× less RAM** and **~2–5× faster startup** than Electron-based VS Code
 
-### Locked-In Technology Choices
+### Locked-In Technology Choices (1:1 VS Code Rust Hybrid Stack)
 
 | Decision | Choice | Rationale |
 |---|---|---|
-| GUI Framework | **GPUI** (forked from Zed) | Only Rust GUI proven for IDE-level perf, 120 FPS, ~3× less RAM than Chromium |
-| JS Runtime | **`deno_core`** (embedded V8) | Full JIT speed for extensions, ~50% less RAM than Node.js process |
-| IPC Format | **MessagePack** (`rmp-serde`) | 40% smaller than JSON, fast (de)serialization |
-| Text Buffer | **Custom Piece Table** | VS Code-compatible editing model, O(log n) operations |
-| Syntax | **Tree-sitter** + TextMate compat | Incremental parsing, extension grammar support |
-| Terminal | **`alacritty_terminal`** | Proven VT100/xterm emulator |
-| GPU Backend | **`wgpu`** (via GPUI) | Vulkan/Metal/DX12, cross-platform |
+| GUI & Text Rasterizer | **`winit` + `wgpu` + `cosmic-text`** behind `RenderSurface` *(replacing Zed `gpui-fork`)* | Preserves existing `Scene` UI views & headless `MockRenderSurface` tests while delivering 120 FPS GPU rendering, ligatures, emoji/CJK/complex shaping, Codicons, and HiDPI |
+| Extension Host Runtime | **Node.js subprocess (`NodeExtHostProcess`)** *(replacing `deno_core`)* | Matches VS Code's own Node.js extension host for full compatibility with top-100 extensions (built-in Node stdlib, worker/network/native modules) without Chromium/Electron |
+| IPC Format | **MessagePack & JSON** (`rmp-serde`, framed stdio `Content-Length`) | Compact, typed Rust ↔ Node extension host RPC bridge (`ContentLengthJson`, `ContentLengthMsgPack`, `NewlineJson`) |
+| Text Buffer | **Custom Piece Table** + `unicode-segmentation` / `unicode-width` / `encoding_rs` | VS Code-compatible editing model with O(log n) ops, grapheme-aware cursoring, display width, and multi-encoding support |
+| Syntax Highlighting | **TextMate `.tmLanguage` + `tree-sitter`** *(layered over 14 built-in grammars)* | Incremental parsing plus native support for extension-contributed VS Code TextMate grammars and themes |
+| Terminal | **`alacritty_terminal` + real PTY** (`portable-pty` / ConPTY / Unix PTY) | Proven VT100/xterm emulation with interactive shells, ANSI colors, TUIs (`vim`, `htop`), signals, and resize |
+| Extension WebViews | **`wry`** (WebView2 / WebKitGTK / WKWebView) | Real OS system webviews with bidirectional `postMessage` bridge for rich extensions & custom editors (retaining headless fallback for tests) |
+| Git / SCM | **Real `git` CLI (`GitCliBackend`)** *(replacing `git2`)* | Matches VS Code's own Git integration — automatically inherits user SSH agents, GPG signing, credential helpers, `.gitconfig`, LFS, and Git hooks |
+| Workspace Search & Fuzzy | **`ripgrep` (`ignore` + `grep-regex`) + `nucleo`** | `.gitignore`-aware fast multi-file search/replace and Helix/VS Code-grade fuzzy ranking |
+| Storage & Native OS UX | **`rusqlite` + `arboard` + `rfd` + `dirs` + `accesskit`** | Persistent SQLite workspace/extension state, native OS clipboard, native file open/save dialogs, standard XDG/AppData paths, and OS screen-reader accessibility (`accesskit`) |
+| Remote Architecture | **`rustcode-remote` + `rustcode-server`** (Phase 11) | Multiplexed remote FS, ext-host, LSP/DAP, and PTY over SSH and Dev Containers (`devcontainer.json`) |
+
+### Anti-Drift Guardrails & Phase-Gate Protocol
+
+1. **No Silent Stack Substitutions**: Once a subsystem engine is locked in the table above (`winit`/`wgpu`/`cosmic-text`, live Node.js `NodeExtHostProcess`, `alacritty_terminal` + real PTY, `wry`, TextMate `.tmLanguage` + `tree-sitter`, real `git` CLI, `ripgrep`/`nucleo`, `rusqlite`/`arboard`/`rfd`/`dirs`, `accesskit`, `rustcode-remote`), milestones MUST NOT silently swap it for a simplified stub or unapproved rewrite. Any technical blocker requires an explicit plan amendment before implementation.
+2. **Trait & Feature-Gate Isolation**: Every native desktop/OS dependency sits behind an explicit Rust trait (`RenderSurface`, `PtyBackend`, `WebviewBackend`, `GitBackend`, `StorageBackend`, `ClipboardBackend`, `FileDialogBackend`, `AccessibilityBackend`) with a deterministic headless/`Mock*` fallback for CI tests, while the `desktop` binary wires the real engine without `sample_*()` placeholders.
+3. **Mandatory Milestone Exit Gate**: Every milestone (`Pre-Phase 8` through `Phase 12`) must verify before completion:
+   - Zero architecture drift against the locked-in stack table and active blueprint
+   - Zero regressions across all prior verification gates (`cargo test --workspace`, `compat_suite`, `ext-host-js/test.js`, `tests/phase7-e2e/`, plus `tests/phase<N>-e2e/`)
+   - `0` `cargo clippy --workspace --all-targets -- -D warnings` on both Windows (`x86_64-pc-windows-gnu`) and Linux (`x86_64-unknown-linux-gnu`) across default + `desktop` features
+   - Immediate synchronization of `README.md`, `rustcode-implementation-plan.md`, `docs/architecture.md`, and `docs/extension-compat-matrix.md`
+
+> [!NOTE]
+> The detailed crate-by-crate design sketches further below retain some original Phase 0–3 prototype code snippets (`deno_core`, `gpui-fork`, `git2`, `rust-toolchain.toml`) as historical design references; Phases 8–12 evolve the active codebase strictly per the **Locked-In Technology Choices** table and **Anti-Drift Guardrails** above.
 
 ---
 
@@ -1693,17 +1741,71 @@ flowchart LR
 
 **Exit**: 80%+ of top-100 VS Code extensions work. Daily-drivable for professional development.
 
-### Phase 8: Native Interactive Desktop Shell, Live Workspace Runtime & Daily-Driver Parity (Planned)
+### Phase 8: 1:1 VS Code Native Desktop & Runtime Parity (Planned — Rust Hybrid Stack)
 
 | Milestone | Target Crates / Paths | Deliverable |
 |---|---|---|
-| **M1 — Native OS Window & Live Scene Rasterizer** | `rustcode-platform::render`, `rustcode-app` | Feature-gated `desktop` `RenderSurface` backend (`winit` + `softbuffer`/`fontdue` or `wgpu`/`cosmic-text`) rendering `Scene::{Quad, GlyphRun, Shadow, PushClip, PopClip}` with rounded corners, borders, clip stack, glyph atlas caching, HiDPI scaling, and live OS input/resize/close event loop (keeping `MockRenderSurface` default for headless tests) |
-| **M2 — CLI Arguments, Disk Config/Session Persistence & Live Background Runtime** | `rustcode-app`, `rustcode-platform`, `rustcode-workbench` | CLI parser (`rustcode [path...]`, `--headless`, `--version`, `--goto file:line[:col]`, `--user-data-dir`, `--extensions-dir`, `--disable-extensions`), disk config/extension/session loading (`~/.rustcode/`, `.vscode/`), and background Tokio loop driving `FileSystemWatcher`, `AutoSaveService`, and live `NodeExtHostProcess` activation/recovery |
-| **M3 — Daily-Driver Editor Ergonomics & Workspace Search/Replace** | `rustcode-editor`, `rustcode-workbench` | OS clipboard shortcuts (`Ctrl+C`/`X`/`V` incl. empty-selection line copy/cut), mouse drag/double/triple-click selection & scrollbar/Minimap dragging, `Ctrl+/` comments across all 14 grammars, `Alt+Up/Down` move & `Shift+Alt+Up/Down` duplicate lines, multi-line indent/outdent, bracket auto-close/matching, context menus, and live multi-file `SearchView` (`Ctrl+Shift+F` / `Ctrl+Shift+H`) |
-| **M4 — Live Git CLI Integration & Real LSP/DAP Process Wiring** | `rustcode-protocols`, `rustcode-workbench`, `rustcode-app` | Pure-Rust `GitCliBackend` wired to `ScmView`/`DiffEditorView`/Status Bar (replacing `ScmRepository::sample_repository()`), auto-attached `LspClientManager` servers (`rust-analyzer`, `typescript-language-server`, `pyright`, `gopls`), and `.vscode/launch.json` DAP launch (replacing `DebugSessionState::sample_session()`) |
-| **M5 — Cross-Platform Hardening, Native Linux CI & Verification** | `rustcode-ext-host`, `rustcode-base`, `ext-host-js`, `.github/workflows/ci.yml`, `tests/phase8-e2e/` | Unix `setsid`/`killpg` process-group termination in `process/mod.rs`, remaining `util.isDeepStrictEqual` & `ContextKey` `[^]/]` edge cases, GitHub Actions CI matrix (`windows-latest` + `ubuntu-latest`), `tests/phase8-e2e/` visual/runtime suite, and doc refresh |
+| **M1 — Hardware GPU Desktop Window & Rich Text Rasterizer** | `rustcode-platform::render`, `rustcode-app` | Feature-gated `desktop` `RenderSurface` backend (`winit` + `wgpu` + `cosmic-text`) rendering `Scene::{Quad, GlyphRun, Shadow, PushClip, PopClip}` with rounded corners, borders, shadows, clip stacks, glyph atlas caching, ligatures, emoji/CJK/complex shaping, Codicons, HiDPI scaling, and live OS input/IME/resize/close event loop (keeping `MockRenderSurface` default for headless tests) |
+| **M2 — CLI, SQLite State Persistence, Native OS Integration & Live Runtime Loop** | `rustcode-app`, `rustcode-platform`, `rustcode-ext-host` | CLI parser (`rustcode [path...]`, `--headless`, `--version`, `--goto file:line[:col]`, `--user-data-dir`, `--extensions-dir`, `--disable-extensions`), disk config/keymap/theme/extension loading (`~/.rustcode/`, `.vscode/`), SQLite `StorageService` (`rusqlite`), native Open/Save dialogs (`rfd`), `arboard` OS clipboard, `dirs` XDG/AppData paths, and background Tokio loop driving `FileSystemWatcher`, `AutoSaveService`, and live `NodeExtHostProcess` auto-activation/crash recovery |
+| **M3 — Daily-Driver Editor, `ripgrep`/`nucleo` Search & TextMate + `tree-sitter` Syntax Engine** | `rustcode-editor`, `rustcode-workbench` | Editor clipboard (`Ctrl+C`/`X`/`V` incl. empty-selection line copy/cut), mouse drag/double/triple-click selection & scrollbar/Minimap dragging, `Ctrl+/` comments, line move/duplicate/indent, bracket auto-close/matching, context menus; `unicode-segmentation`/`unicode-width`/`encoding_rs`; `ignore`/`grep-regex` (`ripgrep`) multi-file search/replace + `nucleo` fuzzy ranking; and TextMate `.tmLanguage` extension grammar loader + `tree-sitter` incremental highlighting layered over the 14 built-in grammars |
+| **M4 — Real PTY Terminal (`alacritty_terminal`) & System WebViews (`wry`)** | `rustcode-terminal`, `rustcode-workbench` | Replace one-shot `std::process::Command` runner with `alacritty_terminal` + real PTY (`portable-pty`/ConPTY/Unix PTY) for interactive shells, ANSI colors, TUIs (`vim`/`htop`), signals & resize; replace simplified HTML tag parser in `WebviewEditorView` with `wry` OS WebViews (WebView2/WebKitGTK/WKWebView) wired to `ExtHostWebviewManager`/`ExtHostCustomEditorManager` `postMessage` channels (preserving headless fallback) |
+| **M5 — Real `git` CLI SCM, Auto-Attached LSP Servers & Live DAP** | `rustcode-protocols`, `rustcode-workbench`, `rustcode-app` | Pure-Rust `GitCliBackend` (`git status --porcelain=v2 -b`, `diff`, `show`, `add`, `restore`, `commit`, Status Bar branch) replacing `ScmRepository::sample_repository()`; auto-attached `LspClientManager` servers (`rust-analyzer`, `typescript-language-server`, `pyright`, `gopls`) for hover/go-to-def/autocomplete/diagnostics/`editor.formatOnSave`; and `.vscode/launch.json` DAP launch replacing `DebugSessionState::sample_session()` |
+| **M6 — Cross-Platform Hardening, Native Windows/Linux CI & 1:1 Extension Verification** | `rustcode-ext-host`, `rustcode-base`, `ext-host-js`, `.github/workflows/ci.yml`, `tests/phase8-e2e/` | Unix `setsid`/`killpg` process-group termination in `process/mod.rs`, remaining `util.isDeepStrictEqual` & `ContextKey` `[^]/]` edge cases, GitHub Actions CI matrix (`windows-latest` + `ubuntu-latest`), `tests/phase8-e2e/` visual/runtime suite, and real-world VS Code extension testing (`One Dark Pro`, `Prettier`, `ESLint`, `rust-analyzer`, `GitLens`) |
 
-**Exit**: Launchable, interactive Windows & Linux desktop IDE capable of opening real Git repositories, running language servers/extensions/terminal side-by-side, with native Windows & Linux CI green.
+**Exit**: Launchable, 120 FPS GPU-rendered Windows & Linux desktop IDE with real PTY terminal, WebView2/WebKit webviews, TextMate/`tree-sitter` highlighting, `ripgrep`/`git` CLI/LSP/DAP integrations, and high top-100 VS Code extension compatibility, verified across native Windows & Linux CI.
+
+```mermaid
+flowchart LR
+    C0["Pre-P8 Cleanup"] --> P8["Phase 8: GPU Window + PTY + wry + Git/LSP/DAP"]
+    P8 --> P9["Phase 9: Deep Editing + Chrome + 100MB Buffer"]
+    P9 --> P10["Phase 10: Top-100 .vsix + Profiles"]
+    P10 --> P11["Phase 11: Remote + Tasks/Merge + accesskit"]
+    P11 --> P12["Phase 12: Perf Budgets + Trust + v1.0 GA"]
+```
+
+### Phase 9: Deep Editing, Navigation & Language Intelligence Parity (Planned)
+
+| Milestone | Target Crates / Paths | Deliverable |
+|---|---|---|
+| **M1 — Advanced LSP & Multi-File Refactoring** | `rustcode-protocols`, `rustcode-editor`, `rustcode-workbench` | Rich Markdown hover popovers, Signature Help (`Ctrl+Shift+Space`), Peek References / Go to Implementation / TypeDef (`Shift+F12`), Rename Symbol (`F2`) with multi-file `WorkspaceEdit` preview & undo, LSP Semantic Tokens layered over TextMate/`tree-sitter`, Inlay Hints, CodeLens, Document Links, and Call/Type Hierarchy |
+| **M2 — Snippets Engine, Language Config & Large-File PieceTable** | `rustcode-editor`, `rustcode-ext-host` | TextMate snippet engine (nested tabstops, `${1\|a,b,c\|}` choices, regex transforms, `$TM_*`), `contributes.snippets` & `language-configuration.json` loader, Sticky Scroll, bracket-pair colorization, and O(log n) balanced piece-tree rebalancing + virtualized rendering for 100 MB+ files |
+| **M3 — Full Workbench Chrome, Context Menus & Multi-Window** | `rustcode-workbench`, `rustcode-app` | Drag-and-drop tabs & Explorer files, Secondary Sidebar, Panel placement (bottom/left/right), draggable Sashes, custom Title/Menu Bar, `contributes.menus` right-click Context Menus with `when` clauses, Window Zoom (`Ctrl+=`/`-`/`0`), Zen Mode (`Ctrl+K Z`), and Multi-Window + `SingleInstanceIpc` |
+| **M4 — Phase 9 Verification & Benchmarks** | `tests/phase9-e2e/` | End-to-end E2E suite covering Rename Symbol, Peek References, Semantic Tokens, Snippets, Drag-and-Drop layout, Multi-Window IPC, and 100 MB file latency budgets |
+
+**Exit**: Full daily-driver IDE navigation, refactoring, snippets, drag-and-drop workbench layout, and multi-window ergonomics at 100 MB+ scale.
+
+### Phase 10: Real-World Top-100 VS Code Extension Ecosystem & Marketplace Maturity (Planned)
+
+| Milestone | Target Crates / Paths | Deliverable |
+|---|---|---|
+| **M1 — Remaining `vscode.*` APIs & Contribution Points** | `rustcode-ext-host`, `ext-host-js/`, `rustcode-workbench` | `workspace.registerFileSystemProvider`, `TextDocumentContentProvider`, `WebviewViewProvider` (sidebar/panel webviews via `wry`), `TreeView` D&D/checkboxes, `SecretStorage` (OS keyring), `LogOutputChannel`, `TerminalShellIntegration`, `CustomExecution` tasks, and `contributes.{menus,viewsContainers,viewsWelcome,submenus,jsonValidation,problemMatchers,iconThemes,productIconThemes}` |
+| **M2 — Extension Host Runtime Polish & Profiling** | `rustcode-ext-host`, `ext-host-js/` | Managed Node.js discovery/version checks, per-extension activation & RPC profiling (`Developer: Show Running Extensions`), unresponsive extension host watchdog + restart banner, and transparent Node.js passthrough alongside `require('vscode')` hook |
+| **M3 — Rich Marketplace UX & Profiles** | `rustcode-workbench`, `rustcode-ext-host` | Rich Open VSX detail panels (`wry`), extension packs, pre-release toggles, auto-updates, install-from-`.vsix`, `.vscode/extensions.json` recommendations, and VS Code **Profiles** |
+| **M4 — Automated Real-`.vsix` Compatibility Harness** | `tests/phase10-ext-compat/`, `docs/extension-compat-matrix.md` | CI harness running real Open VSX `.vsix` extensions (`One Dark Pro`, `Tokyo Night`, `Material Icon Theme`, `Prettier`, `ESLint`, `rust-analyzer`, `Python`, `GitLens`, `Tailwind CSS`, `Error Lens`, `Todo Tree`, `YAML`, `TOML`, `Markdown All in One`) and updating compat scores |
+
+**Exit**: 80%+ of top-100 Open VSX / VS Code extensions install and run cleanly with verified compat-matrix coverage.
+
+### Phase 11: Remote Development, Tasks/Git Merge & Accessibility/I18n (Planned)
+
+| Milestone | Target Crates / Paths | Deliverable |
+|---|---|---|
+| **M1 — Remote Development (`rustcode-remote`)** | `crates/rustcode-remote/`, `rustcode-ext-host`, `rustcode-terminal` | Headless `rustcode-server` over SSH (`vscode-remote://ssh-remote+...`) & Dev Containers (`devcontainer.json`), multiplexing remote `FileSystemProvider`, `NodeExtHostProcess`, LSP/DAP, and PTY terminal over a single framed tunnel |
+| **M2 — `.vscode/tasks.json`, Git Blame/Branches & 3-Way Merge Editor** | `rustcode-workbench`, `rustcode-protocols` | Full `tasks.json` runner with Problem Matchers feeding Problems panel, Git branch/stash/tag picker & inline blame/timeline, and visual 3-way Merge Conflict Editor (`Accept Current`/`Incoming`/`Both`/`Compare`) |
+| **M3 — Native OS Accessibility (`accesskit`), IME & Localization (i18n)** | `rustcode-platform`, `rustcode-workbench` | `AccessibilityTree` bridged to OS screen readers via **`accesskit`** (Windows UIA, Linux AT-SPI, macOS NSAccessibility), full CJK/dead-key IME overlay, High Contrast themes, and `nls.json` localization packs |
+| **M4 — Phase 11 Verification** | `tests/phase11-e2e/` | Loopback `rustcode-server` remote workspace E2E, `tasks.json` + 3-way merge conflict tests, and `accesskit` tree parity suites |
+
+**Exit**: Remote SSH / Dev Container development, task runners, visual merge resolution, and native OS screen-reader/IME parity across supported platforms.
+
+### Phase 12: v1.0 Production Hardening, Performance Budgets, Installers & Release Engineering (Planned)
+
+| Milestone | Target Crates / Paths | Deliverable |
+|---|---|---|
+| **M1 — Performance Budget Enforcement & Soak Testing** | `crates/rustcode-app/benches/`, `.github/workflows/ci.yml` | Enforce CI budgets on real desktop/headless workloads (`< 500 ms` cold start to interactive GPU window, `< 120 MB` idle RAM, `< 350 MB` 20-file RAM, `< 3 ms` keystroke, `< 50 ms` 1 MB open, `< 1 s` 100K search, 120 FPS pacing, `< 80 MB` binary) plus soak/leak checks |
+| **M2 — Security Audit, Workspace Trust & Crash Recovery** | `rustcode-platform`, `rustcode-ext-host`, `rustcode-app` | VS Code **Workspace Trust** (Restricted Mode gating untrusted tasks/extensions/settings), `.vsix` & path-sandbox audit, OS keyring secret encryption, and crash-dump/panic recovery with dirty-buffer hot-exit restore |
+| **M3 — macOS Support, Native OS Installers & Signed Auto-Updater** | `.github/workflows/ci.yml`, `scripts/` | Add macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`) to CI; ship signed native installers (Windows MSI/Inno Setup/`winget` + context menu, Linux `.deb`/`.rpm`/AppImage/Flatpak, macOS `.dmg`/`.app`) + delta auto-updater |
+| **M4 — v1.0 GA Audit & Release** | Workspace-wide, `docs/` | Final side-by-side VS Code UX audit, VS Code migration wizard (`settings.json` / `keybindings.json` / extensions import), full user & extension-author documentation, and tagged `v1.0.0` GA release |
+
+**Exit**: Production-ready **`v1.0.0` GA** cross-platform IDE with enforced performance/security gates, installers, and full 1:1 VS Code fidelity.
 
 ---
 

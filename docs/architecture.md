@@ -219,3 +219,35 @@ Application bootstrap and end-to-end verification:
   - **M6:** Documentation & trackers refreshed across `README.md`, `rustcode-implementation-plan.md`, `docs/architecture.md`, and `docs/extension-compat-matrix.md`.
   - **M7:** Full Stage 3 verification, Tier 5 adversarial hardening, and final doc count synchronization completed.
 - **M7 Verified Totals:** **513/513** workspace tests passing across **8** crates (`rustcode-app` 27 [3 unit + 24 integration], `rustcode-base` 12, `rustcode-editor` 126, `rustcode-ext-host` 127 [86 unit + 41 `compat_suite`], `rustcode-platform` 40, `rustcode-protocols` 24, `rustcode-terminal` 9, `rustcode-workbench` 148), **31/31** `ext-host-js/test.js` sections (**404** `assert(...)` call sites), **8/8** `tests/phase7-e2e/runner.js --syntax-check`, **286/286** Windows (**287** Unix) `tests/phase7-e2e/runner.js --tier all` tests, **0** Windows & `x86_64-unknown-linux-gnu` `clippy` warnings (`-D warnings`), `cargo bench --workspace --no-run`, and `rustcode` startup smoke check.
+
+---
+
+## Planned Phase 8 Architecture (1:1 VS Code Rust Hybrid)
+
+To achieve a genuine **1:1 VS Code user and extension experience** while preserving the 8-crate layered architecture, `Scene`-based view models, and headless test suite (`MockRenderSurface`), Phase 8 targets the following targeted upgrades after the Pre-Phase 8 cleanup:
+
+| Subsystem | Current Phase 7 Baseline | Target Phase 8 Choice | Why |
+|---|---|---|---|
+| **GUI & Text Rasterizer** | Pure-Rust `Scene` (`Quad`/`GlyphRun`) + `MockRenderSurface` | **`winit` + `wgpu` + `cosmic-text`** behind `RenderSurface` (`desktop` feature; `MockRenderSurface` preserved for tests) | 120 FPS GPU rendering, ligatures, emoji/CJK/complex shaping, Codicons, HiDPI without rewriting `rustcode-workbench` views |
+| **Extension Host** | Live Node.js subprocess (`NodeExtHostProcess`) + `ext-host-js` | Keep **`NodeExtHostProcess`** (expanded live Node passthrough & lifecycle recovery) | Real VS Code runs extensions in a Node.js child process; preserves real-world top-100 extension compatibility without Electron/Chromium |
+| **Text Model** | Red-black / balanced `PieceTable` (`UTF-8` + UTF-16 helpers) | Add **`unicode-segmentation`**, **`unicode-width`**, **`encoding_rs`** | Grapheme-aware cursoring, accurate display column widths, and non-UTF-8 file encoding roundtrips |
+| **Syntax Highlighting** | 14 pure-Rust state-machine tokenizers (`GrammarRegistry`) | Add **TextMate `.tmLanguage` loader + `tree-sitter`** incremental parser | Loads extension-bundled `.tmLanguage` grammars and incremental AST highlighting atop the 14 built-in grammars |
+| **Integrated Terminal** | Pure-Rust one-shot `std::process::Command` runner | **`alacritty_terminal` + real PTY** (`portable-pty` / ConPTY / Unix PTY) | Interactive shells, VT100/xterm escape sequences, ANSI colors, TUIs (`vim`/`htop`), resize, and signals |
+| **Extension WebViews** | Simplified HTML tag parser rendered as `Scene` quads | **`wry`** (WebView2 / WebKitGTK / WKWebView) + `postMessage` bridge (headless fallback retained) | Full HTML/CSS/JS execution for rich webview extensions, Markdown previews, notebooks, and Custom Editors |
+| **Git / SCM** | In-memory `ScmRepository::sample_repository()` | Real **`git` CLI (`GitCliBackend`)** | Matches VS Code's own Git integration (inherits SSH agents, GPG signing, credential helpers, `.gitconfig`, LFS, hooks) |
+| **Search, Fuzzy & OS UX** | `std::fs` search, subsequence matcher, shell clipboard CLI | **`ripgrep` (`ignore` + `grep-regex`)**, **`nucleo`**, **`rusqlite`**, **`arboard`**, **`rfd`**, **`dirs`** | `.gitignore`-aware instant workspace search/replace, VS Code-grade fuzzy ranking, SQLite state persistence, native clipboard/dialogs/paths |
+
+---
+
+## Planned Post-Phase 8 Architecture (Phases 9–12) & Anti-Drift Guardrails
+
+Following Phase 8, **Phases 9–12** advance RustCode to **`v1.0.0` GA** without replacing the 8-crate layered design:
+- **Phase 9 (Deep Editing & Workbench Chrome):** Adds LSP Signature Help, Peek/Implementation/TypeDef, multi-file Rename preview, Semantic Tokens, Inlay Hints, TextMate snippets + `language-configuration.json`, Sticky Scroll, 100 MB+ `PieceTable` rebalancing, Drag-and-Drop tabs/files, `contributes.menus` Context Menus, and `SingleInstanceIpc` multi-window routing.
+- **Phase 10 (Ecosystem & Profiles):** Adds `registerFileSystemProvider`, `WebviewViewProvider`, `SecretStorage` (OS keyring), extension host RPC profiler & watchdog, rich Open VSX panels via `wry`, VS Code **Profiles**, and automated top-100 real `.vsix` CI verification (`tests/phase10-ext-compat/`).
+- **Phase 11 (Remote, Tasks/Merge & OS Accessibility):** Introduces **`rustcode-remote`** (`rustcode-server` over SSH & `devcontainer.json` multiplexing FS, `NodeExtHostProcess`, LSP/DAP, and PTY), `.vscode/tasks.json` + 3-way visual Merge Editor, native **`accesskit`** screen-reader bridge (`AccessibilityTree` → Windows UIA / Linux AT-SPI / macOS NSAccessibility), CJK IME, and `nls.json` i18n.
+- **Phase 12 (`v1.0.0` GA):** Enforces desktop CI performance budgets (`< 500 ms` cold start, `< 120 MB` idle RSS, `< 3 ms` keystroke, 120 FPS, `< 80 MB` binary), adds **Workspace Trust** (Restricted Mode), macOS (`darwin`) CI targets, signed OS installers + delta auto-updater, and VS Code import wizard.
+
+### Anti-Drift Guardrails
+1. **No Silent Stack Substitutions:** Locked-in native engines (`winit`/`wgpu`/`cosmic-text`, live Node.js `NodeExtHostProcess`, `alacritty_terminal` + real PTY, `wry`, TextMate `.tmLanguage` + `tree-sitter`, real `git` CLI, `ripgrep`/`nucleo`, `rusqlite`/`arboard`/`rfd`/`dirs`, `accesskit`, `rustcode-remote`) cannot be silently bypassed or replaced by stubs without an explicit plan amendment.
+2. **Trait & Feature-Gate Isolation:** Every native engine sits behind a trait boundary (`RenderSurface`, `PtyBackend`, `WebviewBackend`, `GitBackend`, `StorageBackend`, `ClipboardBackend`, `FileDialogBackend`, `AccessibilityBackend`) keeping headless/`Mock*` test fallbacks deterministic while the `desktop` binary runs real implementations.
+3. **Mandatory Milestone Exit Gate:** Every milestone must verify zero architecture drift, zero regressions across all prior + new phase E2E suites, `0` Windows & Linux `clippy -D warnings` (default + `desktop`), and synchronized updates across all 4 docs.

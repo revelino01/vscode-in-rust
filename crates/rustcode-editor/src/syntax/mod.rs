@@ -13,6 +13,7 @@ pub mod python;
 pub mod registry;
 pub mod rust;
 pub mod scope;
+pub mod semantic;
 pub mod textmate;
 pub mod toml;
 #[cfg(feature = "desktop")]
@@ -33,6 +34,9 @@ pub use registry::{GrammarRegistry, PlainTextGrammar};
 pub use rust::RustGrammar;
 pub use scope::{
     Grammar, GrammarState, SyntaxScope, TextMateStackFrame, TokenMetadata, TokenSpan,
+};
+pub use semantic::{
+    map_semantic_token_to_scope, overlay_semantic_tokens, SemanticTokenOverlay, SemanticTokenSpan,
 };
 pub use textmate::{
     load_textmate_contribution, map_tm_scope_to_syntax_scope, GrammarContribution,

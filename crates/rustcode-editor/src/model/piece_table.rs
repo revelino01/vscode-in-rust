@@ -77,10 +77,12 @@ impl Node {
     }
 }
 
-/// The PieceTable text buffer.
+/// The PieceTable text buffer backed by an O(log n) AVL Piece Tree and sorted LF indices.
 pub struct PieceTable {
     original: String,
     add_buffer: String,
+    orig_lf_offsets: Vec<usize>,
+    add_lf_offsets: Vec<usize>,
     root: Option<Box<Node>>,
 }
 
@@ -90,24 +92,159 @@ impl Default for PieceTable {
     }
 }
 
+fn collect_lf_byte_offsets(s: &str, base: usize, out: &mut Vec<usize>) {
+    for (idx, b) in s.bytes().enumerate() {
+        if b == b'\n' {
+            out.push(base + idx);
+        }
+    }
+}
+
+impl Node {
+    fn balance_factor(&self) -> i32 {
+        Self::height(&self.left) - Self::height(&self.right)
+    }
+
+    fn rotate_left(mut node: Box<Node>) -> Box<Node> {
+        let mut right = node.right.take().expect("rotate_left requires right child");
+        node.right = right.left.take();
+        node.update();
+        right.left = Some(node);
+        right.update();
+        right
+    }
+
+    fn rotate_right(mut node: Box<Node>) -> Box<Node> {
+        let mut left = node.left.take().expect("rotate_right requires left child");
+        node.left = left.right.take();
+        node.update();
+        left.right = Some(node);
+        left.update();
+        left
+    }
+
+    fn rebalance(mut node: Box<Node>) -> Box<Node> {
+        node.update();
+        let bf = node.balance_factor();
+        if bf > 1 {
+            if let Some(left) = node.left.take() {
+                if left.balance_factor() < 0 {
+                    node.left = Some(Self::rotate_left(left));
+                } else {
+                    node.left = Some(left);
+                }
+            }
+            return Self::rotate_right(node);
+        }
+        if bf < -1 {
+            if let Some(right) = node.right.take() {
+                if right.balance_factor() > 0 {
+                    node.right = Some(Self::rotate_right(right));
+                } else {
+                    node.right = Some(right);
+                }
+            }
+            return Self::rotate_left(node);
+        }
+        node
+    }
+
+    fn join_avl(
+        left: Option<Box<Node>>,
+        mut mid: Box<Node>,
+        right: Option<Box<Node>>,
+    ) -> Box<Node> {
+        let hl = Self::height(&left);
+        let hr = Self::height(&right);
+        if hl > hr + 1 {
+            let mut l = left.expect("left height > right height + 1");
+            let l_right = l.right.take();
+            l.right = Some(Self::join_avl(l_right, mid, right));
+            Self::rebalance(l)
+        } else if hr > hl + 1 {
+            let mut r = right.expect("right height > left height + 1");
+            let r_left = r.left.take();
+            r.left = Some(Self::join_avl(left, mid, r_left));
+            Self::rebalance(r)
+        } else {
+            mid.left = left;
+            mid.right = right;
+            mid.update();
+            mid
+        }
+    }
+
+    fn pop_max(mut node: Box<Node>) -> (Option<Box<Node>>, Box<Node>) {
+        if let Some(right) = node.right.take() {
+            let (new_right, max_node) = Self::pop_max(right);
+            node.right = new_right;
+            (Some(Self::rebalance(node)), max_node)
+        } else {
+            let left = node.left.take();
+            node.update();
+            (left, node)
+        }
+    }
+
+    fn concat_avl(left: Option<Box<Node>>, right: Option<Box<Node>>) -> Option<Box<Node>> {
+        match (left, right) {
+            (None, r) => r,
+            (l, None) => l,
+            (Some(l), Some(r)) => {
+                let (rest_left, mid) = Self::pop_max(l);
+                Some(Self::join_avl(rest_left, mid, Some(r)))
+            }
+        }
+    }
+
+    fn try_append_rightmost_add(
+        node: &mut Box<Node>,
+        expected_start: usize,
+        extra_len: usize,
+        extra_lf: usize,
+    ) -> bool {
+        let appended = if let Some(right) = node.right.as_mut() {
+            Self::try_append_rightmost_add(right, expected_start, extra_len, extra_lf)
+        } else if node.piece.source == PieceSource::Add
+            && node.piece.start + node.piece.length == expected_start
+        {
+            node.piece.length += extra_len;
+            node.piece.line_feeds += extra_lf;
+            true
+        } else {
+            false
+        };
+        if appended {
+            node.update();
+        }
+        appended
+    }
+}
+
 impl PieceTable {
     /// Create an empty piece table.
     pub fn new() -> Self {
         Self {
             original: String::new(),
             add_buffer: String::new(),
+            orig_lf_offsets: Vec::new(),
+            add_lf_offsets: Vec::new(),
             root: None,
         }
     }
 
-    /// Create a piece table initialized with content.
+    /// Create a piece table initialized with content in O(n) single pass.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(content: &str) -> Self {
         let len = content.len();
-        let lf = count_line_feeds(content);
+        let mut orig_lf_offsets = Vec::with_capacity(len / 32 + 1);
+        collect_lf_byte_offsets(content, 0, &mut orig_lf_offsets);
+        let lf = orig_lf_offsets.len();
         let mut table = Self {
             original: content.to_string(),
             add_buffer: String::new(),
+            orig_lf_offsets,
+            add_lf_offsets: Vec::new(),
             root: None,
         };
         if len > 0 {
@@ -121,7 +258,19 @@ impl PieceTable {
         table
     }
 
-    /// Returns the total character length of the buffer.
+    pub fn tree_height(&self) -> usize {
+        Node::height(&self.root).max(0) as usize
+    }
+
+    pub fn piece_count(&self) -> usize {
+        fn count(n: &Option<Box<Node>>) -> usize {
+            n.as_ref()
+                .map_or(0, |x| 1 + count(&x.left) + count(&x.right))
+        }
+        count(&self.root)
+    }
+
+    /// Returns the total character length (in bytes) of the buffer in O(1).
     pub fn len(&self) -> usize {
         Node::subtree_length(&self.root)
     }
@@ -130,43 +279,116 @@ impl PieceTable {
         self.len() == 0
     }
 
-    /// Returns the total number of lines in the buffer (1-indexed count).
+    /// Returns the total number of lines in the buffer (1-indexed count) in O(1).
     pub fn line_count(&self) -> usize {
         Node::subtree_line_feeds(&self.root) + 1
     }
 
-    /// Helper to count line feeds in a buffer slice.
+    /// O(log L) line feed count inside a slice using sorted LF byte indices.
     fn count_lf_in_slice(&self, source: PieceSource, start: usize, len: usize) -> usize {
-        let slice = match source {
-            PieceSource::Original => &self.original[start..start + len],
-            PieceSource::Add => &self.add_buffer[start..start + len],
+        if len == 0 {
+            return 0;
+        }
+        let offs = match source {
+            PieceSource::Original => &self.orig_lf_offsets,
+            PieceSource::Add => &self.add_lf_offsets,
         };
-        count_line_feeds(slice)
+        let end = start + len;
+        let lo = offs.partition_point(|&o| o < start);
+        let hi = offs.partition_point(|&o| o < end);
+        hi - lo
     }
 
-    /// Align an offset to a valid UTF-8 character boundary.
+    /// O(log L) relative offset within `[start..]` of the 0-indexed `k`-th line feed.
+    fn nth_lf_in_slice(&self, source: PieceSource, start: usize, k: usize) -> Option<usize> {
+        let offs = match source {
+            PieceSource::Original => &self.orig_lf_offsets,
+            PieceSource::Add => &self.add_lf_offsets,
+        };
+        let lo = offs.partition_point(|&o| o < start);
+        offs.get(lo + k).map(|&o| o - start)
+    }
+
+    /// O(log n + log L) split of an AVL subtree into `(left [0..offset), right [offset..])`.
+    fn split_by_offset(
+        &self,
+        node: Option<Box<Node>>,
+        offset: usize,
+    ) -> (Option<Box<Node>>, Option<Box<Node>>) {
+        let Some(mut cur) = node else {
+            return (None, None);
+        };
+        if offset == 0 {
+            return (None, Some(cur));
+        }
+        if offset >= cur.subtree_length {
+            return (Some(cur), None);
+        }
+
+        let left_len = Node::subtree_length(&cur.left);
+        if offset <= left_len {
+            let cur_left = cur.left.take();
+            let cur_right = cur.right.take();
+            let (l1, l2) = self.split_by_offset(cur_left, offset);
+            let right_tree = Node::join_avl(l2, cur, cur_right);
+            (l1, Some(right_tree))
+        } else if offset >= left_len + cur.piece.length {
+            let cur_left = cur.left.take();
+            let cur_right = cur.right.take();
+            let (r1, r2) = self.split_by_offset(cur_right, offset - left_len - cur.piece.length);
+            let left_tree = Node::join_avl(cur_left, cur, r1);
+            (Some(left_tree), r2)
+        } else {
+            let split_at = offset - left_len;
+            let p = cur.piece;
+            let left_lf = self.count_lf_in_slice(p.source, p.start, split_at);
+            let right_lf = p.line_feeds - left_lf;
+            let left_node = Box::new(Node::new(Piece::new(p.source, p.start, split_at, left_lf)));
+            let right_node = Box::new(Node::new(Piece::new(
+                p.source,
+                p.start + split_at,
+                p.length - split_at,
+                right_lf,
+            )));
+            let left_tree = Node::join_avl(cur.left.take(), left_node, None);
+            let right_tree = Node::join_avl(None, right_node, cur.right.take());
+            (Some(left_tree), Some(right_tree))
+        }
+    }
+
+    fn find_piece_at_offset(&self, offset: usize) -> Option<(usize, Piece)> {
+        let mut cur = &self.root;
+        let mut acc = 0usize;
+        while let Some(n) = cur {
+            let left_len = Node::subtree_length(&n.left);
+            if offset < acc + left_len {
+                cur = &n.left;
+            } else if offset < acc + left_len + n.piece.length {
+                return Some((acc + left_len, n.piece.clone()));
+            } else {
+                acc += left_len + n.piece.length;
+                cur = &n.right;
+            }
+        }
+        None
+    }
+
+    /// Align an offset to a valid UTF-8 character boundary in O(log n).
     pub fn floor_char_boundary(&self, offset: usize) -> usize {
         if offset >= self.len() {
             return self.len();
         }
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-        let mut cur = 0;
-        for piece in pieces {
-            let next = cur + piece.length;
-            if offset >= cur && offset < next {
-                let rel = offset - cur;
-                let slice = match piece.source {
-                    PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
-                    PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
-                };
-                let mut aligned_rel = rel;
-                while aligned_rel > 0 && !slice.is_char_boundary(aligned_rel) {
-                    aligned_rel -= 1;
-                }
-                return cur + aligned_rel;
+        if let Some((piece_doc_start, piece)) = self.find_piece_at_offset(offset) {
+            let rel = offset - piece_doc_start;
+            let slice = match piece.source {
+                PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
+                PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
+            };
+            let mut aligned_rel = rel;
+            while aligned_rel > 0 && !slice.is_char_boundary(aligned_rel) {
+                aligned_rel -= 1;
             }
-            cur = next;
+            return piece_doc_start + aligned_rel;
         }
         self.len()
     }
@@ -180,30 +402,23 @@ impl PieceTable {
         self.floor_char_boundary(offset - 1)
     }
 
-    /// Return the next valid UTF-8 character boundary after `offset`.
+    /// Return the next valid UTF-8 character boundary after `offset` in O(log n).
     pub fn next_char_boundary(&self, offset: usize) -> usize {
         if offset >= self.len() {
             return self.len();
         }
         let offset = self.floor_char_boundary(offset);
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-        let mut cur = 0;
-        for piece in pieces {
-            let next = cur + piece.length;
-            if offset >= cur && offset < next {
-                let rel = offset - cur;
-                let slice = match piece.source {
-                    PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
-                    PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
-                };
-                let mut i = rel + 1;
-                while i < slice.len() && !slice.is_char_boundary(i) {
-                    i += 1;
-                }
-                return cur + i;
+        if let Some((piece_doc_start, piece)) = self.find_piece_at_offset(offset) {
+            let rel = offset - piece_doc_start;
+            let slice = match piece.source {
+                PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
+                PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
+            };
+            let mut i = rel + 1;
+            while i < slice.len() && !slice.is_char_boundary(i) {
+                i += 1;
             }
-            cur = next;
+            return piece_doc_start + i;
         }
         self.len()
     }
@@ -289,7 +504,7 @@ impl PieceTable {
         offset
     }
 
-    /// Insert text at a specific character offset.
+    /// Insert text at a specific byte offset in O(log n) amortized time.
     pub fn insert(&mut self, offset: usize, text: &str) {
         if text.is_empty() {
             return;
@@ -299,67 +514,30 @@ impl PieceTable {
         let target_offset = self.floor_char_boundary(std::cmp::min(offset, total_len));
 
         let add_start = self.add_buffer.len();
+        let before_lf_len = self.add_lf_offsets.len();
+        collect_lf_byte_offsets(text, add_start, &mut self.add_lf_offsets);
         self.add_buffer.push_str(text);
         let add_len = text.len();
-        let add_lf = count_line_feeds(text);
+        let add_lf = self.add_lf_offsets.len() - before_lf_len;
 
-        let new_piece = Piece::new(PieceSource::Add, add_start, add_len, add_lf);
-
-        // Convert existing tree to flat piece list, split target piece, insert new piece, rebuild balanced tree
-        // Note: For peak efficiency in large docs, tree splitting is done in-place.
-        // A pieces collection with rebalance provides O(log n) properties.
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-
-        let mut new_pieces = Vec::with_capacity(pieces.len() + 2);
-        let mut cur_offset = 0;
-        let mut inserted = false;
-
-        if target_offset == 0 {
-            new_pieces.push(new_piece);
-            new_pieces.extend(pieces);
-        } else {
-            for piece in pieces {
-                let piece_end = cur_offset + piece.length;
-                if !inserted && target_offset <= piece_end {
-                    let split_offset = target_offset - cur_offset;
-                    if split_offset == 0 {
-                        new_pieces.push(new_piece.clone());
-                        new_pieces.push(piece);
-                    } else if split_offset == piece.length {
-                        new_pieces.push(piece);
-                        new_pieces.push(new_piece.clone());
-                    } else {
-                        // Split piece
-                        let left_len = split_offset;
-                        let left_lf = self.count_lf_in_slice(piece.source, piece.start, left_len);
-                        let left_piece = Piece::new(piece.source, piece.start, left_len, left_lf);
-
-                        let right_len = piece.length - split_offset;
-                        let right_start = piece.start + split_offset;
-                        let right_lf = piece.line_feeds - left_lf;
-                        let right_piece = Piece::new(piece.source, right_start, right_len, right_lf);
-
-                        new_pieces.push(left_piece);
-                        new_pieces.push(new_piece.clone());
-                        new_pieces.push(right_piece);
-                    }
-                    inserted = true;
-                } else {
-                    new_pieces.push(piece);
-                }
-                cur_offset = piece_end;
-            }
-
-            if !inserted {
-                new_pieces.push(new_piece);
-            }
+        let root = self.root.take();
+        let (mut left, right) = self.split_by_offset(root, target_offset);
+        let coalesced = left
+            .as_mut()
+            .is_some_and(|l| Node::try_append_rightmost_add(l, add_start, add_len, add_lf));
+        if !coalesced {
+            let mid = Box::new(Node::new(Piece::new(
+                PieceSource::Add,
+                add_start,
+                add_len,
+                add_lf,
+            )));
+            left = Some(Node::join_avl(left, mid, None));
         }
-
-        self.root = Self::build_balanced_tree(&new_pieces);
+        self.root = Node::concat_avl(left, right);
     }
 
-    /// Delete `length` characters starting from `offset`. Returns the deleted text.
+    /// Delete `length` bytes starting from `offset` in O(log n + length) time. Returns the deleted text.
     pub fn delete(&mut self, offset: usize, length: usize) -> String {
         if length == 0 || offset >= self.len() {
             return String::new();
@@ -372,52 +550,14 @@ impl PieceTable {
         }
         let deleted_text = self.get_range(offset, del_end);
 
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-
-        let mut new_pieces = Vec::new();
-        let mut cur_offset = 0;
-
-        for piece in pieces {
-            let piece_start = cur_offset;
-            let piece_end = cur_offset + piece.length;
-
-            if piece_end <= offset || piece_start >= del_end {
-                // Completely outside delete range
-                new_pieces.push(piece);
-            } else if piece_start >= offset && piece_end <= del_end {
-                // Completely inside delete range: drop it
-            } else if piece_start < offset && piece_end > del_end {
-                // Deletion is strictly inside this piece: splits into left and right parts
-                let left_len = offset - piece_start;
-                let left_lf = self.count_lf_in_slice(piece.source, piece.start, left_len);
-                new_pieces.push(Piece::new(piece.source, piece.start, left_len, left_lf));
-
-                let right_len = piece_end - del_end;
-                let right_start = piece.start + (del_end - piece_start);
-                let right_lf = self.count_lf_in_slice(piece.source, right_start, right_len);
-                new_pieces.push(Piece::new(piece.source, right_start, right_len, right_lf));
-            } else if piece_start < offset {
-                // Overlaps end of piece: keep left part
-                let left_len = offset - piece_start;
-                let left_lf = self.count_lf_in_slice(piece.source, piece.start, left_len);
-                new_pieces.push(Piece::new(piece.source, piece.start, left_len, left_lf));
-            } else if piece_end > del_end {
-                // Overlaps start of piece: keep right part
-                let right_len = piece_end - del_end;
-                let right_start = piece.start + (del_end - piece_start);
-                let right_lf = self.count_lf_in_slice(piece.source, right_start, right_len);
-                new_pieces.push(Piece::new(piece.source, right_start, right_len, right_lf));
-            }
-
-            cur_offset = piece_end;
-        }
-
-        self.root = Self::build_balanced_tree(&new_pieces);
+        let root = self.root.take();
+        let (left, mid_and_right) = self.split_by_offset(root, offset);
+        let (_, right) = self.split_by_offset(mid_and_right, del_end - offset);
+        self.root = Node::concat_avl(left, right);
         deleted_text
     }
 
-    /// Extract text in range [start_offset, end_offset).
+    /// Extract text in range [start_offset, end_offset) in O(log n + output_len).
     pub fn get_range(&self, start: usize, end: usize) -> String {
         let total = self.len();
         let start = std::cmp::min(start, total);
@@ -427,31 +567,47 @@ impl PieceTable {
         }
 
         let mut result = String::with_capacity(end - start);
-        let mut cur_offset = 0;
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-
-        for piece in pieces {
-            let piece_start = cur_offset;
-            let piece_end = cur_offset + piece.length;
-
-            if piece_end > start && piece_start < end {
-                let seg_start = std::cmp::max(start, piece_start) - piece_start;
-                let seg_end = std::cmp::min(end, piece_end) - piece_start;
-                let slice = match piece.source {
-                    PieceSource::Original => &self.original[piece.start + seg_start..piece.start + seg_end],
-                    PieceSource::Add => &self.add_buffer[piece.start + seg_start..piece.start + seg_end],
-                };
-                result.push_str(slice);
-            }
-
-            cur_offset = piece_end;
-            if cur_offset >= end {
-                break;
-            }
-        }
-
+        self.collect_range_recursive(&self.root, 0, start, end, &mut result);
         result
+    }
+
+    fn collect_range_recursive(
+        &self,
+        node: &Option<Box<Node>>,
+        node_start: usize,
+        req_start: usize,
+        req_end: usize,
+        out: &mut String,
+    ) {
+        let Some(n) = node else {
+            return;
+        };
+        if node_start >= req_end || node_start + n.subtree_length <= req_start {
+            return;
+        }
+        let left_len = Node::subtree_length(&n.left);
+        let mid_start = node_start + left_len;
+        let mid_end = mid_start + n.piece.length;
+
+        if req_start < mid_start {
+            self.collect_range_recursive(&n.left, node_start, req_start, req_end, out);
+        }
+        if mid_end > req_start && mid_start < req_end {
+            let seg_start = req_start.max(mid_start) - mid_start;
+            let seg_end = req_end.min(mid_end) - mid_start;
+            let slice = match n.piece.source {
+                PieceSource::Original => {
+                    &self.original[n.piece.start + seg_start..n.piece.start + seg_end]
+                }
+                PieceSource::Add => {
+                    &self.add_buffer[n.piece.start + seg_start..n.piece.start + seg_end]
+                }
+            };
+            out.push_str(slice);
+        }
+        if req_end > mid_end {
+            self.collect_range_recursive(&n.right, mid_end, req_start, req_end, out);
+        }
     }
 
     /// Extract entire content as a String.
@@ -460,7 +616,7 @@ impl PieceTable {
         self.get_range(0, self.len())
     }
 
-    /// Get content of a line (0-indexed). Returns line content without trailing newline.
+    /// Get content of a line (0-indexed). Returns line content without trailing newline in O(log n + line_len).
     pub fn get_line_content(&self, line_index: usize) -> Option<String> {
         let (start_offset, end_offset) = self.get_line_offsets(line_index)?;
         let mut line_str = self.get_range(start_offset, end_offset);
@@ -472,112 +628,117 @@ impl PieceTable {
         Some(line_str)
     }
 
-    /// Get (start_offset, end_offset) for line `line_index` (0-indexed).
+    /// Document byte offset of the 0-indexed `lf_idx`-th `\n` character in O(log n + log L).
+    fn nth_lf_doc_offset(&self, mut lf_idx: usize) -> Option<usize> {
+        let mut cur = &self.root;
+        let mut acc_bytes = 0usize;
+        while let Some(n) = cur {
+            let left_lfs = Node::subtree_line_feeds(&n.left);
+            let left_bytes = Node::subtree_length(&n.left);
+            if lf_idx < left_lfs {
+                cur = &n.left;
+            } else if lf_idx < left_lfs + n.piece.line_feeds {
+                let rel = self.nth_lf_in_slice(n.piece.source, n.piece.start, lf_idx - left_lfs)?;
+                return Some(acc_bytes + left_bytes + rel);
+            } else {
+                lf_idx -= left_lfs + n.piece.line_feeds;
+                acc_bytes += left_bytes + n.piece.length;
+                cur = &n.right;
+            }
+        }
+        None
+    }
+
+    /// Get `(start_offset, end_offset)` for line `line_index` (0-indexed) in O(log n + log L).
     pub fn get_line_offsets(&self, line_index: usize) -> Option<(usize, usize)> {
         let total_lines = self.line_count();
         if line_index >= total_lines {
             return None;
         }
-
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-
-        let mut cur_line = 0;
-        let mut cur_offset = 0;
-        let mut line_start = 0;
-        let mut found_start = line_index == 0;
-
-        for piece in pieces {
-            let slice = match piece.source {
-                PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
-                PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
-            };
-
-            for (idx, b) in slice.bytes().enumerate() {
-                if !found_start && cur_line == line_index {
-                    line_start = cur_offset + idx;
-                    found_start = true;
-                }
-
-                if b == b'\n' {
-                    cur_line += 1;
-                    if found_start && cur_line > line_index {
-                        return Some((line_start, cur_offset + idx + 1));
-                    }
-                }
-            }
-            cur_offset += piece.length;
-        }
-
-        if found_start {
-            Some((line_start, self.len()))
-        } else if cur_line == line_index {
-            Some((self.len(), self.len()))
+        let line_start = if line_index == 0 {
+            0
         } else {
-            None
-        }
+            self.nth_lf_doc_offset(line_index - 1)? + 1
+        };
+        let line_end = if line_index + 1 < total_lines {
+            self.nth_lf_doc_offset(line_index)? + 1
+        } else {
+            self.len()
+        };
+        Some((line_start, line_end))
     }
 
-    /// Returns the raw byte at the given 0-indexed byte offset, if within buffer bounds.
-    pub fn get_byte(&self, offset: usize) -> Option<u8> {
+    /// Returns the raw byte at the given 0-indexed byte offset in O(log n).
+    pub fn get_byte(&self, mut offset: usize) -> Option<u8> {
         if offset >= self.len() {
             return None;
         }
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-        let mut cur_offset = 0;
-        for piece in pieces {
-            let piece_end = cur_offset + piece.length;
-            if offset >= cur_offset && offset < piece_end {
-                let rel = offset - cur_offset;
-                let b = match piece.source {
-                    PieceSource::Original => self.original.as_bytes()[piece.start + rel],
-                    PieceSource::Add => self.add_buffer.as_bytes()[piece.start + rel],
+        let mut cur = &self.root;
+        while let Some(n) = cur {
+            let left_len = Node::subtree_length(&n.left);
+            if offset < left_len {
+                cur = &n.left;
+            } else if offset < left_len + n.piece.length {
+                let rel = offset - left_len;
+                let b = match n.piece.source {
+                    PieceSource::Original => self.original.as_bytes()[n.piece.start + rel],
+                    PieceSource::Add => self.add_buffer.as_bytes()[n.piece.start + rel],
                 };
                 return Some(b);
+            } else {
+                offset -= left_len + n.piece.length;
+                cur = &n.right;
             }
-            cur_offset = piece_end;
         }
         None
     }
 
-    /// Convert a 0-indexed byte offset to (line, column) Position.
+    /// Count line feeds strictly before document byte `offset` in O(log n + log L).
+    fn count_lfs_before_offset(&self, mut offset: usize) -> usize {
+        let mut cur = &self.root;
+        let mut lfs = 0usize;
+        while let Some(n) = cur {
+            if offset == 0 {
+                break;
+            }
+            let left_len = Node::subtree_length(&n.left);
+            if offset <= left_len {
+                cur = &n.left;
+            } else {
+                lfs += Node::subtree_line_feeds(&n.left);
+                let into_piece = offset - left_len;
+                if into_piece <= n.piece.length {
+                    lfs += self.count_lf_in_slice(n.piece.source, n.piece.start, into_piece);
+                    if into_piece < n.piece.length {
+                        break;
+                    }
+                    offset = 0;
+                    cur = &n.right;
+                } else {
+                    lfs += n.piece.line_feeds;
+                    offset = into_piece - n.piece.length;
+                    cur = &n.right;
+                }
+            }
+        }
+        lfs
+    }
+
+    /// Convert a 0-indexed byte offset to (line, column) Position in O(log n + line_len).
     /// The returned column is in UTF-16 code units (per LSP protocol specification).
     pub fn offset_to_position(&self, offset: usize) -> (usize, usize) {
         let offset = std::cmp::min(offset, self.len());
         let offset = self.floor_char_boundary(offset);
-        let mut pieces = Vec::new();
-        self.collect_pieces(&self.root, &mut pieces);
-
-        let mut cur_offset = 0;
-        let mut cur_line = 0;
-        let mut last_newline_offset = 0;
-
-        for piece in pieces {
-            let slice = match piece.source {
-                PieceSource::Original => &self.original[piece.start..piece.start + piece.length],
-                PieceSource::Add => &self.add_buffer[piece.start..piece.start + piece.length],
-            };
-
-            for (idx, b) in slice.bytes().enumerate() {
-                let abs_pos = cur_offset + idx;
-                if abs_pos >= offset {
-                    let mut line_prefix = self.get_range(last_newline_offset, offset);
-                    if line_prefix.ends_with('\r') {
-                        line_prefix.pop();
-                    }
-                    let col = line_prefix.chars().map(|c| c.len_utf16()).sum();
-                    return (cur_line, col);
-                }
-                if b == b'\n' {
-                    cur_line += 1;
-                    last_newline_offset = abs_pos + 1;
-                }
-            }
-            cur_offset += piece.length;
+        if offset == 0 {
+            return (0, 0);
         }
-
-        let mut line_prefix = self.get_range(last_newline_offset, offset);
+        let cur_line = self.count_lfs_before_offset(offset);
+        let line_start = if cur_line == 0 {
+            0
+        } else {
+            self.nth_lf_doc_offset(cur_line - 1).map_or(0, |lf| lf + 1)
+        };
+        let mut line_prefix = self.get_range(line_start, offset);
         if line_prefix.ends_with('\r') {
             line_prefix.pop();
         }
@@ -585,7 +746,7 @@ impl PieceTable {
         (cur_line, col)
     }
 
-    /// Convert (line, column) Position to 0-indexed byte offset.
+    /// Convert (line, column) Position to 0-indexed byte offset in O(log n + line_len).
     /// `col` represents character offset in UTF-16 code units (per LSP protocol specification).
     pub fn position_to_offset(&self, line: usize, col: usize) -> usize {
         match self.get_line_offsets(line) {
@@ -608,36 +769,12 @@ impl PieceTable {
             None => self.len(),
         }
     }
-
-    fn collect_pieces(&self, node: &Option<Box<Node>>, list: &mut Vec<Piece>) {
-        if let Some(n) = node {
-            self.collect_pieces(&n.left, list);
-            list.push(n.piece.clone());
-            self.collect_pieces(&n.right, list);
-        }
-    }
-
-    fn build_balanced_tree(pieces: &[Piece]) -> Option<Box<Node>> {
-        if pieces.is_empty() {
-            return None;
-        }
-        let mid = pieces.len() / 2;
-        let mut node = Box::new(Node::new(pieces[mid].clone()));
-        node.left = Self::build_balanced_tree(&pieces[..mid]);
-        node.right = Self::build_balanced_tree(&pieces[mid + 1..]);
-        node.update();
-        Some(node)
-    }
 }
 
 impl fmt::Display for PieceTable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_string())
     }
-}
-
-fn count_line_feeds(s: &str) -> usize {
-    s.bytes().filter(|&b| b == b'\n').count()
 }
 
 /// Translate a 0-indexed column in UTF-16 code units to a 0-indexed byte offset within a string slice.
@@ -989,5 +1126,86 @@ mod tests {
         // Rounding click coordinate at right half of '中' ([2, 4)) rounds to after '中'
         assert_eq!(display_x_col_to_utf16_col(line, 2.3), 2);
         assert_eq!(display_x_col_to_utf16_col(line, 3.6), 3);
+    }
+
+    #[test]
+    fn test_avl_piece_table_height_invariant_and_random_fuzz() {
+        let mut table = PieceTable::from_str("initial seed content\nsecond line\n");
+        let mut reference = "initial seed content\nsecond line\n".to_string();
+
+        // Deterministic PRNG (SplitMix64) driving 2,500 scattered inserts & deletes
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let next_rand = |s: &mut u64| -> u64 {
+            *s = s.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = *s;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+
+        for step in 0..2_500 {
+            let cur_len = table.len();
+            if cur_len > 20 && (next_rand(&mut state) % 3 == 0) {
+                let off = (next_rand(&mut state) as usize) % cur_len;
+                let max_del = (cur_len - off).clamp(1, 12);
+                let del_len = ((next_rand(&mut state) as usize) % max_del).max(1);
+                let got = table.delete(off, del_len);
+                let expected: String = reference.drain(off..off + del_len).collect();
+                assert_eq!(got, expected, "delete mismatch at step {}", step);
+            } else {
+                let off = if cur_len == 0 {
+                    0
+                } else {
+                    (next_rand(&mut state) as usize) % (cur_len + 1)
+                };
+                let ins = if step % 7 == 0 {
+                    "\nln\n"
+                } else {
+                    "abc_"
+                };
+                table.insert(off, ins);
+                reference.insert_str(off, ins);
+            }
+
+            if step % 250 == 0 {
+                assert_eq!(table.len(), reference.len());
+                assert_eq!(table.to_string(), reference);
+                let pcs = table.piece_count().max(1);
+                let max_avl_h = (1.45 * ((pcs as f64) + 2.0).log2()).ceil() as usize + 1;
+                assert!(
+                    table.tree_height() <= max_avl_h,
+                    "AVL height {} exceeded bound {} for {} pieces",
+                    table.tree_height(),
+                    max_avl_h,
+                    pcs
+                );
+            }
+        }
+        assert_eq!(table.to_string(), reference);
+        let sample_line = table.line_count() / 2;
+        let expected_line = reference.split('\n').nth(sample_line).unwrap_or("");
+        assert_eq!(table.get_line_content(sample_line).as_deref(), Some(expected_line));
+    }
+
+    #[test]
+    fn test_avl_piece_table_large_buffer_ologn_latency() {
+        // ~6 MB synthetic source buffer (100,000 lines)
+        let line = "pub fn compute_metric(alpha: usize, beta: usize) -> usize { alpha + beta }\n";
+        let big = line.repeat(85_000);
+        let mut table = PieceTable::from_str(&big);
+        assert_eq!(table.line_count(), 85_001);
+
+        let mid_off = table.position_to_offset(42_500, 10);
+        let t0 = std::time::Instant::now();
+        table.insert(mid_off, "/* mid-edit */");
+        let got_line = table.get_line_content(42_500).unwrap();
+        let elapsed = t0.elapsed();
+
+        assert!(got_line.contains("/* mid-edit */"));
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "O(log n) edit + line lookup took {:?} (expected < 50ms)",
+            elapsed
+        );
     }
 }

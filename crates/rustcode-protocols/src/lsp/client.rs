@@ -417,6 +417,19 @@ impl LspClient {
         Ok(hover)
     }
 
+    fn parse_locations(res: Value) -> Vec<LspLocation> {
+        if res.is_null() {
+            return Vec::new();
+        }
+        if let Ok(locs) = serde_json::from_value::<Vec<LspLocation>>(res.clone()) {
+            locs
+        } else if let Ok(single) = serde_json::from_value::<LspLocation>(res) {
+            vec![single]
+        } else {
+            Vec::new()
+        }
+    }
+
     pub async fn definition(
         &self,
         uri: &str,
@@ -428,17 +441,280 @@ impl LspClient {
         });
 
         let res = self.send_request("textDocument/definition", params).await?;
+        Ok(Self::parse_locations(res))
+    }
+
+    pub async fn signature_help(
+        &self,
+        uri: &str,
+        position: LspPosition,
+    ) -> Result<Option<SignatureHelp>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+        });
+        let res = self
+            .send_request("textDocument/signatureHelp", params)
+            .await?;
+        if res.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(res).ok())
+    }
+
+    pub async fn references(
+        &self,
+        uri: &str,
+        position: LspPosition,
+        include_declaration: bool,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+            "context": ReferenceContext { include_declaration },
+        });
+        let res = self
+            .send_request("textDocument/references", params)
+            .await?;
+        Ok(Self::parse_locations(res))
+    }
+
+    pub async fn implementation(
+        &self,
+        uri: &str,
+        position: LspPosition,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+        });
+        let res = self
+            .send_request("textDocument/implementation", params)
+            .await?;
+        Ok(Self::parse_locations(res))
+    }
+
+    pub async fn type_definition(
+        &self,
+        uri: &str,
+        position: LspPosition,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+        });
+        let res = self
+            .send_request("textDocument/typeDefinition", params)
+            .await?;
+        Ok(Self::parse_locations(res))
+    }
+
+    pub async fn prepare_rename(
+        &self,
+        uri: &str,
+        position: LspPosition,
+    ) -> Result<Option<PrepareRenameResult>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+        });
+        let res = self
+            .send_request("textDocument/prepareRename", params)
+            .await?;
+        if res.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(res).ok())
+    }
+
+    pub async fn rename(
+        &self,
+        uri: &str,
+        position: LspPosition,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+            "newName": new_name,
+        });
+        let res = self.send_request("textDocument/rename", params).await?;
+        if res.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(res).ok())
+    }
+
+    pub async fn semantic_tokens_full(&self, uri: &str) -> Result<Option<SemanticTokens>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+        });
+        let res = self
+            .send_request("textDocument/semanticTokens/full", params)
+            .await?;
+        if res.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(res).ok())
+    }
+
+    pub async fn semantic_tokens_range(
+        &self,
+        uri: &str,
+        range: LspRange,
+    ) -> Result<Option<SemanticTokens>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": range,
+        });
+        let res = self
+            .send_request("textDocument/semanticTokens/range", params)
+            .await?;
+        if res.is_null() {
+            return Ok(None);
+        }
+        Ok(serde_json::from_value(res).ok())
+    }
+
+    pub async fn inlay_hints(
+        &self,
+        uri: &str,
+        range: LspRange,
+    ) -> Result<Vec<InlayHint>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "range": range,
+        });
+        let res = self
+            .send_request("textDocument/inlayHint", params)
+            .await?;
         if res.is_null() {
             return Ok(Vec::new());
         }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
 
-        if let Ok(locs) = serde_json::from_value::<Vec<LspLocation>>(res.clone()) {
-            Ok(locs)
-        } else if let Ok(single) = serde_json::from_value::<LspLocation>(res) {
-            Ok(vec![single])
-        } else {
-            Ok(Vec::new())
+    pub async fn code_lens(&self, uri: &str) -> Result<Vec<CodeLens>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+        });
+        let res = self.send_request("textDocument/codeLens", params).await?;
+        if res.is_null() {
+            return Ok(Vec::new());
         }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
+
+    pub async fn code_lens_resolve(&self, lens: &CodeLens) -> Result<CodeLens, LspError> {
+        let res = self
+            .send_request("codeLens/resolve", serde_json::to_value(lens)?)
+            .await?;
+        Ok(serde_json::from_value(res)?)
+    }
+
+    pub async fn document_links(&self, uri: &str) -> Result<Vec<DocumentLink>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+        });
+        let res = self
+            .send_request("textDocument/documentLink", params)
+            .await?;
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
+
+    pub async fn prepare_call_hierarchy(
+        &self,
+        uri: &str,
+        position: LspPosition,
+    ) -> Result<Vec<CallHierarchyItem>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+        });
+        let res = self
+            .send_request("textDocument/prepareCallHierarchy", params)
+            .await?;
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
+
+    pub async fn call_hierarchy_incoming(
+        &self,
+        item: &CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyIncomingCall>, LspError> {
+        let params = json!({ "item": item });
+        let res = self
+            .send_request("callHierarchy/incomingCalls", params)
+            .await?;
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
+
+    pub async fn call_hierarchy_outgoing(
+        &self,
+        item: &CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyOutgoingCall>, LspError> {
+        let params = json!({ "item": item });
+        let res = self
+            .send_request("callHierarchy/outgoingCalls", params)
+            .await?;
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
+
+    pub async fn prepare_type_hierarchy(
+        &self,
+        uri: &str,
+        position: LspPosition,
+    ) -> Result<Vec<TypeHierarchyItem>, LspError> {
+        let params = json!({
+            "textDocument": { "uri": uri },
+            "position": position,
+        });
+        let res = self
+            .send_request("textDocument/prepareTypeHierarchy", params)
+            .await?;
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
+
+    pub async fn type_hierarchy_supertypes(
+        &self,
+        item: &TypeHierarchyItem,
+    ) -> Result<Vec<TypeHierarchyItem>, LspError> {
+        let params = json!({ "item": item });
+        let res = self
+            .send_request("typeHierarchy/supertypes", params)
+            .await?;
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(res).unwrap_or_default())
+    }
+
+    pub async fn type_hierarchy_subtypes(
+        &self,
+        item: &TypeHierarchyItem,
+    ) -> Result<Vec<TypeHierarchyItem>, LspError> {
+        let params = json!({ "item": item });
+        let res = self
+            .send_request("typeHierarchy/subtypes", params)
+            .await?;
+        if res.is_null() {
+            return Ok(Vec::new());
+        }
+        Ok(serde_json::from_value(res).unwrap_or_default())
     }
 
     pub async fn formatting(
@@ -874,5 +1150,117 @@ mod tests {
         assert_eq!(actions[0].title, "Fix typo");
         assert_eq!(actions[0].kind.as_deref(), Some("quickfix"));
         assert!(actions[0].edit.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_lsp_client_phase9_m1_endpoints() {
+        let (client_read, mut server_write) = duplex(8192);
+        let (mut server_read, client_write) = duplex(8192);
+
+        let client = LspClient::from_io(client_read, client_write);
+
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            while let Ok(Some(msg)) = read_framed_message(&mut server_read, &mut buf).await {
+                let req: Value = serde_json::from_slice(&msg).unwrap();
+                let id = req["id"].as_u64().unwrap();
+                let method = req["method"].as_str().unwrap();
+                let result = match method {
+                    "textDocument/signatureHelp" => json!({
+                        "signatures": [{ "label": "fn sum(a: i32, b: i32)" }],
+                        "activeSignature": 0,
+                        "activeParameter": 1
+                    }),
+                    "textDocument/references" | "textDocument/implementation" | "textDocument/typeDefinition" => json!([{
+                        "uri": "file:///lib.rs",
+                        "range": { "start": { "line": 4, "character": 2 }, "end": { "line": 4, "character": 5 } }
+                    }]),
+                    "textDocument/prepareRename" => json!({
+                        "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 1, "character": 7 } },
+                        "placeholder": "sum"
+                    }),
+                    "textDocument/rename" => json!({
+                        "changes": {
+                            "file:///lib.rs": [{
+                                "range": { "start": { "line": 1, "character": 4 }, "end": { "line": 1, "character": 7 } },
+                                "newText": "total"
+                            }]
+                        }
+                    }),
+                    "textDocument/semanticTokens/full" => json!({
+                        "resultId": "1",
+                        "data": [0, 4, 3, 0, 1]
+                    }),
+                    "textDocument/inlayHint" => json!([{
+                        "position": { "line": 1, "character": 10 },
+                        "label": ": i32",
+                        "kind": 1
+                    }]),
+                    "textDocument/codeLens" => json!([{
+                        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 6 } },
+                        "command": { "title": "Run Test", "command": "rust.run" }
+                    }]),
+                    "textDocument/documentLink" => json!([{
+                        "range": { "start": { "line": 2, "character": 3 }, "end": { "line": 2, "character": 18 } },
+                        "target": "https://rust-lang.org"
+                    }]),
+                    "textDocument/prepareCallHierarchy" => json!([{
+                        "name": "main",
+                        "kind": 12,
+                        "uri": "file:///main.rs",
+                        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 5, "character": 1 } },
+                        "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 7 } }
+                    }]),
+                    "callHierarchy/incomingCalls" => json!([{
+                        "from": {
+                            "name": "entry",
+                            "kind": 12,
+                            "uri": "file:///lib.rs",
+                            "range": { "start": { "line": 10, "character": 0 }, "end": { "line": 12, "character": 1 } },
+                            "selectionRange": { "start": { "line": 10, "character": 3 }, "end": { "line": 10, "character": 8 } }
+                        },
+                        "fromRanges": [{ "start": { "line": 11, "character": 4 }, "end": { "line": 11, "character": 8 } }]
+                    }]),
+                    "textDocument/prepareTypeHierarchy" => json!([{
+                        "name": "MyTrait",
+                        "kind": 11,
+                        "uri": "file:///types.rs",
+                        "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 1 } },
+                        "selectionRange": { "start": { "line": 0, "character": 6 }, "end": { "line": 0, "character": 13 } }
+                    }]),
+                    "typeHierarchy/subtypes" => json!([{
+                        "name": "MyStruct",
+                        "kind": 23,
+                        "uri": "file:///types.rs",
+                        "range": { "start": { "line": 4, "character": 0 }, "end": { "line": 6, "character": 1 } },
+                        "selectionRange": { "start": { "line": 4, "character": 7 }, "end": { "line": 4, "character": 15 } }
+                    }]),
+                    _ => Value::Null,
+                };
+                let resp = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+                write_framed_message(&mut server_write, &serde_json::to_vec(&resp).unwrap())
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let pos = LspPosition::new(1, 5);
+        let range = LspRange::new(LspPosition::new(0, 0), LspPosition::new(5, 0));
+        let sig = client.signature_help("file:///main.rs", pos).await.unwrap().unwrap();
+        assert_eq!(sig.active_parameter, Some(1));
+        assert_eq!(client.references("file:///main.rs", pos, true).await.unwrap().len(), 1);
+        assert_eq!(client.implementation("file:///main.rs", pos).await.unwrap().len(), 1);
+        assert_eq!(client.type_definition("file:///main.rs", pos).await.unwrap().len(), 1);
+        assert_eq!(client.prepare_rename("file:///main.rs", pos).await.unwrap().unwrap().placeholder.as_deref(), Some("sum"));
+        let edit = client.rename("file:///main.rs", pos, "total").await.unwrap().unwrap();
+        assert!(edit.changes.as_ref().unwrap().contains_key("file:///lib.rs"));
+        assert_eq!(client.semantic_tokens_full("file:///main.rs").await.unwrap().unwrap().data.len(), 5);
+        assert_eq!(client.inlay_hints("file:///main.rs", range).await.unwrap().len(), 1);
+        assert_eq!(client.code_lens("file:///main.rs").await.unwrap()[0].command.as_ref().unwrap().title, "Run Test");
+        assert_eq!(client.document_links("file:///main.rs").await.unwrap()[0].target.as_deref(), Some("https://rust-lang.org"));
+        let calls = client.prepare_call_hierarchy("file:///main.rs", pos).await.unwrap();
+        assert_eq!(client.call_hierarchy_incoming(&calls[0]).await.unwrap()[0].from.name, "entry");
+        let types = client.prepare_type_hierarchy("file:///types.rs", pos).await.unwrap();
+        assert_eq!(client.type_hierarchy_subtypes(&types[0]).await.unwrap()[0].name, "MyStruct");
     }
 }

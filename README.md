@@ -17,7 +17,8 @@ A ground-up, high-performance Rust rewrite of Visual Studio Code. **RustCode** a
 |---|---|---|---|
 | **Cold Start** | 2–5 s | **< 500 ms** | **~134 µs** (`startup_time.rs`) |
 | **Idle RAM (empty window)** | 300–400 MB | **< 120 MB** | **~5 MB RSS** (`memory_footprint.rs`) |
-| **Keystroke Latency** | 5–20 ms | **< 3 ms** | **~425 µs** (`editor_latency.rs`) |
+| **Keystroke Latency** | 5–20 ms | **< 3 ms** | **36 ns** typing (`editor_latency.rs`) · **111 ns** 100 MiB edit (`large_file.rs`) |
+| **Large File (100 MiB / 1.23M lines)** | 1–4 s+ | **< 3 ms edit** | **43.75 ms** load (2285.8 MiB/s) · **1.49 µs** pos query · **4.59 ms** frame (`large_file.rs`) |
 | **Frame Rate Target** | 60 FPS | **120 FPS** | GPU scene-graph pipeline |
 
 ---
@@ -47,19 +48,19 @@ vscode-in-rust/
 │   ├── rustcode-platform/      # Layer 1: ConfigurationService (JSONC + disk loading), KeybindingService, CommandRegistry, ThemeService,
 │   │                           #          FS/AutoSave/Watcher, Scene + `WgpuRenderSurface` (`desktop`), `SqliteStorageService` (`desktop`),
 │   │                           #          `AppPaths` (`dirs`), `ArboardClipboardBackend`, `RfdFileDialogBackend` (`desktop`), AccessibilityTree
-│   ├── rustcode-editor/        # Layer 2: Piece Table, `unicode-*`/`encoding_rs`, daily-driver EditorView (clipboard, mouse/multi-click,
-│   │                           #          `Ctrl+/`, line move/dup/indent, bracket pair, context menu), FindReplaceWidget (`Ctrl+F`/`Ctrl+H`),
-│   │                           #          FoldingModel, WordWrapMode, TextMate `.tmLanguage` + `tree-sitter` (`desktop`) + 14 built-in grammars
+│   ├── rustcode-editor/        # Layer 2: AVL-balanced Piece Table (100 MB+ ready), `unicode-*`/`encoding_rs`, daily-driver EditorView,
+│   │                           #          Snippets Engine, `language-configuration.json`, Sticky Scroll, Rainbow Brackets, LSP Hover/
+│   │                           #          SignatureHelp/Peek/SemanticTokens/InlayHints/CodeLens/DocumentLinks, FindReplaceWidget, Folding,
+│   │                           #          WordWrapMode, TextMate `.tmLanguage` + `tree-sitter` (`desktop`) + 14 built-in grammars
 │   ├── rustcode-terminal/      # Terminal: `PtyBackend` (`HeadlessPtyBackend` / `PortablePtyBackend`), `alacritty_terminal` VT100/xterm grid, split/tab sessions
-│   ├── rustcode-protocols/     # Layer 5: Shared bounded `codec`, auto-LSP 3.17 (`rust-analyzer`, TS/JS, Python, JSON, `gopls`), DAP + `launch.json`, `GitBackend` / `GitCliBackend`
-│   ├── rustcode-ext-host/      # Layer 4: Extension manifests, `RpcBridge` & `NodeExtHostProcess`, Unix `setsid`/`killpg` process isolation,
-│   │                           #          16 `ProviderType`s, 14 managers, Open VSX marketplace, VSIX installer & `compat_suite`
-│   ├── rustcode-workbench/     # Layer 3: ActivityBar (Explorer, Search, SCM, Debug, Extensions, Testing), Explorer CRUD & Contributed TreeViews,
-│   │                           #          `ripgrep`/`nucleo` Search, `TestingSidebarView` (`workbench.view.testing`), Notifications & Prompts,
-│   │                           #          Split EditorGrid, `WebviewBackend` (`wry` behind `desktop`), live `ScmView` & `DebugSidebarView`,
-│   │                           #          CommandPalette (`Ctrl+P`, `>`, `#`, `:line[:col]`, `@symbol`), StatusBar
-│   └── rustcode-app/           # Layer 6: CLI parser (`src/cli.rs`), Tokio `RuntimeLoop` (`src/runtime.rs`), `winit` desktop loop (`src/desktop.rs`, `desktop`),
-│                               #          `RustCodeContext`, binary entry point (`src/main.rs`), benchmarks & integration tests
+│   ├── rustcode-protocols/     # Layer 5: Shared bounded `codec`, auto-LSP 3.17 (incl. SignatureHelp/SemanticTokens/Rename/Hierarchy + `gopls`), DAP + `launch.json`, `GitBackend` / `GitCliBackend`
+│   ├── rustcode-ext-host/      # Layer 4: Extension manifests (13 `contributes.*` incl. `snippets`/`menus`), `RpcBridge` & `NodeExtHostProcess`, Unix `setsid`/`killpg` isolation,
+│   │                           #          26 `ProviderType`s, 14 managers, Open VSX marketplace, VSIX installer & `compat_suite`
+│   ├── rustcode-workbench/     # Layer 3: ActivityBar (6 views), Explorer CRUD/D&D & TreeViews, `ripgrep`/`nucleo` Search, TestingSidebarView,
+│   │                           #          Title Bar & `ContextMenuRegistry` (`when` clauses), Secondary Sidebar, Panel Bottom/Left/Right + Sashes,
+│   │                           #          Split EditorGrid + Tab D&D, Call/Type Hierarchy & Refactor Preview (atomic undo), Zoom/Zen, WebViews
+│   └── rustcode-app/           # Layer 6: CLI (`-n`/`-r`/`-g`), `WindowManager` & `SingleInstanceIpc` multi-window host, Tokio `RuntimeLoop`,
+│                               #          `winit` desktop loop (`desktop`), `RustCodeContext`, binary (`src/main.rs`), benches & tests
 ├── ext-host-js/
 │   ├── rpc-bridge.js           # Framed stdio transport (`Content-Length` / newline-JSON), `globalThis` singleton, `require('vscode')` hook
 │   ├── vscode-api/             # `require('vscode')` (13 modules): index, commands, window, workspace, languages, notebooks,
@@ -71,6 +72,7 @@ vscode-in-rust/
 ├── scripts/                    # Release packaging scripts: `scripts/package.ps1` (Windows `.zip`) & `scripts/package.sh` (Linux/macOS `.tar.gz`)
 ├── tests/phase7-e2e/           # Standalone Phase 7 opaque-box E2E harness (Tiers 1–4, excluded from root Cargo `[workspace]`)
 ├── tests/phase8-e2e/           # Standalone Phase 8 opaque-box E2E harness (Tiers 1–4 + JS, excluded from root Cargo `[workspace]`)
+├── tests/phase9-e2e/           # Standalone Phase 9 E2E harness (LSP refactoring, snippets, 100 MB virtualization, chrome D&D, multi-window IPC)
 ├── docs/                       # Architecture, contributing guide, and extension compatibility matrix
 └── rustcode-implementation-plan.md # Master implementation plan & progress tracker
 ```
@@ -126,18 +128,18 @@ See [rustcode-implementation-plan.md](rustcode-implementation-plan.md) for the c
 - [x] **Phase 8 M5 — Real `git` CLI SCM, Auto-Attached LSP Servers & Live DAP (`launch.json`)**: Implemented `GitBackend` / `GitCliBackend` (`git status --porcelain=v2 -b`, `diff`, `show HEAD:<path>`, `add`, `restore --staged`, `commit`, `log`, Status Bar branch readout) replacing `ScmRepository::sample_repository()` in default `WorkbenchView`; added auto-attached `LspClientManager` (incl. `gopls`, hover, `F12`/`Ctrl+Click` definition, completion, diagnostics, `editor.formatOnSave`); and added `.vscode/launch.json` JSONC parser + live `DapClient` sessions with `DebugToolbarView` hidden when idle
 - [x] **Phase 8 M6 — Cross-Platform Hardening, CI & Compatibility Refresh**: Added Unix `setsid`/`setpgid`/`killpg` process-group isolation in `crates/rustcode-ext-host/src/process/mod.rs`, hardened `util.isDeepStrictEqual` edge cases, fixed `ContextKeyExpr` `[^]/]` regex char-class parsing, added `.github/workflows/ci.yml` (`ubuntu-latest` + `windows-latest`), updated `scripts/package.ps1` / `scripts/package.sh` (`-Desktop`/`--desktop`, `-Jobs`/`--jobs`), added `tests/phase8-e2e/`, and refreshed all 4 docs/trackers
 
-### Future — Full Roadmap to v1.0 (Phases 9–12)
+### Completed (Phase 9 — Deep Editing, Navigation, Chrome & 100 MiB Buffer, Stage 3 Verified)
+- [x] **Phase 9 M1 — Advanced LSP & Multi-File Refactoring**: Rich Markdown hover popovers, Signature Help (`Ctrl+Shift+Space`), Peek References / Go to Implementation (`Ctrl+F12`) / Type Definition (`Shift+F12`), Rename Symbol (`F2`) with multi-file `RefactorPreviewOverlay` & atomic `WorkspaceEdit` undo (`WorkspaceEditUndoStack`), LSP Semantic Tokens layered over TextMate/`tree-sitter`, Inlay Hints, CodeLens, Document Links, and Call/Type Hierarchy views (`HierarchySidebarView`, `Shift+Alt+H`)
+- [x] **Phase 9 M2 — Snippets Engine, Language Config & Large-File PieceTable**: Full VS Code TextMate snippet engine (nested tabstops, `${1|a,b,c|}` choices, regex transforms, linked mirrors, `$TM_*` variables), `contributes.snippets` & `language-configuration.json` loader (auto-indent, on-enter rules, surrounding pairs), Sticky Scroll, rainbow bracket-pair colorization & guides, and true O(log n) AVL-balanced `PieceTable` rebalancing + virtualized rendering & `benches/large_file.rs` for 100 MB+ files
+- [x] **Phase 9 M3 — Full Workbench Chrome, Context Menus & Multi-Window**: Drag-and-drop tabs across split groups & Explorer files, Secondary Sidebar (`workbench.action.toggleAuxiliaryBar`), Panel position toggle (bottom/left/right), draggable Sash resizing, custom Title Bar & Menu Bar, full `contributes.menus` right-click Context Menus with `when` clauses, Window Zoom (`Ctrl+=`/`-`/`0`), Zen Mode (`Ctrl+K Z`), and Multi-Window orchestration (`Ctrl+Shift+N`, `-n`/`-r` CLI flags, `WindowManager`, and cross-platform `SingleInstanceIpc` socket forwarding)
+- [x] **Phase 9 M4 — Phase 9 E2E & Large-File Benchmarks (`tests/phase9-e2e/`)**: Automated Tier 1–4 Rust + JS E2E verification (`5/5` targets, `4/4` syntax/clippy checks) and `benches/large_file.rs` (`111 ns` mid-file edit latency on 100.00 MiB, `4.59 ms` virtualized viewport frame)
+
+### Future — Full Roadmap to v1.0 (Phases 10–12)
 
 #### Anti-Drift Guardrails
 - **No Silent Stack Substitutions**: Locked-in engines (`winit`/`wgpu`/`cosmic-text`, live Node.js `NodeExtHostProcess`, `alacritty_terminal` + real PTY, `wry`, TextMate `.tmLanguage` + `tree-sitter`, real `git` CLI, `ripgrep`/`nucleo`, `rusqlite`/`arboard`/`rfd`/`dirs`, `accesskit`) MUST NOT be silently replaced by stubs; any change requires an explicit plan amendment first.
 - **Trait & Feature-Gate Isolation**: Keep deterministic headless/`Mock*` backends behind trait boundaries (`RenderSurface`, `PtyBackend`, `WebviewBackend`, `GitBackend`, `StorageBackend`, `ClipboardBackend`, `FileDialogBackend`, `AccessibilityBackend`) for CI tests while wiring real engines in the `desktop` app.
 - **Mandatory Milestone Exit Gate**: Every milestone requires zero stack drift, passing workspace/`compat_suite`/`ext-host-js`/`phase7-e2e`/phase E2E suites, `0` Windows & Linux `clippy -D warnings` (default + `desktop` features), and synchronized tracker updates across all docs.
-
-#### Phase 9: Deep Editing, Navigation & Language Intelligence Parity (Planned)
-- [ ] **Phase 9 M1 — Advanced LSP & Multi-File Refactoring**: Rich Markdown hover popovers, Signature Help (`Ctrl+Shift+Space`), Peek References / Go to Implementation / Type Definition (`Shift+F12`), Rename Symbol (`F2`) with multi-file `WorkspaceEdit` preview & undo, LSP Semantic Tokens layering over TextMate/`tree-sitter`, Inlay Hints, CodeLens, Document Links, and Call/Type Hierarchy views
-- [ ] **Phase 9 M2 — Snippets Engine, Language Config & Large-File PieceTable**: Full VS Code TextMate snippet engine (nested tabstops, `${1|a,b,c|}` choices, regex transforms, `$TM_*` variables), `contributes.snippets` & `language-configuration.json` loader (auto-indent, on-enter rules, surrounding pairs), Sticky Scroll, bracket-pair colorization, and true O(log n) balanced piece-tree rebalancing + virtualized rendering for 100 MB+ files
-- [ ] **Phase 9 M3 — Full Workbench Chrome, Context Menus & Multi-Window**: Drag-and-drop tabs across split groups & Explorer files, Secondary Sidebar (right panel), Panel position toggle (bottom/left/right), draggable Sash resizing, custom Title Bar & Menu Bar, full `contributes.menus` right-click Context Menus with `when` clauses, Window Zoom (`Ctrl+=`/`-`/`0`), Zen Mode (`Ctrl+K Z`), and Multi-Window orchestration (`Ctrl+Shift+N` + single-instance IPC socket forwarding CLI files into active windows)
-- [ ] **Phase 9 M4 — Phase 9 E2E & Large-File Benchmarks (`tests/phase9-e2e/`)**: Automated verification of Rename Symbol, Peek References, Semantic Tokens, Snippets, Drag-and-Drop layout, Multi-Window IPC, and 100 MB file latency budgets
 
 #### Phase 10: Real-World Top-100 VS Code Extension Ecosystem & Marketplace Maturity (Planned)
 - [ ] **Phase 10 M1 — Remaining `vscode.*` APIs & Contribution Points**: `workspace.registerFileSystemProvider` (virtual/remote schemes), `TextDocumentContentProvider`, `WebviewViewProvider` (sidebar/panel webviews), `TreeView` drag-and-drop & checkboxes, `SecretStorage` (OS keyring), `LogOutputChannel`, `TerminalShellIntegration`, `CustomExecution` tasks + Problem Matchers, and `contributes.{menus,viewsContainers,viewsWelcome,submenus,jsonValidation,problemMatchers,iconThemes,productIconThemes}`
@@ -180,6 +182,8 @@ rustcode --user-data-dir /path/to/data --extensions-dir /path/to/exts --disable-
 - `[PATH...]`: Open one or more workspace folders or files (launches Desktop GUI when compiled with `--features desktop`, unless `--headless` is set).
 - `--headless`: Force headless bootstrap via `MockRenderSurface` and exit.
 - `--gui`: Launch the native desktop `winit` + `wgpu` window (requires `--features desktop`).
+- `-n, --new-window`: Force opening a new desktop window (bypasses existing `SingleInstanceIpc` leader reuse).
+- `-r, --reuse-window`: Force forwarding paths / `--goto` requests into the active desktop window via `SingleInstanceIpc`.
 - `-g, --goto <FILE:LINE[:COL]>`: Open a file at a 1-based line and optional column (supports Windows drive-letter paths like `C:\repo\src\lib.rs:10:5`).
 - `--user-data-dir <DIR>`: Override the default user data/config directory (`dirs::config_dir()/rustcode`).
 - `--extensions-dir <DIR>`: Override the default user extensions directory.
@@ -192,7 +196,7 @@ rustcode --user-data-dir /path/to/data --extensions-dir /path/to/exts --disable-
 
 ## 🧪 Building, Testing, CI & Packaging
 
-**Stage 3 Verified Results (Pre-Phase 8 + Phase 8):** **608/608** default (**617/617** `--features desktop`) workspace tests across **8 crates** (`rustcode-app` 37 [13 lib + 24 integration] / 39 desktop, `rustcode-base` 14, `rustcode-editor` 144 / 146 desktop, `rustcode-ext-host` 130 [89 lib + 41 `compat_suite`], `rustcode-platform` 60 / 64 desktop, `rustcode-protocols` 37, `rustcode-terminal` 14, `rustcode-workbench` 172 / 173 desktop), **31/31 `ext-host-js/test.js`** `[Test]` sections, **286/286** Windows (`10/10` targets, `8/8` syntax checks) opaque-box `tests/phase7-e2e/` regression tests, **30/30** (`8/8` targets, `5/5` syntax checks) `tests/phase8-e2e/` tests, **0 `clippy` warnings** (`-D warnings`) on **Windows (`x86_64-pc-windows-gnu`, default + `--features desktop`)** and **Linux (`x86_64-unknown-linux-gnu`)**, `cargo bench --workspace --no-run -j 2`, and standalone default/desktop `rustcode` CLI smoke checks.
+**Stage 3 Verified Results (Phases 0–9):** **637/637** default (**646/646** `--features desktop`) workspace tests across **8 crates** (`rustcode-app` 41 [17 lib + 24 integration] / 43 desktop, `rustcode-base` 14, `rustcode-editor` 156 / 158 desktop, `rustcode-ext-host` 130 [89 lib + 41 `compat_suite`], `rustcode-platform` 60 / 64 desktop, `rustcode-protocols` 39, `rustcode-terminal` 14, `rustcode-workbench` 183 / 184 desktop), **32/32 `ext-host-js/test.js`** `[Test]` sections, **286/286** (`10/10` targets) opaque-box `tests/phase7-e2e/` regression tests, **30/30** (`8/8` targets, `5/5` syntax checks) `tests/phase8-e2e/` tests, **12** (`5/5` targets [1 JS + 11 Rust], `4/4` syntax checks) `tests/phase9-e2e/` tests, **0 `clippy` warnings** (`-D warnings`) on **Windows (`x86_64-pc-windows-gnu`, default + `--features desktop`)** and **Linux (`x86_64-unknown-linux-gnu`)**, passing `editor_latency` (`36 ns` typing mean) & `large_file` (`43.75 ms` 100.00 MiB load, `111 ns` mid-file edit mean, `4.59 ms` viewport frame) benchmarks, and standalone `rustcode` CLI smoke checks (`--help`, `--version`, `--headless`, zero-arg).
 
 ```bash
 # Clone the repository
@@ -207,18 +211,22 @@ cargo test -j 2 --workspace --features desktop
 cargo test -j 2 -p rustcode-ext-host --test compat_suite
 node ext-host-js/test.js
 
-# Run standalone E2E suites (Phase 7 regression + Phase 8 native/runtime E2E)
+# Run standalone E2E suites (Phase 7 regression, Phase 8 native/runtime parity, Phase 9 deep editing & multi-window)
 node tests/phase7-e2e/runner.js --syntax-check
 node tests/phase7-e2e/runner.js --tier all
 node tests/phase8-e2e/runner.js --syntax-check
 node tests/phase8-e2e/runner.js --tier all
+node tests/phase9-e2e/runner.js --syntax-check
+node tests/phase9-e2e/runner.js --tier all
 
 # Lint workspace cleanly on Windows host (default + desktop) and Linux cross-target (warnings treated as errors)
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
 cargo clippy -j 2 --workspace --all-targets --features desktop -- -D warnings
 cargo clippy -j 2 --target x86_64-unknown-linux-gnu --workspace --all-targets -- -D warnings
 
-# Compile benchmarks (without running full bench harness)
+# Run editor keystroke & 100 MB large-file benchmarks (or compile all workspace benchmarks with --no-run)
+cargo bench -j 2 -p rustcode-editor --bench editor_latency
+cargo bench -j 2 -p rustcode-editor --bench large_file
 cargo bench --workspace --no-run -j 2
 
 # Build release binary and package distribution bundle (CI runs both via .github/workflows/ci.yml):
@@ -230,7 +238,7 @@ pwsh -File ./scripts/package.ps1 -Build -Jobs 2
 pwsh -File ./scripts/package.ps1 -Build -Desktop -Jobs 2
 ```
 
-> **Standalone E2E Suites (`tests/phase7-e2e/`, `tests/phase8-e2e/`):** Both suites live in isolated standalone Cargo `[workspace]` manifests outside root `Cargo.toml` and expose unified Node runners (`runner.js --syntax-check`, `--tier 1|2|3|4|all`, `--filter`, `--json`). `.github/workflows/ci.yml` executes the full workspace, JS, Phase 7/8 E2E, `clippy`, benchmark, and `package.ps1` / `package.sh` matrix on both `windows-latest` and `ubuntu-latest`.
+> **Standalone E2E Suites (`tests/phase7-e2e/`, `tests/phase8-e2e/`, `tests/phase9-e2e/`):** All three suites live in isolated standalone Cargo `[workspace]` manifests outside root `Cargo.toml` and expose unified Node runners (`runner.js --syntax-check`, `--tier 1|2|3|4|all`, `--filter`, `--json`). `.github/workflows/ci.yml` executes the full workspace, JS, Phase 7/8/9 E2E, `clippy`, benchmark, and `package.ps1` / `package.sh` matrix on both `windows-latest` and `ubuntu-latest`.
 
 ---
 

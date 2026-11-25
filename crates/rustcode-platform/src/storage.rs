@@ -56,6 +56,18 @@ pub struct PersistedTabState {
     pub scroll_left: f32,
 }
 
+fn default_panel_position_string() -> String {
+    "bottom".to_string()
+}
+
+fn default_secondary_sidebar_width() -> f32 {
+    260.0
+}
+
+fn default_panel_width() -> f32 {
+    300.0
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PersistedWorkspaceState {
     #[serde(default)]
@@ -74,6 +86,20 @@ pub struct PersistedWorkspaceState {
     pub panel_height: f32,
     #[serde(default)]
     pub active_theme_id: Option<String>,
+    #[serde(default)]
+    pub secondary_sidebar_visible: bool,
+    #[serde(default = "default_secondary_sidebar_width")]
+    pub secondary_sidebar_width: f32,
+    #[serde(default = "default_panel_position_string")]
+    pub panel_position: String,
+    #[serde(default = "default_panel_width")]
+    pub panel_width: f32,
+    #[serde(default)]
+    pub title_bar_visible: bool,
+    #[serde(default)]
+    pub zoom_level: f32,
+    #[serde(default)]
+    pub zen_mode: bool,
 }
 
 pub trait StorageBackend: Send + Sync {
@@ -672,6 +698,13 @@ mod tests {
             panel_visible: true,
             panel_height: 210.0,
             active_theme_id: Some("Dark+ (default dark)".to_string()),
+            secondary_sidebar_visible: true,
+            secondary_sidebar_width: 250.0,
+            panel_position: "right".to_string(),
+            panel_width: 320.0,
+            title_bar_visible: true,
+            zoom_level: 1.0,
+            zen_mode: false,
         };
         backend.save_workspace_state("ws-a", &state).unwrap();
         assert_eq!(
@@ -772,6 +805,13 @@ mod tests {
             panel_visible: true,
             panel_height: 180.0,
             active_theme_id: Some("Light+ (default light)".to_string()),
+            secondary_sidebar_visible: true,
+            secondary_sidebar_width: 260.0,
+            panel_position: "left".to_string(),
+            panel_width: 290.0,
+            title_bar_visible: true,
+            zoom_level: 2.0,
+            zen_mode: false,
         };
 
         {

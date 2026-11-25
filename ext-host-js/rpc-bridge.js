@@ -978,6 +978,79 @@ const rpc = {
       const { providerId, uri, position } = params;
       return await this.invokeProvider('Definition', providerId, 'provideDefinition', uri, position);
     }
+    if (method === 'languages.provideSignatureHelp') {
+      const { providerId, uri, position } = params;
+      return await this.invokeProvider('SignatureHelp', providerId, 'provideSignatureHelp', uri, position);
+    }
+    if (method === 'languages.provideReferences') {
+      const { providerId, uri, position, context } = params;
+      return await this.invokeProvider('References', providerId, 'provideReferences', uri, position, context || { includeDeclaration: true });
+    }
+    if (method === 'languages.provideImplementation') {
+      const { providerId, uri, position } = params;
+      return await this.invokeProvider('Implementation', providerId, 'provideImplementation', uri, position);
+    }
+    if (method === 'languages.provideTypeDefinition') {
+      const { providerId, uri, position } = params;
+      return await this.invokeProvider('TypeDefinition', providerId, 'provideTypeDefinition', uri, position);
+    }
+    if (method === 'languages.prepareRename') {
+      const { providerId, uri, position } = params;
+      const proxy = findRegisteredProvider('Rename', providerId);
+      if (!proxy || !proxy.provider || typeof proxy.provider.prepareRename !== 'function') {
+        return null;
+      }
+      return await proxy.provider.prepareRename(uri, position);
+    }
+    if (method === 'languages.provideRenameEdits') {
+      const { providerId, uri, position, newName } = params;
+      const res = await this.invokeProvider('Rename', providerId, 'provideRenameEdits', uri, position, newName);
+      return res && typeof res.toJSON === 'function' ? res.toJSON() : res;
+    }
+    if (method === 'languages.provideDocumentSemanticTokens') {
+      const { providerId, uri } = params;
+      const proxy = findRegisteredProvider('SemanticTokens', providerId);
+      const res = await this.invokeProvider('SemanticTokens', providerId, 'provideDocumentSemanticTokens', uri);
+      const legend = (proxy && proxy.metadata && proxy.metadata.legend) || { tokenTypes: [], tokenModifiers: [] };
+      const data = res && res.data ? Array.from(res.data) : [];
+      return { resultId: res && res.resultId ? res.resultId : null, data, legend };
+    }
+    if (method === 'languages.provideInlayHints') {
+      const { providerId, uri, range } = params;
+      return await this.invokeProvider('InlayHints', providerId, 'provideInlayHints', uri, range);
+    }
+    if (method === 'languages.provideCodeLenses') {
+      const { providerId, uri } = params;
+      return await this.invokeProvider('CodeLens', providerId, 'provideCodeLenses', uri);
+    }
+    if (method === 'languages.provideDocumentLinks') {
+      const { providerId, uri } = params;
+      return await this.invokeProvider('DocumentLink', providerId, 'provideDocumentLinks', uri);
+    }
+    if (method === 'languages.prepareCallHierarchy') {
+      const { providerId, uri, position } = params;
+      return await this.invokeProvider('CallHierarchy', providerId, 'prepareCallHierarchy', uri, position);
+    }
+    if (method === 'languages.provideCallHierarchyIncomingCalls') {
+      const { providerId, item } = params;
+      return await this.invokeProvider('CallHierarchy', providerId, 'provideCallHierarchyIncomingCalls', item);
+    }
+    if (method === 'languages.provideCallHierarchyOutgoingCalls') {
+      const { providerId, item } = params;
+      return await this.invokeProvider('CallHierarchy', providerId, 'provideCallHierarchyOutgoingCalls', item);
+    }
+    if (method === 'languages.prepareTypeHierarchy') {
+      const { providerId, uri, position } = params;
+      return await this.invokeProvider('TypeHierarchy', providerId, 'prepareTypeHierarchy', uri, position);
+    }
+    if (method === 'languages.provideTypeHierarchySupertypes') {
+      const { providerId, item } = params;
+      return await this.invokeProvider('TypeHierarchy', providerId, 'provideTypeHierarchySupertypes', item);
+    }
+    if (method === 'languages.provideTypeHierarchySubtypes') {
+      const { providerId, item } = params;
+      return await this.invokeProvider('TypeHierarchy', providerId, 'provideTypeHierarchySubtypes', item);
+    }
     if (method === 'notebooks.deserializeNotebook' || method === 'NotebookSerializer.deserializeNotebook') {
       const { providerId, notebookType, content, token } = params;
       const id = providerId || notebookType;

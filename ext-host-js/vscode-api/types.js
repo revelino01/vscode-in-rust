@@ -740,6 +740,245 @@ class RelativePattern {
   }
 }
 
+class MarkdownString {
+  constructor(value = '', supportThemeIcons = false) {
+    this.value = String(value || '');
+    this.isTrusted = false;
+    this.supportThemeIcons = Boolean(supportThemeIcons);
+    this.supportHtml = false;
+  }
+
+  appendText(value) {
+    this.value += String(value || '');
+    return this;
+  }
+
+  appendMarkdown(value) {
+    this.value += String(value || '');
+    return this;
+  }
+
+  appendCodeblock(value, language = '') {
+    this.value += `\n\`\`\`${language || ''}\n${String(value || '')}\n\`\`\`\n`;
+    return this;
+  }
+}
+
+class Location {
+  constructor(uri, rangeOrPosition) {
+    this.uri = uri instanceof Uri ? uri.toString() : String(uri || '');
+    if (rangeOrPosition instanceof Position) {
+      this.range = new Range(rangeOrPosition, rangeOrPosition);
+    } else {
+      this.range = rangeOrPosition;
+    }
+  }
+}
+
+class ParameterInformation {
+  constructor(label, documentation) {
+    this.label = label;
+    this.documentation = documentation;
+  }
+}
+
+class SignatureInformation {
+  constructor(label, documentation) {
+    this.label = label;
+    this.documentation = documentation;
+    this.parameters = [];
+    this.activeParameter = undefined;
+  }
+}
+
+class SignatureHelp {
+  constructor() {
+    this.signatures = [];
+    this.activeSignature = 0;
+    this.activeParameter = 0;
+  }
+}
+
+class SemanticTokensLegend {
+  constructor(tokenTypes = [], tokenModifiers = []) {
+    this.tokenTypes = Array.isArray(tokenTypes) ? tokenTypes.slice() : [];
+    this.tokenModifiers = Array.isArray(tokenModifiers) ? tokenModifiers.slice() : [];
+  }
+}
+
+class SemanticTokens {
+  constructor(data, resultId) {
+    this.data = data instanceof Uint32Array ? Array.from(data) : Array.isArray(data) ? data.slice() : [];
+    this.resultId = resultId;
+  }
+}
+
+class SemanticTokensBuilder {
+  constructor(legend) {
+    this._legend = legend || new SemanticTokensLegend();
+    this._data = [];
+    this._prevLine = 0;
+    this._prevChar = 0;
+  }
+
+  push(lineOrRange, charOrTokenType, lengthOrModifiers, tokenTypeOrUndefined, tokenModifiers) {
+    let line;
+    let char;
+    let length;
+    let tokenTypeIdx = 0;
+    let modBits = 0;
+
+    if (typeof lineOrRange === 'number') {
+      line = lineOrRange;
+      char = charOrTokenType;
+      length = lengthOrModifiers;
+      tokenTypeIdx = typeof tokenTypeOrUndefined === 'number'
+        ? tokenTypeOrUndefined
+        : Math.max(0, this._legend.tokenTypes.indexOf(tokenTypeOrUndefined));
+      if (Array.isArray(tokenModifiers)) {
+        for (const m of tokenModifiers) {
+          const idx = this._legend.tokenModifiers.indexOf(m);
+          if (idx >= 0 && idx < 32) modBits |= (1 << idx);
+        }
+      } else if (typeof tokenModifiers === 'number') {
+        modBits = tokenModifiers;
+      }
+    } else if (lineOrRange && lineOrRange.start && lineOrRange.end) {
+      line = lineOrRange.start.line;
+      char = lineOrRange.start.character;
+      length = Math.max(0, lineOrRange.end.character - lineOrRange.start.character);
+      tokenTypeIdx = Math.max(0, this._legend.tokenTypes.indexOf(charOrTokenType));
+      if (Array.isArray(lengthOrModifiers)) {
+        for (const m of lengthOrModifiers) {
+          const idx = this._legend.tokenModifiers.indexOf(m);
+          if (idx >= 0 && idx < 32) modBits |= (1 << idx);
+        }
+      }
+    } else {
+      return;
+    }
+
+    const deltaLine = line - this._prevLine;
+    const deltaChar = deltaLine === 0 ? (char - this._prevChar) : char;
+    this._data.push(deltaLine, deltaChar, length, tokenTypeIdx, modBits);
+    this._prevLine = line;
+    this._prevChar = char;
+  }
+
+  build(resultId) {
+    return new SemanticTokens(this._data, resultId);
+  }
+}
+
+const InlayHintKind = {
+  Type: 1,
+  Parameter: 2,
+};
+
+class InlayHintLabelPart {
+  constructor(value) {
+    this.value = String(value || '');
+    this.tooltip = undefined;
+    this.location = undefined;
+    this.command = undefined;
+  }
+}
+
+class InlayHint {
+  constructor(position, label, kind) {
+    this.position = position;
+    this.label = label;
+    this.kind = kind;
+    this.paddingLeft = false;
+    this.paddingRight = false;
+    this.tooltip = undefined;
+  }
+}
+
+class CodeLens {
+  constructor(range, command) {
+    this.range = range;
+    this.command = command;
+  }
+
+  get isResolved() {
+    return Boolean(this.command);
+  }
+}
+
+class DocumentLink {
+  constructor(range, target) {
+    this.range = range;
+    this.target = target instanceof Uri ? target.toString() : target;
+    this.tooltip = undefined;
+  }
+}
+
+const SymbolKind = {
+  File: 0,
+  Module: 1,
+  Namespace: 2,
+  Package: 3,
+  Class: 4,
+  Method: 5,
+  Property: 6,
+  Field: 7,
+  Constructor: 8,
+  Enum: 9,
+  Interface: 10,
+  Function: 11,
+  Variable: 12,
+  Constant: 13,
+  String: 14,
+  Number: 15,
+  Boolean: 16,
+  Array: 17,
+  Object: 18,
+  Key: 19,
+  Null: 20,
+  EnumMember: 21,
+  Struct: 22,
+  Event: 23,
+  Operator: 24,
+  TypeParameter: 25,
+};
+
+class CallHierarchyItem {
+  constructor(kind, name, detail, uri, range, selectionRange) {
+    this.kind = kind;
+    this.name = name;
+    this.detail = detail;
+    this.uri = uri instanceof Uri ? uri.toString() : String(uri || '');
+    this.range = range;
+    this.selectionRange = selectionRange;
+  }
+}
+
+class CallHierarchyIncomingCall {
+  constructor(from, fromRanges) {
+    this.from = from;
+    this.fromRanges = fromRanges || [];
+  }
+}
+
+class CallHierarchyOutgoingCall {
+  constructor(to, fromRanges) {
+    this.to = to;
+    this.fromRanges = fromRanges || [];
+  }
+}
+
+class TypeHierarchyItem {
+  constructor(kind, name, detail, uri, range, selectionRange) {
+    this.kind = kind;
+    this.name = name;
+    this.detail = detail;
+    this.uri = uri instanceof Uri ? uri.toString() : String(uri || '');
+    this.range = range;
+    this.selectionRange = selectionRange;
+  }
+}
+
 module.exports = {
   Position,
   Range,
@@ -774,4 +1013,22 @@ module.exports = {
   FileType,
   FileSystemError,
   RelativePattern,
+  MarkdownString,
+  Location,
+  ParameterInformation,
+  SignatureInformation,
+  SignatureHelp,
+  SemanticTokensLegend,
+  SemanticTokens,
+  SemanticTokensBuilder,
+  InlayHintKind,
+  InlayHintLabelPart,
+  InlayHint,
+  CodeLens,
+  DocumentLink,
+  SymbolKind,
+  CallHierarchyItem,
+  CallHierarchyIncomingCall,
+  CallHierarchyOutgoingCall,
+  TypeHierarchyItem,
 };

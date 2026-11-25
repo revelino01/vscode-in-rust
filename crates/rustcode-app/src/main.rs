@@ -73,19 +73,11 @@ fn main() -> ExitCode {
             StartupMode::Desktop => {
                 #[cfg(feature = "desktop")]
                 {
-                    match bootstrap_app(&opts, true) {
-                        Ok(app) => {
-                            if let Err(err) = rustcode_app::desktop::run_desktop_event_loop(app) {
-                                eprintln!("Desktop error: {err}");
-                                return ExitCode::from(1);
-                            }
-                            ExitCode::SUCCESS
-                        }
-                        Err(err) => {
-                            eprintln!("Bootstrap error: {err}");
-                            ExitCode::from(1)
-                        }
+                    if let Err(err) = rustcode_app::desktop::run_desktop_app(opts) {
+                        eprintln!("Desktop error: {err}");
+                        return ExitCode::from(1);
                     }
+                    ExitCode::SUCCESS
                 }
                 #[cfg(not(feature = "desktop"))]
                 {

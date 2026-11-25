@@ -3,6 +3,7 @@
 pub mod cli;
 #[cfg(feature = "desktop")]
 pub mod desktop;
+pub mod multi_window;
 pub mod runtime;
 
 use parking_lot::Mutex;
@@ -32,6 +33,9 @@ pub struct RustCodeContext {
     pub layout: SharedWorkbenchLayout,
     pub explorer: FileExplorer,
     pub ext_loader: ExtensionLoader,
+    pub language_configs: rustcode_editor::LanguageConfigurationRegistry,
+    pub snippets: rustcode_editor::SnippetRegistry,
+    pub context_menus: rustcode_workbench::context_menu::ContextMenuRegistry,
     pub file_system: Arc<FileSystemService>,
     pub language_bridge: Arc<LanguageFeatureBridge>,
     pub disposables: Arc<Mutex<DisposableStore>>,
@@ -79,6 +83,9 @@ impl RustCodeContext {
         let layout = SharedWorkbenchLayout::new();
         let explorer = FileExplorer::new();
         let ext_loader = ExtensionLoader::new();
+        let language_configs = rustcode_editor::LanguageConfigurationRegistry::new();
+        let snippets = rustcode_editor::SnippetRegistry::new();
+        let context_menus = rustcode_workbench::context_menu::ContextMenuRegistry::new();
         let file_system = Arc::new(FileSystemService::new());
         let language_bridge = Arc::new(
             LanguageFeatureBridge::new(
@@ -103,6 +110,9 @@ impl RustCodeContext {
             layout,
             explorer,
             ext_loader,
+            language_configs,
+            snippets,
+            context_menus,
             file_system,
             language_bridge,
             disposables,
@@ -508,6 +518,125 @@ impl RustCodeContext {
             "workbench.action.closeEditorsInGroup",
             json!({ "closedGroupEditors": true }),
         );
+        self.register_queue_command(
+            &mut store,
+            "editor.action.triggerParameterHints",
+            json!({ "signatureHelp": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "editor.action.referenceSearch.trigger",
+            json!({ "peekReferences": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "editor.action.goToImplementation",
+            json!({ "goToImplementation": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "editor.action.goToTypeDefinition",
+            json!({ "goToTypeDefinition": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "editor.action.rename",
+            json!({ "rename": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "editor.action.showCallHierarchy",
+            json!({ "callHierarchy": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "editor.action.showTypeHierarchy",
+            json!({ "typeHierarchy": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.action.undoWorkspaceEdit",
+            json!({ "undoWorkspaceEdit": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.action.newWindow",
+            json!({ "newWindow": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.action.closeOtherEditors",
+            json!({ "closeOtherEditors": true }),
+        );
+
+        let register_layout_cmd = |store: &mut DisposableStore,
+                                 cmd_id: &'static str,
+                                 mutator: fn(&mut rustcode_workbench::layout::WorkbenchLayout),
+                                 payload: serde_json::Value| {
+            let sinks = Arc::clone(&self.window_sinks);
+            let layout_handle = app_layout.clone();
+            store.add_boxed(self.commands.register(cmd_id, move |_| {
+                layout_handle.update(mutator);
+                dispatch_to_sinks(&sinks, cmd_id, |s| {
+                    s.layout.update(mutator);
+                });
+                Ok(payload.clone())
+            }));
+        };
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.toggleAuxiliaryBar",
+            |l| l.toggle_secondary_sidebar(),
+            json!({ "auxiliaryBarToggled": true }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.positionPanelBottom",
+            |l| l.set_panel_position(rustcode_workbench::layout::PanelPosition::Bottom),
+            json!({ "panelPosition": "bottom" }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.positionPanelLeft",
+            |l| l.set_panel_position(rustcode_workbench::layout::PanelPosition::Left),
+            json!({ "panelPosition": "left" }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.positionPanelRight",
+            |l| l.set_panel_position(rustcode_workbench::layout::PanelPosition::Right),
+            json!({ "panelPosition": "right" }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.toggleZenMode",
+            |l| l.toggle_zen_mode(),
+            json!({ "zenModeToggled": true }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.zoomIn",
+            |l| l.zoom_in(),
+            json!({ "zoomIn": true }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.zoomOut",
+            |l| l.zoom_out(),
+            json!({ "zoomOut": true }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.zoomReset",
+            |l| l.zoom_reset(),
+            json!({ "zoomReset": true }),
+        );
+        register_layout_cmd(
+            &mut store,
+            "workbench.action.toggleMenuBar",
+            |l| l.toggle_title_bar(),
+            json!({ "menuBarToggled": true }),
+        );
     }
 
     /// Instantiate a GPUI WorkbenchWindow host wired to this service container.
@@ -537,6 +666,10 @@ impl RustCodeContext {
         .with_file_system(Arc::clone(&self.file_system))
         .with_language_bridge(Arc::clone(&self.language_bridge));
 
+        window.view.editor_area.language_configs = self.language_configs.clone();
+        window.view.editor_area.snippet_registry = self.snippets.clone();
+        window.view.context_menu_registry = self.context_menus.clone();
+
         for ext in self.ext_loader.loaded_extensions() {
             if let Some(contribs) = &ext.manifest.contributes {
                 for ce in &contribs.custom_editors {
@@ -546,6 +679,18 @@ impl RustCodeContext {
                     for (container_id, view_list) in views {
                         window.register_view_contributions(container_id, view_list.clone());
                     }
+                }
+                if let Some(menus) = &contribs.menus {
+                    let mut titles = std::collections::HashMap::new();
+                    if let Some(cmds) = &contribs.commands {
+                        for cmd in cmds {
+                            titles.insert(cmd.command.clone(), cmd.title.clone());
+                        }
+                    }
+                    window
+                        .view
+                        .context_menu_registry
+                        .register_contributions(menus, &titles);
                 }
             }
         }

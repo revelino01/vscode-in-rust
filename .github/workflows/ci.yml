@@ -92,6 +92,12 @@ jobs:
       - name: Run Phase 8 E2E suite (all tiers)
         run: node tests/phase8-e2e/runner.js --tier all
 
+      - name: Run Phase 9 E2E syntax checks
+        run: node tests/phase9-e2e/runner.js --syntax-check
+
+      - name: Run Phase 9 E2E suite (all tiers)
+        run: node tests/phase9-e2e/runner.js --tier all
+
       - name: Run Clippy (default features)
         run: cargo clippy -j 2 --workspace --all-targets -- -D warnings
 

@@ -1,11 +1,12 @@
 //! Command-line interface parser for the `rustcode` binary.
 
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
 /// Target file and 1-based cursor position parsed from `--goto <file:line[:col]>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GotoTarget {
     pub path: PathBuf,
     pub line: usize,
@@ -36,6 +37,8 @@ pub struct CliOptions {
     pub goto: Vec<GotoTarget>,
     pub headless: bool,
     pub gui: bool,
+    pub new_window: bool,
+    pub reuse_window: bool,
     pub user_data_dir: Option<PathBuf>,
     pub extensions_dir: Option<PathBuf>,
     pub disable_extensions: bool,
@@ -106,6 +109,8 @@ Options:
   -V, --version               Print version information
       --headless              Run headless bootstrap and exit
       --gui                   Launch native desktop window (requires desktop feature)
+  -n, --new-window            Force opening a new desktop window
+  -r, --reuse-window          Force reusing the last active desktop window
   -g, --goto <FILE:LINE[:COL]>
                               Open file at 1-based line and optional column
       --user-data-dir <DIR>   Override user data/config directory
@@ -150,6 +155,8 @@ where
             "-V" | "--version" => return Ok(CliAction::ShowVersion),
             "--headless" => opts.headless = true,
             "--gui" => opts.gui = true,
+            "-n" | "--new-window" => opts.new_window = true,
+            "-r" | "--reuse-window" => opts.reuse_window = true,
             "--disable-extensions" => opts.disable_extensions = true,
             "-g" | "--goto" => {
                 let val = iter
@@ -426,5 +433,31 @@ mod tests {
             parse_cli_args(["--goto", ""]).unwrap_err(),
             CliError::InvalidGoto(_)
         ));
+    }
+
+    #[test]
+    fn test_cli_new_window_and_reuse_window_preserve_headless_zero_arg_contract() {
+        let zero = match parse_cli_args::<[&str; 0], &str>([]).unwrap() {
+            CliAction::Run(o) => o,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(zero.startup_mode(true), StartupMode::Headless);
+        assert!(!zero.new_window);
+        assert!(!zero.reuse_window);
+
+        let headless_new = match parse_cli_args(["--headless", "--new-window", "foo.rs"]).unwrap() {
+            CliAction::Run(o) => o,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(headless_new.new_window);
+        assert_eq!(headless_new.startup_mode(true), StartupMode::Headless);
+
+        let reuse = match parse_cli_args(["-r", "bar.rs"]).unwrap() {
+            CliAction::Run(o) => o,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(reuse.reuse_window);
+        assert!(!reuse.new_window);
+        assert_eq!(reuse.startup_mode(true), StartupMode::Desktop);
     }
 }

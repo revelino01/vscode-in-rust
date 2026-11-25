@@ -1,33 +1,39 @@
 //! GPUI WorkbenchView coordinator composing all UI shell regions into a cohesive presentation tree.
 
 use crate::activitybar::{ActivityBarAction, ActivityBarView};
+use crate::context_menu::{ContextMenuRegistry, MenuLocation, WorkbenchContextMenu};
 use crate::debug::{
     DebugConsoleView, DebugSidebarView, DebugToolbarAction, DebugToolbarView, DebugViewAction,
 };
 use crate::editor_area::EditorAreaView;
 use crate::explorer::{ExplorerAction, FileExplorerView};
 use crate::extensions_view::{ExtensionsSidebarView, ExtensionsViewAction};
-use crate::layout::SharedWorkbenchLayout;
+use crate::hierarchy::{HierarchyAction, HierarchyView};
+use crate::layout::{PanelPosition, SharedWorkbenchLayout};
 use crate::notifications::{
     NotificationUiAction, NotificationsOverlay, PromptOverlay, PromptUiAction,
 };
 use crate::output_panel::{OutputAction, OutputPanelView};
 use crate::problems::{ProblemsAction, ProblemsPanel};
 use crate::quickinput::{CommandPaletteView, PaletteAction, QuickInputMode};
+use crate::refactor_preview::{RefactorPreviewAction, RefactorPreviewOverlay};
 use crate::scm::{ScmAction, ScmView};
+use crate::search::symbols::search_document_symbols;
 use crate::search::{SearchAction, SearchInputFocus, SearchView};
 use crate::settings_ui::{SettingsFocus, SettingsUiView};
 use crate::statusbar::{StatusBar, StatusBarAction, StatusBarAlignment, StatusBarItem, StatusBarView};
 use crate::terminal_panel::{TerminalAction, TerminalPanelView};
 use crate::testing::{decode_test_uri_to_path, TestingAction, TestingSidebarView};
+use crate::titlebar::{TitleBarAction, TitleBarView};
 use crate::webview::WebviewElementKind;
 use crate::workspace::Workspace;
 use parking_lot::RwLock;
+use rustcode_base::context_key::ContextKeyService;
 use rustcode_platform::accessibility::{AccessibilityTree, AccessibleNode, AccessibleRole};
 use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::render::{
-    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Rgba, Scene, View,
-    WorkbenchThemeStyles,
+    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, MouseButton, Point, Quad, Rect,
+    Rgba, Scene, View, WorkbenchThemeStyles,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -41,9 +47,21 @@ pub enum FocusedRegion {
     CommandPalette,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkbenchSash {
+    Sidebar,
+    SecondarySidebar,
+    Panel,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum WorkbenchAction {
     ExecuteCommand(String),
+    ContextMenuCommand {
+        command: String,
+        context_path: Option<PathBuf>,
+    },
+    TitleBarAction(TitleBarAction),
     OpenFile(PathBuf),
     OpenDiff {
         path: PathBuf,
@@ -66,18 +84,23 @@ pub enum WorkbenchAction {
     PromptAction(PromptUiAction),
     TestingAction(TestingAction),
     ExplorerAction(ExplorerAction),
+    HierarchyAction(HierarchyAction),
+    RefactorPreviewAction(RefactorPreviewAction),
     SidebarToggled(bool),
+    SecondarySidebarToggled(bool),
     PanelToggled(bool),
 }
 
 pub struct WorkbenchView {
     pub layout: SharedWorkbenchLayout,
+    pub title_bar: TitleBarView,
     pub activity_bar: ActivityBarView,
     pub explorer: FileExplorerView,
     pub scm_view: ScmView,
     pub search_view: SearchView,
     pub extensions_view: ExtensionsSidebarView,
     pub testing_view: TestingSidebarView,
+    pub hierarchy_view: HierarchyView,
     pub workspace: Workspace,
     pub debug_sidebar: DebugSidebarView,
     pub debug_toolbar: DebugToolbarView,
@@ -92,6 +115,11 @@ pub struct WorkbenchView {
     pub is_command_palette_open: bool,
     pub notifications: NotificationsOverlay,
     pub prompt_overlay: PromptOverlay,
+    pub refactor_preview: RefactorPreviewOverlay,
+    pub context_menu_registry: ContextMenuRegistry,
+    pub context_menu: WorkbenchContextMenu,
+    pub active_sash: Option<WorkbenchSash>,
+    pub cached_context_keys: Option<ContextKeyService>,
     pub focused_region: FocusedRegion,
     pub last_action: Option<WorkbenchAction>,
     pub pending_settings_open: Arc<AtomicBool>,
@@ -119,12 +147,14 @@ impl WorkbenchView {
 
         Self {
             layout: SharedWorkbenchLayout::new(),
+            title_bar: TitleBarView::new(),
             activity_bar: ActivityBarView::default(),
             explorer: FileExplorerView::default(),
             scm_view: ScmView::default(),
             search_view: SearchView::default(),
             extensions_view: ExtensionsSidebarView::default(),
             testing_view: TestingSidebarView::default(),
+            hierarchy_view: HierarchyView::new(),
             workspace: Workspace::default(),
             debug_sidebar: DebugSidebarView::default(),
             debug_toolbar: DebugToolbarView::default(),
@@ -139,6 +169,11 @@ impl WorkbenchView {
             is_command_palette_open: false,
             notifications: NotificationsOverlay::new(),
             prompt_overlay: PromptOverlay::new(),
+            refactor_preview: RefactorPreviewOverlay::new(),
+            context_menu_registry: ContextMenuRegistry::new(),
+            context_menu: WorkbenchContextMenu::new(),
+            active_sash: None,
+            cached_context_keys: None,
             focused_region: FocusedRegion::Editor,
             last_action: None,
             pending_settings_open: Arc::new(AtomicBool::new(false)),
@@ -292,6 +327,7 @@ impl WorkbenchView {
         self.is_command_palette_open
             || self.prompt_overlay.is_open()
             || self.notifications.has_modal()
+            || self.refactor_preview.is_visible
     }
 
     fn process_explorer_action(&mut self) {
@@ -382,12 +418,185 @@ impl WorkbenchView {
 
     // --- Layout Region Calculations ---
 
+    pub fn effective_font_metrics(&self, base: &FontMetrics) -> FontMetrics {
+        let factor = self.layout.zoom_factor();
+        if (factor - 1.0).abs() < 1e-4 {
+            return base.clone();
+        }
+        FontMetrics {
+            font_family: base.font_family.clone(),
+            font_size: (base.font_size * factor).max(6.0),
+            line_height: (base.line_height * factor).max(8.0),
+            char_width: (base.char_width * factor).max(4.0),
+            ascent: (base.ascent * factor).max(5.0),
+            descent: (base.descent * factor).max(1.0),
+        }
+    }
+
+    fn compute_sashes(&self, regions: &WorkbenchRegions) -> Vec<(WorkbenchSash, Rect)> {
+        let mut sashes = Vec::new();
+        if self.layout.sidebar_visible && regions.sidebar.width() > 0.0 {
+            sashes.push((
+                WorkbenchSash::Sidebar,
+                Rect::from_xywh(
+                    regions.sidebar.max_x() - 2.0,
+                    regions.sidebar.min_y(),
+                    4.0,
+                    regions.sidebar.height(),
+                ),
+            ));
+        }
+        if self.layout.secondary_sidebar_visible && regions.secondary_sidebar.width() > 0.0 {
+            sashes.push((
+                WorkbenchSash::SecondarySidebar,
+                Rect::from_xywh(
+                    regions.secondary_sidebar.min_x() - 2.0,
+                    regions.secondary_sidebar.min_y(),
+                    4.0,
+                    regions.secondary_sidebar.height(),
+                ),
+            ));
+        }
+        if self.layout.panel_visible && regions.panel.width() > 0.0 && regions.panel.height() > 0.0 {
+            let rect = match self.layout.panel_position {
+                PanelPosition::Bottom => Rect::from_xywh(
+                    regions.panel.min_x(),
+                    regions.panel.min_y() - 2.0,
+                    regions.panel.width(),
+                    4.0,
+                ),
+                PanelPosition::Left => Rect::from_xywh(
+                    regions.panel.max_x() - 2.0,
+                    regions.panel.min_y(),
+                    4.0,
+                    regions.panel.height(),
+                ),
+                PanelPosition::Right => Rect::from_xywh(
+                    regions.panel.min_x() - 2.0,
+                    regions.panel.min_y(),
+                    4.0,
+                    regions.panel.height(),
+                ),
+            };
+            sashes.push((WorkbenchSash::Panel, rect));
+        }
+        sashes
+    }
+
+    fn update_sash_drag(&mut self, sash: WorkbenchSash, pos: Point, bounds: Rect) {
+        if !pos.x.is_finite() || !pos.y.is_finite() || !bounds.is_finite_positive() {
+            return;
+        }
+        let regions = self.compute_regions(bounds);
+        match sash {
+            WorkbenchSash::Sidebar => {
+                let act_w = regions.activity_bar.width();
+                let sec_w = regions.secondary_sidebar.width();
+                let max_w = (bounds.width() - act_w - sec_w - 160.0).max(120.0);
+                let raw_w = pos.x - (bounds.min_x() + act_w);
+                self.layout
+                    .mutate(|l| l.sidebar_width = raw_w.clamp(120.0, max_w));
+            }
+            WorkbenchSash::SecondarySidebar => {
+                let act_w = regions.activity_bar.width();
+                let sb_w = regions.sidebar.width();
+                let max_w = (bounds.width() - act_w - sb_w - 160.0).max(120.0);
+                let raw_w = bounds.max_x() - pos.x;
+                self.layout
+                    .mutate(|l| l.secondary_sidebar_width = raw_w.clamp(120.0, max_w));
+            }
+            WorkbenchSash::Panel => {
+                let top_y = regions.title_bar.max_y();
+                let status_h = regions.status_bar.height();
+                let main_h = (bounds.height() - regions.title_bar.height() - status_h).max(0.0);
+                let center_x = regions.activity_bar.width() + regions.sidebar.width() + bounds.min_x();
+                let center_w =
+                    (bounds.width() - regions.activity_bar.width() - regions.sidebar.width() - regions.secondary_sidebar.width()).max(0.0);
+                match self.layout.panel_position {
+                    PanelPosition::Bottom => {
+                        let max_h = (main_h - 80.0).max(80.0);
+                        let raw_h = top_y + main_h - pos.y;
+                        self.layout
+                            .mutate(|l| l.panel_height = raw_h.clamp(80.0, max_h));
+                    }
+                    PanelPosition::Left => {
+                        let max_w = (center_w - 160.0).max(120.0);
+                        let raw_w = pos.x - center_x;
+                        self.layout
+                            .mutate(|l| l.panel_width = raw_w.clamp(120.0, max_w));
+                    }
+                    PanelPosition::Right => {
+                        let max_w = (center_w - 160.0).max(120.0);
+                        let raw_w = (center_x + center_w) - pos.x;
+                        self.layout
+                            .mutate(|l| l.panel_width = raw_w.clamp(120.0, max_w));
+                    }
+                }
+            }
+        }
+    }
+
+    fn secondary_sidebar_outline_items(&self) -> Vec<(String, u32)> {
+        let Some(tab) = self.editor_area.model.current_group_ref().active_tab() else {
+            return Vec::new();
+        };
+        let Some(ed) = self
+            .editor_area
+            .editor_for_group(self.editor_area.model.active_group_id(), &tab.uri)
+        else {
+            return Vec::new();
+        };
+        let text = ed.text();
+        let path = if rustcode_platform::is_file_uri(&tab.uri) {
+            rustcode_platform::file_uri_to_path(&tab.uri)
+        } else {
+            PathBuf::from(&tab.title)
+        };
+        search_document_symbols(&text, &path)
+            .into_iter()
+            .map(|s| (s.name, s.location.range.start.line))
+            .collect()
+    }
+
+    fn secondary_sidebar_rects(sec_rect: Rect) -> (Rect, Rect, Rect, Rect) {
+        let hdr_h = 26.0f32.min(sec_rect.height());
+        let tab_outline = Rect::from_xywh(sec_rect.min_x() + 6.0, sec_rect.min_y(), 66.0, hdr_h);
+        let tab_hierarchy = Rect::from_xywh(sec_rect.min_x() + 74.0, sec_rect.min_y(), 78.0, hdr_h);
+        let close_rect = Rect::from_xywh(
+            (sec_rect.max_x() - 24.0).max(sec_rect.min_x()),
+            sec_rect.min_y(),
+            24.0_f32.min(sec_rect.width()),
+            hdr_h,
+        );
+        let content_rect = Rect::from_xywh(
+            sec_rect.min_x(),
+            sec_rect.min_y() + hdr_h,
+            sec_rect.width(),
+            (sec_rect.height() - hdr_h).max(0.0),
+        );
+        (tab_outline, tab_hierarchy, close_rect, content_rect)
+    }
+
+    fn open_context_menu_at(&mut self, location: MenuLocation, pos: Point, context_path: Option<PathBuf>) {
+        let ctx = self.cached_context_keys.clone().unwrap_or_default();
+        if let Some(p) = &context_path {
+            ctx.set_bool("explorerResourceSelected", true);
+            ctx.set_bool("explorerResourceIsFolder", p.is_dir());
+        } else {
+            ctx.set_bool("explorerResourceSelected", false);
+        }
+        let entries = self.context_menu_registry.resolve(location.as_id(), &ctx);
+        self.context_menu.open(location.as_id(), pos, entries, context_path);
+    }
+
     pub fn compute_regions(&self, bounds: Rect) -> WorkbenchRegions {
         if !bounds.is_finite_positive() {
             let zero = Rect::zero();
             return WorkbenchRegions {
+                title_bar: zero,
                 activity_bar: zero,
                 sidebar: zero,
+                secondary_sidebar: zero,
                 editor_area: zero,
                 panel: zero,
                 status_bar: zero,
@@ -402,6 +611,18 @@ impl WorkbenchView {
             }
         };
 
+        let title_bar_h = if self.layout.title_bar_visible {
+            TitleBarView::HEIGHT.min(bounds.height())
+        } else {
+            0.0
+        };
+        let title_bar = sanitize(Rect::from_xywh(
+            bounds.min_x(),
+            bounds.min_y(),
+            bounds.width(),
+            title_bar_h,
+        ));
+
         let status_bar_h = if self.layout.status_bar_visible { 22.0 } else { 0.0 };
         let status_bar = sanitize(Rect::from_xywh(
             bounds.min_x(),
@@ -410,11 +631,12 @@ impl WorkbenchView {
             status_bar_h,
         ));
 
-        let main_h = (bounds.height() - status_bar_h).max(0.0);
+        let top_y = bounds.min_y() + title_bar_h;
+        let main_h = (bounds.height() - title_bar_h - status_bar_h).max(0.0);
         let act_bar_w = if self.layout.activity_bar_visible { 48.0 } else { 0.0 };
         let activity_bar = sanitize(Rect::from_xywh(
             bounds.min_x(),
-            bounds.min_y(),
+            top_y,
             act_bar_w,
             main_h,
         ));
@@ -428,30 +650,75 @@ impl WorkbenchView {
         };
         let sidebar = sanitize(Rect::from_xywh(
             bounds.min_x() + act_bar_w,
-            bounds.min_y(),
+            top_y,
             sidebar_w,
             main_h,
         ));
 
-        let rem_w = (bounds.width() - act_bar_w - sidebar_w).max(0.0);
-        let panel_h = if self.layout.panel_visible {
-            self.layout.panel_height.min((main_h - 100.0).max(0.0))
+        let secondary_sidebar_w = if self.layout.secondary_sidebar_visible {
+            self.layout
+                .secondary_sidebar_width
+                .min((bounds.width() - act_bar_w - sidebar_w - 160.0).max(0.0))
         } else {
             0.0
         };
-        let panel = sanitize(Rect::from_xywh(
-            bounds.min_x() + act_bar_w + sidebar_w,
-            bounds.min_y() + main_h - panel_h,
-            rem_w,
-            panel_h,
+        let secondary_sidebar = sanitize(Rect::from_xywh(
+            (bounds.max_x() - secondary_sidebar_w).max(bounds.min_x()),
+            top_y,
+            secondary_sidebar_w,
+            main_h,
         ));
 
-        let editor_area = sanitize(Rect::from_xywh(
-            bounds.min_x() + act_bar_w + sidebar_w,
-            bounds.min_y(),
-            rem_w,
-            (main_h - panel_h).max(0.0),
-        ));
+        let center_x = bounds.min_x() + act_bar_w + sidebar_w;
+        let rem_w = (bounds.width() - act_bar_w - sidebar_w - secondary_sidebar_w).max(0.0);
+        let (panel, editor_area) = match self.layout.panel_position {
+            PanelPosition::Bottom => {
+                let panel_h = if self.layout.panel_visible {
+                    self.layout.panel_height.min((main_h - 100.0).max(0.0))
+                } else {
+                    0.0
+                };
+                let p = sanitize(Rect::from_xywh(
+                    center_x,
+                    top_y + main_h - panel_h,
+                    rem_w,
+                    panel_h,
+                ));
+                let e = sanitize(Rect::from_xywh(
+                    center_x,
+                    top_y,
+                    rem_w,
+                    (main_h - panel_h).max(0.0),
+                ));
+                (p, e)
+            }
+            PanelPosition::Left => {
+                let panel_w = if self.layout.panel_visible {
+                    self.layout.panel_width.min((rem_w - 160.0).max(0.0))
+                } else {
+                    0.0
+                };
+                let p = sanitize(Rect::from_xywh(center_x, top_y, panel_w, main_h));
+                let e = sanitize(Rect::from_xywh(
+                    center_x + panel_w,
+                    top_y,
+                    (rem_w - panel_w).max(0.0),
+                    main_h,
+                ));
+                (p, e)
+            }
+            PanelPosition::Right => {
+                let panel_w = if self.layout.panel_visible {
+                    self.layout.panel_width.min((rem_w - 160.0).max(0.0))
+                } else {
+                    0.0
+                };
+                let ed_w = (rem_w - panel_w).max(0.0);
+                let e = sanitize(Rect::from_xywh(center_x, top_y, ed_w, main_h));
+                let p = sanitize(Rect::from_xywh(center_x + ed_w, top_y, panel_w, main_h));
+                (p, e)
+            }
+        };
 
         let pal_w = (600.0f32).min((bounds.width() - 40.0).max(0.0));
         let pal_h = (320.0f32).min((bounds.height() - 80.0).max(0.0));
@@ -463,8 +730,10 @@ impl WorkbenchView {
         ));
 
         WorkbenchRegions {
+            title_bar,
             activity_bar,
             sidebar,
+            secondary_sidebar,
             editor_area,
             panel,
             status_bar,
@@ -1021,6 +1290,8 @@ impl WorkbenchView {
                 } else if view_id == "testing" || view_id == "workbench.view.testing" {
                     let nodes = self.testing_view.accessibility_nodes(regions.sidebar, font);
                     ("Testing", nodes, false)
+                } else if view_id == "hierarchy" || view_id == "workbench.view.hierarchy" {
+                    ("Hierarchy", Vec::new(), false)
                 } else {
                     let nodes = self.explorer.accessibility_nodes(regions.sidebar, font);
                     let input_focused = sidebar_focused && self.explorer.is_input_active();
@@ -1345,8 +1616,10 @@ impl WorkbenchView {
 }
 
 pub struct WorkbenchRegions {
+    pub title_bar: Rect,
     pub activity_bar: Rect,
     pub sidebar: Rect,
+    pub secondary_sidebar: Rect,
     pub editor_area: Rect,
     pub panel: Rect,
     pub status_bar: Rect,
@@ -1364,10 +1637,17 @@ impl View for WorkbenchView {
         if !bounds.is_finite_positive() || !font.is_finite() {
             return;
         }
+        let eff_font = self.effective_font_metrics(font);
+        let font = &eff_font;
         let regions = self.compute_regions(bounds);
 
         // 1. Overall base background
         scene.push_quad(Quad::new(bounds).with_background(theme.editor_background));
+
+        // 1b. Title bar
+        if self.layout.title_bar_visible {
+            self.title_bar.render_bar(regions.title_bar, theme, font, scene);
+        }
 
         // 2. Activity bar
         if self.layout.activity_bar_visible {
@@ -1387,6 +1667,8 @@ impl View for WorkbenchView {
                 self.extensions_view.render(regions.sidebar, theme, font, scene);
             } else if view_id == "testing" || view_id == "workbench.view.testing" {
                 self.testing_view.render(regions.sidebar, theme, font, scene);
+            } else if view_id == "hierarchy" || view_id == "workbench.view.hierarchy" {
+                self.hierarchy_view.render(regions.sidebar, theme, font, scene);
             } else {
                 self.explorer.render(regions.sidebar, theme, font, scene);
             }
@@ -1529,6 +1811,79 @@ impl View for WorkbenchView {
             }
         }
 
+        // 6b. Secondary Sidebar (Outline & Hierarchy switcher)
+        if self.layout.secondary_sidebar_visible && regions.secondary_sidebar.is_finite_positive() {
+            let sr = regions.secondary_sidebar;
+            scene.push_finite_quad(
+                Quad::new(sr)
+                    .with_background(theme.sidebar_bg)
+                    .with_border_edges(theme.sidebar_border, Edges::new(0.0, 0.0, 0.0, 1.0)),
+            );
+            let (tab_outline, tab_hierarchy, close_rect, content_rect) =
+                Self::secondary_sidebar_rects(sr);
+            let is_hier = self.layout.active_secondary_sidebar_view == "hierarchy";
+            scene.push_finite_text(GlyphRun::new(
+                "OUTLINE".to_string(),
+                Point::new(tab_outline.min_x() + 2.0, tab_outline.min_y() + 5.0),
+                tab_outline,
+                if !is_hier { theme.tab_active_fg } else { theme.tab_inactive_fg },
+                font.font_size * 0.85,
+            ));
+            scene.push_finite_text(GlyphRun::new(
+                "HIERARCHY".to_string(),
+                Point::new(tab_hierarchy.min_x() + 2.0, tab_hierarchy.min_y() + 5.0),
+                tab_hierarchy,
+                if is_hier { theme.tab_active_fg } else { theme.tab_inactive_fg },
+                font.font_size * 0.85,
+            ));
+            scene.push_finite_text(GlyphRun::new(
+                "x".to_string(),
+                Point::new(close_rect.min_x() + 6.0, close_rect.min_y() + 5.0),
+                close_rect,
+                theme.sidebar_header_fg,
+                font.font_size * 0.85,
+            ));
+            if is_hier {
+                self.hierarchy_view.render(content_rect, theme, font, scene);
+            } else {
+                let symbols = self.secondary_sidebar_outline_items();
+                if symbols.is_empty() {
+                    scene.push_finite_text(GlyphRun::new(
+                        "No symbols in active editor".to_string(),
+                        Point::new(content_rect.min_x() + 10.0, content_rect.min_y() + 10.0),
+                        content_rect,
+                        theme.breadcrumb_fg,
+                        font.font_size * 0.9,
+                    ));
+                } else {
+                    for (idx, (sym_name, sym_line)) in symbols.iter().enumerate() {
+                        let ry = content_rect.min_y() + 4.0 + (idx as f32) * 22.0;
+                        if ry + 20.0 > content_rect.max_y() {
+                            break;
+                        }
+                        let row_rect = Rect::from_xywh(content_rect.min_x() + 4.0, ry, content_rect.width() - 8.0, 20.0);
+                        scene.push_finite_text(GlyphRun::new(
+                            format!("{} :{}", sym_name, sym_line + 1),
+                            Point::new(row_rect.min_x() + 6.0, ry + 3.0),
+                            row_rect,
+                            theme.sidebar_fg,
+                            font.font_size * 0.9,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // 6c. Draggable Workbench Sashes highlight
+        for (sash_kind, sash_rect) in self.compute_sashes(&regions) {
+            let color = if self.active_sash == Some(sash_kind) {
+                theme.sash_hover
+            } else {
+                theme.panel_border
+            };
+            scene.push_finite_quad(Quad::new(sash_rect).with_background(color));
+        }
+
         // 7. Command Palette modal overlay
         if self.is_command_palette_open {
             if let Some(palette) = &self.command_palette {
@@ -1545,6 +1900,21 @@ impl View for WorkbenchView {
         if self.prompt_overlay.is_open() {
             self.prompt_overlay.render(bounds, theme, font, scene);
         }
+
+        // 10. Multi-file Refactoring Preview overlay
+        if self.refactor_preview.is_visible {
+            scene.push_quad(Quad::new(bounds).with_background(Rgba::new(0.0, 0.0, 0.0, 0.35)));
+            self.refactor_preview.render(bounds, theme, font, scene);
+        }
+
+        // 11. Custom TitleBar dropdown menu & Workbench Context Menu overlays (top z-order)
+        if self.layout.title_bar_visible {
+            self.title_bar
+                .render_dropdown(regions.title_bar, bounds, theme, font, scene);
+        }
+        if self.context_menu.is_open {
+            self.context_menu.render(bounds, theme, font, scene);
+        }
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
@@ -1558,6 +1928,18 @@ impl View for WorkbenchView {
             let res = self.prompt_overlay.handle_event(event, bounds);
             if let Some(act) = self.prompt_overlay.last_action.take() {
                 self.last_action = Some(WorkbenchAction::PromptAction(act));
+            }
+            return res;
+        }
+
+        // Modal refactor preview overlay intercept
+        if self.refactor_preview.is_visible {
+            if matches!(event, InputEvent::MouseUp(_)) {
+                self.editor_area.clear_all_drag_state();
+            }
+            let res = self.refactor_preview.handle_event(event, bounds);
+            if let Some(act) = self.refactor_preview.last_action.take() {
+                self.last_action = Some(WorkbenchAction::RefactorPreviewAction(act));
             }
             return res;
         }
@@ -1649,8 +2031,120 @@ impl View for WorkbenchView {
             }
         }
 
+        // Context Menu overlay (captures clicks/keys before region dispatch)
+        if self.context_menu.is_open {
+            let res = self.context_menu.handle_event(event, bounds);
+            if let Some(cmd) = self.context_menu.take_selected_command() {
+                let ctx_path = self.context_menu.context_path.take();
+                self.last_action = Some(WorkbenchAction::ContextMenuCommand {
+                    command: cmd,
+                    context_path: ctx_path,
+                });
+            }
+            if res == EventResult::Consumed {
+                return EventResult::Consumed;
+            }
+        }
+
+        // Custom TitleBar & Menu dropdown intercept
+        if self.layout.title_bar_visible {
+            let pointer_in_title = match event {
+                InputEvent::MouseDown(m) => regions.title_bar.contains(m.position),
+                InputEvent::MouseMove(mm) => regions.title_bar.contains(mm.position),
+                _ => false,
+            };
+            if self.title_bar.is_dropdown_open() || pointer_in_title {
+                let res = self.title_bar.dispatch_event_with_overlay(
+                    event,
+                    regions.title_bar,
+                    bounds,
+                );
+                if let Some(act) = self.title_bar.take_action() {
+                    match act {
+                        TitleBarAction::TogglePrimarySidebar => self.toggle_sidebar(),
+                        TitleBarAction::ToggleSecondarySidebar => {
+                            self.layout.toggle_secondary_sidebar();
+                            self.last_action = Some(WorkbenchAction::SecondarySidebarToggled(
+                                self.layout.secondary_sidebar_visible,
+                            ));
+                        }
+                        TitleBarAction::TogglePanel => self.toggle_panel(),
+                        TitleBarAction::ExecuteCommand(cmd) => {
+                            self.last_action = Some(WorkbenchAction::ExecuteCommand(cmd));
+                        }
+                        other => {
+                            self.last_action = Some(WorkbenchAction::TitleBarAction(other));
+                        }
+                    }
+                }
+                if res == EventResult::Consumed {
+                    return EventResult::Consumed;
+                }
+            }
+        }
+
         match event {
             InputEvent::MouseDown(mouse) => {
+                // Priority 0: Draggable Workbench sashes (±4px hit margin)
+                if mouse.button == MouseButton::Left {
+                    for (sash_kind, sash_rect) in self.compute_sashes(&regions) {
+                        let hit = Rect::from_xywh(
+                            sash_rect.min_x() - 4.0,
+                            sash_rect.min_y() - 4.0,
+                            sash_rect.width() + 8.0,
+                            sash_rect.height() + 8.0,
+                        );
+                        if hit.contains(mouse.position) {
+                            self.active_sash = Some(sash_kind);
+                            return EventResult::Consumed;
+                        }
+                    }
+                }
+
+                // Priority 0b: Right-click context menu dispatch
+                if mouse.button == MouseButton::Right {
+                    if self.layout.sidebar_visible && regions.sidebar.contains(mouse.position) {
+                        self.focused_region = FocusedRegion::Sidebar;
+                        let is_explorer = matches!(
+                            self.layout.active_sidebar_view.as_str(),
+                            "workbench.view.explorer" | "explorer" | ""
+                        );
+                        if is_explorer {
+                            let path = self.explorer.entry_path_at_point(regions.sidebar, mouse.position);
+                            if let Some(p) = &path {
+                                self.explorer.model.selected_path = Some(p.clone());
+                            }
+                            self.open_context_menu_at(
+                                MenuLocation::ExplorerContext,
+                                mouse.position,
+                                path,
+                            );
+                            return EventResult::Consumed;
+                        }
+                    } else if regions.editor_area.contains(mouse.position) {
+                        self.focused_region = FocusedRegion::Editor;
+                        if self.editor_area.tab_bar_contains(regions.editor_area, mouse.position) {
+                            let _ = self.editor_area.handle_event(event, regions.editor_area);
+                            self.open_context_menu_at(
+                                MenuLocation::EditorTitleContext,
+                                mouse.position,
+                                None,
+                            );
+                        } else {
+                            let _ = self.editor_area.handle_event(event, regions.editor_area);
+                            if let Some(ed) = self.editor_area.active_editor_mut() {
+                                ed.context_menu.close();
+                            }
+                            self.open_context_menu_at(
+                                MenuLocation::EditorContext,
+                                mouse.position,
+                                None,
+                            );
+                        }
+                        return EventResult::Consumed;
+                    }
+                }
+
                 // Priority 1: Floating Debug Toolbar overlay
                 if self.debug_toolbar.is_visible {
                     let tb_bounds = self.debug_toolbar.toolbar_bounds(regions.editor_area);
@@ -1771,6 +2265,12 @@ impl View for WorkbenchView {
                     } else if view_id == "testing" || view_id == "workbench.view.testing" {
                         let res = self.testing_view.handle_event(event, regions.sidebar);
                         self.process_testing_action();
+                        res
+                    } else if view_id == "hierarchy" || view_id == "workbench.view.hierarchy" {
+                        let res = self.hierarchy_view.handle_event(event, regions.sidebar);
+                        if let Some(act) = self.hierarchy_view.last_action.take() {
+                            self.last_action = Some(WorkbenchAction::HierarchyAction(act));
+                        }
                         res
                     } else {
                         let res = self.explorer.handle_event(event, regions.sidebar);
@@ -1901,6 +2401,55 @@ impl View for WorkbenchView {
                             _ => EventResult::Consumed,
                         }
                     }
+                } else if self.layout.secondary_sidebar_visible
+                    && regions.secondary_sidebar.contains(mouse.position)
+                {
+                    let (tab_outline, tab_hierarchy, close_rect, content_rect) =
+                        Self::secondary_sidebar_rects(regions.secondary_sidebar);
+                    if close_rect.contains(mouse.position) {
+                        self.layout.mutate(|l| l.secondary_sidebar_visible = false);
+                        self.last_action = Some(WorkbenchAction::SecondarySidebarToggled(false));
+                        return EventResult::Consumed;
+                    }
+                    if tab_outline.contains(mouse.position) {
+                        self.layout.mutate(|l| {
+                            l.active_secondary_sidebar_view = "outline".to_string();
+                            l.secondary_sidebar_visible = true;
+                        });
+                        return EventResult::Consumed;
+                    }
+                    if tab_hierarchy.contains(mouse.position) {
+                        self.layout.mutate(|l| {
+                            l.active_secondary_sidebar_view = "hierarchy".to_string();
+                            l.secondary_sidebar_visible = true;
+                        });
+                        return EventResult::Consumed;
+                    }
+                    if self.layout.active_secondary_sidebar_view == "hierarchy" {
+                        let res = self.hierarchy_view.handle_event(event, content_rect);
+                        if let Some(act) = self.hierarchy_view.last_action.take() {
+                            self.last_action = Some(WorkbenchAction::HierarchyAction(act));
+                        }
+                        return res;
+                    }
+                    if content_rect.contains(mouse.position) {
+                        let rel_y = mouse.position.y - (content_rect.min_y() + 4.0);
+                        if rel_y >= 0.0 {
+                            let idx = (rel_y / 22.0).floor() as usize;
+                            let syms = self.secondary_sidebar_outline_items();
+                            if let Some((_, line)) = syms.get(idx) {
+                                if let Some(ed) = self.editor_area.active_editor_mut() {
+                                    ed.jump_to_position_and_unfold(rustcode_editor::Position::new(
+                                        *line as usize,
+                                        0,
+                                    ));
+                                }
+                                self.focused_region = FocusedRegion::Editor;
+                            }
+                        }
+                        return EventResult::Consumed;
+                    }
+                    EventResult::Consumed
                 } else if regions.editor_area.contains(mouse.position) {
                     self.focused_region = FocusedRegion::Editor;
                     let res = self.editor_area.handle_event(event, regions.editor_area);
@@ -1993,6 +2542,12 @@ impl View for WorkbenchView {
                             let res = self.testing_view.handle_event(event, regions.sidebar);
                             self.process_testing_action();
                             res
+                        } else if view_id == "hierarchy" || view_id == "workbench.view.hierarchy" {
+                            let res = self.hierarchy_view.handle_event(event, regions.sidebar);
+                            if let Some(act) = self.hierarchy_view.last_action.take() {
+                                self.last_action = Some(WorkbenchAction::HierarchyAction(act));
+                            }
+                            res
                         } else {
                             let res = self.explorer.handle_event(event, regions.sidebar);
                             self.process_explorer_action();
@@ -2045,6 +2600,8 @@ impl View for WorkbenchView {
                         self.extensions_view.handle_event(event, regions.sidebar)
                     } else if view_id == "testing" || view_id == "workbench.view.testing" {
                         self.testing_view.handle_event(event, regions.sidebar)
+                    } else if view_id == "hierarchy" || view_id == "workbench.view.hierarchy" {
+                        self.hierarchy_view.handle_event(event, regions.sidebar)
                     } else {
                         self.explorer.handle_event(event, regions.sidebar)
                     }
@@ -2067,6 +2624,14 @@ impl View for WorkbenchView {
                 }
             }
             InputEvent::MouseMove(mouse) => {
+                if let Some(sash) = self.active_sash {
+                    self.update_sash_drag(sash, mouse.position, bounds);
+                    return EventResult::Consumed;
+                }
+                if self.explorer.drag_state.is_some() {
+                    let _ = self.explorer.handle_event(event, regions.sidebar);
+                    return EventResult::Consumed;
+                }
                 let dragging = self.editor_area.is_minimap_or_sash_dragging();
                 if dragging || regions.editor_area.contains(mouse.position) {
                     self.editor_area.handle_event(event, regions.editor_area)
@@ -2074,7 +2639,44 @@ impl View for WorkbenchView {
                     EventResult::Ignored
                 }
             }
-            InputEvent::MouseUp(_) => {
+            InputEvent::MouseUp(mouse) => {
+                if self.active_sash.take().is_some() {
+                    return EventResult::Consumed;
+                }
+                if self.explorer.drag_state.is_some() {
+                    if regions.editor_area.contains(mouse.position) {
+                        if let Some(drag) = self.explorer.take_active_drag() {
+                            if !drag.is_dir {
+                                if let Some(gid) = self
+                                    .editor_area
+                                    .group_id_at_point(regions.editor_area, mouse.position)
+                                {
+                                    self.editor_area.focus_group(gid);
+                                }
+                                let uri = self
+                                    .editor_area
+                                    .find_open_tab_uri_for_path(&drag.source_path)
+                                    .unwrap_or_else(|| {
+                                        rustcode_platform::path_to_file_uri(&drag.source_path)
+                                    });
+                                let title = drag
+                                    .source_path
+                                    .file_name()
+                                    .map_or("untitled", |n| n.to_str().unwrap_or(""));
+                                let content =
+                                    std::fs::read_to_string(&drag.source_path).unwrap_or_default();
+                                self.editor_area.open_file(&uri, title, &content, false);
+                                self.focused_region = FocusedRegion::Editor;
+                                self.editor_area.sync_breadcrumbs(Some(&self.workspace));
+                                self.last_action = Some(WorkbenchAction::OpenFile(drag.source_path));
+                            }
+                            return EventResult::Consumed;
+                        }
+                    }
+                    let res = self.explorer.handle_event(event, regions.sidebar);
+                    self.process_explorer_action();
+                    return res;
+                }
                 let any_dragging = self.editor_area.is_minimap_or_sash_dragging();
                 let res = if any_dragging || self.focused_region == FocusedRegion::Editor {
                     self.editor_area.handle_event(event, regions.editor_area)
@@ -3261,5 +3863,112 @@ mod tests {
             .active_tab()
             .unwrap()
             .is_dirty);
+    }
+
+    #[test]
+    fn test_workbench_view_phase9_m3_layout_sashes_zoom_zen_context_and_dnd() {
+        use rustcode_platform::render::{MouseButton, MouseEvent, MouseMoveEvent};
+        use crate::explorer::FileTreeNode;
+
+        let mut wb = WorkbenchView::new();
+        let bounds = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+
+        // 1. Secondary Sidebar + TitleBar + PanelPosition::{Left, Right, Bottom} + Zoom + Zen Mode
+        wb.layout.mutate(|l| {
+            l.toggle_title_bar();
+            l.toggle_secondary_sidebar();
+            l.panel_visible = true;
+            l.set_panel_position(PanelPosition::Right);
+        });
+        let reg = wb.compute_regions(bounds);
+        assert_eq!(reg.title_bar.height(), TitleBarView::HEIGHT);
+        assert!(reg.secondary_sidebar.width() > 0.0);
+        assert!(reg.panel.min_x() >= reg.editor_area.max_x() - 0.1);
+        assert!(reg.secondary_sidebar.min_x() >= reg.panel.max_x() - 0.1);
+
+        // Sash drag on Sidebar resizes sidebar_width
+        let orig_sb_w = wb.layout.sidebar_width;
+        let sb_sash_x = reg.sidebar.max_x();
+        assert_eq!(
+            wb.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(Point::new(sb_sash_x, 200.0), MouseButton::Left)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            wb.handle_event(
+                &InputEvent::MouseMove(MouseMoveEvent {
+                    position: Point::new(sb_sash_x + 40.0, 200.0)
+                }),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        wb.handle_event(
+            &InputEvent::MouseUp(MouseEvent::new(
+                Point::new(sb_sash_x + 40.0, 200.0),
+                MouseButton::Left
+            )),
+            bounds,
+        );
+        assert!((wb.layout.sidebar_width - (orig_sb_w + 40.0)).abs() < 1.0);
+
+        // Zoom scales effective font metrics
+        let base_font = FontMetrics::default_monospace();
+        assert_eq!(wb.effective_font_metrics(&base_font), base_font);
+        wb.layout.zoom_in();
+        let zoomed_font = wb.effective_font_metrics(&base_font);
+        assert!(zoomed_font.font_size > base_font.font_size);
+
+        // Zen Mode hides chrome and restores on exit
+        wb.layout.toggle_zen_mode();
+        let zen_reg = wb.compute_regions(bounds);
+        assert_eq!(zen_reg.editor_area, bounds);
+        wb.layout.toggle_zen_mode();
+        let restored_reg = wb.compute_regions(bounds);
+        assert!(restored_reg.title_bar.height() > 0.0);
+        assert!(restored_reg.sidebar.width() > 0.0);
+        assert!(restored_reg.secondary_sidebar.width() > 0.0);
+
+        // 2. Right-click opens WorkbenchContextMenu in editor area and selects command
+        let ed_pt = Point::new(restored_reg.editor_area.min_x() + 80.0, restored_reg.editor_area.min_y() + 80.0);
+        assert_eq!(
+            wb.handle_event(
+                &InputEvent::MouseDown(MouseEvent::new(ed_pt, MouseButton::Right)),
+                bounds
+            ),
+            EventResult::Consumed
+        );
+        assert!(wb.context_menu.is_open);
+
+        // Render full M3 chrome + overlays
+        let mut scene = Scene::new();
+        wb.render(bounds, &WorkbenchThemeStyles::dark_default(), &base_font, &mut scene);
+        assert!(scene.contains_text("File"));
+        assert!(scene.contains_text("OUTLINE"));
+        assert!(scene.contains_text("Go to Definition"));
+
+        // 3. Explorer -> Editor D&D opens dragged file in target editor group
+        let tmp = std::env::temp_dir().join(format!("rustcode_wb_dnd_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let drag_file = tmp.join("dragged.rs");
+        std::fs::write(&drag_file, "fn dragged_fn() {}\n").unwrap();
+        wb.explorer.model.set_roots(vec![FileTreeNode::from_path(tmp.clone())]);
+        wb.explorer.model.expanded_paths.insert(tmp.clone());
+        let reg2 = wb.compute_regions(bounds);
+        wb.render(bounds, &WorkbenchThemeStyles::dark_default(), &base_font, &mut scene);
+
+        // Close context menu first
+        wb.context_menu.close();
+        let file_y = reg2.sidebar.min_y() + 28.0 + 22.0 + 8.0; // header(28) + root(22) + first child
+        let start = Point::new(reg2.sidebar.min_x() + 20.0, file_y);
+        let drop_pt = Point::new(reg2.editor_area.min_x() + 100.0, reg2.editor_area.min_y() + 120.0);
+        wb.handle_event(&InputEvent::MouseDown(MouseEvent::new(start, MouseButton::Left)), bounds);
+        wb.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: drop_pt }), bounds);
+        wb.handle_event(&InputEvent::MouseUp(MouseEvent::new(drop_pt, MouseButton::Left)), bounds);
+        assert!(wb.editor_area.find_open_tab_uri_for_path(&drag_file).is_some());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

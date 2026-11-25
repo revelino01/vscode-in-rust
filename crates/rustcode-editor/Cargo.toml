@@ -39,3 +39,7 @@ tree-sitter-json = { version = "0.24", optional = true }
 [[bench]]
 name = "editor_latency"
 harness = false
+
+[[bench]]
+name = "large_file"
+harness = false

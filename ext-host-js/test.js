@@ -1997,6 +1997,76 @@ exec.end(true, 200);
     }
   }
 
+  console.log('[Test] Testing Phase 9 M1 vscode.languages advanced providers & types...');
+  {
+    const md = new vscode.MarkdownString('**Hello** ');
+    md.appendCodeblock('let x = 1;', 'rust');
+    assert(md.value.includes('**Hello**') && md.value.includes('```rust'), 'MarkdownString failed');
+
+    const legend = new vscode.SemanticTokensLegend(['function', 'variable'], ['declaration', 'readonly']);
+    const builder = new vscode.SemanticTokensBuilder(legend);
+    builder.push(0, 3, 4, 'function', ['declaration']);
+    builder.push(1, 4, 3, 'variable', ['readonly']);
+    const semTokens = builder.build('rev-1');
+    assert(semTokens.resultId === 'rev-1', 'SemanticTokens resultId mismatch');
+    assert(JSON.stringify(semTokens.data) === JSON.stringify([0, 3, 4, 0, 1, 1, 4, 3, 1, 2]), 'SemanticTokensBuilder delta mismatch');
+
+    const loc = new vscode.Location(vscode.Uri.file('/tmp/a.rs'), new vscode.Range(1, 2, 1, 5));
+    assert(loc.uri === 'file:///tmp/a.rs' && loc.range.start.line === 1, 'Location failed');
+
+    const sigHelp = new vscode.SignatureHelp();
+    const sigInfo = new vscode.SignatureInformation('fn foo(a: i32)', new vscode.MarkdownString('Docs'));
+    sigInfo.parameters = [new vscode.ParameterInformation('a: i32', 'Param a')];
+    sigHelp.signatures.push(sigInfo);
+    assert(sigHelp.signatures[0].parameters[0].label === 'a: i32', 'SignatureHelp failed');
+
+    const hint = new vscode.InlayHint(new vscode.Position(0, 5), [new vscode.InlayHintLabelPart(': i32')], vscode.InlayHintKind.Type);
+    assert(hint.kind === 1 && hint.label[0].value === ': i32', 'InlayHint failed');
+
+    const lens = new vscode.CodeLens(new vscode.Range(0, 0, 0, 1), { title: 'Run', command: 'test.run' });
+    assert(lens.isResolved === true, 'CodeLens isResolved failed');
+
+    const d1 = vscode.languages.registerReferenceProvider('rust', { provideReferences: () => [loc] });
+    const d2 = vscode.languages.registerSignatureHelpProvider('rust', { provideSignatureHelp: () => sigHelp }, '(');
+    const d3 = vscode.languages.registerImplementationProvider('rust', { provideImplementation: () => [loc] });
+    const d4 = vscode.languages.registerTypeDefinitionProvider('rust', { provideTypeDefinition: () => [loc] });
+    const d5 = vscode.languages.registerRenameProvider('rust', {
+      prepareRename: () => new vscode.Range(0, 0, 0, 3),
+      provideRenameEdits: () => {
+        const we = new vscode.WorkspaceEdit();
+        we.replace(vscode.Uri.file('/tmp/a.rs'), new vscode.Range(0, 0, 0, 3), 'bar');
+        return we;
+      },
+    });
+    const d6 = vscode.languages.registerDocumentSemanticTokensProvider('rust', { provideDocumentSemanticTokens: () => semTokens }, legend);
+    const d7 = vscode.languages.registerInlayHintsProvider('rust', { provideInlayHints: () => [hint] });
+    const d8 = vscode.languages.registerCodeLensProvider('rust', { provideCodeLenses: () => [lens] });
+    const d9 = vscode.languages.registerDocumentLinkProvider('rust', { provideDocumentLinks: () => [new vscode.DocumentLink(new vscode.Range(0, 0, 0, 5), 'https://example.com')] });
+    const chItem = new vscode.CallHierarchyItem(12, 'foo', 'mod', vscode.Uri.file('/tmp/a.rs'), new vscode.Range(0, 0, 2, 1), new vscode.Range(0, 3, 0, 6));
+    const d10 = vscode.languages.registerCallHierarchyProvider('rust', {
+      prepareCallHierarchy: () => [chItem],
+      provideCallHierarchyIncomingCalls: () => [new vscode.CallHierarchyIncomingCall(chItem, [new vscode.Range(1, 0, 1, 3)])],
+      provideCallHierarchyOutgoingCalls: () => [new vscode.CallHierarchyOutgoingCall(chItem, [new vscode.Range(1, 0, 1, 3)])],
+    });
+    const thItem = new vscode.TypeHierarchyItem(11, 'MyTrait', 'mod', vscode.Uri.file('/tmp/a.rs'), new vscode.Range(0, 0, 2, 1), new vscode.Range(0, 6, 0, 13));
+    const d11 = vscode.languages.registerTypeHierarchyProvider('rust', {
+      prepareTypeHierarchy: () => [thItem],
+      provideTypeHierarchySupertypes: () => [thItem],
+      provideTypeHierarchySubtypes: () => [thItem],
+    });
+
+    const sigRes = await rpc.handleIncomingRequest('languages.provideSignatureHelp', { providerId: 'rust', uri: 'file:///tmp/a.rs', position: { line: 0, character: 1 } });
+    assert(sigRes && sigRes.signatures.length === 1, 'provideSignatureHelp RPC failed');
+    const semRes = await rpc.handleIncomingRequest('languages.provideDocumentSemanticTokens', { providerId: 'rust', uri: 'file:///tmp/a.rs' });
+    assert(semRes && semRes.legend && semRes.data.length === 10, 'provideDocumentSemanticTokens RPC failed');
+    const renameRes = await rpc.handleIncomingRequest('languages.provideRenameEdits', { providerId: 'rust', uri: 'file:///tmp/a.rs', position: { line: 0, character: 1 }, newName: 'bar' });
+    assert(renameRes && renameRes.changes && renameRes.changes['file:///tmp/a.rs'].length === 1, 'provideRenameEdits RPC failed');
+    const callRes = await rpc.handleIncomingRequest('languages.provideCallHierarchyIncomingCalls', { providerId: 'rust', item: chItem });
+    assert(Array.isArray(callRes) && callRes.length === 1, 'provideCallHierarchyIncomingCalls RPC failed');
+
+    [d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11].forEach((d) => d.dispose());
+  }
+
   console.log('All JavaScript extension host tests passed successfully!');
 })();
 

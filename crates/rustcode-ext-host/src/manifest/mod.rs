@@ -37,6 +37,27 @@ pub struct Contributions {
     pub authentication: Option<Vec<AuthenticationContribution>>,
     #[serde(rename = "customEditors", default)]
     pub custom_editors: Vec<CustomEditorContribution>,
+    #[serde(default)]
+    pub snippets: Option<Vec<SnippetContribution>>,
+    #[serde(default)]
+    pub menus: Option<std::collections::HashMap<String, Vec<MenuContribution>>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnippetContribution {
+    pub language: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MenuContribution {
+    pub command: String,
+    #[serde(default)]
+    pub when: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+    #[serde(default)]
+    pub alt: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,6 +207,8 @@ pub struct LanguageContribution {
     pub extensions: Vec<String>,
     #[serde(default)]
     pub aliases: Vec<String>,
+    #[serde(default)]
+    pub configuration: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,24 +2,25 @@
 
 use parking_lot::RwLock;
 use rustcode_editor::{
-    DiffEditorView, EditorView, GrammarRegistry, Position, Range, RangeEdit, TextDocument,
-    WordWrapMode,
+    DiffEditorView, EditorView, GrammarRegistry, LanguageConfigurationRegistry, Position, Range,
+    RangeEdit, SnippetRegistry, TextDocument, WordWrapMode,
 };
 use rustcode_ext_host::manifest::CustomEditorContribution;
 use rustcode_ext_host::webview::{ExtHostWebviewManager, WebviewOptions};
 use rustcode_platform::fs::{FileMetadata, FileSystemError, FileSystemService};
 use rustcode_platform::render::{
-    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, Point, Quad, Rect, Scene, View,
-    WorkbenchThemeStyles,
+    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, MouseButton, Point, Quad, Rect, Rgba,
+    Scene, View, WorkbenchThemeStyles,
 };
 use rustcode_platform::theme::ThemeService;
-use rustcode_protocols::lsp::WorkspaceEdit;
+use rustcode_protocols::lsp::{DocumentChange, WorkspaceEdit};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use crate::breadcrumbs::{BreadcrumbItem, BreadcrumbKind, BreadcrumbsAction, BreadcrumbsBar};
 use crate::notebook::NotebookEditorView;
+use crate::refactor_preview::{FileUndoSnapshot, WorkspaceEditUndoEntry};
 use crate::settings_ui::SettingsUiView;
 use crate::webview::WebviewEditorView;
 use crate::workspace::Workspace;
@@ -245,6 +246,47 @@ impl EditorArea {
         true
     }
 
+    pub fn reorder_tab_in_group(&mut self, group_id: usize, from_idx: usize, to_idx: usize) -> bool {
+        let Some(group) = self.group_by_id_mut(group_id) else {
+            return false;
+        };
+        if from_idx >= group.tabs.len() {
+            return false;
+        }
+        let target = to_idx.min(group.tabs.len() - 1);
+        if from_idx == target {
+            group.active_tab_index = Some(from_idx);
+            return false;
+        }
+        let tab = group.tabs.remove(from_idx);
+        group.tabs.insert(target, tab);
+        group.active_tab_index = Some(target);
+        true
+    }
+
+    pub fn split_group_empty(
+        &mut self,
+        target_group_id: usize,
+        direction: SplitDirection,
+        insert_before: bool,
+    ) -> Option<usize> {
+        self.group_by_id(target_group_id)?;
+        let new_id = self.next_group_id;
+        self.next_group_id += 1;
+        let new_group = EditorGroup::with_id(new_id);
+        if !Self::split_leaf_with_order(
+            &mut self.grid,
+            target_group_id,
+            new_id,
+            direction,
+            insert_before,
+        ) {
+            return None;
+        }
+        self.groups.push(new_group);
+        Some(new_id)
+    }
+
     pub fn focus_group(&mut self, group_id: usize) -> bool {
         if let Some(idx) = self.group_index_by_id(group_id) {
             self.active_group = idx;
@@ -327,20 +369,35 @@ impl EditorArea {
         new_id: usize,
         direction: SplitDirection,
     ) -> bool {
+        Self::split_leaf_with_order(node, target_id, new_id, direction, false)
+    }
+
+    fn split_leaf_with_order(
+        node: &mut EditorGridNode,
+        target_id: usize,
+        new_id: usize,
+        direction: SplitDirection,
+        insert_before: bool,
+    ) -> bool {
         match node {
             EditorGridNode::Leaf(id) if *id == target_id => {
+                let (first_id, second_id) = if insert_before {
+                    (new_id, target_id)
+                } else {
+                    (target_id, new_id)
+                };
                 *node = EditorGridNode::Split {
                     direction,
                     ratio: 0.5,
-                    first: Box::new(EditorGridNode::Leaf(target_id)),
-                    second: Box::new(EditorGridNode::Leaf(new_id)),
+                    first: Box::new(EditorGridNode::Leaf(first_id)),
+                    second: Box::new(EditorGridNode::Leaf(second_id)),
                 };
                 true
             }
             EditorGridNode::Leaf(_) => false,
             EditorGridNode::Split { first, second, .. } => {
-                Self::split_leaf(first, target_id, new_id, direction)
-                    || Self::split_leaf(second, target_id, new_id, direction)
+                Self::split_leaf_with_order(first, target_id, new_id, direction, insert_before)
+                    || Self::split_leaf_with_order(second, target_id, new_id, direction, insert_before)
             }
         }
     }
@@ -581,6 +638,30 @@ pub enum EditorAreaAction {
     GroupClosed(usize),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabDragState {
+    pub source_group_id: usize,
+    pub source_tab_index: usize,
+    pub uri: String,
+    pub start_pos: Point,
+    pub current_pos: Point,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TabDropZone {
+    ReorderTab {
+        group_id: usize,
+        target_index: usize,
+    },
+    MoveToGroup(usize),
+    SplitGroup {
+        group_id: usize,
+        direction: SplitDirection,
+        insert_before: bool,
+    },
+}
+
 pub struct EditorAreaView {
     pub model: EditorArea,
     pub editors: HashMap<String, EditorView>,
@@ -594,6 +675,8 @@ pub struct EditorAreaView {
     pub settings_views: HashMap<String, SettingsUiView>,
     pub notebooks: HashMap<String, NotebookEditorView>,
     pub grammar_registry: Arc<GrammarRegistry>,
+    pub language_configs: LanguageConfigurationRegistry,
+    pub snippet_registry: SnippetRegistry,
     pub last_action: Option<EditorAreaAction>,
     pub breadcrumbs_enabled: bool,
     pub minimap_enabled: bool,
@@ -604,6 +687,7 @@ pub struct EditorAreaView {
     pub custom_editor_panels: HashMap<String, String>,
     pub custom_editor_contributions: Vec<CustomEditorContribution>,
     pub active_sash_drag: Option<(Vec<bool>, Rect)>,
+    pub active_tab_drag: Option<TabDragState>,
     known_workspace: Option<Workspace>,
 }
 
@@ -632,6 +716,8 @@ impl EditorAreaView {
             settings_views: HashMap::new(),
             notebooks: HashMap::new(),
             grammar_registry: Arc::new(GrammarRegistry::new()),
+            language_configs: LanguageConfigurationRegistry::new(),
+            snippet_registry: SnippetRegistry::new(),
             last_action: None,
             breadcrumbs_enabled: true,
             minimap_enabled: true,
@@ -642,6 +728,7 @@ impl EditorAreaView {
             custom_editor_panels: HashMap::new(),
             custom_editor_contributions: Vec::new(),
             active_sash_drag: None,
+            active_tab_drag: None,
             known_workspace: None,
         }
     }
@@ -874,6 +961,7 @@ impl EditorAreaView {
 
     pub fn is_minimap_or_sash_dragging(&self) -> bool {
         self.active_sash_drag.is_some()
+            || self.active_tab_drag.is_some()
             || self.editors.values().any(|e| e.minimap_dragging)
             || self.split_editors.values().any(|e| e.minimap_dragging)
     }
@@ -886,7 +974,187 @@ impl EditorAreaView {
     }
 
     pub fn clear_all_drag_state(&mut self) {
+        self.active_tab_drag = None;
         self.clear_all_minimap_dragging();
+    }
+
+    pub fn group_id_at_point(&self, bounds: Rect, pos: Point) -> Option<usize> {
+        self.model
+            .compute_group_rects(bounds)
+            .into_iter()
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(gid, _)| gid)
+    }
+
+    pub fn tab_rects_for_group(
+        &self,
+        group_id: usize,
+        group_rect: Rect,
+        font: &FontMetrics,
+    ) -> Vec<(usize, Rect, f32)> {
+        let tab_bar_h = 35.0;
+        let Some(group) = self.model.group_by_id(group_id) else {
+            return Vec::new();
+        };
+        let mut cur_x = group_rect.min_x();
+        let mut list = Vec::with_capacity(group.tabs.len());
+        for (idx, tab) in group.tabs.iter().enumerate() {
+            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
+            let tab_rect = Rect::from_xywh(cur_x, group_rect.min_y(), tab_w, tab_bar_h);
+            list.push((idx, tab_rect, cur_x + tab_w - 22.0));
+            cur_x += tab_w;
+        }
+        list
+    }
+
+    pub fn tab_bar_contains(&self, bounds: Rect, pos: Point) -> bool {
+        self.model
+            .compute_group_rects(bounds)
+            .into_iter()
+            .any(|(_, rect)| rect.contains(pos) && pos.y < rect.min_y() + 35.0)
+    }
+
+    pub fn move_tab_to_group(
+        &mut self,
+        from_group: usize,
+        from_index: usize,
+        to_group: usize,
+    ) -> bool {
+        if from_group == to_group {
+            return false;
+        }
+        if self.model.group_by_id(to_group).is_none() {
+            return false;
+        }
+        let Some(tab) = (if let Some(src) = self.model.group_by_id_mut(from_group) {
+            if from_index < src.tabs.len() {
+                let removed = src.tabs.remove(from_index);
+                if src.tabs.is_empty() {
+                    src.active_tab_index = None;
+                } else if let Some(active) = src.active_tab_index {
+                    if active >= src.tabs.len() {
+                        src.active_tab_index = Some(src.tabs.len() - 1);
+                    } else if active > from_index {
+                        src.active_tab_index = Some(active - 1);
+                    }
+                }
+                Some(removed)
+            } else {
+                None
+            }
+        } else {
+            None
+        }) else {
+            return false;
+        };
+
+        let target_already_has_uri = self
+            .model
+            .group_by_id(to_group)
+            .is_some_and(|g| g.tabs.iter().any(|t| t.uri == tab.uri));
+
+        if !target_already_has_uri {
+            if self.primary_editor_group.get(&tab.uri) == Some(&from_group) {
+                self.primary_editor_group.insert(tab.uri.clone(), to_group);
+            } else if let Some(ed) = self.split_editors.remove(&(from_group, tab.uri.clone())) {
+                self.split_editors.entry((to_group, tab.uri.clone())).or_insert(ed);
+            }
+            if self.primary_webview_group.get(&tab.uri) == Some(&from_group) {
+                self.primary_webview_group.insert(tab.uri.clone(), to_group);
+            } else if let Some(wv) = self.split_webviews.remove(&(from_group, tab.uri.clone())) {
+                self.split_webviews.entry((to_group, tab.uri.clone())).or_insert(wv);
+            }
+        }
+
+        if let Some(dst) = self.model.group_by_id_mut(to_group) {
+            if let Some(existing_idx) = dst.tabs.iter().position(|t| t.uri == tab.uri) {
+                dst.tabs[existing_idx].is_preview = false;
+                dst.active_tab_index = Some(existing_idx);
+            } else {
+                dst.tabs.push(tab);
+                dst.active_tab_index = Some(dst.tabs.len() - 1);
+            }
+        }
+
+        let src_empty = self
+            .model
+            .group_by_id(from_group)
+            .is_some_and(|g| g.tabs.is_empty());
+        if src_empty && self.model.groups.len() > 1 && self.model.close_group(from_group) {
+            self.active_sash_drag = None;
+            self.last_action = Some(EditorAreaAction::GroupClosed(from_group));
+        }
+
+        self.focus_group(to_group);
+        self.retain_open_resources();
+        self.sync_editor_focus();
+        self.sync_breadcrumbs(None);
+        true
+    }
+
+    pub fn resolve_tab_drop_target(&self, bounds: Rect, pos: Point) -> Option<TabDropZone> {
+        let font = FontMetrics::default_monospace();
+        let src_gid = self.active_tab_drag.as_ref().map(|d| d.source_group_id);
+        for (gid, rect) in self.model.compute_group_rects(bounds) {
+            if !rect.contains(pos) {
+                continue;
+            }
+            if pos.y < rect.min_y() + 35.0 {
+                let tabs_len = self.model.group_by_id(gid).map_or(0, |g| g.tabs.len());
+                if tabs_len == 0 {
+                    return Some(TabDropZone::MoveToGroup(gid));
+                }
+                let tab_rects = self.tab_rects_for_group(gid, rect, &font);
+                for (idx, tr, _) in &tab_rects {
+                    if pos.x < tr.min_x() + tr.width() * 0.5 || tr.contains(pos) {
+                        return Some(TabDropZone::ReorderTab {
+                            group_id: gid,
+                            target_index: *idx,
+                        });
+                    }
+                }
+                if src_gid == Some(gid) {
+                    return Some(TabDropZone::ReorderTab {
+                        group_id: gid,
+                        target_index: tabs_len.saturating_sub(1),
+                    });
+                }
+                return Some(TabDropZone::MoveToGroup(gid));
+            }
+            let rel_x = (pos.x - rect.min_x()) / rect.width().max(1.0);
+            let rel_y = (pos.y - rect.min_y()) / rect.height().max(1.0);
+            let can_split = src_gid != Some(gid)
+                || self.model.group_by_id(gid).is_some_and(|g| g.tabs.len() > 1);
+            if can_split {
+                if rel_x < 0.25 {
+                    return Some(TabDropZone::SplitGroup {
+                        group_id: gid,
+                        direction: SplitDirection::Horizontal,
+                        insert_before: true,
+                    });
+                } else if rel_x > 0.75 {
+                    return Some(TabDropZone::SplitGroup {
+                        group_id: gid,
+                        direction: SplitDirection::Horizontal,
+                        insert_before: false,
+                    });
+                } else if rel_y < 0.25 {
+                    return Some(TabDropZone::SplitGroup {
+                        group_id: gid,
+                        direction: SplitDirection::Vertical,
+                        insert_before: true,
+                    });
+                } else if rel_y > 0.75 {
+                    return Some(TabDropZone::SplitGroup {
+                        group_id: gid,
+                        direction: SplitDirection::Vertical,
+                        insert_before: false,
+                    });
+                }
+            }
+            return Some(TabDropZone::MoveToGroup(gid));
+        }
+        None
     }
 
     pub fn webview_for_group(&self, group_id: usize, uri: &str) -> Option<&WebviewEditorView> {
@@ -1612,6 +1880,9 @@ impl EditorAreaView {
                 .with_word_wrap_column(self.word_wrap_column);
             let theme = ThemeService::default_dark_theme();
             editor.set_language(grammar.language_id(), theme, &self.grammar_registry);
+            if let Some(cfg) = self.language_configs.get(grammar.language_id()).cloned() {
+                editor.set_language_config(Some(cfg));
+            }
 
             self.editors.insert(uri.to_string(), editor);
             self.primary_editor_group.insert(uri.to_string(), gid);
@@ -1759,38 +2030,194 @@ impl EditorAreaView {
 
     pub fn apply_workspace_edit(&mut self, edit: &WorkspaceEdit) -> usize {
         let mut total_applied = 0;
-        if let Some(changes) = &edit.changes {
-            for (uri, lsp_edits) in changes {
-                let range_edits: Vec<RangeEdit> = lsp_edits
-                    .iter()
-                    .map(|e| RangeEdit {
-                        range: Range::new(
-                            Position::new(e.range.start.line as usize, e.range.start.character as usize),
-                            Position::new(e.range.end.line as usize, e.range.end.character as usize),
-                        ),
-                        new_text: e.new_text.clone(),
-                    })
-                    .collect();
 
-                if self.apply_text_edits(uri, &range_edits) {
+        if let Some(doc_changes) = &edit.document_changes {
+            for change in doc_changes {
+                match change {
+                    DocumentChange::CreateFile { uri } => {
+                        let path = rustcode_platform::file_uri_to_path(uri);
+                        if !path.exists() {
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::write(&path, "").is_ok() {
+                                total_applied += 1;
+                            }
+                        }
+                    }
+                    DocumentChange::RenameFile { old_uri, new_uri } => {
+                        let old_path = rustcode_platform::file_uri_to_path(old_uri);
+                        let new_path = rustcode_platform::file_uri_to_path(new_uri);
+                        if old_path.exists() {
+                            if let Some(parent) = new_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            if std::fs::rename(&old_path, &new_path).is_ok() {
+                                total_applied += 1;
+                            }
+                        }
+                    }
+                    DocumentChange::DeleteFile { uri } => {
+                        let path = rustcode_platform::file_uri_to_path(uri);
+                        if path.exists() {
+                            let ok = if path.is_dir() {
+                                std::fs::remove_dir_all(&path).is_ok()
+                            } else {
+                                std::fs::remove_file(&path).is_ok()
+                            };
+                            if ok {
+                                total_applied += 1;
+                            }
+                        }
+                    }
+                    DocumentChange::Edit(_) => {}
+                }
+            }
+        }
+
+        for (uri, lsp_edits) in edit.all_text_edits() {
+            let range_edits: Vec<RangeEdit> = lsp_edits
+                .into_iter()
+                .map(|e| RangeEdit {
+                    range: Range::new(
+                        Position::new(e.range.start.line as usize, e.range.start.character as usize),
+                        Position::new(e.range.end.line as usize, e.range.end.character as usize),
+                    ),
+                    new_text: e.new_text,
+                })
+                .collect();
+
+            let path = rustcode_platform::file_uri_to_path(&uri);
+            let target_uri = self
+                .find_open_tab_uri_for_path(&path)
+                .unwrap_or_else(|| uri.clone());
+
+            if self.apply_text_edits(&target_uri, &range_edits) {
+                total_applied += range_edits.len();
+            } else if let Ok(content) = std::fs::read_to_string(&path) {
+                let fallback_title = path.to_string_lossy().into_owned();
+                let title = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&fallback_title);
+                self.open_file(&uri, title, &content, false);
+                if self.apply_text_edits(&uri, &range_edits) {
                     total_applied += range_edits.len();
-                } else {
-                    let path = rustcode_platform::file_uri_to_path(uri);
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let fallback_title = path.to_string_lossy().into_owned();
-                        let title = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or(&fallback_title);
-                        self.open_file(uri, title, &content, false);
-                        if self.apply_text_edits(uri, &range_edits) {
-                            total_applied += range_edits.len();
+                }
+            }
+        }
+
+        total_applied
+    }
+
+    pub fn snapshot_files_for_workspace_edit(
+        &self,
+        edit: &WorkspaceEdit,
+        label: impl Into<String>,
+    ) -> WorkspaceEditUndoEntry {
+        let mut uris: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for (uri, _) in edit.all_text_edits() {
+            if seen.insert(uri.clone()) {
+                uris.push(uri);
+            }
+        }
+        if let Some(doc_changes) = &edit.document_changes {
+            for c in doc_changes {
+                match c {
+                    DocumentChange::Edit(e) => {
+                        let u = &e.text_document.uri;
+                        if seen.insert(u.clone()) {
+                            uris.push(u.clone());
+                        }
+                    }
+                    DocumentChange::CreateFile { uri } | DocumentChange::DeleteFile { uri } => {
+                        if seen.insert(uri.clone()) {
+                            uris.push(uri.clone());
+                        }
+                    }
+                    DocumentChange::RenameFile { old_uri, new_uri } => {
+                        for u in [old_uri, new_uri] {
+                            if seen.insert(u.clone()) {
+                                uris.push(u.clone());
+                            }
                         }
                     }
                 }
             }
         }
-        total_applied
+
+        let snapshots = uris
+            .into_iter()
+            .map(|uri| {
+                let path = rustcode_platform::file_uri_to_path(&uri);
+                let resolved_uri = self
+                    .find_open_tab_uri_for_path(&path)
+                    .unwrap_or_else(|| uri.clone());
+                let open_editor = self.any_editor_for_uri(&resolved_uri);
+                let existed_before = path.exists();
+                let previous_content = if let Some(ed) = open_editor {
+                    Some(ed.text())
+                } else {
+                    std::fs::read_to_string(&path).ok()
+                };
+                FileUndoSnapshot {
+                    uri: resolved_uri,
+                    path: (!uri.is_empty()).then_some(path),
+                    existed_before,
+                    previous_content,
+                    was_open: open_editor.is_some(),
+                }
+            })
+            .collect();
+
+        WorkspaceEditUndoEntry {
+            label: label.into(),
+            snapshots,
+        }
+    }
+
+    pub fn restore_workspace_edit_snapshot(&mut self, entry: &WorkspaceEditUndoEntry) -> usize {
+        let mut restored = 0;
+        for snap in &entry.snapshots {
+            if !snap.existed_before && !snap.was_open {
+                if let Some(path) = &snap.path {
+                    let closed = self.close_tabs_for_path(path) > 0;
+                    let removed = path.exists() && std::fs::remove_file(path).is_ok();
+                    if closed || removed {
+                        restored += 1;
+                    }
+                }
+                continue;
+            }
+            if let Some(prev) = &snap.previous_content {
+                let is_open = self.any_editor_for_uri(&snap.uri).is_some();
+                if is_open {
+                    self.for_each_editor_for_uri_mut(&snap.uri, |ed| {
+                        *ed.buffer.write() = rustcode_editor::PieceTable::from_str(prev);
+                        if let Some(doc) = &ed.document {
+                            let mut d = doc.write();
+                            d.version_id = d.version_id.saturating_add(1);
+                        }
+                        ed.recompute_folding();
+                    });
+                    restored += 1;
+                } else if let Some(path) = &snap.path {
+                    if snap.existed_before {
+                        if std::fs::write(path, prev).is_ok() {
+                            restored += 1;
+                        }
+                    } else if path.exists() && std::fs::remove_file(path).is_ok() {
+                        restored += 1;
+                    }
+                }
+            }
+        }
+        if restored > 0 {
+            self.sync_dirty_states();
+            self.sync_breadcrumbs(None);
+        }
+        restored
     }
 
     fn route_event_to_group_content(
@@ -2028,6 +2455,63 @@ impl View for EditorAreaView {
             };
             scene.push_finite_quad(Quad::new(sash.rect).with_background(color));
         }
+
+        if let Some(drag) = &self.active_tab_drag {
+            if drag.active {
+                if let Some(drop_zone) = self.resolve_tab_drop_target(bounds, drag.current_pos) {
+                    let group_rects = self.model.compute_group_rects(bounds);
+                    match drop_zone {
+                        TabDropZone::ReorderTab { group_id, target_index } => {
+                            if let Some((_, grect)) =
+                                group_rects.into_iter().find(|(id, _)| *id == group_id)
+                            {
+                                let rects = self.tab_rects_for_group(group_id, grect, font);
+                                if let Some((_, tr, _)) = rects.get(target_index) {
+                                    scene.push_finite_quad(
+                                        Quad::new(Rect::from_xywh(tr.min_x(), tr.min_y(), 3.0, tr.height()))
+                                            .with_background(theme.activity_bar_active_border),
+                                    );
+                                }
+                            }
+                        }
+                        TabDropZone::MoveToGroup(gid) => {
+                            if let Some((_, grect)) = group_rects.into_iter().find(|(id, _)| *id == gid) {
+                                scene.push_finite_quad(
+                                    Quad::new(grect)
+                                        .with_background(Rgba::new(0.0, 0.48, 0.8, 0.16))
+                                        .with_border_edges(theme.activity_bar_active_border, Edges::all(2.0)),
+                                );
+                            }
+                        }
+                        TabDropZone::SplitGroup { group_id, direction, insert_before } => {
+                            if let Some((_, grect)) =
+                                group_rects.into_iter().find(|(id, _)| *id == group_id)
+                            {
+                                let preview = match (direction, insert_before) {
+                                    (SplitDirection::Horizontal, true) => {
+                                        Rect::from_xywh(grect.min_x(), grect.min_y(), grect.width() * 0.5, grect.height())
+                                    }
+                                    (SplitDirection::Horizontal, false) => {
+                                        Rect::from_xywh(grect.min_x() + grect.width() * 0.5, grect.min_y(), grect.width() * 0.5, grect.height())
+                                    }
+                                    (SplitDirection::Vertical, true) => {
+                                        Rect::from_xywh(grect.min_x(), grect.min_y(), grect.width(), grect.height() * 0.5)
+                                    }
+                                    (SplitDirection::Vertical, false) => {
+                                        Rect::from_xywh(grect.min_x(), grect.min_y() + grect.height() * 0.5, grect.width(), grect.height() * 0.5)
+                                    }
+                                };
+                                scene.push_finite_quad(
+                                    Quad::new(preview)
+                                        .with_background(Rgba::new(0.0, 0.48, 0.8, 0.22))
+                                        .with_border_edges(theme.activity_bar_active_border, Edges::all(2.0)),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn handle_event(&mut self, event: &InputEvent, bounds: Rect) -> EventResult {
@@ -2070,29 +2554,31 @@ impl View for EditorAreaView {
 
                 if mouse.position.y < group_rect.min_y() + tab_bar_h {
                     let font = FontMetrics::default_monospace();
-                    let tab_rects: Vec<(usize, Rect, f32)> = {
-                        let Some(group) = self.model.group_by_id(group_id) else {
-                            return EventResult::Ignored;
-                        };
-                        let mut cur_x = group_rect.min_x();
-                        let mut list = Vec::with_capacity(group.tabs.len());
-                        for (idx, tab) in group.tabs.iter().enumerate() {
-                            let tab_w = (font.text_width(&tab.title) + 40.0).clamp(80.0, 220.0);
-                            let tab_rect =
-                                Rect::from_xywh(cur_x, group_rect.min_y(), tab_w, tab_bar_h);
-                            list.push((idx, tab_rect, cur_x + tab_w - 22.0));
-                            cur_x += tab_w;
-                        }
-                        list
-                    };
+                    let tab_rects = self.tab_rects_for_group(group_id, group_rect, &font);
 
                     for (idx, tab_rect, close_min_x) in tab_rects {
                         if tab_rect.contains(mouse.position) {
-                            if mouse.position.x >= close_min_x {
+                            if mouse.position.x >= close_min_x && mouse.button == MouseButton::Left {
                                 self.close_tab_in_group(group_id, idx);
                             } else {
                                 if let Some(group) = self.model.group_by_id_mut(group_id) {
                                     group.active_tab_index = Some(idx);
+                                }
+                                if mouse.button == MouseButton::Left {
+                                    if let Some(tab) = self
+                                        .model
+                                        .group_by_id(group_id)
+                                        .and_then(|g| g.tabs.get(idx))
+                                    {
+                                        self.active_tab_drag = Some(TabDragState {
+                                            source_group_id: group_id,
+                                            source_tab_index: idx,
+                                            uri: tab.uri.clone(),
+                                            start_pos: mouse.position,
+                                            current_pos: mouse.position,
+                                            active: false,
+                                        });
+                                    }
                                 }
                                 self.last_action = Some(EditorAreaAction::TabSelected(idx));
                                 self.sync_editor_focus();
@@ -2173,6 +2659,18 @@ impl View for EditorAreaView {
                 }
             }
             InputEvent::MouseMove(mouse) => {
+                if let Some(drag) = &mut self.active_tab_drag {
+                    drag.current_pos = mouse.position;
+                    let dx = mouse.position.x - drag.start_pos.x;
+                    let dy = mouse.position.y - drag.start_pos.y;
+                    if !drag.active && (dx * dx + dy * dy).sqrt() >= 6.0 {
+                        drag.active = true;
+                    }
+                    if drag.active {
+                        return EventResult::Consumed;
+                    }
+                }
+
                 if let Some((path, parent_bounds)) = self.active_sash_drag.clone() {
                     self.model
                         .update_sash_ratio(&path, mouse.position, parent_bounds);
@@ -2211,7 +2709,66 @@ impl View for EditorAreaView {
                     EventResult::Ignored
                 }
             }
-            InputEvent::MouseUp(_) => {
+            InputEvent::MouseUp(mouse) => {
+                if let Some(drag) = self.active_tab_drag.take() {
+                    if drag.active {
+                        self.active_tab_drag = Some(drag.clone());
+                        let drop_target = self.resolve_tab_drop_target(bounds, mouse.position);
+                        self.active_tab_drag = None;
+                        if let Some(zone) = drop_target {
+                            match zone {
+                                TabDropZone::ReorderTab {
+                                    group_id,
+                                    target_index,
+                                } => {
+                                    if group_id == drag.source_group_id {
+                                        self.model.reorder_tab_in_group(
+                                            group_id,
+                                            drag.source_tab_index,
+                                            target_index,
+                                        );
+                                        self.last_action =
+                                            Some(EditorAreaAction::TabSelected(target_index));
+                                        self.sync_editor_focus();
+                                        self.sync_breadcrumbs(None);
+                                    } else {
+                                        self.move_tab_to_group(
+                                            drag.source_group_id,
+                                            drag.source_tab_index,
+                                            group_id,
+                                        );
+                                    }
+                                }
+                                TabDropZone::MoveToGroup(gid) => {
+                                    self.move_tab_to_group(
+                                        drag.source_group_id,
+                                        drag.source_tab_index,
+                                        gid,
+                                    );
+                                }
+                                TabDropZone::SplitGroup {
+                                    group_id,
+                                    direction,
+                                    insert_before,
+                                } => {
+                                    if let Some(new_gid) = self.model.split_group_empty(
+                                        group_id,
+                                        direction,
+                                        insert_before,
+                                    ) {
+                                        self.group_breadcrumbs.entry(new_gid).or_default();
+                                        self.move_tab_to_group(
+                                            drag.source_group_id,
+                                            drag.source_tab_index,
+                                            new_gid,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        return EventResult::Consumed;
+                    }
+                }
                 if self.active_sash_drag.take().is_some() {
                     return EventResult::Consumed;
                 }
@@ -3455,6 +4012,49 @@ mod tests {
         assert!(area_view.find_open_tab_uri_for_path(&f3).is_some());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_editor_area_tab_drag_reorder_and_split_drop() {
+        use rustcode_platform::render::{MouseButton, MouseEvent, MouseMoveEvent};
+
+        let mut area_view = EditorAreaView::default();
+        area_view.open_file("file:///a.rs", "a.rs", "let a = 1;", false);
+        area_view.open_file("file:///b.rs", "b.rs", "let b = 2;", false);
+        area_view.open_file("file:///c.rs", "c.rs", "let c = 3;", false);
+
+        let bounds = Rect::from_xywh(0.0, 0.0, 900.0, 500.0);
+        let font = FontMetrics::default_monospace();
+        let rects = area_view.tab_rects_for_group(0, bounds, &font);
+        assert_eq!(rects.len(), 3);
+
+        // Drag tab 0 (a.rs) past tab 2 (c.rs) -> reorders tabs within group 0
+        let start = Point::new(rects[0].1.min_x() + 15.0, rects[0].1.min_y() + 15.0);
+        let target = Point::new(rects[2].1.min_x() + 20.0, rects[2].1.min_y() + 15.0);
+        area_view.handle_event(&InputEvent::MouseDown(MouseEvent::new(start, MouseButton::Left)), bounds);
+        area_view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: target }), bounds);
+        area_view.handle_event(&InputEvent::MouseUp(MouseEvent::new(target, MouseButton::Left)), bounds);
+
+        let titles: Vec<&str> = area_view.model.groups[0]
+            .tabs
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect();
+        assert_eq!(titles, vec!["b.rs", "c.rs", "a.rs"]);
+
+        // Drag active tab (a.rs, index 2) to right 25% edge zone -> splits & moves to new group
+        let rects_after = area_view.tab_rects_for_group(0, bounds, &font);
+        let a_start = Point::new(rects_after[2].1.min_x() + 15.0, 15.0);
+        let right_edge = Point::new(bounds.max_x() - 30.0, 250.0);
+        area_view.handle_event(&InputEvent::MouseDown(MouseEvent::new(a_start, MouseButton::Left)), bounds);
+        area_view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: right_edge }), bounds);
+        area_view.handle_event(&InputEvent::MouseUp(MouseEvent::new(right_edge, MouseButton::Left)), bounds);
+
+        assert_eq!(area_view.model.groups.len(), 2);
+        assert_eq!(area_view.model.groups[0].tabs.len(), 2);
+        assert_eq!(area_view.model.groups[1].tabs.len(), 1);
+        assert_eq!(area_view.model.groups[1].tabs[0].uri, "file:///a.rs");
+        assert!(area_view.editor_for_group(area_view.model.groups[1].id, "file:///a.rs").is_some());
     }
 }
 

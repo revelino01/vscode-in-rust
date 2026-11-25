@@ -6,8 +6,8 @@ use rustcode_ext_host::manifest::ViewContribution;
 use rustcode_ext_host::provider::{TreeItem, TreeItemCollapsibleState};
 use rustcode_platform::accessibility::{AccessibleNode, AccessibleRole};
 use rustcode_platform::render::{
-    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, Point, Quad, Rect, Scene, View,
-    WorkbenchThemeStyles,
+    Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, MouseButton, Point, Quad,
+    Rect, Scene, View, WorkbenchThemeStyles,
 };
 use rustcode_protocols::lsp::LspCommand;
 use serde_json::Value;
@@ -324,6 +324,10 @@ pub enum ExplorerAction {
     Renamed {
         old_path: PathBuf,
         new_path: PathBuf,
+    },
+    Moved {
+        from: PathBuf,
+        to: PathBuf,
     },
     Deleted(PathBuf),
     ExpandContributedItem {
@@ -663,12 +667,24 @@ struct ExplorerLayout {
     contrib_sections: Vec<ContributedSectionLayout>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExplorerDragState {
+    pub source_path: PathBuf,
+    pub is_dir: bool,
+    pub start_pos: Point,
+    pub current_pos: Point,
+    pub active: bool,
+}
+
 pub struct FileExplorerView {
     pub model: FileExplorer,
     pub last_action: Option<ExplorerAction>,
     pub input_mode: ExplorerInputMode,
     pub scroll_top: f32,
     pub contributed_trees: SharedContributedTrees,
+    pub drag_state: Option<ExplorerDragState>,
+    pub hovered_drop_dir: Option<PathBuf>,
+    last_bounds: RwLock<Rect>,
     last_font: RwLock<FontMetrics>,
 }
 
@@ -686,6 +702,9 @@ impl FileExplorerView {
             input_mode: ExplorerInputMode::None,
             scroll_top: 0.0,
             contributed_trees: Arc::new(RwLock::new(ContributedTreesState::default())),
+            drag_state: None,
+            hovered_drop_dir: None,
+            last_bounds: RwLock::new(Rect::zero()),
             last_font: RwLock::new(FontMetrics::default_monospace()),
         }
     }
@@ -971,6 +990,83 @@ impl FileExplorerView {
             }
             ExplorerInputMode::None | ExplorerInputMode::ConfirmDelete { .. } => {}
         }
+    }
+
+    pub fn clear_drag(&mut self) {
+        self.drag_state = None;
+        self.hovered_drop_dir = None;
+    }
+
+    pub fn take_active_drag(&mut self) -> Option<ExplorerDragState> {
+        self.hovered_drop_dir = None;
+        match self.drag_state.take() {
+            Some(d) if d.active => Some(d),
+            _ => None,
+        }
+    }
+
+    /// Move `src` (file or folder) into `target_dir`, guarding against cycles and collisions.
+    pub fn move_entry(&mut self, src: &Path, target_dir: &Path) -> Result<PathBuf, String> {
+        if !src.exists() {
+            return Err("Source path does not exist".to_string());
+        }
+        if !target_dir.is_dir() {
+            return Err("Target path is not a directory".to_string());
+        }
+        if rustcode_platform::paths_equivalent(src, target_dir)
+            || rustcode_platform::path_starts_with(target_dir, src)
+        {
+            return Err("Cannot move a directory into itself or a descendant".to_string());
+        }
+        let Some(file_name) = src.file_name() else {
+            return Err("Source path has no file name".to_string());
+        };
+        let dest = target_dir.join(file_name);
+        if rustcode_platform::paths_equivalent(src, &dest) {
+            return Err("Source is already in the target directory".to_string());
+        }
+        if dest.exists() {
+            return Err("Target destination already exists".to_string());
+        }
+        std::fs::rename(src, &dest).map_err(|e| format!("Failed moving entry: {e}"))?;
+        self.model.update_paths_after_rename(src, &dest);
+        self.model.expanded_paths.insert(target_dir.to_path_buf());
+        self.model.refresh_from_disk();
+        self.model.selected_path = Some(dest.clone());
+        self.last_action = Some(ExplorerAction::Moved {
+            from: src.to_path_buf(),
+            to: dest.clone(),
+        });
+        Ok(dest)
+    }
+
+    pub fn entry_path_at_point(&self, bounds: Rect, pos: Point) -> Option<PathBuf> {
+        if !bounds.is_finite_positive() || !bounds.contains(pos) {
+            return None;
+        }
+        let font = self.last_font.read().clone();
+        let layout = self.compute_layout(bounds, &font);
+        layout
+            .file_rows
+            .into_iter()
+            .find(|(_, r)| r.contains(pos))
+            .map(|(row, _)| row.path)
+    }
+
+    fn resolve_drop_dir_at(&self, layout: &ExplorerLayout, pos: Point) -> Option<PathBuf> {
+        for (row, r) in &layout.file_rows {
+            if r.contains(pos) {
+                return if row.is_dir {
+                    Some(row.path.clone())
+                } else {
+                    row.path.parent().map(Path::to_path_buf)
+                };
+            }
+        }
+        if layout.file_tree_rect.contains(pos) {
+            return self.model.roots.first().map(|r| r.path.clone());
+        }
+        None
     }
 
     fn compute_layout(&self, bounds: Rect, font: &FontMetrics) -> ExplorerLayout {
@@ -1623,6 +1719,17 @@ impl View for FileExplorerView {
                     Quad::new(row_rect).with_background(theme.list_active_selection_bg),
                 );
             }
+            if self
+                .hovered_drop_dir
+                .as_ref()
+                .is_some_and(|d| row.is_dir && rustcode_platform::paths_equivalent(&row.path, d))
+            {
+                scene.push_finite_quad(
+                    Quad::new(row_rect)
+                        .with_background(theme.list_hover_bg)
+                        .with_border_edges(theme.activity_bar_active_border, Edges::all(1.0)),
+                );
+            }
 
             let max_indent = (row_rect.width() - 48.0).max(0.0);
             let indent_offset = (8.0 + (row.depth as f32 * 14.0)).min(max_indent);
@@ -1840,17 +1947,57 @@ impl View for FileExplorerView {
                 // Workspace file tree rows
                 for (row, row_rect) in &layout.file_rows {
                     if row_rect.contains(mouse.position) {
+                        *self.last_bounds.write() = bounds;
                         self.model.selected_path = Some(row.path.clone());
-                        if row.is_dir {
-                            self.model.toggle_expanded(&row.path);
-                            self.last_action = Some(ExplorerAction::ToggleDir(row.path.clone()));
-                        } else {
-                            self.last_action = Some(ExplorerAction::OpenFile(row.path.clone()));
+                        if mouse.button == MouseButton::Left {
+                            self.drag_state = Some(ExplorerDragState {
+                                source_path: row.path.clone(),
+                                is_dir: row.is_dir,
+                                start_pos: mouse.position,
+                                current_pos: mouse.position,
+                                active: false,
+                            });
+                            if row.is_dir {
+                                self.model.toggle_expanded(&row.path);
+                                self.last_action = Some(ExplorerAction::ToggleDir(row.path.clone()));
+                            } else {
+                                self.last_action = Some(ExplorerAction::OpenFile(row.path.clone()));
+                            }
                         }
                         return EventResult::Consumed;
                     }
                 }
 
+                EventResult::Ignored
+            }
+            InputEvent::MouseMove(mm) => {
+                if let Some(drag) = &mut self.drag_state {
+                    drag.current_pos = mm.position;
+                    let dx = mm.position.x - drag.start_pos.x;
+                    let dy = mm.position.y - drag.start_pos.y;
+                    if !drag.active && (dx * dx + dy * dy).sqrt() >= 6.0 {
+                        drag.active = true;
+                    }
+                    if drag.active {
+                        let layout = self.compute_layout(bounds, &font);
+                        self.hovered_drop_dir = self.resolve_drop_dir_at(&layout, mm.position);
+                        return EventResult::Consumed;
+                    }
+                }
+                EventResult::Ignored
+            }
+            InputEvent::MouseUp(mouse) => {
+                if let Some(drag) = self.drag_state.take() {
+                    self.hovered_drop_dir = None;
+                    if drag.active && mouse.button == MouseButton::Left && bounds.contains(mouse.position)
+                    {
+                        let layout = self.compute_layout(bounds, &font);
+                        if let Some(target_dir) = self.resolve_drop_dir_at(&layout, mouse.position) {
+                            let _ = self.move_entry(&drag.source_path, &target_dir);
+                        }
+                        return EventResult::Consumed;
+                    }
+                }
                 EventResult::Ignored
             }
             InputEvent::KeyDown(key) => {
@@ -2568,5 +2715,78 @@ mod tests {
         assert!(evaluate_when_clause(&ctx, Some("op_str == '&& ||'")));
         assert!(evaluate_when_clause(&ctx, Some("op_str2 == 'a &&|| b'")));
         assert!(evaluate_when_clause(&ctx, Some("path =~ /foo||bar/ && a")));
+    }
+
+    #[test]
+    fn test_explorer_drag_and_drop_move_and_cycle_guard() {
+        use rustcode_platform::render::{MouseEvent, MouseMoveEvent};
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root_dir = std::env::temp_dir().join(format!("rustcode_explorer_dnd_{suffix}"));
+        let sub_a = root_dir.join("dir_a");
+        let nested = sub_a.join("nested");
+        let sub_b = root_dir.join("dir_b");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&sub_b).unwrap();
+        let file_x = root_dir.join("x.txt");
+        std::fs::write(&file_x, "hello").unwrap();
+
+        let mut explorer = FileExplorer::new();
+        explorer.set_roots(vec![FileTreeNode::from_path(root_dir.clone())]);
+        explorer.expanded_paths.insert(root_dir.clone());
+        explorer.expanded_paths.insert(sub_a.clone());
+
+        let mut view = FileExplorerView::new(explorer);
+        let bounds = Rect::from_xywh(0.0, 0.0, 260.0, 500.0);
+        let font = FontMetrics::default_monospace();
+        let layout = view.compute_layout(bounds, &font);
+
+        let dir_b_rect = layout
+            .file_rows
+            .iter()
+            .find(|(r, _)| rustcode_platform::paths_equivalent(&r.path, &sub_b))
+            .unwrap()
+            .1;
+        let file_x_rect = layout
+            .file_rows
+            .iter()
+            .find(|(r, _)| rustcode_platform::paths_equivalent(&r.path, &file_x))
+            .unwrap()
+            .1;
+
+        let start = Point::new(file_x_rect.min_x() + 12.0, file_x_rect.min_y() + 8.0);
+        let end = Point::new(dir_b_rect.min_x() + 12.0, dir_b_rect.min_y() + 8.0);
+        assert_eq!(
+            view.handle_event(&InputEvent::MouseDown(MouseEvent::new(start, MouseButton::Left)), bounds),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            view.handle_event(&InputEvent::MouseMove(MouseMoveEvent { position: end }), bounds),
+            EventResult::Consumed
+        );
+        assert_eq!(
+            view.handle_event(&InputEvent::MouseUp(MouseEvent::new(end, MouseButton::Left)), bounds),
+            EventResult::Consumed
+        );
+
+        let moved_x = sub_b.join("x.txt");
+        assert!(moved_x.exists(), "file should move to dir_b");
+        assert!(!file_x.exists());
+        assert_eq!(
+            view.last_action,
+            Some(ExplorerAction::Moved {
+                from: file_x.clone(),
+                to: moved_x
+            })
+        );
+
+        // Cycle guard: moving dir_a into its descendant nested must fail
+        let err = view.move_entry(&sub_a, &nested).unwrap_err();
+        assert!(err.contains("descendant") || err.contains("itself"));
+        assert!(sub_a.exists());
+
+        let _ = std::fs::remove_dir_all(&root_dir);
     }
 }

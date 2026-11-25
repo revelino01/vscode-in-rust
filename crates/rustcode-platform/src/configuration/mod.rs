@@ -68,7 +68,17 @@ impl ConfigurationService {
                 "formatOnPaste": false,
                 "autoSave": "off",
                 "cursorStyle": "line",
-                "renderWhitespace": "selection"
+                "renderWhitespace": "selection",
+                "stickyScroll": {
+                    "enabled": true,
+                    "maxLineCount": 5
+                },
+                "bracketPairColorization": {
+                    "enabled": true
+                },
+                "guides": {
+                    "bracketPairs": true
+                }
             },
             "workbench": {
                 "colorTheme": "Default Dark+",

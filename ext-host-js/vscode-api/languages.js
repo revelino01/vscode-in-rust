@@ -89,6 +89,96 @@ const languages = {
     });
   },
 
+  registerReferenceProvider(selector, provider) {
+    const id = `references_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('References', id, provider, ['provideReferences'], {
+      selector: sel,
+    });
+  },
+
+  registerSignatureHelpProvider(selector, provider, ...triggerCharacters) {
+    const id = `sighelp_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('SignatureHelp', id, provider, ['provideSignatureHelp'], {
+      selector: sel,
+      triggerCharacters,
+    });
+  },
+
+  registerImplementationProvider(selector, provider) {
+    const id = `impl_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('Implementation', id, provider, ['provideImplementation'], {
+      selector: sel,
+    });
+  },
+
+  registerTypeDefinitionProvider(selector, provider) {
+    const id = `typedef_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('TypeDefinition', id, provider, ['provideTypeDefinition'], {
+      selector: sel,
+    });
+  },
+
+  registerRenameProvider(selector, provider) {
+    const id = `rename_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('Rename', id, provider, ['provideRenameEdits', 'prepareRename'], {
+      selector: sel,
+    });
+  },
+
+  registerDocumentSemanticTokensProvider(selector, provider, legend) {
+    const id = `semtok_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('SemanticTokens', id, provider, ['provideDocumentSemanticTokens', 'provideDocumentSemanticTokensEdits'], {
+      selector: sel,
+      legend: legend || { tokenTypes: [], tokenModifiers: [] },
+    });
+  },
+
+  registerInlayHintsProvider(selector, provider) {
+    const id = `inlay_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('InlayHints', id, provider, ['provideInlayHints', 'resolveInlayHint'], {
+      selector: sel,
+    });
+  },
+
+  registerCodeLensProvider(selector, provider) {
+    const id = `codelens_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('CodeLens', id, provider, ['provideCodeLenses', 'resolveCodeLens'], {
+      selector: sel,
+    });
+  },
+
+  registerDocumentLinkProvider(selector, provider) {
+    const id = `doclink_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('DocumentLink', id, provider, ['provideDocumentLinks', 'resolveDocumentLink'], {
+      selector: sel,
+    });
+  },
+
+  registerCallHierarchyProvider(selector, provider) {
+    const id = `callhier_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('CallHierarchy', id, provider, ['prepareCallHierarchy', 'provideCallHierarchyIncomingCalls', 'provideCallHierarchyOutgoingCalls'], {
+      selector: sel,
+    });
+  },
+
+  registerTypeHierarchyProvider(selector, provider) {
+    const id = `typehier_${nextProviderId++}`;
+    const sel = typeof selector === 'string' ? selector : (selector && selector.language) || '*';
+    return rpc.registerObjectProxy('TypeHierarchy', id, provider, ['prepareTypeHierarchy', 'provideTypeHierarchySupertypes', 'provideTypeHierarchySubtypes'], {
+      selector: sel,
+    });
+  },
+
   async format(documentOrUri, options = { tabSize: 4, insertSpaces: true }) {
     const uri = (documentOrUri && documentOrUri.uri) ? documentOrUri.uri.toString() : (documentOrUri ? documentOrUri.toString() : '');
     const languageId = (documentOrUri && documentOrUri.languageId) ? documentOrUri.languageId : '*';

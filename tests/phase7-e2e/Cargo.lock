@@ -1176,6 +1176,7 @@ dependencies = [
  "rustcode-platform",
  "rustcode-protocols",
  "rustcode-workbench",
+ "serde",
  "serde_json",
  "tokio",
 ]

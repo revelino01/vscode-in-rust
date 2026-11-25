@@ -367,13 +367,25 @@ pub struct Hover {
     pub range: Option<LspRange>,
 }
 
-pub fn deserialize_markup_content<'de, D>(deserializer: D) -> Result<MarkupContent, D::Error>
+pub fn deserialize_optional_markup_content<'de, D>(
+    deserializer: D,
+) -> Result<Option<MarkupContent>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let val = serde_json::Value::deserialize(deserializer)?;
+    let val = Option::<serde_json::Value>::deserialize(deserializer)?;
+    let Some(v) = val else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(parse_markup_value(v)))
+}
+
+fn parse_markup_value(val: serde_json::Value) -> MarkupContent {
     match val {
-        serde_json::Value::String(s) => Ok(MarkupContent::markdown(s)),
+        serde_json::Value::String(s) => MarkupContent::markdown(s),
         serde_json::Value::Object(map) => {
             let kind_str = map.get("kind").and_then(|k| k.as_str()).unwrap_or("markdown");
             let kind = if kind_str.eq_ignore_ascii_case("plaintext") {
@@ -386,7 +398,7 @@ where
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            Ok(MarkupContent { kind, value })
+            MarkupContent { kind, value }
         }
         serde_json::Value::Array(arr) => {
             let mut combined = String::new();
@@ -413,10 +425,18 @@ where
                     _ => {}
                 }
             }
-            Ok(MarkupContent::markdown(combined))
+            MarkupContent::markdown(combined)
         }
-        _ => Ok(MarkupContent::markdown("")),
+        _ => MarkupContent::markdown(""),
     }
+}
+
+pub fn deserialize_markup_content<'de, D>(deserializer: D) -> Result<MarkupContent, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    Ok(parse_markup_value(val))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -488,10 +508,76 @@ pub struct DidCloseTextDocumentParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClientCapabilities {
-    #[serde(default)]
+    #[serde(rename = "textDocument", alias = "text_document", default)]
     pub text_document: Option<serde_json::Value>,
     #[serde(default)]
     pub workspace: Option<serde_json::Value>,
+}
+
+impl ClientCapabilities {
+    pub fn default_phase9() -> Self {
+        Self {
+            text_document: Some(serde_json::json!({
+                "synchronization": {
+                    "didSave": true,
+                    "willSave": false
+                },
+                "completion": {
+                    "completionItem": {
+                        "snippetSupport": true,
+                        "documentationFormat": ["markdown", "plaintext"]
+                    }
+                },
+                "hover": {
+                    "contentFormat": ["markdown", "plaintext"]
+                },
+                "signatureHelp": {
+                    "signatureInformation": {
+                        "documentationFormat": ["markdown", "plaintext"],
+                        "parameterInformation": {
+                            "labelOffsetSupport": true
+                        },
+                        "activeParameterSupport": true
+                    }
+                },
+                "definition": { "linkSupport": true },
+                "typeDefinition": { "linkSupport": true },
+                "implementation": { "linkSupport": true },
+                "references": {},
+                "rename": { "prepareSupport": true },
+                "semanticTokens": {
+                    "requests": {
+                        "range": true,
+                        "full": { "delta": true }
+                    },
+                    "tokenTypes": [
+                        "namespace", "type", "class", "enum", "interface", "struct",
+                        "typeParameter", "parameter", "variable", "property", "enumMember",
+                        "event", "function", "method", "macro", "keyword", "modifier",
+                        "comment", "string", "number", "regexp", "operator", "decorator"
+                    ],
+                    "tokenModifiers": [
+                        "declaration", "definition", "readonly", "static", "deprecated",
+                        "abstract", "async", "modification", "documentation", "defaultLibrary"
+                    ],
+                    "formats": ["relative"]
+                },
+                "inlayHint": {},
+                "codeLens": {},
+                "documentLink": { "tooltipSupport": true },
+                "callHierarchy": {},
+                "typeHierarchy": {}
+            })),
+            workspace: Some(serde_json::json!({
+                "workspaceEdit": {
+                    "documentChanges": true,
+                    "resourceOperations": ["create", "rename", "delete"]
+                },
+                "workspaceFolders": true,
+                "symbol": {}
+            })),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -806,20 +892,112 @@ impl LspCommand {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionalVersionedTextDocumentIdentifier {
+    pub uri: String,
+    #[serde(default)]
+    pub version: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextDocumentEdit {
+    #[serde(rename = "textDocument")]
+    pub text_document: OptionalVersionedTextDocumentIdentifier,
+    pub edits: Vec<LspTextEdit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum DocumentChange {
+    Edit(TextDocumentEdit),
+    CreateFile { uri: String },
+    RenameFile { old_uri: String, new_uri: String },
+    DeleteFile { uri: String },
+}
+
+impl<'de> Deserialize<'de> for DocumentChange {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let val = serde_json::Value::deserialize(deserializer)?;
+        let Some(obj) = val.as_object() else {
+            return Err(serde::de::Error::custom("expected DocumentChange object"));
+        };
+        if let Some(kind) = obj.get("kind").and_then(|k| k.as_str()) {
+            match kind {
+                "create" => {
+                    let uri = obj
+                        .get("uri")
+                        .and_then(|u| u.as_str())
+                        .ok_or_else(|| serde::de::Error::custom("CreateFile missing 'uri'"))?;
+                    return Ok(DocumentChange::CreateFile {
+                        uri: uri.to_string(),
+                    });
+                }
+                "rename" => {
+                    let old_uri = obj
+                        .get("oldUri")
+                        .and_then(|u| u.as_str())
+                        .ok_or_else(|| serde::de::Error::custom("RenameFile missing 'oldUri'"))?;
+                    let new_uri = obj
+                        .get("newUri")
+                        .and_then(|u| u.as_str())
+                        .ok_or_else(|| serde::de::Error::custom("RenameFile missing 'newUri'"))?;
+                    return Ok(DocumentChange::RenameFile {
+                        old_uri: old_uri.to_string(),
+                        new_uri: new_uri.to_string(),
+                    });
+                }
+                "delete" => {
+                    let uri = obj
+                        .get("uri")
+                        .and_then(|u| u.as_str())
+                        .ok_or_else(|| serde::de::Error::custom("DeleteFile missing 'uri'"))?;
+                    return Ok(DocumentChange::DeleteFile {
+                        uri: uri.to_string(),
+                    });
+                }
+                other => {
+                    return Err(serde::de::Error::custom(format!(
+                        "Unknown DocumentChange kind '{}'",
+                        other
+                    )));
+                }
+            }
+        }
+        let edit: TextDocumentEdit =
+            serde_json::from_value(val).map_err(serde::de::Error::custom)?;
+        Ok(DocumentChange::Edit(edit))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceEdit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<HashMap<String, Vec<LspTextEdit>>>,
+    #[serde(rename = "documentChanges", default, skip_serializing_if = "Option::is_none")]
+    pub document_changes: Option<Vec<DocumentChange>>,
 }
 
 impl WorkspaceEdit {
     pub fn new() -> Self {
-        Self { changes: None }
+        Self {
+            changes: None,
+            document_changes: None,
+        }
     }
 
     pub fn with_changes(changes: HashMap<String, Vec<LspTextEdit>>) -> Self {
         Self {
             changes: Some(changes),
+            document_changes: None,
+        }
+    }
+
+    pub fn with_document_changes(document_changes: Vec<DocumentChange>) -> Self {
+        Self {
+            changes: None,
+            document_changes: Some(document_changes),
         }
     }
 
@@ -828,6 +1006,346 @@ impl WorkspaceEdit {
         let map = self.changes.get_or_insert_with(HashMap::new);
         map.entry(uri).or_default().push(edit);
     }
+
+    /// Collect all per-URI text edits from both `changes` and `documentChanges`.
+    pub fn all_text_edits(&self) -> HashMap<String, Vec<LspTextEdit>> {
+        let mut combined: HashMap<String, Vec<LspTextEdit>> = HashMap::new();
+        if let Some(changes) = &self.changes {
+            for (uri, edits) in changes {
+                combined.entry(uri.clone()).or_default().extend(edits.clone());
+            }
+        }
+        if let Some(doc_changes) = &self.document_changes {
+            for dc in doc_changes {
+                if let DocumentChange::Edit(tde) = dc {
+                    combined
+                        .entry(tde.text_document.uri.clone())
+                        .or_default()
+                        .extend(tde.edits.clone());
+                }
+            }
+        }
+        combined
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ParameterLabel {
+    Simple(String),
+    Offsets([u32; 2]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParameterInformation {
+    pub label: ParameterLabel,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_markup_content",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub documentation: Option<MarkupContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureInformation {
+    pub label: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_markup_content",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub documentation: Option<MarkupContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Vec<ParameterInformation>>,
+    #[serde(rename = "activeParameter", default, skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SignatureHelp {
+    #[serde(default)]
+    pub signatures: Vec<SignatureInformation>,
+    #[serde(rename = "activeSignature", default, skip_serializing_if = "Option::is_none")]
+    pub active_signature: Option<u32>,
+    #[serde(rename = "activeParameter", default, skip_serializing_if = "Option::is_none")]
+    pub active_parameter: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceContext {
+    #[serde(rename = "includeDeclaration")]
+    pub include_declaration: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PrepareRenameResult {
+    pub range: LspRange,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for PrepareRenameResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let val = serde_json::Value::deserialize(deserializer)?;
+        if let Some(obj) = val.as_object() {
+            if let Some(range_val) = obj.get("range") {
+                let range: LspRange =
+                    serde_json::from_value(range_val.clone()).map_err(serde::de::Error::custom)?;
+                let placeholder = obj
+                    .get("placeholder")
+                    .and_then(|p| p.as_str())
+                    .map(ToString::to_string);
+                return Ok(Self { range, placeholder });
+            }
+        }
+        let range: LspRange = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            range,
+            placeholder: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SemanticTokensLegend {
+    #[serde(rename = "tokenTypes", default)]
+    pub token_types: Vec<String>,
+    #[serde(rename = "tokenModifiers", default)]
+    pub token_modifiers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SemanticTokens {
+    #[serde(rename = "resultId", default, skip_serializing_if = "Option::is_none")]
+    pub result_id: Option<String>,
+    #[serde(default)]
+    pub data: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticTokensEdit {
+    pub start: u32,
+    #[serde(rename = "deleteCount")]
+    pub delete_count: u32,
+    #[serde(default)]
+    pub data: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SemanticTokensDelta {
+    #[serde(rename = "resultId", default, skip_serializing_if = "Option::is_none")]
+    pub result_id: Option<String>,
+    #[serde(default)]
+    pub edits: Vec<SemanticTokensEdit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedSemanticToken {
+    pub line: u32,
+    pub start_char: u32,
+    pub length: u32,
+    pub token_type: String,
+    pub modifiers: Vec<String>,
+}
+
+/// Decode LSP 3.17 relative 5-tuples `[deltaLine, deltaStartChar, length, tokenType, tokenModifiers]`
+/// into absolute positions using `legend`. Incomplete trailing elements or unknown type indices
+/// are safely skipped without panicking.
+pub fn decode_semantic_tokens(
+    data: &[u32],
+    legend: &SemanticTokensLegend,
+) -> Vec<DecodedSemanticToken> {
+    let mut out = Vec::with_capacity(data.len() / 5);
+    let mut cur_line: u32 = 0;
+    let mut cur_char: u32 = 0;
+
+    for chunk in data.as_chunks::<5>().0 {
+        let delta_line = chunk[0];
+        let delta_start = chunk[1];
+        let length = chunk[2];
+        let type_idx = chunk[3] as usize;
+        let mod_bits = chunk[4];
+
+        if delta_line > 0 {
+            cur_line = cur_line.saturating_add(delta_line);
+            cur_char = delta_start;
+        } else {
+            cur_char = cur_char.saturating_add(delta_start);
+        }
+
+        let Some(token_type) = legend.token_types.get(type_idx) else {
+            continue;
+        };
+
+        let mut modifiers = Vec::new();
+        for (bit, mod_name) in legend.token_modifiers.iter().enumerate() {
+            if bit < 32 && (mod_bits & (1u32 << bit)) != 0 {
+                modifiers.push(mod_name.clone());
+            }
+        }
+
+        out.push(DecodedSemanticToken {
+            line: cur_line,
+            start_char: cur_char,
+            length,
+            token_type: token_type.clone(),
+            modifiers,
+        });
+    }
+
+    out
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum InlayHintKind {
+    Type = 1,
+    Parameter = 2,
+}
+
+impl Serialize for InlayHintKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u8(*self as u8)
+    }
+}
+
+impl<'de> Deserialize<'de> for InlayHintKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let val = u8::deserialize(deserializer)?;
+        match val {
+            1 => Ok(Self::Type),
+            2 => Ok(Self::Parameter),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid InlayHintKind: {}",
+                val
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InlayHintLabelPart {
+    pub value: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_markup_content",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tooltip: Option<MarkupContent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<LspLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<LspCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum InlayHintLabel {
+    String(String),
+    Parts(Vec<InlayHintLabelPart>),
+}
+
+impl InlayHintLabel {
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::String(s) => s.clone(),
+            Self::Parts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InlayHint {
+    pub position: LspPosition,
+    pub label: InlayHintLabel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<InlayHintKind>,
+    #[serde(rename = "paddingLeft", default, skip_serializing_if = "Option::is_none")]
+    pub padding_left: Option<bool>,
+    #[serde(rename = "paddingRight", default, skip_serializing_if = "Option::is_none")]
+    pub padding_right: Option<bool>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_markup_content",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tooltip: Option<MarkupContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodeLens {
+    pub range: LspRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<LspCommand>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentLink {
+    pub range: LspRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tooltip: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallHierarchyItem {
+    pub name: String,
+    pub kind: SymbolKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub uri: String,
+    pub range: LspRange,
+    #[serde(rename = "selectionRange")]
+    pub selection_range: LspRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallHierarchyIncomingCall {
+    pub from: CallHierarchyItem,
+    #[serde(rename = "fromRanges", default)]
+    pub from_ranges: Vec<LspRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallHierarchyOutgoingCall {
+    pub to: CallHierarchyItem,
+    #[serde(rename = "fromRanges", default)]
+    pub from_ranges: Vec<LspRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TypeHierarchyItem {
+    pub name: String,
+    pub kind: SymbolKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<u32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub uri: String,
+    pub range: LspRange,
+    #[serde(rename = "selectionRange")]
+    pub selection_range: LspRange,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -868,6 +1386,36 @@ pub struct ServerCapabilities {
     pub hover_provider: Option<serde_json::Value>,
     #[serde(rename = "definitionProvider", default)]
     pub definition_provider: Option<serde_json::Value>,
+    #[serde(rename = "signatureHelpProvider", default)]
+    pub signature_help_provider: Option<serde_json::Value>,
+    #[serde(rename = "referencesProvider", default)]
+    pub references_provider: Option<serde_json::Value>,
+    #[serde(rename = "implementationProvider", default)]
+    pub implementation_provider: Option<serde_json::Value>,
+    #[serde(rename = "typeDefinitionProvider", default)]
+    pub type_definition_provider: Option<serde_json::Value>,
+    #[serde(rename = "renameProvider", default)]
+    pub rename_provider: Option<serde_json::Value>,
+    #[serde(rename = "semanticTokensProvider", default)]
+    pub semantic_tokens_provider: Option<serde_json::Value>,
+    #[serde(rename = "inlayHintProvider", default)]
+    pub inlay_hint_provider: Option<serde_json::Value>,
+    #[serde(rename = "codeLensProvider", default)]
+    pub code_lens_provider: Option<serde_json::Value>,
+    #[serde(rename = "documentLinkProvider", default)]
+    pub document_link_provider: Option<serde_json::Value>,
+    #[serde(rename = "callHierarchyProvider", default)]
+    pub call_hierarchy_provider: Option<serde_json::Value>,
+    #[serde(rename = "typeHierarchyProvider", default)]
+    pub type_hierarchy_provider: Option<serde_json::Value>,
+}
+
+impl ServerCapabilities {
+    pub fn semantic_tokens_legend(&self) -> Option<SemanticTokensLegend> {
+        let provider = self.semantic_tokens_provider.as_ref()?;
+        let legend_val = provider.get("legend")?;
+        serde_json::from_value(legend_val.clone()).ok()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1039,5 +1587,99 @@ mod tests {
             action_deser.edit.as_ref().unwrap().changes.as_ref().unwrap().get("file:///src/main.rs").unwrap().len(),
             1
         );
+    }
+
+    #[test]
+    fn test_phase9_m1_lsp_types_serde_and_semantic_decoding() {
+        // SignatureHelp with offset label and string docs
+        let sig_json = r#"{
+            "signatures": [{
+                "label": "fn add(a: i32, b: i32) -> i32",
+                "documentation": "Adds two numbers",
+                "parameters": [
+                    { "label": [7, 13], "documentation": { "kind": "markdown", "value": "First arg" } },
+                    { "label": "b: i32" }
+                ]
+            }],
+            "activeSignature": 0,
+            "activeParameter": 1
+        }"#;
+        let sig: SignatureHelp = serde_json::from_str(sig_json).expect("SignatureHelp serde");
+        assert_eq!(sig.signatures.len(), 1);
+        assert_eq!(sig.active_parameter, Some(1));
+        assert_eq!(
+            sig.signatures[0].parameters.as_ref().unwrap()[0].label,
+            ParameterLabel::Offsets([7, 13])
+        );
+
+        // PrepareRenameResult both object and bare LspRange
+        let pr_obj: PrepareRenameResult = serde_json::from_str(
+            r#"{"range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}},"placeholder":"foo"}"#,
+        )
+        .expect("PrepareRename object");
+        assert_eq!(pr_obj.placeholder.as_deref(), Some("foo"));
+        let pr_range: PrepareRenameResult = serde_json::from_str(
+            r#"{"start":{"line":3,"character":0},"end":{"line":3,"character":4}}"#,
+        )
+        .expect("PrepareRename bare range");
+        assert_eq!(pr_range.range.start.line, 3);
+        assert!(pr_range.placeholder.is_none());
+
+        // WorkspaceEdit with both changes and documentChanges
+        let ws_json = r#"{
+            "changes": {
+                "file:///a.rs": [{ "range": { "start": {"line":0,"character":0}, "end": {"line":0,"character":3} }, "newText": "bar" }]
+            },
+            "documentChanges": [
+                {
+                    "textDocument": { "uri": "file:///b.rs", "version": 1 },
+                    "edits": [{ "range": { "start": {"line":2,"character":4}, "end": {"line":2,"character":7} }, "newText": "bar" }]
+                },
+                { "kind": "create", "uri": "file:///c.rs" }
+            ]
+        }"#;
+        let ws: WorkspaceEdit = serde_json::from_str(ws_json).expect("WorkspaceEdit documentChanges");
+        let all = ws.all_text_edits();
+        assert_eq!(all.get("file:///a.rs").unwrap().len(), 1);
+        assert_eq!(all.get("file:///b.rs").unwrap().len(), 1);
+
+        // Semantic tokens decoding
+        let legend = SemanticTokensLegend {
+            token_types: vec!["function".into(), "variable".into()],
+            token_modifiers: vec!["declaration".into(), "readonly".into()],
+        };
+        let raw = vec![
+            0, 4, 3, 0, 1, // line 0, col 4, len 3, function, declaration
+            2, 2, 5, 1, 2, // line 2, col 2, len 5, variable, readonly
+            0, 8, 2, 99, 0, // invalid token_type -> safely skipped
+            1, 0, // incomplete trailing -> safely ignored
+        ];
+        let decoded = decode_semantic_tokens(&raw, &legend);
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].line, 0);
+        assert_eq!(decoded[0].start_char, 4);
+        assert_eq!(decoded[0].token_type, "function");
+        assert_eq!(decoded[0].modifiers, vec!["declaration".to_string()]);
+        assert_eq!(decoded[1].line, 2);
+        assert_eq!(decoded[1].start_char, 2);
+        assert_eq!(decoded[1].token_type, "variable");
+        assert_eq!(decoded[1].modifiers, vec!["readonly".to_string()]);
+
+        // InlayHint label string + parts
+        let hint: InlayHint = serde_json::from_str(
+            r#"{"position":{"line":1,"character":10},"label":[{"value":": i32"}],"kind":1,"paddingLeft":true}"#,
+        )
+        .expect("InlayHint parts");
+        assert_eq!(hint.label.display_text(), ": i32");
+        assert_eq!(hint.kind, Some(InlayHintKind::Type));
+
+        // ServerCapabilities legend extraction & ClientCapabilities
+        let caps: ServerCapabilities = serde_json::from_str(
+            r#"{"semanticTokensProvider":{"legend":{"tokenTypes":["type"],"tokenModifiers":["static"]}}}"#,
+        )
+        .expect("ServerCapabilities");
+        assert_eq!(caps.semantic_tokens_legend().unwrap().token_types, vec!["type".to_string()]);
+        let client_caps = ClientCapabilities::default_phase9();
+        assert!(client_caps.text_document.is_some());
     }
 }

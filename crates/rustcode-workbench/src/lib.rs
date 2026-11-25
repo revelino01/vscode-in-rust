@@ -10,22 +10,26 @@
 
 pub mod activitybar;
 pub mod breadcrumbs;
+pub mod context_menu;
 pub mod debug;
 pub mod editor_area;
 pub mod explorer;
 pub mod extensions_view;
+pub mod hierarchy;
 pub mod layout;
 pub mod notebook;
 pub mod notifications;
 pub mod output_panel;
 pub mod problems;
 pub mod quickinput;
+pub mod refactor_preview;
 pub mod scm;
 pub mod search;
 pub mod settings_ui;
 pub mod statusbar;
 pub mod terminal_panel;
 pub mod testing;
+pub mod titlebar;
 pub mod webview;
 pub mod window;
 pub mod workbench_view;
@@ -47,10 +51,15 @@ pub use extensions_view::{
     ExtensionsSidebarView, ExtensionsViewAction, InstalledExtensionItem,
     MarketplaceExtensionItem,
 };
+pub use hierarchy::{FlatHierarchyRow, HierarchyAction, HierarchyItemNode, HierarchyMode, HierarchyView};
 pub use layout::WorkbenchLayout;
 pub use notebook::{
     CellKind, CellOutput, KernelValue, NotebookAction, NotebookCell, NotebookClickTarget,
     NotebookDocument, NotebookEditorView, NotebookKernel,
+};
+pub use refactor_preview::{
+    FileEditPreview, FileUndoSnapshot, RefactorPreviewAction, RefactorPreviewOverlay,
+    WorkspaceEditUndoEntry, WorkspaceEditUndoStack,
 };
 pub use notifications::{
     ActivePromptKind, ActivePromptUi, NotificationUiAction, NotificationsOverlay, PromptOverlay,

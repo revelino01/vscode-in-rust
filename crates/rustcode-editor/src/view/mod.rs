@@ -1,24 +1,40 @@
 //! GPUI EditorView component rendering text lines, line numbers, cursor, selections, and routing input.
 
+pub mod brackets;
 pub mod comments;
 pub mod context_menu;
+pub mod lsp_widgets;
 pub mod minimap;
+pub mod sticky_scroll;
 
+pub use brackets::{compute_visible_brackets, BracketColorConfig, BracketGuide, BracketSpan};
 pub use comments::{comment_config_for_language, CommentConfig};
 pub use context_menu::{ContextMenuAction, ContextMenuItem, EditorContextMenu};
+pub use lsp_widgets::{
+    hit_test_codelens, parse_markdown_hover, render_inline_annotations,
+    render_markdown_hover_popover, EditorCodeLens, EditorDocumentLink, EditorInlayHint,
+    MarkdownBlock, MarkdownSpan, PeekKind, PeekLocationItem, PeekViewWidget, RenameInputWidget,
+    SignatureEntry, SignatureHelpWidget, SignatureParamInfo,
+};
 pub use minimap::MinimapState;
+pub use sticky_scroll::{
+    compute_sticky_scroll_lines, hit_test_sticky_scroll, render_sticky_scroll,
+    StickyScrollConfig, StickyScrollLine,
+};
 
 use crate::completion::{AutocompleteWidget, CompletionItem, CompletionItemKind};
 use crate::cursor::{CursorState, Position, Range, RangeEdit, Selection};
 use crate::document::TextDocument;
 use crate::find_replace::{FindReplaceClickTarget, FindReplaceFocus, FindReplaceWidget};
 use crate::folding::FoldingModel;
+use crate::language_config::{LanguageConfiguration, LanguageConfigurationRegistry};
 use crate::model::piece_table::{
     display_col_to_utf16_col, display_x_col_to_utf16_col, grapheme_display_width,
     str_display_width, utf16_col_to_byte_offset, utf16_col_to_display_col, PieceTable,
 };
 use crate::model::undo_redo::{TextEdit, UndoRedoStack};
-use crate::syntax::{GrammarRegistry, SyntaxHighlighter};
+use crate::snippets::{expand_snippet_with_context, SnippetContext, SnippetSession};
+use crate::syntax::{GrammarRegistry, SemanticTokenSpan, SyntaxHighlighter};
 #[cfg(all(test, feature = "desktop"))]
 use crate::syntax::SyntaxScope;
 use crate::viewmodel::{DiagnosticSeverity, EditorDiagnostic};
@@ -31,7 +47,7 @@ use rustcode_platform::render::{
 };
 use rustcode_platform::theme::ColorTheme;
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -48,12 +64,36 @@ pub struct LspHoverInfo {
     pub position: Position,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum EditorAction {
     GoToDefinition(Position),
     FormatDocument,
     OpenCommandPalette,
     HoverRequested(Position),
+    TriggerSignatureHelp(Position),
+    PeekReferences(Position),
+    GoToImplementation(Position),
+    GoToTypeDefinition(Position),
+    StartRename(Position),
+    RenameConfirm {
+        position: Position,
+        new_name: String,
+        preview: bool,
+    },
+    PeekNavigate {
+        uri: String,
+        range: Range,
+    },
+    ExecuteCodeLens {
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    },
+    OpenDocumentLink {
+        target: String,
+    },
+    ShowCallHierarchy(Position),
+    ShowTypeHierarchy(Position),
+    ExecuteCommand(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,7 +166,9 @@ pub(crate) struct VisualLayout {
 impl VisualLayout {
     pub fn build(buf: &PieceTable, folding: &FoldingModel, max_cols: Option<usize>) -> Self {
         let line_count = buf.line_count();
-        if max_cols.is_none() && !folding.has_collapsed() {
+        let is_large = buf.len() >= crate::LARGE_FILE_BYTE_THRESHOLD
+            || line_count >= crate::LARGE_FILE_LINE_THRESHOLD;
+        if (max_cols.is_none() && !folding.has_collapsed()) || is_large {
             return Self {
                 identity: true,
                 line_count,
@@ -424,6 +466,17 @@ pub struct EditorView {
     pub auto_closing_brackets: bool,
     pub context_menu: EditorContextMenu,
     pub custom_comment_config: Option<CommentConfig>,
+    pub signature_help: SignatureHelpWidget,
+    pub peek_view: PeekViewWidget,
+    pub rename_input: RenameInputWidget,
+    pub inlay_hints: Vec<EditorInlayHint>,
+    pub code_lenses: Vec<EditorCodeLens>,
+    pub document_links: Vec<EditorDocumentLink>,
+    pub snippet_session: Option<SnippetSession>,
+    pub language_config: Option<LanguageConfiguration>,
+    pub sticky_scroll_enabled: bool,
+    pub sticky_scroll_max_lines: usize,
+    pub bracket_color_config: BracketColorConfig,
     language_id: Option<String>,
     clipboard_buffer: Arc<Mutex<String>>,
     clipboard_read: Option<ClipboardReadFn>,
@@ -481,6 +534,17 @@ impl EditorView {
             auto_closing_brackets: true,
             context_menu: EditorContextMenu::new(),
             custom_comment_config: None,
+            signature_help: SignatureHelpWidget::new(),
+            peek_view: PeekViewWidget::new(),
+            rename_input: RenameInputWidget::new(),
+            inlay_hints: Vec::new(),
+            code_lenses: Vec::new(),
+            document_links: Vec::new(),
+            snippet_session: None,
+            language_config: None,
+            sticky_scroll_enabled: true,
+            sticky_scroll_max_lines: 5,
+            bracket_color_config: BracketColorConfig::default(),
             language_id: None,
             clipboard_buffer: Arc::new(Mutex::new(String::new())),
             clipboard_read: None,
@@ -922,13 +986,45 @@ impl EditorView {
         let _ = text_snapshot;
     }
 
+    pub fn is_large_file(&self) -> bool {
+        let buf = self.buffer.read();
+        buf.len() >= crate::LARGE_FILE_BYTE_THRESHOLD
+            || buf.line_count() >= crate::LARGE_FILE_LINE_THRESHOLD
+    }
+
+    pub fn set_language_config(&mut self, cfg: Option<LanguageConfiguration>) {
+        self.language_config = cfg;
+    }
+
+    pub fn set_sticky_scroll_enabled(&mut self, enabled: bool) {
+        self.sticky_scroll_enabled = enabled;
+    }
+
+    pub fn set_sticky_scroll_max_lines(&mut self, max_lines: usize) {
+        self.sticky_scroll_max_lines = max_lines.clamp(1, 20);
+    }
+
+    pub fn set_bracket_pair_colorization(&mut self, enabled: bool) {
+        self.bracket_color_config.enabled = enabled;
+    }
+
+    pub fn set_bracket_pair_guides(&mut self, enabled: bool) {
+        self.bracket_color_config.guides_enabled = enabled;
+    }
+
     pub fn set_language(&mut self, lang_id: &str, theme: ColorTheme, registry: &GrammarRegistry) {
         self.language_id = Some(lang_id.to_string());
+        if self.language_config.is_none() {
+            let defaults = LanguageConfigurationRegistry::new();
+            self.language_config = defaults.get(lang_id).cloned();
+        }
         #[allow(unused_mut)]
         let mut sh = SyntaxHighlighter::for_language(lang_id, theme, registry);
         let buf = self.buffer.read();
+        let is_large = buf.len() >= crate::LARGE_FILE_BYTE_THRESHOLD
+            || buf.line_count() >= crate::LARGE_FILE_LINE_THRESHOLD;
         #[cfg(feature = "desktop")]
-        {
+        if !is_large {
             let ts_lang = self
                 .document
                 .as_ref()
@@ -944,7 +1040,11 @@ impl EditorView {
             sh.enable_tree_sitter(ts_lang, &buf.to_string());
         }
         *self.syntax_highlighter.lock() = Some(sh);
-        self.folding_model.compute_from_buffer(&buf, Some(lang_id));
+        if !is_large {
+            self.folding_model.compute_from_buffer(&buf, Some(lang_id));
+        } else {
+            self.folding_model.collapsed.clear();
+        }
     }
 
     pub fn set_theme(&mut self, theme: ColorTheme) {
@@ -1000,6 +1100,98 @@ impl EditorView {
 
     pub fn clear_lsp_hover(&mut self) {
         self.lsp_hover = None;
+    }
+
+    pub fn set_semantic_tokens(&mut self, spans: Vec<SemanticTokenSpan>) {
+        let overlay = crate::syntax::SemanticTokenOverlay::from_spans(spans);
+        let mut guard = self.syntax_highlighter.lock();
+        if let Some(sh) = guard.as_mut() {
+            sh.set_semantic_tokens(overlay);
+        } else {
+            let registry = GrammarRegistry::new();
+            let theme = rustcode_platform::theme::ThemeService::default_dark_theme();
+            let lang = self.language_id.as_deref().unwrap_or("plaintext");
+            let mut sh = SyntaxHighlighter::for_language(lang, theme, &registry);
+            sh.set_semantic_tokens(overlay);
+            *guard = Some(sh);
+        }
+    }
+
+    pub fn clear_semantic_tokens(&mut self) {
+        if let Some(sh) = self.syntax_highlighter.lock().as_mut() {
+            sh.clear_semantic_tokens();
+        }
+    }
+
+    pub fn set_inlay_hints(&mut self, hints: Vec<EditorInlayHint>) {
+        self.inlay_hints = hints;
+    }
+
+    pub fn set_code_lenses(&mut self, lenses: Vec<EditorCodeLens>) {
+        self.code_lenses = lenses;
+    }
+
+    pub fn set_document_links(&mut self, links: Vec<EditorDocumentLink>) {
+        self.document_links = links;
+    }
+
+    pub fn set_signature_help(
+        &mut self,
+        sig_help: Option<(Vec<SignatureEntry>, usize, usize)>,
+        pos: Position,
+    ) {
+        if let Some((signatures, active_sig, active_param)) = sig_help {
+            self.signature_help
+                .show(signatures, active_sig, active_param, pos);
+        } else {
+            self.signature_help.hide();
+        }
+    }
+
+    pub fn clear_signature_help(&mut self) {
+        self.signature_help.hide();
+    }
+
+    pub fn open_peek_view(
+        &mut self,
+        kind: PeekKind,
+        title: impl Into<String>,
+        anchor_line: usize,
+        items: Vec<PeekLocationItem>,
+    ) {
+        self.peek_view.open(kind, title, anchor_line, items);
+    }
+
+    pub fn close_peek_view(&mut self) {
+        self.peek_view.close();
+    }
+
+    pub fn word_at_position(&self, pos: Position) -> String {
+        let (ws, we) = self.word_range_at(pos);
+        if ws.line != pos.line || we.line != pos.line || we.column <= ws.column {
+            return String::new();
+        }
+        let buf = self.buffer.read();
+        let Some(line) = buf.get_line_content(pos.line) else {
+            return String::new();
+        };
+        let b_start = utf16_col_to_byte_offset(&line, ws.column);
+        let b_end = utf16_col_to_byte_offset(&line, we.column).min(line.len());
+        if b_start < b_end && line.is_char_boundary(b_start) && line.is_char_boundary(b_end) {
+            line[b_start..b_end].to_string()
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn start_rename(&mut self, position: Position, current_name: impl Into<String>) {
+        let initial = current_name.into();
+        let seed = if initial.is_empty() {
+            self.word_at_position(position)
+        } else {
+            initial
+        };
+        self.rename_input.open(position, seed);
     }
 
     pub fn hover_request_position(&self) -> Option<Position> {
@@ -2642,10 +2834,165 @@ impl EditorView {
         if let Some(cfg) = &self.custom_comment_config {
             return cfg.clone();
         }
+        if let Some(lang_cfg) = &self.language_config {
+            if let Some(cc) = lang_cfg.to_comment_config() {
+                return cc;
+            }
+        }
         let lang = self
             .detected_language_id()
             .unwrap_or_else(|| "plaintext".to_string());
         comments::comment_config_for_language(&lang)
+    }
+
+    /// Insert and activate a TextMate snippet session at the current cursor/selection.
+    pub fn insert_snippet(&mut self, template: &str, ctx: Option<SnippetContext>) -> bool {
+        let primary = self.cursor_state.primary().clone();
+        let (sel_start, sel_end) = if primary.is_empty() {
+            (primary.active, primary.active)
+        } else {
+            (primary.start(), primary.end())
+        };
+        let mut resolved_ctx = ctx.unwrap_or_else(|| {
+            let buf = self.buffer.read();
+            let s_off = buf.position_to_offset(sel_start.line, sel_start.column);
+            let e_off = buf.position_to_offset(sel_end.line, sel_end.column);
+            let selected = if e_off > s_off {
+                buf.get_range(s_off, e_off)
+            } else {
+                String::new()
+            };
+            let line_txt = buf.get_line_content(sel_start.line).unwrap_or_default();
+            let path = self.document.as_ref().and_then(|d| d.read().path.clone());
+            let word = self.word_at_position(sel_start);
+            let clip = self
+                .clipboard_read
+                .as_ref()
+                .and_then(|f| f())
+                .unwrap_or_else(|| self.clipboard_buffer.lock().clone());
+            SnippetContext::from_editor(
+                path.as_deref(),
+                sel_start.line,
+                &line_txt,
+                &selected,
+                &word,
+                &clip,
+            )
+        });
+        let cc = self.effective_comment_config();
+        if let Some(lc) = &cc.line_comment {
+            resolved_ctx.line_comment = lc.clone();
+        }
+        if let Some((bs, be)) = &cc.block_comment {
+            resolved_ctx.block_comment_start = bs.clone();
+            resolved_ctx.block_comment_end = be.clone();
+        }
+
+        let expanded = expand_snippet_with_context(template, &resolved_ctx);
+        let ins_text = expanded.text.clone();
+        let insert_off = {
+            let buf = self.buffer.read();
+            buf.position_to_offset(sel_start.line, sel_start.column)
+        };
+        let e_off = {
+            let buf = self.buffer.read();
+            buf.position_to_offset(sel_end.line, sel_end.column)
+        };
+        if !self.apply_offset_edits(vec![(insert_off, e_off, ins_text)]) {
+            return false;
+        }
+        if let Some(session) = SnippetSession::from_expanded(insert_off, expanded) {
+            if let Some((s, e)) = session.active_primary_span() {
+                let buf = self.buffer.read();
+                let p_s = buf.offset_to_position(s);
+                let p_e = buf.offset_to_position(e);
+                *self.cursor_state.primary_mut() =
+                    Selection::new(Position::new(p_s.0, p_s.1), Position::new(p_e.0, p_e.1));
+            }
+            self.snippet_session = Some(session);
+        }
+        true
+    }
+
+    fn select_active_snippet_tabstop(&mut self) {
+        if let Some(session) = &self.snippet_session {
+            if let Some((s, e)) = session.active_primary_span() {
+                let buf = self.buffer.read();
+                let p_s = buf.offset_to_position(s);
+                let p_e = buf.offset_to_position(e);
+                self.cursor_state.clear_secondary_cursors();
+                *self.cursor_state.primary_mut() =
+                    Selection::new(Position::new(p_s.0, p_s.1), Position::new(p_e.0, p_e.1));
+            }
+        }
+    }
+
+    fn sync_snippet_mirrors_for_delta(&mut self, cursor_after_edit: usize, delta: isize) {
+        let Some(mut session) = self.snippet_session.take() else {
+            return;
+        };
+        let Some((p_start, p_end)) = session.active_primary_span() else {
+            return;
+        };
+        let expected_new_end = (p_end as isize + delta).max(p_start as isize) as usize;
+        if cursor_after_edit < p_start || cursor_after_edit > expected_new_end {
+            session.finish();
+            return;
+        }
+        let new_primary_val = self.buffer.read().get_range(p_start, expected_new_end);
+        let mirror_edits = session.update_active_text(&new_primary_val, delta);
+        if !mirror_edits.is_empty() {
+            let shift_before: isize = mirror_edits
+                .iter()
+                .filter(|(ms, _, _)| *ms < cursor_after_edit)
+                .map(|(ms, me, rep)| rep.len() as isize - (me - ms) as isize)
+                .sum();
+            let raw_edits: Vec<(usize, usize, String)> = mirror_edits.into_iter().collect();
+            let _ = self.apply_offset_edits(raw_edits);
+            let final_cursor_off = (cursor_after_edit as isize + shift_before).max(0) as usize;
+            let pos = self.buffer.read().offset_to_position(final_cursor_off);
+            self.cursor_state
+                .set_primary(Position::new(pos.0, pos.1));
+        }
+        if !session.finished {
+            self.snippet_session = Some(session);
+        }
+    }
+
+    fn handle_enter_with_language_config(&mut self) {
+        let Some(cfg) = self.language_config.clone() else {
+            self.insert_text("\n");
+            return;
+        };
+        if self.cursor_state.selections.len() != 1 || !self.cursor_state.primary().is_empty() {
+            self.insert_text("\n");
+            return;
+        }
+        let pos = self.primary_position();
+        let (before, after) = {
+            let buf = self.buffer.read();
+            let line = buf.get_line_content(pos.line).unwrap_or_default();
+            let byte_col = utf16_col_to_byte_offset(&line, pos.column).min(line.len());
+            if line.is_char_boundary(byte_col) {
+                (line[..byte_col].to_string(), line[byte_col..].to_string())
+            } else {
+                (line, String::new())
+            }
+        };
+        let indent_unit = self.indent_unit();
+        let (ins_text, back_bytes) = cfg.compute_enter_action(&before, &after, &indent_unit);
+        self.insert_text(&ins_text);
+        if back_bytes > 0 {
+            let cur_pos = self.primary_position();
+            let cur_off = self
+                .buffer
+                .read()
+                .position_to_offset(cur_pos.line, cur_pos.column);
+            let target_off = cur_off.saturating_sub(back_bytes);
+            let new_pos = self.buffer.read().offset_to_position(target_off);
+            self.cursor_state
+                .set_primary(Position::new(new_pos.0, new_pos.1));
+        }
     }
 
     pub fn toggle_line_comment(&mut self) -> bool {
@@ -2991,15 +3338,51 @@ impl EditorView {
             }
         }
 
+        // Surrounding pair wrap when a non-empty single selection exists under a language configuration
+        if self.cursor_state.selections.len() == 1 && !self.cursor_state.primary().is_empty() {
+            if let Some(close_str) = self
+                .language_config
+                .as_ref()
+                .and_then(|c| c.matching_surrounding_pair(ch))
+                .map(ToString::to_string)
+            {
+                let primary = self.cursor_state.primary().clone();
+                let s_pos = primary.start();
+                let e_pos = primary.end();
+                let (s_off, e_off, wrapped) = {
+                    let buf = self.buffer.read();
+                    let s_off = buf.position_to_offset(s_pos.line, s_pos.column);
+                    let e_off = buf.position_to_offset(e_pos.line, e_pos.column);
+                    let inner = buf.get_range(s_off, e_off);
+                    (s_off, e_off, format!("{}{}{}", ch, inner, close_str))
+                };
+                if self.apply_offset_edits(vec![(s_off, e_off, wrapped)]) {
+                    let buf = self.buffer.read();
+                    let inner_start = buf.offset_to_position(s_off + ch.len_utf8());
+                    let inner_end = buf.offset_to_position(e_off + ch.len_utf8());
+                    *self.cursor_state.primary_mut() = Selection::new(
+                        Position::new(inner_start.0, inner_start.1),
+                        Position::new(inner_end.0, inner_end.1),
+                    );
+                    return;
+                }
+            }
+        }
+
         // Auto-close pairs
-        let pair_close = match ch {
+        let custom_close = self
+            .language_config
+            .as_ref()
+            .and_then(|c| c.matching_auto_closing_pair(ch))
+            .and_then(|cl| (cl.chars().count() == 1).then(|| cl.chars().next().unwrap()));
+        let pair_close = custom_close.or(match ch {
             '(' => Some(')'),
             '[' => Some(']'),
             '{' => Some('}'),
             '"' => Some('"'),
             '\'' => Some('\''),
             _ => None,
-        };
+        });
 
         if let Some(close_ch) = pair_close {
             if self.cursor_state.selections.len() == 1 && self.cursor_state.primary().is_empty() {
@@ -3040,8 +3423,27 @@ impl EditorView {
                 .collect();
             self.insert_text(s);
             self.auto_closed_offsets = shifted;
+            if self.snippet_session.is_some() {
+                self.sync_snippet_mirrors_for_delta(off + delta, delta as isize);
+            }
         } else {
+            let s_off = {
+                let buf = self.buffer.read();
+                let st = self.cursor_state.primary().start();
+                buf.position_to_offset(st.line, st.column)
+            };
+            let sel_len = {
+                let buf = self.buffer.read();
+                let st = self.cursor_state.primary().start();
+                let en = self.cursor_state.primary().end();
+                buf.position_to_offset(en.line, en.column)
+                    .saturating_sub(buf.position_to_offset(st.line, st.column))
+            };
             self.insert_text(s);
+            if self.snippet_session.is_some() && self.cursor_state.selections.len() == 1 {
+                let delta = s.len() as isize - sel_len as isize;
+                self.sync_snippet_mirrors_for_delta(s_off + s.len(), delta);
+            }
         }
     }
 
@@ -3049,6 +3451,11 @@ impl EditorView {
     /// to `(`, `)`, `[`, `]`, `{`, `}`, skipping brackets inside strings and comments.
     pub fn matching_bracket_pair(&self) -> Option<(Position, Position)> {
         let buf = self.buffer.read();
+        if buf.len() >= crate::LARGE_FILE_BYTE_THRESHOLD
+            || buf.line_count() >= crate::LARGE_FILE_LINE_THRESHOLD
+        {
+            return None;
+        }
         let text = buf.to_string();
         if text.is_empty() {
             return None;
@@ -3510,17 +3917,27 @@ impl View for EditorView {
         let primary_pos = self.primary_position();
         let text_area_x = bounds.min_x() + gutter_w + 8.0;
 
-        // Warm up tokenizer cache sequentially up to the last visible buffer line so multiline state
-        // is preserved across blank lines and folded ranges.
+        // Warm up tokenizer cache safely: bounded to local window on large files to stay O(viewport).
+        let is_large_doc = buf.len() >= crate::LARGE_FILE_BYTE_THRESHOLD
+            || line_count >= crate::LARGE_FILE_LINE_THRESHOLD;
         let max_warmup_line = segments
             .last()
             .map_or(0, |s| (s.buffer_line + 1).min(line_count));
         {
             let mut highlighter_guard = self.syntax_highlighter.lock();
             if let Some(highlighter) = highlighter_guard.as_mut() {
-                let last_cached = highlighter.cache_len();
-                if last_cached < max_warmup_line {
-                    for l in last_cached..max_warmup_line {
+                if !is_large_doc && max_warmup_line <= 4096 {
+                    let last_cached = highlighter.cache_len();
+                    if last_cached < max_warmup_line {
+                        for l in last_cached..max_warmup_line {
+                            if let Some(content) = buf.get_line_content(l) {
+                                highlighter.get_line_tokens(l, &content);
+                            }
+                        }
+                    }
+                } else if !segments.is_empty() {
+                    let win_start = segments[0].buffer_line.saturating_sub(64);
+                    for l in win_start..max_warmup_line {
                         if let Some(content) = buf.get_line_content(l) {
                             highlighter.get_line_tokens(l, &content);
                         }
@@ -3631,6 +4048,17 @@ impl View for EditorView {
             }
         }
 
+        let (bracket_spans, bracket_guides) = if (self.bracket_color_config.enabled
+            || self.bracket_color_config.guides_enabled)
+            && !segments.is_empty()
+        {
+            let first_l = segments[0].buffer_line;
+            let last_l = segments.last().map_or(first_l, |s| s.buffer_line);
+            brackets::compute_visible_brackets(&buf, first_l, last_l, &self.bracket_color_config)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         for seg in &segments {
             let line_idx = seg.buffer_line;
             let line_y = bounds.min_y() + (seg.visual_row as f32 - scroll_top) * font.line_height;
@@ -3650,6 +4078,22 @@ impl View for EditorView {
                 scene.push_finite_quad(
                     Quad::new(hl_rect).with_background(Rgba::new(0.4, 0.4, 0.1, 0.3)),
                 );
+            }
+
+            // Bracket indent guides for this line
+            if seg.is_first_segment && self.bracket_color_config.guides_enabled {
+                for g in bracket_guides.iter().filter(|g| g.line == line_idx) {
+                    let gx = text_area_x + (g.column as f32 - scroll_left) * font.char_width;
+                    if gx >= code_clip_rect.min_x()
+                        && gx <= code_clip_rect.max_x()
+                        && gx.is_finite()
+                    {
+                        scene.push_finite_quad(
+                            Quad::new(Rect::from_xywh(gx, line_y, 1.0, font.line_height))
+                                .with_background(g.color),
+                        );
+                    }
+                }
             }
 
             let line_content = buf.get_line_content(line_idx).unwrap_or_default();
@@ -3880,6 +4324,37 @@ impl View for EditorView {
                         code_clip_rect,
                     );
                 }
+
+                // 5c2. Bracket-pair rainbow colorization overlay
+                if self.bracket_color_config.enabled {
+                    for bspan in bracket_spans.iter().filter(|b| {
+                        b.line == line_idx
+                            && b.byte_start >= seg.byte_start
+                            && b.byte_end <= seg.byte_end
+                    }) {
+                        if line_content.is_char_boundary(bspan.byte_start)
+                            && line_content.is_char_boundary(bspan.byte_end)
+                        {
+                            let ch_str = &line_content[bspan.byte_start..bspan.byte_end];
+                            let start_vis =
+                                str_display_width(&line_content[seg.byte_start..bspan.byte_start]);
+                            let bx =
+                                text_area_x + (start_vis as f32 - scroll_left) * font.char_width;
+                            push_clipped_code_glyph_run(
+                                scene,
+                                ch_str,
+                                bx,
+                                line_y,
+                                bspan.color,
+                                font,
+                                false,
+                                false,
+                                false,
+                                code_clip_rect,
+                            );
+                        }
+                    }
+                }
             }
 
             // Collapsed fold summary badge (" ...") on folded header lines
@@ -3948,6 +4423,27 @@ impl View for EditorView {
                 }
             }
 
+            // 5d2. Inline Inlay Hints, CodeLens badges, and Document Link underlines
+            if seg.is_last_segment
+                && (!self.inlay_hints.is_empty()
+                    || !self.code_lenses.is_empty()
+                    || !self.document_links.is_empty())
+            {
+                render_inline_annotations(
+                    line_idx,
+                    &line_content,
+                    line_y,
+                    text_area_x,
+                    scroll_left,
+                    code_clip_rect,
+                    &self.inlay_hints,
+                    &self.code_lenses,
+                    &self.document_links,
+                    font,
+                    scene,
+                );
+            }
+
             // 5e. Cursors on this visual segment
             if self.is_focused {
                 for sel in &self.cursor_state.selections {
@@ -4001,16 +4497,47 @@ impl View for EditorView {
         }
 
         // Release buffer lock before calling helpers that acquire `buffer.read()`
-        let autocomplete_pos = if self.autocomplete.is_visible {
-            let (ac_row, ac_col) = visual.buffer_pos_to_visual(primary_pos, &buf, &self.folding_model);
-            Some((
-                text_area_x + (ac_col as f32 - scroll_left) * font.char_width,
-                bounds.min_y() + (ac_row as f32 - scroll_top) * font.line_height,
-            ))
+        let needs_cursor_anchor = self.autocomplete.is_visible
+            || self.signature_help.is_visible
+            || self.rename_input.is_visible;
+        let cursor_anchor_pt = if needs_cursor_anchor {
+            let (ac_row, ac_col) =
+                visual.buffer_pos_to_visual(primary_pos, &buf, &self.folding_model);
+            let px = text_area_x + (ac_col as f32 - scroll_left) * font.char_width;
+            let py = bounds.min_y() + (ac_row as f32 - scroll_top) * font.line_height;
+            (px.is_finite() && py.is_finite()).then_some(Point::new(px, py))
         } else {
             None
         };
+        let autocomplete_pos = if self.autocomplete.is_visible {
+            cursor_anchor_pt.map(|p| (p.x, p.y))
+        } else {
+            None
+        };
+        let sticky_lines = if self.sticky_scroll_enabled && !is_large_doc && !segments.is_empty() {
+            sticky_scroll::compute_sticky_scroll_lines(
+                &buf,
+                segments[0].buffer_line,
+                self.sticky_scroll_max_lines,
+                self.language_id.as_deref(),
+            )
+        } else {
+            Vec::new()
+        };
         drop(buf);
+
+        if !sticky_lines.is_empty() {
+            let _ = render_sticky_scroll(
+                &sticky_lines,
+                bounds,
+                gutter_w,
+                code_area_w,
+                scroll_left,
+                theme,
+                font,
+                scene,
+            );
+        }
 
         // 5g. Vertical & Horizontal Scrollbar tracks and thumbs
         if let Some(vtrack) = self.vertical_scrollbar_rect(bounds, gutter_w) {
@@ -4135,52 +4662,54 @@ impl View for EditorView {
                 );
             }
         } else if let Some(hover) = &self.lsp_hover {
-            let lines: Vec<&str> = hover.contents.lines().take(12).collect();
-            if !lines.is_empty() {
-                let max_line_w = lines
-                    .iter()
-                    .map(|l| font.text_width(l))
-                    .fold(120.0_f32, f32::max)
-                    .min((bounds.width() - 24.0).max(120.0));
-                let card_w = max_line_w + 20.0;
-                let card_h = (lines.len() as f32 * font.line_height + 12.0)
-                    .min((bounds.height() - 16.0).max(font.line_height + 12.0));
-                let anchor_pos = hover
-                    .range
-                    .map_or(primary_pos, |r| r.start);
-                let anchor_x = bounds.min_x() + gutter_w + 8.0 + (anchor_pos.column as f32 - scroll_left) * font.char_width;
-                let anchor_y = bounds.min_y() + (anchor_pos.line as f32 - scroll_top + 1.0) * font.line_height;
-                let card_x = anchor_x.clamp(bounds.min_x() + 4.0, (bounds.max_x() - card_w - 4.0).max(bounds.min_x() + 4.0));
-                let card_y = if anchor_y + card_h <= bounds.max_y() - 4.0 {
-                    anchor_y
-                } else {
-                    (anchor_y - card_h - font.line_height).max(bounds.min_y() + 4.0)
-                };
-                let card_rect = Rect::from_xywh(card_x, card_y, card_w, card_h);
-                if card_rect.is_finite() {
-                    scene.push_finite_quad(
-                        Quad::new(card_rect)
-                            .with_background(theme.command_palette_bg)
-                            .with_border_edges(theme.panel_border, Edges::all(1.0))
-                            .with_corner_radius(4.0),
-                    );
-                    for (idx, line_text) in lines.iter().enumerate() {
-                        let line_pt = Point::new(card_x + 10.0, card_y + 6.0 + idx as f32 * font.line_height);
-                        scene.push_finite_text(GlyphRun::new(
-                            (*line_text).to_string(),
-                            line_pt,
-                            Rect::from_xywh(line_pt.x, line_pt.y, max_line_w, font.line_height),
-                            theme.editor_foreground,
-                            font.font_size,
-                        ));
-                    }
-                }
+            if !hover.contents.trim().is_empty() {
+                static HOVER_GRAMMAR_REGISTRY: OnceLock<GrammarRegistry> = OnceLock::new();
+                let registry = HOVER_GRAMMAR_REGISTRY.get_or_init(GrammarRegistry::new);
+                let color_theme = self.syntax_highlighter.lock().as_ref().map_or_else(
+                    rustcode_platform::theme::ThemeService::default_dark_theme,
+                    |sh| sh.theme().clone(),
+                );
+                let anchor_pos = hover.range.map_or(primary_pos, |r| r.start);
+                render_markdown_hover_popover(
+                    &hover.contents,
+                    anchor_pos,
+                    scroll_left,
+                    scroll_top,
+                    gutter_w,
+                    bounds,
+                    theme,
+                    font,
+                    registry,
+                    &color_theme,
+                    scene,
+                );
             }
         }
 
         // 8. Find & Replace widget overlay
         if self.find_replace.is_visible {
             self.find_replace.render(bounds, theme, font, scene);
+        }
+
+        // 8b. Signature Help widget overlay
+        if self.signature_help.is_visible {
+            if let Some(anchor) = cursor_anchor_pt {
+                self.signature_help
+                    .render(anchor, bounds, theme, font, scene);
+            }
+        }
+
+        // 8c. Peek References / Implementations / Type Definitions widget overlay
+        if self.peek_view.is_visible {
+            self.peek_view.render(bounds, theme, font, scene);
+        }
+
+        // 8d. Inline Rename input widget overlay
+        if self.rename_input.is_visible {
+            if let Some(anchor) = cursor_anchor_pt {
+                self.rename_input
+                    .render(anchor, bounds, theme, font, scene);
+            }
         }
 
         // 9. Right-click Context Menu overlay
@@ -4285,6 +4814,68 @@ impl View for EditorView {
                         FindReplaceClickTarget::Widget => {}
                     }
                     return EventResult::Consumed;
+                }
+
+                // Peek References/Implementations overlay interaction
+                if self.peek_view.is_visible {
+                    if let Some(outcome) = self.peek_view.handle_event(event, bounds, &font) {
+                        if let Some(item) = outcome {
+                            self.last_action = Some(EditorAction::PeekNavigate {
+                                uri: item.uri,
+                                range: item.range,
+                            });
+                        }
+                        return EventResult::Consumed;
+                    }
+                }
+
+                // Inline Rename input box outside click dismissal
+                if self.rename_input.is_visible {
+                    let inside = (*self.rename_input.last_bounds.lock())
+                        .is_some_and(|r| r.contains(mouse.position));
+                    if inside {
+                        return EventResult::Consumed;
+                    }
+                    self.rename_input.close();
+                }
+
+                // Sticky Scroll pinned header click jumps to scope header line
+                if mouse.button == MouseButton::Left
+                    && self.sticky_scroll_enabled
+                    && !self.is_large_file()
+                    && self.scroll_top >= 1.0
+                {
+                    let max_wrap_cols = self.effective_wrap_columns(bounds, gutter_w, &font);
+                    let maybe_target = {
+                        let buf = self.buffer.read();
+                        let visual = VisualLayout::build(&buf, &self.folding_model, max_wrap_cols);
+                        let max_st = visual.total_rows().saturating_sub(1) as f32;
+                        let clamped_st = if self.scroll_top.is_finite() {
+                            self.scroll_top.clamp(0.0, max_st)
+                        } else {
+                            0.0
+                        };
+                        if clamped_st >= 1.0 {
+                            let top_row = (clamped_st.floor() as usize)
+                                .min(visual.total_rows().saturating_sub(1));
+                            let top_l = visual
+                                .segment_at(top_row, &buf)
+                                .map_or(0, |s| s.buffer_line);
+                            let sticky_lines = sticky_scroll::compute_sticky_scroll_lines(
+                                &buf,
+                                top_l,
+                                self.sticky_scroll_max_lines,
+                                self.language_id.as_deref(),
+                            );
+                            hit_test_sticky_scroll(mouse.position, &sticky_lines, bounds, &font)
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(target_line) = maybe_target {
+                        self.jump_to_position_and_unfold(Position::new(target_line, 0));
+                        return EventResult::Consumed;
+                    }
                 }
 
                 // Right-click opens context menu
@@ -4458,12 +5049,68 @@ impl View for EditorView {
                         true,
                     );
 
-                    // Ctrl+Click triggers Go to Definition
+                    // Plain left click on an inline CodeLens executes its command
+                    if mouse.button == MouseButton::Left
+                        && !mouse.modifiers.ctrl
+                        && !mouse.modifiers.alt
+                        && !mouse.modifiers.meta
+                        && self.code_lenses.iter().any(|l| l.line == target.line)
+                    {
+                        let line_content = self
+                            .buffer
+                            .read()
+                            .get_line_content(target.line)
+                            .unwrap_or_default();
+                        let visual_row = {
+                            let buf = self.buffer.read();
+                            let max_wrap_cols =
+                                self.effective_wrap_columns(bounds, gutter_w, &font);
+                            VisualLayout::build(&buf, &self.folding_model, max_wrap_cols)
+                                .buffer_pos_to_visual(
+                                    Position::new(target.line, 0),
+                                    &buf,
+                                    &self.folding_model,
+                                )
+                                .0
+                        };
+                        let line_y =
+                            bounds.min_y() + (visual_row as f32 - self.scroll_top) * font.line_height;
+                        if let Some(lens) = hit_test_codelens(
+                            mouse.position,
+                            target.line,
+                            &line_content,
+                            line_y,
+                            bounds.min_x() + gutter_w + 8.0,
+                            self.scroll_left,
+                            &self.code_lenses,
+                            &font,
+                        ) {
+                            if let Some(cmd) = &lens.command {
+                                self.last_action = Some(EditorAction::ExecuteCodeLens {
+                                    command: cmd.clone(),
+                                    arguments: lens.arguments.clone(),
+                                });
+                                return EventResult::Consumed;
+                            }
+                        }
+                    }
+
+                    // Ctrl+Click opens Document Link if under cursor, otherwise Go to Definition
                     if mouse.modifiers.ctrl && !mouse.modifiers.alt && !mouse.modifiers.meta {
                         self.cursor_state.clear_secondary_cursors();
                         self.cursor_state.set_primary(target);
                         self.preferred_visual_col = None;
-                        self.last_action = Some(EditorAction::GoToDefinition(target));
+                        if let Some(link) = self
+                            .document_links
+                            .iter()
+                            .find(|l| target >= l.range.start && target <= l.range.end)
+                        {
+                            self.last_action = Some(EditorAction::OpenDocumentLink {
+                                target: link.target.clone(),
+                            });
+                        } else {
+                            self.last_action = Some(EditorAction::GoToDefinition(target));
+                        }
                         return EventResult::Consumed;
                     }
 
@@ -4640,6 +5287,91 @@ impl View for EditorView {
                             self.context_menu.close();
                         }
                     }
+                }
+
+                // Inline Rename input routing when visible
+                if self.rename_input.is_visible {
+                    if let Some(outcome) = self.rename_input.handle_key(key) {
+                        if let Some((position, new_name, preview)) = outcome {
+                            self.last_action = Some(EditorAction::RenameConfirm {
+                                position,
+                                new_name,
+                                preview,
+                            });
+                        }
+                        return EventResult::Consumed;
+                    }
+                }
+
+                // Peek View keyboard routing when visible
+                if self.peek_view.is_visible {
+                    if let Some(outcome) = self.peek_view.handle_event(event, bounds, &font) {
+                        if let Some(item) = outcome {
+                            self.last_action = Some(EditorAction::PeekNavigate {
+                                uri: item.uri,
+                                range: item.range,
+                            });
+                        }
+                        return EventResult::Consumed;
+                    }
+                }
+
+                // F2 Rename Symbol
+                if key.key == KeyCode::F2
+                    && !key.modifiers.ctrl
+                    && !key.modifiers.alt
+                    && !key.modifiers.meta
+                    && !key.modifiers.shift
+                {
+                    self.last_action = Some(EditorAction::StartRename(self.primary_position()));
+                    return EventResult::Consumed;
+                }
+
+                // Shift+F12 Peek References
+                if key.key == KeyCode::F12
+                    && key.modifiers.shift
+                    && !key.modifiers.ctrl
+                    && !key.modifiers.alt
+                    && !key.modifiers.meta
+                {
+                    self.last_action = Some(EditorAction::PeekReferences(self.primary_position()));
+                    return EventResult::Consumed;
+                }
+
+                // Ctrl+F12 Go to Implementation
+                if key.key == KeyCode::F12
+                    && key.modifiers.ctrl
+                    && !key.modifiers.alt
+                    && !key.modifiers.meta
+                    && !key.modifiers.shift
+                {
+                    self.last_action =
+                        Some(EditorAction::GoToImplementation(self.primary_position()));
+                    return EventResult::Consumed;
+                }
+
+                // Ctrl+Shift+Space Trigger Signature Help
+                if key.key == KeyCode::Space
+                    && key.modifiers.ctrl
+                    && key.modifiers.shift
+                    && !key.modifiers.alt
+                    && !key.modifiers.meta
+                {
+                    self.last_action =
+                        Some(EditorAction::TriggerSignatureHelp(self.primary_position()));
+                    return EventResult::Consumed;
+                }
+
+                // Shift+Alt+H Call Hierarchy
+                if key.modifiers.shift
+                    && key.modifiers.alt
+                    && !key.modifiers.ctrl
+                    && !key.modifiers.meta
+                    && matches!(key.key, KeyCode::Char('h') | KeyCode::Char('H'))
+                {
+                    self.last_action =
+                        Some(EditorAction::ShowCallHierarchy(self.primary_position()));
+                    return EventResult::Consumed;
                 }
 
                 // F12 Go to Definition hook
@@ -4968,7 +5700,21 @@ impl View for EditorView {
                         EventResult::Consumed
                     }
                     KeyCode::Backspace => {
+                        let before_off = if self.snippet_session.is_some()
+                            && self.cursor_state.selections.len() == 1
+                        {
+                            let p = self.primary_position();
+                            Some(self.buffer.read().position_to_offset(p.line, p.column))
+                        } else {
+                            None
+                        };
                         self.delete_backwards();
+                        if let Some(b_off) = before_off {
+                            let p = self.primary_position();
+                            let a_off = self.buffer.read().position_to_offset(p.line, p.column);
+                            let delta = a_off as isize - b_off as isize;
+                            self.sync_snippet_mirrors_for_delta(a_off, delta);
+                        }
                         EventResult::Consumed
                     }
                     KeyCode::Delete => {
@@ -4976,10 +5722,25 @@ impl View for EditorView {
                         EventResult::Consumed
                     }
                     KeyCode::Enter => {
-                        self.insert_text("\n");
+                        self.handle_enter_with_language_config();
                         EventResult::Consumed
                     }
                     KeyCode::Tab if !key.modifiers.ctrl && !key.modifiers.alt && !key.modifiers.meta => {
+                        if let Some(sess) = self.snippet_session.as_mut() {
+                            if !sess.finished {
+                                let moved = if key.modifiers.shift {
+                                    sess.prev_tabstop()
+                                } else {
+                                    sess.advance_tabstop()
+                                };
+                                if moved {
+                                    self.select_active_snippet_tabstop();
+                                } else {
+                                    self.snippet_session = None;
+                                }
+                                return EventResult::Consumed;
+                            }
+                        }
                         if key.modifiers.shift {
                             self.outdent_selection();
                         } else {
@@ -5012,6 +5773,12 @@ impl View for EditorView {
                     KeyCode::Escape => {
                         if self.autocomplete.is_visible {
                             self.autocomplete.hide();
+                            EventResult::Consumed
+                        } else if self.signature_help.is_visible {
+                            self.signature_help.hide();
+                            EventResult::Consumed
+                        } else if self.snippet_session.as_ref().is_some_and(|s| !s.finished) {
+                            self.snippet_session = None;
                             EventResult::Consumed
                         } else if self.cursor_state.has_multiple_cursors() {
                             self.cursor_state.clear_secondary_cursors();
@@ -9107,6 +9874,306 @@ mod tests {
         let mut hl = view.syntax_highlighter.lock();
         let tokens_code = hl.as_mut().unwrap().get_line_tokens(2, &line2_restored);
         assert!(tokens_code.iter().any(|t| t.scope == SyntaxScope::Keyword));
+    }
+
+    #[test]
+    fn test_editor_view_phase9_m1_widgets_and_semantic_tokens() {
+        let mut view = EditorView::from_str("fn compute(alpha: i32) -> i32 {\n    alpha + 1\n}\n");
+        let bounds = Rect::from_xywh(0.0, 0.0, 900.0, 600.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+
+        // 1. Semantic token overlay layers over syntax highlighter
+        view.set_semantic_tokens(vec![crate::syntax::SemanticTokenSpan {
+            line: 0,
+            start_utf16: 3,
+            length_utf16: 7,
+            token_type: "function".to_string(),
+            modifiers: vec!["defaultLibrary".to_string(), "deprecated".to_string()],
+        }]);
+        {
+            let line0 = view.buffer.read().get_line_content(0).unwrap();
+            let mut hl = view.syntax_highlighter.lock();
+            let tokens = hl.as_mut().unwrap().get_line_tokens(0, &line0);
+            assert!(tokens
+                .iter()
+                .any(|t| t.start == 3 && t.end == 10 && t.metadata.is_underline()));
+        }
+
+        // 2. Rich markdown hover + inlay hints + codelens + document links + signature help + rename + peek render
+        view.set_lsp_hover(
+            Some(LspHoverInfo {
+                contents: "### compute\n\n**Fast** helper\n```rust\nfn compute(alpha: i32) -> i32\n```".to_string(),
+                range: Some(Range::new(Position::new(0, 3), Position::new(0, 10))),
+                position: Position::new(0, 4),
+            }),
+            Some(Point::new(120.0, 10.0)),
+        );
+        view.set_inlay_hints(vec![EditorInlayHint {
+            position: Position::new(1, 9),
+            label: ": i32".to_string(),
+            is_type: true,
+            padding_left: true,
+            padding_right: false,
+            tooltip: None,
+        }]);
+        view.set_code_lenses(vec![EditorCodeLens {
+            line: 0,
+            title: "2 references".to_string(),
+            command: Some("editor.action.showReferences".to_string()),
+            arguments: vec![],
+        }]);
+        view.set_document_links(vec![EditorDocumentLink {
+            range: Range::new(Position::new(0, 3), Position::new(0, 10)),
+            target: "https://example.com/compute".to_string(),
+            tooltip: None,
+        }]);
+        view.set_signature_help(
+            Some((
+                vec![SignatureEntry {
+                    label: "fn compute(alpha: i32) -> i32".to_string(),
+                    documentation: Some("Adds 1".to_string()),
+                    parameters: vec![SignatureParamInfo {
+                        label: "alpha: i32".to_string(),
+                        label_offsets: None,
+                        documentation: None,
+                    }],
+                    active_parameter: Some(0),
+                }],
+                0,
+                0,
+            )),
+            Position::new(0, 11),
+        );
+
+        let mut scene = Scene::new();
+        view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.glyph_runs().iter().any(|r| r.text.contains("Fast")));
+        assert!(scene.glyph_runs().iter().any(|r| r.text == ": i32"));
+        assert!(scene.glyph_runs().iter().any(|r| r.text == "2 references"));
+
+        // 3. Click CodeLens -> ExecuteCodeLens action
+        let text_area_x = bounds.min_x() + view.gutter_width(&font) + 8.0;
+        let line0_vis = view.buffer.read().get_line_content(0).unwrap().chars().count();
+        let lens_x = text_area_x + (line0_vis as f32 + 2.5) * font.char_width;
+        view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(Point::new(lens_x, 4.0), MouseButton::Left)),
+            bounds,
+        );
+        assert!(matches!(
+            view.take_last_action(),
+            Some(EditorAction::ExecuteCodeLens { command, .. }) if command == "editor.action.showReferences"
+        ));
+
+        // 4. Ctrl+Click inside DocumentLink -> OpenDocumentLink
+        view.handle_event(
+            &InputEvent::MouseDown(
+                MouseEvent::new(
+                    Point::new(text_area_x + 4.0 * font.char_width, 4.0),
+                    MouseButton::Left,
+                )
+                .with_modifiers(Modifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                    meta: false,
+                }),
+            ),
+            bounds,
+        );
+        assert!(matches!(
+            view.take_last_action(),
+            Some(EditorAction::OpenDocumentLink { target }) if target == "https://example.com/compute"
+        ));
+
+        // 5. F2 -> StartRename, then start_rename + type + Enter -> RenameConfirm
+        view.cursor_state.set_primary(Position::new(0, 4));
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::F2,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(
+            view.take_last_action(),
+            Some(EditorAction::StartRename(Position::new(0, 4)))
+        );
+        view.start_rename(Position::new(0, 4), "");
+        assert_eq!(view.rename_input.buffer, "compute");
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('2'),
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert!(matches!(
+            view.take_last_action(),
+            Some(EditorAction::RenameConfirm { new_name, .. }) if new_name == "compute2"
+        ));
+
+        // 6. Peek view open, down/enter -> PeekNavigate
+        view.open_peek_view(
+            PeekKind::References,
+            "References",
+            0,
+            vec![
+                PeekLocationItem {
+                    uri: "file:///a.rs".to_string(),
+                    display_path: "a.rs:1:3".to_string(),
+                    range: Range::new(Position::new(0, 3), Position::new(0, 10)),
+                    preview_lines: vec![(0, "fn compute(alpha: i32) -> i32 {".to_string())],
+                    preview_match_line: 0,
+                },
+                PeekLocationItem {
+                    uri: "file:///b.rs".to_string(),
+                    display_path: "b.rs:5:1".to_string(),
+                    range: Range::new(Position::new(4, 0), Position::new(4, 7)),
+                    preview_lines: vec![(4, "compute(1);".to_string())],
+                    preview_match_line: 4,
+                },
+            ],
+        );
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::ArrowDown,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert!(matches!(
+            view.take_last_action(),
+            Some(EditorAction::PeekNavigate { uri, .. }) if uri == "file:///b.rs"
+        ));
+    }
+
+    #[test]
+    fn test_editor_view_phase9_m2_snippets_langcfg_sticky_brackets_large_file() {
+        let bounds = Rect::from_xywh(0.0, 0.0, 900.0, 500.0);
+        let font = FontMetrics::default_monospace();
+        let theme = WorkbenchThemeStyles::dark_default();
+        let reg = GrammarRegistry::new();
+
+        // 1. Snippets session inside EditorView: mirror updates on edit, Tab/Shift+Tab, Escape
+        let mut snip_view = EditorView::from_str("");
+        snip_view.set_language(
+            "rust",
+            rustcode_platform::theme::ThemeService::default_dark_theme(),
+            &reg,
+        );
+        assert!(snip_view.insert_snippet("fn ${1:name}() { println!(\"${1}\"); $0 }", None));
+        assert!(snip_view.snippet_session.is_some());
+        snip_view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('g'),
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(snip_view.text(), "fn g() { println!(\"g\");  }");
+        snip_view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Tab,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        // Moved to $0; next Tab finishes snippet session
+        snip_view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Tab,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert!(snip_view.snippet_session.is_none());
+
+        // 2. LanguageConfiguration Enter auto-indent & surrounding selection wrap
+        let mut lc_view = EditorView::from_str("fn outer() {}");
+        lc_view.set_language(
+            "rust",
+            rustcode_platform::theme::ThemeService::default_dark_theme(),
+            &reg,
+        );
+        lc_view.cursor_state.set_primary(Position::new(0, 12)); // between { and }
+        lc_view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Enter,
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(lc_view.text(), "fn outer() {\n    \n}");
+        assert_eq!(lc_view.primary_position(), Position::new(1, 4));
+
+        // Surrounding pair wrap with selection
+        let mut wrap_view = EditorView::from_str("hello");
+        wrap_view.set_language(
+            "rust",
+            rustcode_platform::theme::ThemeService::default_dark_theme(),
+            &reg,
+        );
+        *wrap_view.cursor_state.primary_mut() =
+            Selection::new(Position::new(0, 0), Position::new(0, 5));
+        wrap_view.handle_event(
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                KeyCode::Char('('),
+                Modifiers::none(),
+            )),
+            bounds,
+        );
+        assert_eq!(wrap_view.text(), "(hello)");
+
+        // 3. Sticky Scroll + Rainbow Brackets render & click jump
+        let code = "pub mod demo {\n    pub fn calc() {\n        let a = (1 + [2]);\n        let b = a;\n        let c = b;\n    }\n}\n";
+        let mut ui_view = EditorView::from_str(code);
+        ui_view.set_language(
+            "rust",
+            rustcode_platform::theme::ThemeService::default_dark_theme(),
+            &reg,
+        );
+        ui_view.scroll_top = 2.0;
+        let mut scene = Scene::new();
+        ui_view.render(bounds, &theme, &font, &mut scene);
+        assert!(scene.glyph_runs().iter().any(|r| r.text.contains("pub mod demo")));
+
+        ui_view.handle_event(
+            &InputEvent::MouseDown(MouseEvent::new(Point::new(100.0, 4.0), MouseButton::Left)),
+            bounds,
+        );
+        assert_eq!(ui_view.primary_position().line, 0);
+
+        // 4. Large file (>4 MB) virtualization: O(1) layout, skipped folding, fast render
+        let line = "pub fn big_file_line_content_padding_0123456789abcdef() -> usize { 42 }\n";
+        let big = line.repeat(70_000); // ~4.9 MB & 70,000 lines
+        let mut big_view = EditorView::from_str(&big);
+        assert!(big_view.is_large_file());
+        big_view.set_language(
+            "rust",
+            rustcode_platform::theme::ThemeService::default_dark_theme(),
+            &reg,
+        );
+        assert!(big_view.folding_model.ranges().is_empty());
+        big_view.scroll_top = 60_000.0;
+        let t0 = Instant::now();
+        let mut big_scene = Scene::new();
+        big_view.render(bounds, &theme, &font, &mut big_scene);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(100));
     }
 }
 

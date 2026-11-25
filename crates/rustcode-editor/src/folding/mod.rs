@@ -347,6 +347,12 @@ impl FoldingModel {
     }
 
     fn recompute_internal(&mut self, buf: &PieceTable, language_id: Option<&str>) {
+        if buf.len() >= crate::LARGE_FILE_BYTE_THRESHOLD
+            || buf.line_count() >= crate::LARGE_FILE_LINE_THRESHOLD
+        {
+            self.ranges.clear();
+            return;
+        }
         let mut detected = detect_ranges(buf, language_id);
         let line_count = buf.line_count();
         for mr in &self.manual_ranges {

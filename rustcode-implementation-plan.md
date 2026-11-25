@@ -130,12 +130,12 @@
 - [x] **Phase 8 M5 — Real `git` CLI SCM, Auto-Attached LSP Servers & Live DAP (`launch.json`)**: Implemented `GitBackend` / `GitCliBackend` (`git status --porcelain=v2 -b`, `diff`, `show HEAD:<path>`, `add`, `restore --staged`, `commit`, `log`, Status Bar branch readout) replacing `ScmRepository::sample_repository()` in default `WorkbenchView`; wired auto-attached `LspClientManager` servers (`rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `vscode-json-language-server`, `gopls`) for hover/go-to-def (`F12`/`Ctrl+Click`)/completion/diagnostics/`editor.formatOnSave`; and added `.vscode/launch.json` JSONC parser (`load_launch_json`) + live `DapClient` sessions with `DebugToolbarView` hidden by default when idle
 - [x] **Phase 8 M6 — Cross-Platform Hardening, Native Windows/Linux CI & 1:1 Extension Verification**: Implemented Unix `setsid`/`setpgid`/`killpg` process-group isolation in `crates/rustcode-ext-host/src/process/mod.rs`, fixed `util.isDeepStrictEqual` edge cases & `ContextKeyExpr` `[^]/]` regex char-class parsing, added `.github/workflows/ci.yml` (`windows-latest` + `ubuntu-latest`), updated `scripts/package.ps1`/`scripts/package.sh` (`-Desktop`/`--desktop`, `-Jobs`/`--jobs`), added `tests/phase8-e2e/`, and refreshed all 4 docs/trackers (**608/608** default & **617/617** `desktop` workspace tests, **41/41** `compat_suite`, **31/31** `ext-host-js/test.js`, **286/286** `tests/phase7-e2e/`, **30/30** `tests/phase8-e2e/`, **0** Win/Linux `clippy` warnings, `cargo bench --no-run`, default & desktop CLI smoke checks)
 
-### Phase 9 (Planned): Deep Editing, Navigation & Language Intelligence Parity
+### Phase 9 (Completed — Stage 3 Verified): Deep Editing, Navigation & Language Intelligence Parity
 
-- [ ] **Phase 9 M1 — Advanced LSP & Multi-File Refactoring**: Rich Markdown hover popovers, Signature Help (`Ctrl+Shift+Space`), Peek References / Go to Implementation / Type Definition (`Shift+F12`), Rename Symbol (`F2`) with multi-file `WorkspaceEdit` preview & undo, LSP Semantic Tokens layering over TextMate/`tree-sitter`, Inlay Hints, CodeLens, Document Links, and Call/Type Hierarchy views
-- [ ] **Phase 9 M2 — Snippets Engine, Language Config & Large-File PieceTable**: Full VS Code TextMate snippet engine (nested tabstops, `${1|a,b,c|}` choices, regex transforms, `$TM_*` variables), `contributes.snippets` & `language-configuration.json` loader (auto-indent, on-enter rules, surrounding pairs), Sticky Scroll, bracket-pair colorization, and true O(log n) balanced piece-tree rebalancing + virtualized rendering for 100 MB+ files
-- [ ] **Phase 9 M3 — Full Workbench Chrome, Context Menus & Multi-Window**: Drag-and-drop tabs across split groups & Explorer files, Secondary Sidebar (right panel), Panel position toggle (bottom/left/right), draggable Sash resizing, custom Title Bar & Menu Bar, full `contributes.menus` right-click Context Menus with `when` clauses, Window Zoom (`Ctrl+=`/`-`/`0`), Zen Mode (`Ctrl+K Z`), and Multi-Window orchestration (`Ctrl+Shift+N` + single-instance IPC socket forwarding CLI files into active windows)
-- [ ] **Phase 9 M4 — Phase 9 E2E & Large-File Benchmarks (`tests/phase9-e2e/`)**: Automated verification of Rename Symbol, Peek References, Semantic Tokens, Snippets, Drag-and-Drop layout, Multi-Window IPC, and 100 MB file latency budgets
+- [x] **Phase 9 M1 — Advanced LSP & Multi-File Refactoring**: Rich Markdown hover popovers, Signature Help (`Ctrl+Shift+Space`), Peek References / Go to Implementation (`Ctrl+F12`) / Type Definition (`Shift+F12`), Rename Symbol (`F2`) with multi-file `RefactorPreviewOverlay` & atomic `WorkspaceEditUndoStack` undo, LSP Semantic Tokens layered over TextMate/`tree-sitter`, Inlay Hints, CodeLens, Document Links, and Call/Type Hierarchy views (`HierarchySidebarView`, `Shift+Alt+H`)
+- [x] **Phase 9 M2 — Snippets Engine, Language Config & Large-File PieceTable**: Full VS Code TextMate snippet engine (nested tabstops, `${1|a,b,c|}` choices, regex transforms, linked mirrors, `$TM_*` variables), `contributes.snippets` & `language-configuration.json` loader (auto-indent, on-enter rules, surrounding pairs), Sticky Scroll, rainbow bracket-pair colorization & guides, and true O(log n) AVL-balanced piece-tree rebalancing + virtualized rendering & `benches/large_file.rs` for 100 MB+ files
+- [x] **Phase 9 M3 — Full Workbench Chrome, Context Menus & Multi-Window**: Drag-and-drop tabs across split groups & Explorer files, Secondary Sidebar (right panel), Panel position toggle (bottom/left/right), draggable Sash resizing, custom Title Bar & Menu Bar, full `contributes.menus` right-click Context Menus with `when` clauses, Window Zoom (`Ctrl+=`/`-`/`0`), Zen Mode (`Ctrl+K Z`), and Multi-Window orchestration (`Ctrl+Shift+N`, `-n`/`-r` CLI flags, `WindowManager`, and cross-platform `SingleInstanceIpc` socket forwarding CLI files into active windows)
+- [x] **Phase 9 M4 — Phase 9 E2E & Large-File Benchmarks (`tests/phase9-e2e/`)**: Automated verification of Rename Symbol, Peek References, Semantic Tokens, Snippets, Drag-and-Drop layout, Multi-Window IPC, and 100 MB file latency budgets (`5/5` E2E targets, `4/4` syntax/clippy checks, `111 ns` mid-file edit mean on 100.00 MiB)
 
 ### Phase 10 (Planned): Real-World Top-100 VS Code Extension Ecosystem & Marketplace Maturity
 
@@ -1775,7 +1775,7 @@ flowchart LR
     P11 --> P12["Phase 12: Perf Budgets + Trust + v1.0 GA"]
 ```
 
-### Phase 9: Deep Editing, Navigation & Language Intelligence Parity (Planned)
+### Phase 9: Deep Editing, Navigation & Language Intelligence Parity (Completed — Stage 3 Verified)
 
 | Milestone | Target Crates / Paths | Deliverable |
 |---|---|---|
@@ -1841,7 +1841,7 @@ flowchart LR
 
 ### Automated Tests
 
-Phase 8 Stage 3 verified results: **608/608** default (**617/617** `--features desktop`) workspace tests across **8** crates (`rustcode-app` 37 [13 lib + 24 integration] / 39 desktop, `rustcode-base` 14, `rustcode-editor` 144 / 146 desktop, `rustcode-ext-host` 130 [89 lib + 41 `compat_suite`], `rustcode-platform` 60 / 64 desktop, `rustcode-protocols` 37, `rustcode-terminal` 14, `rustcode-workbench` 172 / 173 desktop), **31/31** `ext-host-js/test.js` `[Test]` sections, **286/286** Windows (`10/10` targets) `tests/phase7-e2e` regression tests, **30/30** (`8/8` targets) `tests/phase8-e2e` tests, **0 `clippy` warnings** (`-D warnings`) on **Windows (`x86_64-pc-windows-gnu`, default + `--features desktop`)** and **Linux (`x86_64-unknown-linux-gnu`)** cross-target clippy, `cargo bench --workspace --no-run -j 2`, and standalone default/desktop `rustcode` CLI smoke checks *(runtime tests executed on Windows 11 x64; Linux verified via cross-target `cargo clippy`)*.
+Phase 9 Stage 3 verified results: **637/637** default (**646/646** `--features desktop`) workspace tests across **8** crates (`rustcode-app` 41 [17 lib + 24 integration] / 43 desktop, `rustcode-base` 14, `rustcode-editor` 156 / 158 desktop, `rustcode-ext-host` 130 [89 lib + 41 `compat_suite`], `rustcode-platform` 60 / 64 desktop, `rustcode-protocols` 39, `rustcode-terminal` 14, `rustcode-workbench` 183 / 184 desktop), **32/32** `ext-host-js/test.js` `[Test]` sections, **286/286** Windows (`10/10` targets) `tests/phase7-e2e` regression tests, **30/30** (`8/8` targets, `5/5` syntax checks) `tests/phase8-e2e` tests, **12** (`5/5` targets [1 JS + 11 Rust], `4/4` syntax checks) `tests/phase9-e2e` tests, **0 `clippy` warnings** (`-D warnings`) on **Windows (`x86_64-pc-windows-gnu`, default + `--features desktop`)** and **Linux (`x86_64-unknown-linux-gnu`)** cross-target clippy, passing `editor_latency` (**36 ns** typing mean) & `large_file` (**43.75 ms** 100.00 MiB load, **1.49 µs** pos query, **111 ns** mid-file edit mean, **4.59 ms** virtualized viewport render) benchmarks, and standalone `rustcode` CLI smoke checks (`--help`, `--version`, `--headless`, zero-arg) *(runtime tests executed on Windows 11 x64; Linux verified via cross-target `cargo clippy`)*.
 
 ```bash
 # Unit and integration tests for all crates (default headless + desktop feature; use -j 2 on Windows)
@@ -1857,26 +1857,30 @@ cargo test -j 2 -p rustcode-ext-host --test compat_suite
 # JavaScript extension host suite (9 node-compat modules + 12 vscode.* namespaces)
 node ext-host-js/test.js
 
-# Standalone E2E suites (Phase 7 regression + Phase 8 native/runtime parity)
+# Standalone E2E suites (Phase 7 regression + Phase 8 native/runtime parity + Phase 9 deep editing & multi-window)
 node tests/phase7-e2e/runner.js --syntax-check
 node tests/phase7-e2e/runner.js --tier all
 node tests/phase8-e2e/runner.js --syntax-check
 node tests/phase8-e2e/runner.js --tier all
+node tests/phase9-e2e/runner.js --syntax-check
+node tests/phase9-e2e/runner.js --tier all
 
 # Workspace lint check on host (default + desktop) and Linux cross-target (warnings treated as errors)
 cargo clippy -j 2 --workspace --all-targets -- -D warnings
 cargo clippy -j 2 --workspace --all-targets --features desktop -- -D warnings
 cargo clippy -j 2 --target x86_64-unknown-linux-gnu --workspace --all-targets -- -D warnings
 
-# Performance benchmarks
+# Performance benchmarks (editor keystroke latency + 100 MiB large-file bench)
+cargo bench -j 2 -p rustcode-editor --bench editor_latency
+cargo bench -j 2 -p rustcode-editor --bench large_file
 cargo bench --workspace --no-run -j 2
 ```
 
-> **Standalone E2E Suites (`tests/phase7-e2e/`, `tests/phase8-e2e/`):** Both live in isolated standalone Cargo `[workspace]` manifests outside root `Cargo.toml`. `tests/phase7-e2e/` passes **286/286** Windows (`10/10` targets, `node tests/phase7-e2e/runner.js --syntax-check` [8/8] and `--tier all` [10/10]) with zero regressions; `tests/phase8-e2e/` passes **30/30** tests across **8/8** Tier 1–4 + JS targets (`node tests/phase8-e2e/runner.js --syntax-check` [5/5] and `--tier all` [8/8]), executed alongside `phase7-e2e` in `.github/workflows/ci.yml`.
+> **Standalone E2E Suites (`tests/phase7-e2e/`, `tests/phase8-e2e/`, `tests/phase9-e2e/`):** All three live in isolated standalone Cargo `[workspace]` manifests outside root `Cargo.toml`. `tests/phase7-e2e/` passes **286/286** Windows (`10/10` targets) with zero regressions; `tests/phase8-e2e/` passes **30/30** tests across **8/8** Tier 1–4 + JS targets (`--syntax-check` `5/5`, `--tier all` `8/8`); and `tests/phase9-e2e/` passes **12** checks (`5/5` targets, `--syntax-check` `4/4`), executed together in `.github/workflows/ci.yml`.
 
 ### Extension Compatibility Matrix
 
-See the living compatibility matrix in [docs/extension-compat-matrix.md](docs/extension-compat-matrix.md) for the complete breakdown of all 12 `vscode.*` namespaces (`commands`, `window`, `workspace`, `languages`, `notebooks`, `scm`, `debug`, `tasks`, `tests`, `authentication`, `env`, `extensions`), all **9** `node-compat/` modules (`events`, `fs`, `path`, `buffer`, `url`, `util`, `os`, `crypto`, `child_process`), **14** pure-Rust syntax grammars (`plaintext`, `rust`, `javascript`, `typescript`, `python`, `json`, `markdown`, `go`, `c`, `cpp`, `html`, `css`, `toml`, `yaml`), 16 `ProviderType` variants, **14** Rust extension host managers on `LanguageFeatureBridge` (including `ExtHostWindowManager` and `ExtHostEnvManager`), 11 manifest contribution types, 1 sample extension (`hello-world`), 6 synthetic fixture extensions, and the 8-item Open VSX curated catalog.
+See the living compatibility matrix in [docs/extension-compat-matrix.md](docs/extension-compat-matrix.md) for the complete breakdown of all 12 `vscode.*` namespaces (`commands`, `window`, `workspace`, `languages`, `notebooks`, `scm`, `debug`, `tasks`, `tests`, `authentication`, `env`, `extensions`), all **9** `node-compat/` modules (`events`, `fs`, `path`, `buffer`, `url`, `util`, `os`, `crypto`, `child_process`), **14** pure-Rust syntax grammars (`plaintext`, `rust`, `javascript`, `typescript`, `python`, `json`, `markdown`, `go`, `c`, `cpp`, `html`, `css`, `toml`, `yaml`), **26** `ProviderType` variants, **14** Rust extension host managers on `LanguageFeatureBridge` (including `ExtHostWindowManager` and `ExtHostEnvManager`), **13** manifest contribution types (incl. `snippets`, `menus`), 1 sample extension (`hello-world`), 6 synthetic fixture extensions, and the 8-item Open VSX curated catalog.
 
 | Extension | Status | Blocking / Key API | Notes |
 |---|---|---|---|

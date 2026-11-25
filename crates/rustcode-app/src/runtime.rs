@@ -275,6 +275,77 @@ pub fn load_extension_themes(themes: &mut ThemeService, loader: &ExtensionLoader
     }
 }
 
+/// Load any snippet JSON files contributed by loaded extensions into `SnippetRegistry`.
+pub fn load_extension_snippets(
+    registry: &mut rustcode_editor::SnippetRegistry,
+    loader: &ExtensionLoader,
+) {
+    for ext in loader.loaded_extensions() {
+        if let Some(contribs) = &ext.manifest.contributes {
+            if let Some(snippet_contribs) = &contribs.snippets {
+                for contrib in snippet_contribs {
+                    let Some(snippet_path) =
+                        resolve_contained_extension_path(&ext.root_dir, &contrib.path)
+                    else {
+                        continue;
+                    };
+                    if let Ok(raw) = std::fs::read_to_string(&snippet_path) {
+                        let _ = registry.load_vscode_json(&contrib.language, &raw);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load any `language-configuration.json` files contributed by loaded extensions.
+pub fn load_extension_language_configs(
+    registry: &mut rustcode_editor::LanguageConfigurationRegistry,
+    loader: &ExtensionLoader,
+) {
+    for ext in loader.loaded_extensions() {
+        if let Some(contribs) = &ext.manifest.contributes {
+            if let Some(langs) = &contribs.languages {
+                for lang in langs {
+                    let Some(cfg_rel) = &lang.configuration else {
+                        continue;
+                    };
+                    let Some(cfg_path) =
+                        resolve_contained_extension_path(&ext.root_dir, cfg_rel)
+                    else {
+                        continue;
+                    };
+                    if let Ok(raw) = std::fs::read_to_string(&cfg_path) {
+                        let _ = registry.load_from_json_str(&lang.id, &raw);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Register extension `contributes.menus` contributions into `ContextMenuRegistry`.
+pub fn load_extension_menus(
+    registry: &mut rustcode_workbench::context_menu::ContextMenuRegistry,
+    loader: &ExtensionLoader,
+) {
+    for ext in loader.loaded_extensions() {
+        let Some(contribs) = &ext.manifest.contributes else {
+            continue;
+        };
+        let Some(menus) = &contribs.menus else {
+            continue;
+        };
+        let mut command_titles = HashMap::new();
+        if let Some(cmds) = &contribs.commands {
+            for cmd in cmds {
+                command_titles.insert(cmd.command.clone(), cmd.title.clone());
+            }
+        }
+        registry.register_contributions(menus, &command_titles);
+    }
+}
+
 /// Load user settings, user keybindings, workspace settings, built-in themes, and extension discovery.
 pub fn load_disk_resources(
     ctx: &mut RustCodeContext,
@@ -316,6 +387,9 @@ pub fn load_disk_resources(
     }
 
     load_extension_themes(&mut ctx.theme, &ctx.ext_loader);
+    load_extension_snippets(&mut ctx.snippets, &ctx.ext_loader);
+    load_extension_language_configs(&mut ctx.language_configs, &ctx.ext_loader);
+    load_extension_menus(&mut ctx.context_menus, &ctx.ext_loader);
     let _ = ctx.theme.sync_with_configuration(&ctx.config);
 }
 
@@ -362,15 +436,39 @@ pub fn capture_workspace_state(window: &WorkbenchWindow) -> PersistedWorkspaceSt
         }
     }
 
+    let (sb_vis, sec_sb_vis, pan_vis, tb_vis) =
+        if let Some(snap) = &window.view.layout.zen_snapshot {
+            (
+                snap.sidebar_visible,
+                snap.secondary_sidebar_visible,
+                snap.panel_visible,
+                snap.title_bar_visible,
+            )
+        } else {
+            (
+                window.view.layout.sidebar_visible,
+                window.view.layout.secondary_sidebar_visible,
+                window.view.layout.panel_visible,
+                window.view.layout.title_bar_visible,
+            )
+        };
+
     PersistedWorkspaceState {
         open_files,
         active_tab_index: current_group.active_tab_index,
         tab_states,
-        sidebar_visible: window.view.layout.sidebar_visible,
+        sidebar_visible: sb_vis,
         sidebar_width: window.view.layout.sidebar_width,
-        panel_visible: window.view.layout.panel_visible,
+        panel_visible: pan_vis,
         panel_height: window.view.layout.panel_height,
         active_theme_id: Some(window.theme.current().name.clone()),
+        secondary_sidebar_visible: sec_sb_vis,
+        secondary_sidebar_width: window.view.layout.secondary_sidebar_width,
+        panel_position: window.view.layout.panel_position.as_str().to_string(),
+        panel_width: window.view.layout.panel_width,
+        title_bar_visible: tb_vis,
+        zoom_level: window.view.layout.zoom_level,
+        zen_mode: window.view.layout.zen_mode,
     }
 }
 
@@ -408,6 +506,26 @@ pub fn restore_workbench_state(
         l.panel_visible = state.panel_visible;
         if state.panel_height.is_finite() && state.panel_height > 40.0 {
             l.panel_height = state.panel_height;
+        }
+        l.secondary_sidebar_visible = state.secondary_sidebar_visible;
+        if state.secondary_sidebar_width.is_finite() && state.secondary_sidebar_width > 50.0 {
+            l.secondary_sidebar_width = state.secondary_sidebar_width;
+        }
+        if !state.panel_position.is_empty() {
+            l.panel_position =
+                rustcode_workbench::layout::PanelPosition::from_str_lossy(&state.panel_position);
+        }
+        if state.panel_width.is_finite() && state.panel_width > 50.0 {
+            l.panel_width = state.panel_width;
+        }
+        l.title_bar_visible = state.title_bar_visible;
+        if state.zoom_level.is_finite() {
+            l.zoom_level = state.zoom_level.clamp(-5.0, 5.0);
+        }
+        l.zen_mode = false;
+        l.zen_snapshot = None;
+        if state.zen_mode {
+            l.toggle_zen_mode();
         }
     });
 
@@ -495,12 +613,17 @@ pub fn memento_update(
     storage.memento_update(scope, ext_id, key, value)
 }
 
-/// Apply CLI positional `[path...]` and `--goto <file:line[:col]>` arguments to `window`.
-pub fn apply_cli_targets(window: &mut WorkbenchWindow, opts: &CliOptions, restore_saved: bool) {
+fn apply_paths_and_goto(
+    window: &mut WorkbenchWindow,
+    paths: &[PathBuf],
+    goto: &[GotoTarget],
+    restore_saved: bool,
+    allow_empty_restore: bool,
+) {
     let mut workspace_dirs = Vec::new();
     let mut file_paths = Vec::new();
 
-    for path in &opts.paths {
+    for path in paths {
         if path.is_dir() {
             workspace_dirs.push(path.clone());
         } else {
@@ -509,10 +632,17 @@ pub fn apply_cli_targets(window: &mut WorkbenchWindow, opts: &CliOptions, restor
     }
 
     if let Some(first_dir) = workspace_dirs.first() {
-        window.open_workspace(first_dir);
-        for extra_dir in workspace_dirs.iter().skip(1) {
-            let cleaned = strip_windows_verbatim_prefix(extra_dir.clone());
-            window.view.workspace.add_folder(cleaned, None);
+        if window.view.workspace.folders().is_empty() {
+            window.open_workspace(first_dir);
+            for extra_dir in workspace_dirs.iter().skip(1) {
+                let cleaned = strip_windows_verbatim_prefix(extra_dir.clone());
+                window.view.workspace.add_folder(cleaned, None);
+            }
+        } else {
+            for dir in &workspace_dirs {
+                let cleaned = strip_windows_verbatim_prefix(dir.clone());
+                window.view.workspace.add_folder(cleaned, None);
+            }
         }
         if workspace_dirs.len() > 1 {
             window
@@ -521,10 +651,10 @@ pub fn apply_cli_targets(window: &mut WorkbenchWindow, opts: &CliOptions, restor
                 .model
                 .sync_from_workspace(&window.view.workspace);
         }
-        if restore_saved && file_paths.is_empty() && opts.goto.is_empty() {
+        if restore_saved && file_paths.is_empty() && goto.is_empty() {
             let _ = restore_workbench_state(window, Some(first_dir));
         }
-    } else if restore_saved && file_paths.is_empty() && opts.goto.is_empty() && opts.gui {
+    } else if restore_saved && file_paths.is_empty() && goto.is_empty() && allow_empty_restore {
         let _ = restore_workbench_state(window, None);
     }
 
@@ -532,9 +662,24 @@ pub fn apply_cli_targets(window: &mut WorkbenchWindow, opts: &CliOptions, restor
         window.open_path(file, false);
     }
 
-    for target in &opts.goto {
+    for target in goto {
         open_goto_target(window, target);
     }
+}
+
+/// Apply CLI positional `[path...]` and `--goto <file:line[:col]>` arguments to `window`.
+pub fn apply_cli_targets(window: &mut WorkbenchWindow, opts: &CliOptions, restore_saved: bool) {
+    apply_paths_and_goto(window, &opts.paths, &opts.goto, restore_saved, opts.gui);
+}
+
+/// Apply an IPC [`crate::multi_window::OpenRequest`] to an existing or newly opened window.
+pub fn apply_open_request(
+    window: &mut WorkbenchWindow,
+    req: &crate::multi_window::OpenRequest,
+) {
+    let had_folders = !window.view.workspace.folders().is_empty();
+    apply_paths_and_goto(window, &req.paths, &req.goto, !had_folders, false);
+    window.sync_all();
 }
 
 /// Open a `--goto` file and jump cursor to its clamped 0-based line & column.
@@ -1516,6 +1661,12 @@ mod tests {
             win.view.layout.mutate(|l| {
                 l.sidebar_visible = false;
                 l.panel_visible = true;
+                l.secondary_sidebar_visible = true;
+                l.secondary_sidebar_width = 275.0;
+                l.set_panel_position(rustcode_workbench::layout::PanelPosition::Right);
+                l.panel_width = 340.0;
+                l.title_bar_visible = true;
+                l.zoom_in();
             });
             let _ = win.theme.set_theme_by_name("Default Light+");
             save_workbench_state(&win).unwrap();
@@ -1527,6 +1678,15 @@ mod tests {
         assert!(restore_workbench_state(&mut restored_win, Some(&ws)).unwrap());
         assert!(!restored_win.view.layout.sidebar_visible);
         assert!(restored_win.view.layout.panel_visible);
+        assert!(restored_win.view.layout.secondary_sidebar_visible);
+        assert_eq!(restored_win.view.layout.secondary_sidebar_width, 275.0);
+        assert_eq!(
+            restored_win.view.layout.panel_position,
+            rustcode_workbench::layout::PanelPosition::Right
+        );
+        assert_eq!(restored_win.view.layout.panel_width, 340.0);
+        assert!(restored_win.view.layout.title_bar_visible);
+        assert_eq!(restored_win.view.layout.zoom_level, 1.0);
         assert_eq!(
             restored_win.theme.current().kind,
             rustcode_platform::ThemeKind::Light
@@ -1797,5 +1957,56 @@ exports.activate = (context) => {
         assert!(resolve_contained_extension_path(&ext_dir, "themes\\..\\..\\outside-theme.json").is_none());
         assert!(resolve_contained_extension_path(&ext_dir, "C:\\outside-theme.json").is_none());
         assert!(resolve_contained_extension_path(&ext_dir, "/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn test_load_extension_snippets_and_language_configs_with_traversal_guard() {
+        let tmp = TempDirGuard::new("rustcode_m2_ext_contribs");
+        let ext_dir = tmp.path.join("ext");
+        std::fs::create_dir_all(ext_dir.join("snippets")).unwrap();
+        std::fs::write(
+            tmp.path.join("escaped.json"),
+            r#"{ "Bad": { "prefix": "bad", "body": "bad" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("snippets/rust.json"),
+            r#"{ "Print": { "prefix": "pr", "body": "println!(\"$1\");$0" } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("language-configuration.json"),
+            r###"{ "comments": { "lineComment": "##" }, "surroundingPairs": [["(", ")"]] }"###,
+        )
+        .unwrap();
+        std::fs::write(
+            ext_dir.join("package.json"),
+            r#"{
+                "name": "m2-lang-ext",
+                "publisher": "TestPub",
+                "version": "1.0.0",
+                "contributes": {
+                    "languages": [{ "id": "customlang", "configuration": "./language-configuration.json" }],
+                    "snippets": [
+                        { "language": "customlang", "path": "./snippets/rust.json" },
+                        { "language": "customlang", "path": "../escaped.json" }
+                    ]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let mut loader = ExtensionLoader::new();
+        loader.load_from_dir(&ext_dir).unwrap();
+
+        let mut snip_reg = rustcode_editor::SnippetRegistry::new();
+        load_extension_snippets(&mut snip_reg, &loader);
+        assert_eq!(snip_reg.snippets_for_language("customlang").len(), 1);
+        assert_eq!(snip_reg.snippets_for_language("customlang")[0].prefixes, vec!["pr"]);
+
+        let mut lc_reg = rustcode_editor::LanguageConfigurationRegistry::new();
+        load_extension_language_configs(&mut lc_reg, &loader);
+        let loaded_lc = lc_reg.get("customlang").unwrap();
+        assert_eq!(loaded_lc.comments.line_comment.as_deref(), Some("##"));
     }
 }

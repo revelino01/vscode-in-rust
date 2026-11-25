@@ -1,14 +1,23 @@
 //! Native desktop window & `winit` OS event loop (`#[cfg(feature = "desktop")]`).
 
-use crate::runtime::{save_workbench_state, BootstrappedApp, RuntimeLoop};
+use crate::cli::CliOptions;
+use crate::multi_window::{
+    OpenRequest, SingleInstanceBind, SingleInstanceIpc, SingleInstanceIpcServer, WindowManager,
+    WindowRouteDecision,
+};
+use crate::runtime::{apply_open_request, bootstrap_app, save_workbench_state, BootstrappedApp, RuntimeLoop};
+use crate::RustCodeContext;
+use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use rustcode_platform::keybindings::Modifiers;
+use rustcode_platform::os_ux::{AppPaths, ClipboardBackend, FileDialogBackend};
 use rustcode_platform::render::{
     sanitize_scale_factor, ClickTracker, InputEvent, KeyCode, KeyEvent, MouseButton, MouseEvent,
     MouseMoveEvent, Point, Rect, RenderSurface, ScrollEvent, WgpuRenderSurface,
 };
+use rustcode_platform::storage::StorageBackend;
 use rustcode_workbench::WorkbenchWindow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 use winit::application::ApplicationHandler;
@@ -23,6 +32,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DesktopWakeEvent {
     RuntimeTick,
+    IpcOpenRequest,
 }
 
 /// Translate `winit::keyboard::ModifiersState` into RustCode `Modifiers`.
@@ -288,10 +298,10 @@ fn attach_webviews_to_window<W>(
     attached.retain(|k| live_ids.contains(k));
 }
 
-struct DesktopApp {
+struct ManagedDesktopWindow {
+    logical_id: u64,
     window: WorkbenchWindow,
-    runtime_loop: RuntimeLoop,
-    os_window: Option<Arc<Window>>,
+    os_window: Arc<Window>,
     surface: Option<WgpuRenderSurface>,
     modifiers: Modifiers,
     cursor_pos: Point,
@@ -300,89 +310,250 @@ struct DesktopApp {
     scale_factor: f32,
     bounds: Rect,
     attached_webviews: HashSet<String>,
-    proxy: EventLoopProxy<DesktopWakeEvent>,
-    ticker_started: bool,
     shutdown_done: bool,
 }
 
+impl ManagedDesktopWindow {
+    fn request_redraw(&self) {
+        self.os_window.request_redraw();
+    }
+}
+
+struct DesktopApp {
+    context: RustCodeContext,
+    runtime_loop: RuntimeLoop,
+    storage_backend: Arc<dyn StorageBackend>,
+    clipboard_backend: Arc<dyn ClipboardBackend>,
+    file_dialog_backend: Arc<dyn FileDialogBackend>,
+    initial_window: Option<WorkbenchWindow>,
+    windows: HashMap<WindowId, ManagedDesktopWindow>,
+    logical_to_winit: HashMap<u64, WindowId>,
+    window_manager: WindowManager,
+    ipc_server: Option<SingleInstanceIpcServer>,
+    proxy: EventLoopProxy<DesktopWakeEvent>,
+    ticker_started: bool,
+    runtime_shutdown_done: bool,
+}
+
 impl DesktopApp {
-    fn new(bootstrapped: BootstrappedApp, proxy: EventLoopProxy<DesktopWakeEvent>) -> Self {
+    fn new(
+        bootstrapped: BootstrappedApp,
+        proxy: EventLoopProxy<DesktopWakeEvent>,
+        ipc_server: Option<SingleInstanceIpcServer>,
+    ) -> Self {
+        let storage_backend = Arc::clone(&bootstrapped.window.storage_backend);
+        let clipboard_backend = Arc::clone(&bootstrapped.window.clipboard_backend);
+        let file_dialog_backend = Arc::clone(&bootstrapped.window.file_dialog_backend);
         Self {
-            window: bootstrapped.window,
+            context: bootstrapped.context,
             runtime_loop: bootstrapped.runtime_loop,
-            os_window: None,
-            surface: None,
-            modifiers: Modifiers::none(),
-            cursor_pos: Point::zero(),
-            click_tracker: ClickTracker::default(),
-            start_instant: Instant::now(),
-            scale_factor: 1.0,
-            bounds: Rect::from_xywh(0.0, 0.0, 1280.0, 800.0),
-            attached_webviews: HashSet::new(),
+            storage_backend,
+            clipboard_backend,
+            file_dialog_backend,
+            initial_window: Some(bootstrapped.window),
+            windows: HashMap::new(),
+            logical_to_winit: HashMap::new(),
+            window_manager: WindowManager::new(),
+            ipc_server,
             proxy,
             ticker_started: false,
-            shutdown_done: false,
+            runtime_shutdown_done: false,
         }
     }
 
-    fn perform_shutdown(&mut self) {
-        if self.shutdown_done {
+    fn spawn_os_window(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        mut wb_window: WorkbenchWindow,
+    ) -> Result<WindowId, String> {
+        let attrs = WindowAttributes::default()
+            .with_title("RustCode")
+            .with_inner_size(LogicalSize::new(1280.0, 800.0));
+
+        let created = Arc::new(
+            event_loop
+                .create_window(attrs)
+                .map_err(|e| format!("Failed to create desktop window: {e}"))?,
+        );
+        created.set_ime_allowed(true);
+        let scale = sanitize_scale_factor(created.scale_factor() as f32);
+        let phys = created.inner_size();
+        let bounds = safe_logical_bounds(phys.width, phys.height, scale);
+
+        let surface = match WgpuRenderSurface::new_for_window(
+            Arc::clone(&created),
+            phys.width,
+            phys.height,
+            scale,
+        ) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                eprintln!("Failed to initialize WgpuRenderSurface: {err}");
+                None
+            }
+        };
+
+        let mut attached_webviews = HashSet::new();
+        attach_webviews_to_window(&mut wb_window, &created, &mut attached_webviews);
+        created.request_redraw();
+
+        let roots = wb_window
+            .view
+            .workspace
+            .folders()
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        let logical_id = self.window_manager.register_window(roots);
+        let winit_id = created.id();
+        self.logical_to_winit.insert(logical_id, winit_id);
+        self.windows.insert(
+            winit_id,
+            ManagedDesktopWindow {
+                logical_id,
+                window: wb_window,
+                os_window: created,
+                surface,
+                modifiers: Modifiers::none(),
+                cursor_pos: Point::zero(),
+                click_tracker: ClickTracker::default(),
+                start_instant: Instant::now(),
+                scale_factor: scale,
+                bounds,
+                attached_webviews,
+                shutdown_done: false,
+            },
+        );
+        Ok(winit_id)
+    }
+
+    fn create_window_for_request(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        req: Option<&OpenRequest>,
+    ) {
+        let mut wb_win = self
+            .context
+            .create_window()
+            .with_storage_backend(Arc::clone(&self.storage_backend))
+            .with_clipboard_backend(Arc::clone(&self.clipboard_backend))
+            .with_file_dialog_backend(Arc::clone(&self.file_dialog_backend));
+        self.runtime_loop.register_contributed_command_stubs(&mut wb_win);
+        if let Some(open_req) = req {
+            apply_open_request(&mut wb_win, open_req);
+        }
+        if let Err(err) = self.spawn_os_window(event_loop, wb_win) {
+            eprintln!("Failed spawning secondary window: {err}");
+        }
+    }
+
+    fn close_window(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId) {
+        if let Some(mut win) = self.windows.remove(&window_id) {
+            if !win.shutdown_done {
+                win.shutdown_done = true;
+                let _ = save_workbench_state(&win.window);
+            }
+            self.logical_to_winit.remove(&win.logical_id);
+            self.window_manager.unregister_window(win.logical_id);
+        }
+        if self.windows.is_empty() {
+            self.perform_global_shutdown();
+            event_loop.exit();
+        }
+    }
+
+    fn perform_global_shutdown(&mut self) {
+        if self.runtime_shutdown_done {
             return;
         }
-        self.shutdown_done = true;
-        let _ = save_workbench_state(&self.window);
-        self.runtime_loop.shutdown(&mut self.window);
+        self.runtime_shutdown_done = true;
+        if !self.windows.is_empty() {
+            for w in self.windows.values_mut() {
+                if !w.shutdown_done {
+                    w.shutdown_done = true;
+                    let _ = save_workbench_state(&w.window);
+                }
+            }
+            if let Some(first) = self.windows.values_mut().next() {
+                self.runtime_loop.shutdown(&mut first.window);
+            }
+        } else if let Some(mut init) = self.initial_window.take() {
+            let _ = save_workbench_state(&init);
+            self.runtime_loop.shutdown(&mut init);
+        } else {
+            let mut dummy = self.context.create_window();
+            self.runtime_loop.shutdown(&mut dummy);
+        }
     }
 
-    fn request_redraw(&self) {
-        if let Some(win) = &self.os_window {
-            win.request_redraw();
+    fn process_ipc_requests(&mut self, event_loop: &ActiveEventLoop) {
+        let requests = self
+            .ipc_server
+            .as_ref()
+            .map(SingleInstanceIpcServer::drain_requests)
+            .unwrap_or_default();
+        for req in requests {
+            match self.window_manager.route_request(req) {
+                WindowRouteDecision::OpenInExisting { window_id, request } => {
+                    if let Some(&winit_id) = self.logical_to_winit.get(&window_id) {
+                        if let Some(win) = self.windows.get_mut(&winit_id) {
+                            apply_open_request(&mut win.window, &request);
+                            let roots = win
+                                .window
+                                .view
+                                .workspace
+                                .folders()
+                                .iter()
+                                .map(|f| f.path.clone())
+                                .collect();
+                            self.window_manager.update_workspace_roots(window_id, roots);
+                            self.window_manager.set_focused(window_id);
+                            win.os_window.focus_window();
+                            win.request_redraw();
+                            continue;
+                        }
+                    }
+                    self.create_window_for_request(event_loop, Some(&request));
+                }
+                WindowRouteDecision::OpenNewWindow(request) => {
+                    self.create_window_for_request(event_loop, Some(&request));
+                }
+            }
+        }
+    }
+
+    fn drain_window_spawn_or_close(&mut self, event_loop: &ActiveEventLoop) {
+        let mut spawn_count = 0usize;
+        let mut to_close = Vec::new();
+        for (&wid, win) in &mut self.windows {
+            if win.window.pending_new_window_request {
+                win.window.pending_new_window_request = false;
+                spawn_count += 1;
+            }
+            if win.window.pending_window_close_request {
+                win.window.pending_window_close_request = false;
+                to_close.push(wid);
+            }
+        }
+        for _ in 0..spawn_count {
+            self.create_window_for_request(event_loop, None);
+        }
+        for wid in to_close {
+            self.close_window(event_loop, wid);
         }
     }
 }
 
 impl ApplicationHandler<DesktopWakeEvent> for DesktopApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.os_window.is_some() {
-            return;
-        }
-
-        let attrs = WindowAttributes::default()
-            .with_title("RustCode")
-            .with_inner_size(LogicalSize::new(1280.0, 800.0));
-
-        let created = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(err) => {
-                eprintln!("Failed to create desktop window: {err}");
-                self.perform_shutdown();
-                event_loop.exit();
-                return;
-            }
-        };
-
-        created.set_ime_allowed(true);
-        let scale = sanitize_scale_factor(created.scale_factor() as f32);
-        let phys = created.inner_size();
-        self.scale_factor = scale;
-        self.bounds = safe_logical_bounds(phys.width, phys.height, scale);
-
-        match WgpuRenderSurface::new_for_window(Arc::clone(&created), phys.width, phys.height, scale)
-        {
-            Ok(surface) => {
-                self.surface = Some(surface);
-            }
-            Err(err) => {
-                eprintln!("Failed to initialize WgpuRenderSurface: {err}");
-                self.perform_shutdown();
+        if let Some(initial) = self.initial_window.take() {
+            if let Err(err) = self.spawn_os_window(event_loop, initial) {
+                eprintln!("{err}");
+                self.perform_global_shutdown();
                 event_loop.exit();
                 return;
             }
         }
-
-        attach_webviews_to_window(&mut self.window, &created, &mut self.attached_webviews);
-        created.request_redraw();
-        self.os_window = Some(created);
 
         if !self.ticker_started {
             self.ticker_started = true;
@@ -399,18 +570,24 @@ impl ApplicationHandler<DesktopWakeEvent> for DesktopApp {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: DesktopWakeEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: DesktopWakeEvent) {
         match event {
             DesktopWakeEvent::RuntimeTick => {
-                self.runtime_loop.tick(&mut self.window);
-                if let Some(os_win) = &self.os_window {
+                for win in self.windows.values_mut() {
+                    self.runtime_loop.tick(&mut win.window);
                     attach_webviews_to_window(
-                        &mut self.window,
-                        os_win,
-                        &mut self.attached_webviews,
+                        &mut win.window,
+                        &win.os_window,
+                        &mut win.attached_webviews,
                     );
-                    os_win.request_redraw();
+                    win.request_redraw();
                 }
+                self.process_ipc_requests(event_loop);
+                self.drain_window_spawn_or_close(event_loop);
+            }
+            DesktopWakeEvent::IpcOpenRequest => {
+                self.process_ipc_requests(event_loop);
+                self.drain_window_spawn_or_close(event_loop);
             }
         }
     }
@@ -418,36 +595,40 @@ impl ApplicationHandler<DesktopWakeEvent> for DesktopApp {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        if matches!(event, WindowEvent::CloseRequested) {
+            self.close_window(event_loop, window_id);
+            return;
+        }
+
+        let Some(win) = self.windows.get_mut(&window_id) else {
+            return;
+        };
+        let logical_id = win.logical_id;
+        let mut focus_gained = false;
+
         match event {
-            WindowEvent::CloseRequested => {
-                self.perform_shutdown();
-                event_loop.exit();
-            }
             WindowEvent::Resized(new_size) => {
-                if let Some(surface) = &mut self.surface {
-                    surface.resize(new_size.width, new_size.height, self.scale_factor);
+                if let Some(surface) = &mut win.surface {
+                    surface.resize(new_size.width, new_size.height, win.scale_factor);
                 }
-                self.bounds =
-                    safe_logical_bounds(new_size.width, new_size.height, self.scale_factor);
-                self.request_redraw();
+                win.bounds =
+                    safe_logical_bounds(new_size.width, new_size.height, win.scale_factor);
+                win.request_redraw();
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                self.scale_factor = sanitize_scale_factor(scale_factor as f32);
-                if let Some(os_win) = &self.os_window {
-                    let phys = os_win.inner_size();
-                    if let Some(surface) = &mut self.surface {
-                        surface.resize(phys.width, phys.height, self.scale_factor);
-                    }
-                    self.bounds =
-                        safe_logical_bounds(phys.width, phys.height, self.scale_factor);
+                win.scale_factor = sanitize_scale_factor(scale_factor as f32);
+                let phys = win.os_window.inner_size();
+                if let Some(surface) = &mut win.surface {
+                    surface.resize(phys.width, phys.height, win.scale_factor);
                 }
-                self.request_redraw();
+                win.bounds = safe_logical_bounds(phys.width, phys.height, win.scale_factor);
+                win.request_redraw();
             }
             WindowEvent::ModifiersChanged(mods) => {
-                self.modifiers = translate_winit_modifiers(mods.state());
+                win.modifiers = translate_winit_modifiers(mods.state());
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let Some(input_ev) = translate_winit_key_event(
@@ -455,101 +636,146 @@ impl ApplicationHandler<DesktopWakeEvent> for DesktopApp {
                     Some(event.physical_key),
                     event.text.as_deref(),
                     event.state,
-                    self.modifiers,
+                    win.modifiers,
                 ) {
-                    self.window.dispatch_event(&input_ev, self.bounds);
-                    self.request_redraw();
+                    win.window.dispatch_event(&input_ev, win.bounds);
+                    win.request_redraw();
                 }
             }
             WindowEvent::Ime(ime) => {
                 if let Some(input_ev) = translate_winit_ime(&ime) {
-                    self.window.dispatch_event(&input_ev, self.bounds);
-                    self.request_redraw();
+                    win.window.dispatch_event(&input_ev, win.bounds);
+                    win.request_redraw();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let scale = self.scale_factor as f64;
-                self.cursor_pos = Point::new(
+                let scale = win.scale_factor as f64;
+                win.cursor_pos = Point::new(
                     (position.x / scale) as f32,
                     (position.y / scale) as f32,
                 );
                 let move_ev = InputEvent::MouseMove(MouseMoveEvent {
-                    position: self.cursor_pos,
+                    position: win.cursor_pos,
                 });
-                self.window.dispatch_event(&move_ev, self.bounds);
-                self.request_redraw();
+                win.window.dispatch_event(&move_ev, win.bounds);
+                win.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(btn) = translate_winit_mouse_button(button) {
                     let input_ev = match state {
                         ElementState::Pressed => {
-                            let ts_ms = self.start_instant.elapsed().as_millis() as u64;
+                            let ts_ms = win.start_instant.elapsed().as_millis() as u64;
                             let count =
-                                self.click_tracker
-                                    .register_click(btn, self.cursor_pos, ts_ms);
+                                win.click_tracker
+                                    .register_click(btn, win.cursor_pos, ts_ms);
                             InputEvent::MouseDown(
-                                MouseEvent::new(self.cursor_pos, btn)
+                                MouseEvent::new(win.cursor_pos, btn)
                                     .with_click_count(count)
-                                    .with_modifiers(self.modifiers),
+                                    .with_modifiers(win.modifiers),
                             )
                         }
                         ElementState::Released => InputEvent::MouseUp(
-                            MouseEvent::new(self.cursor_pos, btn).with_modifiers(self.modifiers),
+                            MouseEvent::new(win.cursor_pos, btn).with_modifiers(win.modifiers),
                         ),
                     };
-                    self.window.dispatch_event(&input_ev, self.bounds);
-                    self.request_redraw();
+                    win.window.dispatch_event(&input_ev, win.bounds);
+                    win.request_redraw();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let line_h = self.window.font_metrics.line_height;
+                let line_h = win.window.font_metrics.line_height;
                 let scroll_ev = translate_winit_mouse_wheel(
                     delta,
-                    self.cursor_pos,
-                    self.modifiers,
+                    win.cursor_pos,
+                    win.modifiers,
                     line_h,
-                    self.scale_factor,
+                    win.scale_factor,
                 );
-                self.window.dispatch_event(&scroll_ev, self.bounds);
-                self.request_redraw();
+                win.window.dispatch_event(&scroll_ev, win.bounds);
+                win.request_redraw();
+            }
+            WindowEvent::Focused(true) => {
+                focus_gained = true;
             }
             WindowEvent::Focused(false) => {
-                self.runtime_loop.on_window_blur(&mut self.window);
-                self.request_redraw();
+                self.runtime_loop.on_window_blur(&mut win.window);
+                win.request_redraw();
             }
             WindowEvent::RedrawRequested => {
-                self.runtime_loop.tick(&mut self.window);
-                if let Some(os_win) = &self.os_window {
-                    attach_webviews_to_window(
-                        &mut self.window,
-                        os_win,
-                        &mut self.attached_webviews,
-                    );
-                }
-                if let Some(surface) = &mut self.surface {
+                self.runtime_loop.tick(&mut win.window);
+                attach_webviews_to_window(
+                    &mut win.window,
+                    &win.os_window,
+                    &mut win.attached_webviews,
+                );
+                if let Some(surface) = &mut win.surface {
                     let sz = surface.size();
                     if sz.width > 0.0 && sz.height > 0.0 {
-                        let _ = self.window.render(surface);
+                        let _ = win.window.render(surface);
                     }
                 }
             }
             _ => {}
         }
+
+        if focus_gained {
+            self.window_manager.set_focused(logical_id);
+        }
+        self.drain_window_spawn_or_close(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.perform_shutdown();
+        self.perform_global_shutdown();
     }
 }
 
-/// Run the native `winit` + `WgpuRenderSurface` desktop event loop.
+/// Run the desktop multi-window host with cross-platform single-instance IPC forwarding.
+pub fn run_desktop_app(opts: CliOptions) -> Result<(), String> {
+    let app_paths = AppPaths::resolve(
+        opts.user_data_dir.as_deref(),
+        opts.extensions_dir.as_deref(),
+    );
+    let request = OpenRequest::from_cli(&opts);
+    let wake_slot: Arc<Mutex<Option<EventLoopProxy<DesktopWakeEvent>>>> = Arc::new(Mutex::new(None));
+    let wake_cb_slot = Arc::clone(&wake_slot);
+    let ipc_server = match SingleInstanceIpc::try_bind_or_forward(
+        &app_paths.user_data_dir,
+        &request,
+        Some(Arc::new(move || {
+            if let Some(proxy) = wake_cb_slot.lock().as_ref() {
+                let _ = proxy.send_event(DesktopWakeEvent::IpcOpenRequest);
+            }
+        })),
+    ) {
+        Ok(SingleInstanceBind::Forwarded) => return Ok(()),
+        Ok(SingleInstanceBind::Leader(srv)) => Some(srv),
+        Err(err) => {
+            eprintln!("Warning: single-instance IPC disabled ({err})");
+            None
+        }
+    };
+
+    let bootstrapped = bootstrap_app(&opts, true)?;
+    let event_loop = EventLoop::<DesktopWakeEvent>::with_user_event()
+        .build()
+        .map_err(|e| format!("Failed to create winit event loop: {e}"))?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+    *wake_slot.lock() = Some(proxy.clone());
+    let mut app = DesktopApp::new(bootstrapped, proxy, ipc_server);
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| format!("Desktop event loop error: {e}"))
+}
+
+/// Run the native `winit` + `WgpuRenderSurface` desktop event loop from an already-bootstrapped app.
 pub fn run_desktop_event_loop(bootstrapped: BootstrappedApp) -> Result<(), String> {
     let event_loop = EventLoop::<DesktopWakeEvent>::with_user_event()
         .build()
         .map_err(|e| format!("Failed to create winit event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let mut app = DesktopApp::new(bootstrapped, proxy);
+    let mut app = DesktopApp::new(bootstrapped, proxy, None);
     event_loop
         .run_app(&mut app)
         .map_err(|e| format!("Desktop event loop error: {e}"))

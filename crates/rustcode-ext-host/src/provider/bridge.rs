@@ -9,9 +9,12 @@ use rustcode_platform::{
     FileSystemError, FileSystemService,
 };
 use rustcode_protocols::lsp::{
-    CodeAction, CodeActionContext, CodeActionKind, CompletionContext, CompletionTriggerKind,
-    FormattingOptions, Hover, LspClientManager, LspCommand, LspCompletionItem, LspDiagnostic,
-    LspLocation, LspPosition, LspRange, LspTextEdit, MarkupContent,
+    decode_semantic_tokens, CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall,
+    CodeAction, CodeActionContext, CodeActionKind, CodeLens, CompletionContext,
+    CompletionTriggerKind, DecodedSemanticToken, DocumentLink, FormattingOptions, Hover, InlayHint,
+    LspClientManager, LspCommand, LspCompletionItem, LspDiagnostic, LspLocation, LspPosition,
+    LspRange, LspTextEdit, MarkupContent, PrepareRenameResult, SemanticTokens,
+    SemanticTokensLegend, SignatureHelp, TypeHierarchyItem, WorkspaceEdit,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
@@ -1328,7 +1331,661 @@ impl LanguageFeatureBridge {
         results
     }
 
-    /// Request hierarchical tree items for a tree data provider, propagating RPC errors.
+    /// Request signature help from LSP or registered JS extension providers.
+    pub async fn request_signature_help(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Option<SignatureHelp> {
+        if let Ok(Some(sig)) = self
+            .lsp_manager
+            .request_signature_help(uri, language_id, position)
+            .await
+        {
+            if !sig.signatures.is_empty() {
+                return Some(sig);
+            }
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::SignatureHelp, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideSignatureHelp",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "position": position,
+                    }),
+                    std::time::Duration::from_millis(250),
+                )
+                .await
+            {
+                if let Ok(sig) = serde_json::from_value::<SignatureHelp>(val) {
+                    if !sig.signatures.is_empty() {
+                        return Some(sig);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Request symbol references from LSP and registered JS extension providers.
+    pub async fn request_references(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+        include_declaration: bool,
+    ) -> Vec<LspLocation> {
+        let mut results = Vec::new();
+        if let Ok(locs) = self
+            .lsp_manager
+            .request_references(uri, language_id, position, include_declaration)
+            .await
+        {
+            results.extend(locs);
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::References, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideReferences",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "position": position,
+                        "context": { "includeDeclaration": include_declaration },
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(locs) = serde_json::from_value::<Vec<LspLocation>>(val) {
+                    results.extend(locs);
+                }
+            }
+        }
+        results
+    }
+
+    async fn request_js_locations(
+        &self,
+        provider_type: ProviderType,
+        rpc_method: &str,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Vec<LspLocation> {
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(provider_type, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    rpc_method,
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "position": position,
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(locs) = serde_json::from_value::<Vec<LspLocation>>(val.clone()) {
+                    if !locs.is_empty() {
+                        return locs;
+                    }
+                } else if let Ok(single) = serde_json::from_value::<LspLocation>(val) {
+                    return vec![single];
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Request implementation locations from LSP or JS extension providers.
+    pub async fn request_implementation(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Vec<LspLocation> {
+        if let Ok(locs) = self
+            .lsp_manager
+            .request_implementation(uri, language_id, position)
+            .await
+        {
+            if !locs.is_empty() {
+                return locs;
+            }
+        }
+        self.request_js_locations(
+            ProviderType::Implementation,
+            "languages.provideImplementation",
+            uri,
+            language_id,
+            position,
+        )
+        .await
+    }
+
+    /// Request type definition locations from LSP or JS extension providers.
+    pub async fn request_type_definition(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Vec<LspLocation> {
+        if let Ok(locs) = self
+            .lsp_manager
+            .request_type_definition(uri, language_id, position)
+            .await
+        {
+            if !locs.is_empty() {
+                return locs;
+            }
+        }
+        self.request_js_locations(
+            ProviderType::TypeDefinition,
+            "languages.provideTypeDefinition",
+            uri,
+            language_id,
+            position,
+        )
+        .await
+    }
+
+    /// Validate rename position and retrieve default placeholder if supported.
+    pub async fn request_prepare_rename(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Option<PrepareRenameResult> {
+        if let Ok(Some(res)) = self
+            .lsp_manager
+            .request_prepare_rename(uri, language_id, position)
+            .await
+        {
+            return Some(res);
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::Rename, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.prepareRename",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "position": position,
+                    }),
+                    std::time::Duration::from_millis(250),
+                )
+                .await
+            {
+                if let Ok(res) = serde_json::from_value::<PrepareRenameResult>(val) {
+                    return Some(res);
+                }
+            }
+        }
+        None
+    }
+
+    /// Request multi-file rename WorkspaceEdit from LSP or JS extension providers.
+    pub async fn request_rename(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+        new_name: &str,
+    ) -> Option<WorkspaceEdit> {
+        if let Ok(Some(edit)) = self
+            .lsp_manager
+            .request_rename(uri, language_id, position, new_name)
+            .await
+        {
+            return Some(edit);
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::Rename, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideRenameEdits",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "position": position,
+                        "newName": new_name,
+                    }),
+                    std::time::Duration::from_millis(500),
+                )
+                .await
+            {
+                if let Ok(edit) = serde_json::from_value::<WorkspaceEdit>(val) {
+                    return Some(edit);
+                }
+            }
+        }
+        None
+    }
+
+    /// Request decoded semantic tokens for a document from LSP or JS extension providers.
+    pub async fn request_semantic_tokens(
+        &self,
+        uri: &str,
+        language_id: &str,
+    ) -> Vec<DecodedSemanticToken> {
+        if let Ok(Some(tokens)) = self
+            .lsp_manager
+            .request_semantic_tokens_full(uri, language_id)
+            .await
+        {
+            if !tokens.data.is_empty() {
+                if let Some(legend) = self.lsp_manager.semantic_tokens_legend(language_id) {
+                    return decode_semantic_tokens(&tokens.data, &legend);
+                }
+            }
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::SemanticTokens, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideDocumentSemanticTokens",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                    }),
+                    std::time::Duration::from_millis(500),
+                )
+                .await
+            {
+                if let (Ok(tokens), Ok(legend)) = (
+                    serde_json::from_value::<SemanticTokens>(val.clone()),
+                    val.get("legend")
+                        .cloned()
+                        .ok_or(())
+                        .and_then(|l| serde_json::from_value::<SemanticTokensLegend>(l).map_err(|_| ())),
+                ) {
+                    let decoded = decode_semantic_tokens(&tokens.data, &legend);
+                    if !decoded.is_empty() {
+                        return decoded;
+                    }
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Request inlay hints for a range from LSP and registered JS extension providers.
+    pub async fn request_inlay_hints(
+        &self,
+        uri: &str,
+        language_id: &str,
+        range: LspRange,
+    ) -> Vec<InlayHint> {
+        let mut results = Vec::new();
+        if let Ok(hints) = self
+            .lsp_manager
+            .request_inlay_hints(uri, language_id, range)
+            .await
+        {
+            results.extend(hints);
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::InlayHints, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideInlayHints",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "range": range,
+                    }),
+                    std::time::Duration::from_millis(250),
+                )
+                .await
+            {
+                if let Ok(hints) = serde_json::from_value::<Vec<InlayHint>>(val) {
+                    results.extend(hints);
+                }
+            }
+        }
+        results
+    }
+
+    /// Request CodeLenses for a document from LSP and registered JS extension providers.
+    pub async fn request_code_lenses(&self, uri: &str, language_id: &str) -> Vec<CodeLens> {
+        let mut results = Vec::new();
+        if let Ok(lenses) = self.lsp_manager.request_code_lens(uri, language_id).await {
+            results.extend(lenses);
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::CodeLens, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideCodeLenses",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                    }),
+                    std::time::Duration::from_millis(250),
+                )
+                .await
+            {
+                if let Ok(lenses) = serde_json::from_value::<Vec<CodeLens>>(val) {
+                    results.extend(lenses);
+                }
+            }
+        }
+        results
+    }
+
+    /// Request DocumentLinks for a document from LSP and registered JS extension providers.
+    pub async fn request_document_links(
+        &self,
+        uri: &str,
+        language_id: &str,
+    ) -> Vec<DocumentLink> {
+        let mut results = Vec::new();
+        if let Ok(links) = self
+            .lsp_manager
+            .request_document_links(uri, language_id)
+            .await
+        {
+            results.extend(links);
+        }
+
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::DocumentLink, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideDocumentLinks",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                    }),
+                    std::time::Duration::from_millis(250),
+                )
+                .await
+            {
+                if let Ok(links) = serde_json::from_value::<Vec<DocumentLink>>(val) {
+                    results.extend(links);
+                }
+            }
+        }
+        results
+    }
+
+    pub async fn request_call_hierarchy_prepare(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Vec<CallHierarchyItem> {
+        if let Ok(items) = self
+            .lsp_manager
+            .request_prepare_call_hierarchy(uri, language_id, position)
+            .await
+        {
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::CallHierarchy, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.prepareCallHierarchy",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "position": position,
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(items) = serde_json::from_value::<Vec<CallHierarchyItem>>(val.clone()) {
+                    return items;
+                } else if let Ok(item) = serde_json::from_value::<CallHierarchyItem>(val) {
+                    return vec![item];
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub async fn request_call_hierarchy_incoming(
+        &self,
+        language_id: &str,
+        item: &CallHierarchyItem,
+    ) -> Vec<CallHierarchyIncomingCall> {
+        if let Ok(calls) = self
+            .lsp_manager
+            .request_call_hierarchy_incoming(language_id, item)
+            .await
+        {
+            if !calls.is_empty() {
+                return calls;
+            }
+        }
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::CallHierarchy, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideCallHierarchyIncomingCalls",
+                    json!({
+                        "providerId": provider.id,
+                        "item": item,
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(calls) = serde_json::from_value::<Vec<CallHierarchyIncomingCall>>(val) {
+                    return calls;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub async fn request_call_hierarchy_outgoing(
+        &self,
+        language_id: &str,
+        item: &CallHierarchyItem,
+    ) -> Vec<CallHierarchyOutgoingCall> {
+        if let Ok(calls) = self
+            .lsp_manager
+            .request_call_hierarchy_outgoing(language_id, item)
+            .await
+        {
+            if !calls.is_empty() {
+                return calls;
+            }
+        }
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::CallHierarchy, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideCallHierarchyOutgoingCalls",
+                    json!({
+                        "providerId": provider.id,
+                        "item": item,
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(calls) = serde_json::from_value::<Vec<CallHierarchyOutgoingCall>>(val) {
+                    return calls;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub async fn request_type_hierarchy_prepare(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Vec<TypeHierarchyItem> {
+        if let Ok(items) = self
+            .lsp_manager
+            .request_prepare_type_hierarchy(uri, language_id, position)
+            .await
+        {
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::TypeHierarchy, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.prepareTypeHierarchy",
+                    json!({
+                        "providerId": provider.id,
+                        "uri": uri,
+                        "position": position,
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(items) = serde_json::from_value::<Vec<TypeHierarchyItem>>(val.clone()) {
+                    return items;
+                } else if let Ok(item) = serde_json::from_value::<TypeHierarchyItem>(val) {
+                    return vec![item];
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub async fn request_type_hierarchy_supertypes(
+        &self,
+        language_id: &str,
+        item: &TypeHierarchyItem,
+    ) -> Vec<TypeHierarchyItem> {
+        if let Ok(items) = self
+            .lsp_manager
+            .request_type_hierarchy_supertypes(language_id, item)
+            .await
+        {
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::TypeHierarchy, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideTypeHierarchySupertypes",
+                    json!({
+                        "providerId": provider.id,
+                        "item": item,
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(items) = serde_json::from_value::<Vec<TypeHierarchyItem>>(val) {
+                    return items;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    pub async fn request_type_hierarchy_subtypes(
+        &self,
+        language_id: &str,
+        item: &TypeHierarchyItem,
+    ) -> Vec<TypeHierarchyItem> {
+        if let Ok(items) = self
+            .lsp_manager
+            .request_type_hierarchy_subtypes(language_id, item)
+            .await
+        {
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        let js_providers = self
+            .provider_registry
+            .get_providers_for_language(ProviderType::TypeHierarchy, language_id);
+        for provider in js_providers {
+            if let Ok(val) = self
+                .rpc_bridge
+                .request(
+                    "languages.provideTypeHierarchySubtypes",
+                    json!({
+                        "providerId": provider.id,
+                        "item": item,
+                    }),
+                    std::time::Duration::from_millis(350),
+                )
+                .await
+            {
+                if let Ok(items) = serde_json::from_value::<Vec<TypeHierarchyItem>>(val) {
+                    return items;
+                }
+            }
+        }
+        Vec::new()
+    }
     pub async fn request_tree_children_result(
         &self,
         provider_id: &str,

@@ -330,14 +330,18 @@ async fn t1_c5_c6_cleanup_and_context_key_char_class_m6_03() {
         );
     }
 
-    // C5-01: Dead AVL rotations removed from piece_table.rs.
+    // C5-01: No dead/uncalled AVL rotations in piece_table.rs (Phase 9 M2 wired live AVL rebalancing).
     let pt_src =
         std::fs::read_to_string(root.join("crates/rustcode-editor/src/model/piece_table.rs"))
             .unwrap();
-    assert!(
-        !pt_src.contains("fn rotate_left") && !pt_src.contains("fn rotate_right"),
-        "[C5-01] Dead AVL rotations still present in piece_table.rs"
-    );
+    if pt_src.contains("fn rotate_left") || pt_src.contains("fn rotate_right") {
+        assert!(
+            pt_src.contains("fn rebalance")
+                && pt_src.contains("Self::rotate_left(")
+                && pt_src.contains("Self::rotate_right("),
+            "[C5-01] AVL rotations in piece_table.rs must be live and called by rebalance()"
+        );
+    }
 
     // C5-04: Multi-root FileExplorer uses `roots` cleanly.
     let ws = TempWorkspace::new();

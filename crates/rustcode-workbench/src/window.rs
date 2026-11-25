@@ -4,21 +4,26 @@ use crate::debug::{DebugToolbarAction, DebugViewAction};
 use crate::editor_area::SplitDirection;
 use crate::explorer::{ContributedViewDescriptor, ExplorerAction};
 use crate::extensions_view::ExtensionsViewAction;
+use crate::hierarchy::{HierarchyAction, HierarchyMode};
 use crate::layout::LayoutHandle;
 use crate::notifications::{NotificationUiAction, PromptUiAction};
 use crate::output_panel::OutputAction;
 use crate::quickinput::{CommandPalette, CommandPaletteView, PaletteItem};
+use crate::refactor_preview::{RefactorPreviewAction, WorkspaceEditUndoStack};
 use crate::scm::ScmAction;
 use crate::search::{SearchAction, SearchInputFocus, WorkspaceReplaceResult};
 use crate::terminal_panel::TerminalAction;
 use crate::testing::TestingAction;
+use crate::titlebar::TitleBarAction;
 use crate::workbench_view::{FocusedRegion, WorkbenchAction, WorkbenchView};
 use parking_lot::Mutex;
 use rustcode_base::context_key::ContextKeyService;
 use rustcode_base::disposable::DisposableStore;
 use rustcode_editor::{
-    CompletionItem, CompletionItemKind as EditorCompletionKind, EditorAction, LspHoverInfo,
-    Position, Range, RangeEdit, TextDocument, WordWrapMode,
+    CompletionItem, CompletionItemKind as EditorCompletionKind, EditorAction, EditorCodeLens,
+    EditorDocumentLink, EditorInlayHint, LspHoverInfo, PeekKind, PeekLocationItem, Position,
+    Range, RangeEdit, SemanticTokenSpan, SignatureEntry, SignatureParamInfo, TextDocument,
+    WordWrapMode,
 };
 use rustcode_ext_host::manifest::{CustomEditorContribution, ViewContribution};
 use rustcode_ext_host::marketplace::ExtensionInstaller;
@@ -46,9 +51,11 @@ use rustcode_protocols::dap::{
     LaunchVariableContext, Scope, StackFrame, StoppedEventBody, Thread, Variable,
 };
 use rustcode_protocols::lsp::{
-    CodeAction, CodeActionContext, CompletionItemKind as LspCompletionKind, FormattingOptions,
-    Hover, LspCompletionItem, LspDiagnostic, LspLocation, LspPosition, LspRange, LspTextEdit,
-    WorkspaceEdit,
+    CallHierarchyIncomingCall, CallHierarchyItem, CallHierarchyOutgoingCall, CodeAction,
+    CodeActionContext, CodeLens, CompletionItemKind as LspCompletionKind, DecodedSemanticToken,
+    DocumentLink, FormattingOptions, Hover, InlayHint, InlayHintKind, LspCompletionItem,
+    LspDiagnostic, LspLocation, LspPosition, LspRange, LspTextEdit, ParameterLabel,
+    PrepareRenameResult, SignatureHelp, TypeHierarchyItem, WorkspaceEdit,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -93,6 +100,55 @@ enum PendingLspResult {
         edits: Vec<LspTextEdit>,
         save_after: bool,
     },
+    SignatureHelp {
+        uri: String,
+        position: Position,
+        help: Option<SignatureHelp>,
+    },
+    PeekLocations {
+        uri: String,
+        anchor_line: usize,
+        kind: PeekKind,
+        title: String,
+        locations: Vec<LspLocation>,
+    },
+    PrepareRename {
+        uri: String,
+        position: Position,
+        prepared: Option<PrepareRenameResult>,
+    },
+    RenameEdit {
+        new_name: String,
+        preview: bool,
+        edit: Option<WorkspaceEdit>,
+    },
+    SemanticTokens {
+        uri: String,
+        tokens: Vec<DecodedSemanticToken>,
+    },
+    InlayHints {
+        uri: String,
+        hints: Vec<InlayHint>,
+    },
+    CodeLenses {
+        uri: String,
+        lenses: Vec<CodeLens>,
+    },
+    DocumentLinks {
+        uri: String,
+        links: Vec<DocumentLink>,
+    },
+    CallHierarchy {
+        mode: HierarchyMode,
+        root: Option<CallHierarchyItem>,
+        incoming: Vec<CallHierarchyIncomingCall>,
+        outgoing: Vec<CallHierarchyOutgoingCall>,
+    },
+    TypeHierarchy {
+        mode: HierarchyMode,
+        root: Option<TypeHierarchyItem>,
+        relatives: Vec<TypeHierarchyItem>,
+    },
 }
 
 struct PendingDapSnapshot {
@@ -122,6 +178,7 @@ pub struct WorkbenchWindow {
     pub extension_disposables: HashMap<String, DisposableStore>,
     pub custom_editor_contributions: Vec<CustomEditorContribution>,
     pub registered_view_contributions: HashMap<String, Vec<ViewContribution>>,
+    pub workspace_edit_undo: WorkspaceEditUndoStack,
     synced_output_revision: u64,
     synced_terminal_revision: u64,
     synced_webview_revision: u64,
@@ -145,6 +202,8 @@ pub struct WorkbenchWindow {
     last_hover_request: Option<(String, Position)>,
     synced_debug_console_len: usize,
     last_synced_color_theme: Option<String>,
+    pub pending_new_window_request: bool,
+    pub pending_window_close_request: bool,
 }
 
 impl Default for WorkbenchWindow {
@@ -195,6 +254,7 @@ impl WorkbenchWindow {
             extension_disposables: HashMap::new(),
             custom_editor_contributions: Vec::new(),
             registered_view_contributions: HashMap::new(),
+            workspace_edit_undo: WorkspaceEditUndoStack::new(),
             synced_output_revision: 0,
             synced_terminal_revision: 0,
             synced_webview_revision: 0,
@@ -218,6 +278,8 @@ impl WorkbenchWindow {
             last_hover_request: None,
             synced_debug_console_len: 0,
             last_synced_color_theme: initial_theme,
+            pending_new_window_request: false,
+            pending_window_close_request: false,
         };
         win.sync_configuration();
         win.sync_focus_context_keys();
@@ -325,6 +387,23 @@ impl WorkbenchWindow {
             .config
             .get::<bool>("editor.insertSpaces")
             .unwrap_or(true);
+        let default_sticky_scroll = self
+            .config
+            .get::<bool>("editor.stickyScroll.enabled")
+            .unwrap_or(true);
+        let default_sticky_max = self
+            .config
+            .get::<usize>("editor.stickyScroll.maxLineCount")
+            .unwrap_or(5)
+            .clamp(1, 20);
+        let default_bracket_colors = self
+            .config
+            .get::<bool>("editor.bracketPairColorization.enabled")
+            .unwrap_or(true);
+        let default_bracket_guides = self
+            .config
+            .get::<bool>("editor.guides.bracketPairs")
+            .unwrap_or(true);
         let active_path: Option<PathBuf> = self
             .view
             .editor_area
@@ -375,6 +454,26 @@ impl WorkbenchWindow {
                 .get_for_resource::<bool>("editor.insertSpaces", doc_path.as_deref())
                 .unwrap_or(default_insert_spaces);
             editor.set_insert_spaces(insert_spaces);
+            let sticky = config
+                .get_for_resource::<bool>("editor.stickyScroll.enabled", doc_path.as_deref())
+                .unwrap_or(default_sticky_scroll);
+            editor.set_sticky_scroll_enabled(sticky);
+            let sticky_max = config
+                .get_for_resource::<usize>("editor.stickyScroll.maxLineCount", doc_path.as_deref())
+                .unwrap_or(default_sticky_max)
+                .clamp(1, 20);
+            editor.set_sticky_scroll_max_lines(sticky_max);
+            let bracket_colors = config
+                .get_for_resource::<bool>(
+                    "editor.bracketPairColorization.enabled",
+                    doc_path.as_deref(),
+                )
+                .unwrap_or(default_bracket_colors);
+            editor.set_bracket_pair_colorization(bracket_colors);
+            let bracket_guides = config
+                .get_for_resource::<bool>("editor.guides.bracketPairs", doc_path.as_deref())
+                .unwrap_or(default_bracket_guides);
+            editor.set_bracket_pair_guides(bracket_guides);
         });
         self.view
             .editor_area
@@ -445,6 +544,7 @@ impl WorkbenchWindow {
                 self.context_keys.set_bool("notebookEditorFocused", false);
             }
         }
+        self.view.cached_context_keys = Some(self.context_keys.clone());
     }
 
     pub fn sync_output_channels(&mut self) {
@@ -1419,7 +1519,9 @@ impl WorkbenchWindow {
             }
         }
 
+        let mut changed_docs: Vec<(String, String, u32)> = Vec::new();
         for (uri, (lang_id, version_id, text)) in current {
+            let line_count = text.lines().count().max(1) as u32;
             match self.tracked_documents.get(&uri).cloned() {
                 None => {
                     self.tracked_documents
@@ -1427,6 +1529,7 @@ impl WorkbenchWindow {
                     if let Some(bridge) = &self.language_bridge {
                         bridge.did_open_document_sync(&uri, &lang_id, version_id as i32, &text);
                     }
+                    changed_docs.push((uri, lang_id, line_count));
                 }
                 Some((_, prev_ver)) if prev_ver != version_id => {
                     self.tracked_documents
@@ -1434,9 +1537,13 @@ impl WorkbenchWindow {
                     if let Some(bridge) = &self.language_bridge {
                         bridge.did_change_document_sync(&uri, &lang_id, version_id as i32, &text);
                     }
+                    changed_docs.push((uri, lang_id, line_count));
                 }
                 _ => {}
             }
+        }
+        for (uri, lang_id, line_count) in changed_docs {
+            self.trigger_document_annotations(&uri, &lang_id, line_count);
         }
 
         let active_uri = self
@@ -3073,6 +3180,341 @@ impl WorkbenchWindow {
         });
     }
 
+    pub fn trigger_signature_help_at(&self, pos: Position) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let help = bridge
+                .request_signature_help(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            queue.lock().push(PendingLspResult::SignatureHelp {
+                uri,
+                position: pos,
+                help,
+            });
+        });
+    }
+
+    pub fn trigger_references_at(&self, pos: Position) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let locations = bridge
+                .request_references(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                    true,
+                )
+                .await;
+            if !locations.is_empty() {
+                queue.lock().push(PendingLspResult::PeekLocations {
+                    uri,
+                    anchor_line: pos.line,
+                    kind: PeekKind::References,
+                    title: format!("References ({})", locations.len()),
+                    locations,
+                });
+            }
+        });
+    }
+
+    pub fn trigger_implementation_at(&self, pos: Position) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let locations = bridge
+                .request_implementation(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            if !locations.is_empty() {
+                queue.lock().push(PendingLspResult::PeekLocations {
+                    uri,
+                    anchor_line: pos.line,
+                    kind: PeekKind::Implementations,
+                    title: format!("Implementations ({})", locations.len()),
+                    locations,
+                });
+            }
+        });
+    }
+
+    pub fn trigger_type_definition_at(&self, pos: Position) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let locations = bridge
+                .request_type_definition(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            if !locations.is_empty() {
+                queue.lock().push(PendingLspResult::PeekLocations {
+                    uri,
+                    anchor_line: pos.line,
+                    kind: PeekKind::TypeDefinitions,
+                    title: format!("Type Definitions ({})", locations.len()),
+                    locations,
+                });
+            }
+        });
+    }
+
+    pub fn trigger_prepare_rename_at(&mut self, pos: Position) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                ed.start_rename(pos, "");
+            }
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                ed.start_rename(pos, "");
+            }
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let prepared = bridge
+                .request_prepare_rename(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            queue.lock().push(PendingLspResult::PrepareRename {
+                uri,
+                position: pos,
+                prepared,
+            });
+        });
+    }
+
+    pub fn trigger_rename_at(&self, pos: Position, new_name: String, preview: bool) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let edit = bridge
+                .request_rename(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                    &new_name,
+                )
+                .await;
+            queue.lock().push(PendingLspResult::RenameEdit {
+                new_name,
+                preview,
+                edit,
+            });
+        });
+    }
+
+    pub fn trigger_call_hierarchy_at(&self, pos: Position, mode: HierarchyMode) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let items = bridge
+                .request_call_hierarchy_prepare(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            if let Some(root) = items.into_iter().next() {
+                if matches!(mode, HierarchyMode::CallOutgoing) {
+                    let outgoing = bridge.request_call_hierarchy_outgoing(&lang_id, &root).await;
+                    queue.lock().push(PendingLspResult::CallHierarchy {
+                        mode: HierarchyMode::CallOutgoing,
+                        root: Some(root),
+                        incoming: Vec::new(),
+                        outgoing,
+                    });
+                } else {
+                    let incoming = bridge.request_call_hierarchy_incoming(&lang_id, &root).await;
+                    queue.lock().push(PendingLspResult::CallHierarchy {
+                        mode: HierarchyMode::CallIncoming,
+                        root: Some(root),
+                        incoming,
+                        outgoing: Vec::new(),
+                    });
+                }
+            }
+        });
+    }
+
+    pub fn trigger_type_hierarchy_at(&self, pos: Position, mode: HierarchyMode) {
+        let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
+            return;
+        };
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        handle.spawn(async move {
+            let items = bridge
+                .request_type_hierarchy_prepare(
+                    &uri,
+                    &lang_id,
+                    LspPosition::new(pos.line as u32, pos.column as u32),
+                )
+                .await;
+            if let Some(root) = items.into_iter().next() {
+                let relatives = if matches!(mode, HierarchyMode::TypeSubtypes) {
+                    bridge.request_type_hierarchy_subtypes(&lang_id, &root).await
+                } else {
+                    bridge
+                        .request_type_hierarchy_supertypes(&lang_id, &root)
+                        .await
+                };
+                queue.lock().push(PendingLspResult::TypeHierarchy {
+                    mode,
+                    root: Some(root),
+                    relatives,
+                });
+            }
+        });
+    }
+
+    pub fn trigger_document_annotations(&self, uri: &str, lang_id: &str, line_count: u32) {
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let has_lsp = bridge.lsp_manager.get_client(lang_id).is_some();
+        let has_sem = has_lsp
+            || !bridge
+                .provider_registry
+                .get_providers_for_language(ProviderType::SemanticTokens, lang_id)
+                .is_empty();
+        let has_inlay = has_lsp
+            || !bridge
+                .provider_registry
+                .get_providers_for_language(ProviderType::InlayHints, lang_id)
+                .is_empty();
+        let has_lens = has_lsp
+            || !bridge
+                .provider_registry
+                .get_providers_for_language(ProviderType::CodeLens, lang_id)
+                .is_empty();
+        let has_links = has_lsp
+            || !bridge
+                .provider_registry
+                .get_providers_for_language(ProviderType::DocumentLink, lang_id)
+                .is_empty();
+        if !has_sem && !has_inlay && !has_lens && !has_links {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let queue = Arc::clone(&self.pending_lsp_results);
+        let uri_owned = uri.to_string();
+        let lang_owned = lang_id.to_string();
+        let end_line = line_count.max(1);
+        handle.spawn(async move {
+            if has_sem {
+                let tokens = bridge.request_semantic_tokens(&uri_owned, &lang_owned).await;
+                if !tokens.is_empty() {
+                    queue.lock().push(PendingLspResult::SemanticTokens {
+                        uri: uri_owned.clone(),
+                        tokens,
+                    });
+                }
+            }
+            if has_inlay {
+                let range = LspRange::new(LspPosition::new(0, 0), LspPosition::new(end_line, 0));
+                let hints = bridge.request_inlay_hints(&uri_owned, &lang_owned, range).await;
+                if !hints.is_empty() {
+                    queue.lock().push(PendingLspResult::InlayHints {
+                        uri: uri_owned.clone(),
+                        hints,
+                    });
+                }
+            }
+            if has_lens {
+                let lenses = bridge.request_code_lenses(&uri_owned, &lang_owned).await;
+                if !lenses.is_empty() {
+                    queue.lock().push(PendingLspResult::CodeLenses {
+                        uri: uri_owned.clone(),
+                        lenses,
+                    });
+                }
+            }
+            if has_links {
+                let links = bridge.request_document_links(&uri_owned, &lang_owned).await;
+                if !links.is_empty() {
+                    queue.lock().push(PendingLspResult::DocumentLinks {
+                        uri: uri_owned,
+                        links,
+                    });
+                }
+            }
+        });
+    }
+
     fn trigger_completions_at(&self, pos: Position, trigger_char: Option<char>) {
         let Some((uri, lang_id)) = self.active_editor_uri_and_lang() else {
             return;
@@ -3167,6 +3609,98 @@ impl WorkbenchWindow {
         applied
     }
 
+    fn build_peek_items(&self, locations: &[LspLocation]) -> Vec<PeekLocationItem> {
+        locations
+            .iter()
+            .map(|loc| {
+                let path = rustcode_platform::file_uri_to_path(&loc.uri);
+                let resolved_uri = self
+                    .view
+                    .editor_area
+                    .find_open_tab_uri_for_path(&path)
+                    .unwrap_or_else(|| loc.uri.clone());
+                let text = if let Some(ed) = self.view.editor_area.any_editor_for_uri(&resolved_uri) {
+                    Some(ed.text())
+                } else {
+                    std::fs::read_to_string(&path).ok()
+                };
+                let match_line = loc.range.start.line as usize;
+                let preview_lines: Vec<(usize, String)> = if let Some(src) = text {
+                    let lines: Vec<&str> = src.lines().collect();
+                    let start = match_line.saturating_sub(1);
+                    let end = (match_line + 2).min(lines.len());
+                    (start..end)
+                        .map(|idx| (idx, lines[idx].to_string()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&loc.uri);
+                let display_path = format!(
+                    "{}:{}:{}",
+                    file_name,
+                    loc.range.start.line + 1,
+                    loc.range.start.character + 1
+                );
+                PeekLocationItem {
+                    uri: loc.uri.clone(),
+                    display_path,
+                    range: Range::new(
+                        Position::new(loc.range.start.line as usize, loc.range.start.character as usize),
+                        Position::new(loc.range.end.line as usize, loc.range.end.character as usize),
+                    ),
+                    preview_lines,
+                    preview_match_line: match_line,
+                }
+            })
+            .collect()
+    }
+
+    fn convert_signature_help(help: SignatureHelp) -> (Vec<SignatureEntry>, usize, usize) {
+        let active_sig = help.active_signature.unwrap_or(0) as usize;
+        let active_param = help.active_parameter.unwrap_or(0) as usize;
+        let signatures = help
+            .signatures
+            .into_iter()
+            .map(|sig| {
+                let parameters = sig
+                    .parameters
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| {
+                        let (label, label_offsets) = match p.label {
+                            ParameterLabel::Simple(s) => (s, None),
+                            ParameterLabel::Offsets([s, e]) => {
+                                let label_str = sig
+                                    .label
+                                    .chars()
+                                    .skip(s as usize)
+                                    .take((e.saturating_sub(s)) as usize)
+                                    .collect();
+                                (label_str, Some((s as usize, e as usize)))
+                            }
+                        };
+                        SignatureParamInfo {
+                            label,
+                            label_offsets,
+                            documentation: p.documentation.map(|d| d.value),
+                        }
+                    })
+                    .collect();
+                SignatureEntry {
+                    label: sig.label,
+                    documentation: sig.documentation.map(|d| d.value),
+                    parameters,
+                    active_parameter: sig.active_parameter.map(|v| v as usize),
+                }
+            })
+            .collect();
+        (signatures, active_sig, active_param)
+    }
+
     fn drain_pending_lsp_results(&mut self) {
         let results: Vec<PendingLspResult> = {
             let mut guard = self.pending_lsp_results.lock();
@@ -3206,6 +3740,174 @@ impl WorkbenchWindow {
                     self.apply_lsp_text_edits_to_uri(&uri, edits);
                     if save_after {
                         let _ = self.save_active_file_without_format();
+                    }
+                }
+                PendingLspResult::SignatureHelp {
+                    uri,
+                    position,
+                    help,
+                } => {
+                    let converted = help.map(Self::convert_signature_help);
+                    self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.set_signature_help(converted.clone(), position);
+                    });
+                }
+                PendingLspResult::PeekLocations {
+                    uri,
+                    anchor_line,
+                    kind,
+                    title,
+                    locations,
+                } => {
+                    if kind != PeekKind::References && locations.len() == 1 {
+                        self.navigate_to_definition_locations(&locations);
+                    } else {
+                        let items = self.build_peek_items(&locations);
+                        self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                            ed.open_peek_view(kind, title.clone(), anchor_line, items.clone());
+                        });
+                    }
+                }
+                PendingLspResult::PrepareRename {
+                    uri,
+                    position,
+                    prepared,
+                } => {
+                    let seed = prepared
+                        .and_then(|p| p.placeholder)
+                        .unwrap_or_default();
+                    self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.start_rename(position, seed.clone());
+                    });
+                }
+                PendingLspResult::RenameEdit {
+                    new_name,
+                    preview,
+                    edit,
+                } => {
+                    if let Some(ws_edit) = edit {
+                        if preview {
+                            self.preview_workspace_edit(format!("Rename -> {}", new_name), ws_edit);
+                        } else {
+                            self.apply_workspace_edit_with_undo(
+                                format!("Rename -> {}", new_name),
+                                &ws_edit,
+                            );
+                        }
+                    }
+                }
+                PendingLspResult::SemanticTokens { uri, tokens } => {
+                    let spans: Vec<SemanticTokenSpan> = tokens
+                        .into_iter()
+                        .map(|t| SemanticTokenSpan {
+                            line: t.line as usize,
+                            start_utf16: t.start_char as usize,
+                            length_utf16: t.length as usize,
+                            token_type: t.token_type,
+                            modifiers: t.modifiers,
+                        })
+                        .collect();
+                    self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.set_semantic_tokens(spans.clone());
+                    });
+                }
+                PendingLspResult::InlayHints { uri, hints } => {
+                    let editor_hints: Vec<EditorInlayHint> = hints
+                        .into_iter()
+                        .map(|h| EditorInlayHint {
+                            position: Position::new(
+                                h.position.line as usize,
+                                h.position.character as usize,
+                            ),
+                            label: h.label.display_text(),
+                            is_type: matches!(h.kind, Some(InlayHintKind::Type) | None),
+                            padding_left: h.padding_left.unwrap_or(false),
+                            padding_right: h.padding_right.unwrap_or(false),
+                            tooltip: h.tooltip.map(|m| m.value),
+                        })
+                        .collect();
+                    self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.set_inlay_hints(editor_hints.clone());
+                    });
+                }
+                PendingLspResult::CodeLenses { uri, lenses } => {
+                    let editor_lenses: Vec<EditorCodeLens> = lenses
+                        .into_iter()
+                        .map(|l| EditorCodeLens {
+                            line: l.range.start.line as usize,
+                            title: l
+                                .command
+                                .as_ref()
+                                .map(|c| c.title.clone())
+                                .unwrap_or_default(),
+                            command: l.command.as_ref().map(|c| c.command.clone()),
+                            arguments: l.command.and_then(|c| c.arguments).unwrap_or_default(),
+                        })
+                        .collect();
+                    self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.set_code_lenses(editor_lenses.clone());
+                    });
+                }
+                PendingLspResult::DocumentLinks { uri, links } => {
+                    let editor_links: Vec<EditorDocumentLink> = links
+                        .into_iter()
+                        .filter_map(|l| {
+                            let target = l.target?;
+                            Some(EditorDocumentLink {
+                                range: Range::new(
+                                    Position::new(
+                                        l.range.start.line as usize,
+                                        l.range.start.character as usize,
+                                    ),
+                                    Position::new(
+                                        l.range.end.line as usize,
+                                        l.range.end.character as usize,
+                                    ),
+                                ),
+                                target,
+                                tooltip: l.tooltip,
+                            })
+                        })
+                        .collect();
+                    self.view.editor_area.for_each_editor_for_uri_mut(&uri, |ed| {
+                        ed.set_document_links(editor_links.clone());
+                    });
+                }
+                PendingLspResult::CallHierarchy {
+                    mode,
+                    root,
+                    incoming,
+                    outgoing,
+                } => {
+                    if let Some(root_item) = root {
+                        if matches!(mode, HierarchyMode::CallOutgoing) {
+                            self.view
+                                .hierarchy_view
+                                .set_call_outgoing(root_item, outgoing);
+                        } else {
+                            self.view
+                                .hierarchy_view
+                                .set_call_incoming(root_item, incoming);
+                        }
+                        self.view.layout.mutate(|l| {
+                            l.sidebar_visible = true;
+                            l.active_sidebar_view = "workbench.view.hierarchy".to_string();
+                        });
+                    }
+                }
+                PendingLspResult::TypeHierarchy {
+                    mode,
+                    root,
+                    relatives,
+                } => {
+                    if let Some(root_item) = root {
+                        self.view
+                            .hierarchy_view
+                            .set_type_hierarchy(mode, root_item, relatives);
+                        self.view.layout.mutate(|l| {
+                            l.sidebar_visible = true;
+                            l.active_sidebar_view = "workbench.view.hierarchy".to_string();
+                        });
                     }
                 }
             }
@@ -3319,11 +4021,15 @@ impl WorkbenchWindow {
             self.handle_workbench_action(pending_action, event, bounds);
         }
 
-        // 1. If key down, check keybindings evaluation first (unless modal overlay or explorer inline input is open)
+        self.sync_focus_context_keys();
+
+        // 1. If key down, check keybindings evaluation first (unless modal overlay, popup menu, or explorer inline input is open)
         if !self.view.is_command_palette_open
             && !self.view.is_prompt_open()
             && !self.view.notifications.has_modal()
             && !self.view.is_explorer_input_active()
+            && !self.view.context_menu.is_open
+            && !self.view.title_bar.is_dropdown_open()
         {
             if let InputEvent::KeyDown(key_ev) = event {
                 let combo = key_ev.to_key_combo();
@@ -3355,7 +4061,7 @@ impl WorkbenchWindow {
         // 3. Update context keys from focused region
         self.sync_focus_context_keys();
 
-        // 3b. Poll EditorView actions (GoToDefinition, FormatDocument, OpenCommandPalette, Hover)
+        // 3b. Poll EditorView actions (GoToDefinition, FormatDocument, OpenCommandPalette, Hover, M1 actions)
         let editor_action = self
             .view
             .editor_area
@@ -3376,6 +4082,78 @@ impl WorkbenchWindow {
                     if let Some((uri, lang)) = self.active_editor_uri_and_lang() {
                         self.trigger_hover_at(uri, lang, pos);
                     }
+                }
+                EditorAction::TriggerSignatureHelp(pos) => {
+                    self.trigger_signature_help_at(pos);
+                }
+                EditorAction::PeekReferences(pos) => {
+                    self.trigger_references_at(pos);
+                }
+                EditorAction::GoToImplementation(pos) => {
+                    self.trigger_implementation_at(pos);
+                }
+                EditorAction::GoToTypeDefinition(pos) => {
+                    self.trigger_type_definition_at(pos);
+                }
+                EditorAction::StartRename(pos) => {
+                    self.trigger_prepare_rename_at(pos);
+                }
+                EditorAction::RenameConfirm {
+                    position,
+                    new_name,
+                    preview,
+                } => {
+                    self.trigger_rename_at(position, new_name, preview);
+                }
+                EditorAction::PeekNavigate { uri, range } => {
+                    let loc = LspLocation {
+                        uri,
+                        range: LspRange::new(
+                            LspPosition::new(range.start.line as u32, range.start.column as u32),
+                            LspPosition::new(range.end.line as u32, range.end.column as u32),
+                        ),
+                    };
+                    self.navigate_to_definition_locations(&[loc]);
+                }
+                EditorAction::ExecuteCodeLens { command, arguments } => {
+                    if let Some(bridge) = &self.language_bridge {
+                        if bridge.is_js_command(&command) {
+                            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                                let b = Arc::clone(bridge);
+                                handle.spawn(async move {
+                                    let _ = b.request_execute_command(&command, arguments).await;
+                                });
+                            }
+                        } else {
+                            let arg_val = (!arguments.is_empty())
+                                .then_some(serde_json::Value::Array(arguments));
+                            let _ = self.commands.execute(&command, arg_val);
+                            self.handle_builtin_command_effects(&command);
+                        }
+                    } else {
+                        let arg_val =
+                            (!arguments.is_empty()).then_some(serde_json::Value::Array(arguments));
+                        let _ = self.commands.execute(&command, arg_val);
+                        self.handle_builtin_command_effects(&command);
+                    }
+                }
+                EditorAction::OpenDocumentLink { target } => {
+                    if rustcode_platform::is_file_uri(&target) || Path::new(&target).exists() {
+                        let p = rustcode_platform::file_uri_to_path(&target);
+                        self.open_path(&p, false);
+                    } else if let Some(bridge) = &self.language_bridge {
+                        let _ = bridge.env_manager.open_external(&target);
+                    }
+                }
+                EditorAction::ShowCallHierarchy(pos) => {
+                    self.trigger_call_hierarchy_at(pos, HierarchyMode::CallIncoming);
+                }
+                EditorAction::ShowTypeHierarchy(pos) => {
+                    self.trigger_type_hierarchy_at(pos, HierarchyMode::TypeSupertypes);
+                }
+                EditorAction::ExecuteCommand(cmd) => {
+                    let _ = self.commands.execute(&cmd, None);
+                    self.handle_builtin_command_effects(&cmd);
                 }
             }
         }
@@ -3430,6 +4208,20 @@ impl WorkbenchWindow {
                                 .map(|ed| ed.primary_position())
                             {
                                 self.trigger_completions_at(pos, typed_char);
+                            }
+                        }
+                        if matches!(typed_char, Some('(') | Some(',')) {
+                            if let Some(pos) = self
+                                .view
+                                .editor_area
+                                .active_editor()
+                                .map(|ed| ed.primary_position())
+                            {
+                                self.trigger_signature_help_at(pos);
+                            }
+                        } else if typed_char == Some(')') {
+                            if let Some(ed) = self.view.editor_area.active_editor_mut() {
+                                ed.clear_signature_help();
                             }
                         }
                     }
@@ -3568,7 +4360,34 @@ impl WorkbenchWindow {
                 self.sync_focus_context_keys();
             }
             WorkbenchAction::SidebarToggled(_) => {}
+            WorkbenchAction::SecondarySidebarToggled(_) => {}
             WorkbenchAction::PanelToggled(_) => {}
+            WorkbenchAction::TitleBarAction(act) => match act {
+                TitleBarAction::CloseWindow => {
+                    self.pending_window_close_request = true;
+                }
+                TitleBarAction::ExecuteCommand(cmd) => {
+                    self.execute_command_from_dispatch(&cmd);
+                    self.handle_builtin_command_effects(&cmd);
+                    self.sync_focus_context_keys();
+                }
+                TitleBarAction::TogglePrimarySidebar
+                | TitleBarAction::ToggleSecondarySidebar
+                | TitleBarAction::TogglePanel
+                | TitleBarAction::MinimizeWindow
+                | TitleBarAction::MaximizeOrRestoreWindow => {}
+            },
+            WorkbenchAction::ContextMenuCommand {
+                command,
+                context_path,
+            } => {
+                if let Some(p) = context_path {
+                    self.view.explorer.model.selected_path = Some(p);
+                }
+                self.execute_command_from_dispatch(&command);
+                self.handle_builtin_command_effects(&command);
+                self.sync_focus_context_keys();
+            }
             WorkbenchAction::OpenDiff {
                 path,
                 title,
@@ -3801,12 +4620,98 @@ impl WorkbenchWindow {
                         self.handle_builtin_command_effects(&command);
                     }
                 }
+                ExplorerAction::Moved { from, to } => {
+                    self.view.editor_area.rename_tab(&from, &to);
+                    self.sync_focus_context_keys();
+                }
                 ExplorerAction::OpenFile(_)
                 | ExplorerAction::ToggleDir(_)
                 | ExplorerAction::CreateFile(_)
                 | ExplorerAction::CreateFolder(_)
                 | ExplorerAction::Renamed { .. }
                 | ExplorerAction::Deleted(_) => {}
+            },
+            WorkbenchAction::HierarchyAction(act) => match act {
+                HierarchyAction::NavigateTo { uri, range } => {
+                    let loc = LspLocation {
+                        uri,
+                        range: LspRange::new(
+                            LspPosition::new(range.start.line as u32, range.start.column as u32),
+                            LspPosition::new(range.end.line as u32, range.end.column as u32),
+                        ),
+                    };
+                    self.navigate_to_definition_locations(&[loc]);
+                }
+                HierarchyAction::SwitchMode(next_mode) => {
+                    if let Some(bridge) = self.language_bridge.clone() {
+                        let lang = self
+                            .active_editor_uri_and_lang()
+                            .map(|(_, l)| l)
+                            .unwrap_or_else(|| "rust".to_string());
+                        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                            let queue = Arc::clone(&self.pending_lsp_results);
+                            if next_mode.is_call() {
+                                if let Some(root) = self.view.hierarchy_view.raw_call_root.clone() {
+                                    handle.spawn(async move {
+                                        if matches!(next_mode, HierarchyMode::CallOutgoing) {
+                                            let outgoing = bridge
+                                                .request_call_hierarchy_outgoing(&lang, &root)
+                                                .await;
+                                            queue.lock().push(PendingLspResult::CallHierarchy {
+                                                mode: HierarchyMode::CallOutgoing,
+                                                root: Some(root),
+                                                incoming: Vec::new(),
+                                                outgoing,
+                                            });
+                                        } else {
+                                            let incoming = bridge
+                                                .request_call_hierarchy_incoming(&lang, &root)
+                                                .await;
+                                            queue.lock().push(PendingLspResult::CallHierarchy {
+                                                mode: HierarchyMode::CallIncoming,
+                                                root: Some(root),
+                                                incoming,
+                                                outgoing: Vec::new(),
+                                            });
+                                        }
+                                    });
+                                }
+                            } else if let Some(root) = self.view.hierarchy_view.raw_type_root.clone()
+                            {
+                                handle.spawn(async move {
+                                    let relatives = if matches!(next_mode, HierarchyMode::TypeSubtypes) {
+                                        bridge
+                                            .request_type_hierarchy_subtypes(&lang, &root)
+                                            .await
+                                    } else {
+                                        bridge
+                                            .request_type_hierarchy_supertypes(&lang, &root)
+                                            .await
+                                    };
+                                    queue.lock().push(PendingLspResult::TypeHierarchy {
+                                        mode: next_mode,
+                                        root: Some(root),
+                                        relatives,
+                                    });
+                                });
+                            }
+                        }
+                    }
+                }
+            },
+            WorkbenchAction::RefactorPreviewAction(act) => match act {
+                RefactorPreviewAction::ApplySelected => {
+                    if let Some(filtered) = self.view.refactor_preview.filtered_workspace_edit() {
+                        let title = self.view.refactor_preview.title.clone();
+                        self.view.refactor_preview.close();
+                        self.apply_workspace_edit_with_undo(title, &filtered);
+                    } else {
+                        self.view.refactor_preview.close();
+                    }
+                }
+                RefactorPreviewAction::Cancel => {
+                    self.view.refactor_preview.close();
+                }
             },
         }
     }
@@ -4258,6 +5163,159 @@ impl WorkbenchWindow {
             "editor.action.quickFix" => {
                 self.show_quick_fixes_palette();
             }
+            "editor.action.triggerParameterHints" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_signature_help_at(pos);
+                }
+            }
+            "editor.action.referenceSearch.trigger" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_references_at(pos);
+                }
+            }
+            "editor.action.goToImplementation" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_implementation_at(pos);
+                }
+            }
+            "editor.action.goToTypeDefinition" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_type_definition_at(pos);
+                }
+            }
+            "editor.action.rename" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_prepare_rename_at(pos);
+                }
+            }
+            "editor.action.showCallHierarchy" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_call_hierarchy_at(pos, HierarchyMode::CallIncoming);
+                }
+            }
+            "editor.action.showTypeHierarchy" => {
+                if let Some(pos) = self
+                    .view
+                    .editor_area
+                    .active_editor()
+                    .map(|ed| ed.primary_position())
+                {
+                    self.trigger_type_hierarchy_at(pos, HierarchyMode::TypeSupertypes);
+                }
+            }
+            "workbench.action.undoWorkspaceEdit" => {
+                self.undo_last_workspace_edit();
+            }
+            "workbench.action.toggleAuxiliaryBar" => {
+                self.view.layout.toggle_secondary_sidebar();
+                self.view.last_action = Some(WorkbenchAction::SecondarySidebarToggled(
+                    self.view.layout.secondary_sidebar_visible,
+                ));
+            }
+            "workbench.action.positionPanelBottom" => {
+                self.view
+                    .layout
+                    .set_panel_position(crate::layout::PanelPosition::Bottom);
+            }
+            "workbench.action.positionPanelLeft" => {
+                self.view
+                    .layout
+                    .set_panel_position(crate::layout::PanelPosition::Left);
+            }
+            "workbench.action.positionPanelRight" => {
+                self.view
+                    .layout
+                    .set_panel_position(crate::layout::PanelPosition::Right);
+            }
+            "workbench.action.toggleZenMode" => {
+                self.view.layout.toggle_zen_mode();
+            }
+            "workbench.action.zoomIn" => {
+                self.view.layout.zoom_in();
+            }
+            "workbench.action.zoomOut" => {
+                self.view.layout.zoom_out();
+            }
+            "workbench.action.zoomReset" => {
+                self.view.layout.zoom_reset();
+            }
+            "workbench.action.toggleMenuBar" => {
+                self.view.layout.toggle_title_bar();
+            }
+            "workbench.action.newWindow" => {
+                self.pending_new_window_request = true;
+            }
+            "workbench.action.closeOtherEditors" => {
+                if let Some(active_idx) = self
+                    .view
+                    .editor_area
+                    .model
+                    .current_group_ref()
+                    .active_tab_index
+                {
+                    let gid = self.view.editor_area.model.active_group_id();
+                    let len = self
+                        .view
+                        .editor_area
+                        .model
+                        .current_group_ref()
+                        .tabs
+                        .len();
+                    for i in (0..len).rev() {
+                        if i != active_idx {
+                            self.view.editor_area.close_tab_in_group(gid, i);
+                        }
+                    }
+                    self.sync_closed_webview_panels();
+                    self.sync_document_lifecycle();
+                }
+            }
+            "explorer.newFile" => {
+                self.view.focused_region = FocusedRegion::Sidebar;
+                self.view.explorer.start_new_file();
+            }
+            "explorer.newFolder" => {
+                self.view.focused_region = FocusedRegion::Sidebar;
+                self.view.explorer.start_new_folder();
+            }
+            "explorer.rename" => {
+                self.view.focused_region = FocusedRegion::Sidebar;
+                self.view.explorer.start_rename();
+            }
+            "explorer.delete" => {
+                self.view.focused_region = FocusedRegion::Sidebar;
+                self.view.explorer.start_delete();
+            }
             cmd if cmd.starts_with("quickfix:") || cmd.starts_with("codeaction:") => {
                 if let Some(idx_str) = cmd.strip_prefix("quickfix:").or_else(|| cmd.strip_prefix("codeaction:")) {
                     if let Ok(idx) = idx_str.parse::<usize>() {
@@ -4678,12 +5736,42 @@ impl WorkbenchWindow {
     }
 
     pub fn apply_workspace_edit(&mut self, edit: &WorkspaceEdit) -> usize {
+        self.apply_workspace_edit_with_undo("WorkspaceEdit", edit)
+    }
+
+    pub fn apply_workspace_edit_with_undo(
+        &mut self,
+        label: impl Into<String>,
+        edit: &WorkspaceEdit,
+    ) -> usize {
+        let snapshot = self
+            .view
+            .editor_area
+            .snapshot_files_for_workspace_edit(edit, label);
         let count = self.view.editor_area.apply_workspace_edit(edit);
         if count > 0 {
+            self.workspace_edit_undo.push(snapshot);
             self.sync_document_lifecycle();
             self.sync_configuration();
         }
         count
+    }
+
+    pub fn undo_last_workspace_edit(&mut self) -> usize {
+        let Some(entry) = self.workspace_edit_undo.pop() else {
+            return 0;
+        };
+        let restored = self.view.editor_area.restore_workspace_edit_snapshot(&entry);
+        if restored > 0 {
+            self.sync_document_lifecycle();
+            self.sync_diagnostics();
+            self.sync_configuration();
+        }
+        restored
+    }
+
+    pub fn preview_workspace_edit(&mut self, title: impl Into<String>, edit: WorkspaceEdit) {
+        self.view.refactor_preview.open(title, edit);
     }
 }
 
@@ -7437,5 +8525,356 @@ mod tests {
 
         server_task.abort();
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_workbench_window_phase9_m1_lsp_lifecycle_and_atomic_undo() {
+        use rustcode_ext_host::provider::ProviderRegistry;
+        use rustcode_ext_host::rpc::RpcBridge;
+        use rustcode_platform::render::{MockRenderSurface, Rect};
+        use rustcode_protocols::codec::{read_framed_message, write_framed_message};
+        use rustcode_protocols::lsp::{LspClient, LspClientManager};
+        use serde_json::json;
+
+        let tmp = make_temp_test_dir("phase9_m1");
+        let main_rs = tmp.join("main.rs");
+        let lib_rs = tmp.join("lib.rs");
+        std::fs::write(&main_rs, "fn main() { foo(1); }\n").unwrap();
+        std::fs::write(&lib_rs, "pub fn foo(val: i32) {}\n").unwrap();
+        let main_uri = rustcode_platform::path_to_file_uri(&main_rs);
+        let lib_uri = rustcode_platform::path_to_file_uri(&lib_rs);
+
+        let (client_read, server_write) = tokio::io::duplex(16384);
+        let (server_read, client_write) = tokio::io::duplex(16384);
+
+        let main_uri_srv = main_uri.clone();
+        let lib_uri_srv = lib_uri.clone();
+        let server_task = tokio::spawn(async move {
+            let mut reader = server_read;
+            let mut writer = server_write;
+            let mut msg_buf = Vec::new();
+            while let Ok(Some(bytes)) = read_framed_message(&mut reader, &mut msg_buf).await {
+                let msg: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let id = msg.get("id").cloned();
+                let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                if let Some(req_id) = id {
+                    let result = match method {
+                        "initialize" => json!({
+                            "capabilities": {
+                                "hoverProvider": true,
+                                "signatureHelpProvider": { "triggerCharacters": ["(", ","] },
+                                "referencesProvider": true,
+                                "renameProvider": { "prepareProvider": true },
+                                "semanticTokensProvider": {
+                                    "legend": { "tokenTypes": ["function"], "tokenModifiers": [] },
+                                    "full": true
+                                },
+                                "inlayHintProvider": true,
+                                "codeLensProvider": { "resolveProvider": false },
+                                "documentLinkProvider": { "resolveProvider": false },
+                                "callHierarchyProvider": true
+                            }
+                        }),
+                        "textDocument/signatureHelp" => json!({
+                            "signatures": [{
+                                "label": "fn foo(val: i32)",
+                                "documentation": { "kind": "markdown", "value": "Computes foo" },
+                                "parameters": [{ "label": "val: i32" }]
+                            }],
+                            "activeSignature": 0,
+                            "activeParameter": 0
+                        }),
+                        "textDocument/references" => json!([
+                            {
+                                "uri": main_uri_srv,
+                                "range": { "start": { "line": 0, "character": 12 }, "end": { "line": 0, "character": 15 } }
+                            },
+                            {
+                                "uri": lib_uri_srv,
+                                "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 10 } }
+                            }
+                        ]),
+                        "textDocument/prepareRename" => json!({
+                            "range": { "start": { "line": 0, "character": 12 }, "end": { "line": 0, "character": 15 } },
+                            "placeholder": "foo"
+                        }),
+                        "textDocument/rename" => json!({
+                            "documentChanges": [
+                                {
+                                    "textDocument": { "uri": main_uri_srv, "version": 1 },
+                                    "edits": [{
+                                        "range": { "start": { "line": 0, "character": 12 }, "end": { "line": 0, "character": 15 } },
+                                        "newText": "bar"
+                                    }]
+                                },
+                                {
+                                    "textDocument": { "uri": lib_uri_srv, "version": 1 },
+                                    "edits": [{
+                                        "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 10 } },
+                                        "newText": "bar"
+                                    }]
+                                }
+                            ]
+                        }),
+                        "textDocument/semanticTokens/full" => json!({
+                            "data": [0, 12, 3, 0, 0]
+                        }),
+                        "textDocument/inlayHint" => json!([{
+                            "position": { "line": 0, "character": 16 },
+                            "label": "val:",
+                            "kind": 2,
+                            "paddingRight": true
+                        }]),
+                        "textDocument/codeLens" => json!([{
+                            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 9 } },
+                            "command": { "title": "1 reference", "command": "editor.action.referenceSearch.trigger" }
+                        }]),
+                        "textDocument/documentLink" => json!([{
+                            "range": { "start": { "line": 0, "character": 12 }, "end": { "line": 0, "character": 15 } },
+                            "target": lib_uri_srv
+                        }]),
+                        "textDocument/prepareCallHierarchy" => json!([{
+                            "name": "foo",
+                            "kind": 12,
+                            "uri": lib_uri_srv,
+                            "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 22 } },
+                            "selectionRange": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 10 } }
+                        }]),
+                        "callHierarchy/incomingCalls" => json!([{
+                            "from": {
+                                "name": "main",
+                                "kind": 12,
+                                "uri": main_uri_srv,
+                                "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 20 } },
+                                "selectionRange": { "start": { "line": 0, "character": 3 }, "end": { "line": 0, "character": 7 } }
+                            },
+                            "fromRanges": [{ "start": { "line": 0, "character": 12 }, "end": { "line": 0, "character": 15 } }]
+                        }]),
+                        _ => json!(null),
+                    };
+                    let resp = json!({ "jsonrpc": "2.0", "id": req_id, "result": result });
+                    let _ = write_framed_message(&mut writer, resp.to_string().as_bytes()).await;
+                }
+            }
+        });
+
+        let client = Arc::new(LspClient::from_io(client_read, client_write));
+        client
+            .initialize(rustcode_protocols::lsp::InitializeParams::default())
+            .await
+            .unwrap();
+        let rpc = Arc::new(RpcBridge::new());
+        let registry = Arc::new(ProviderRegistry::new());
+        let lsp_mgr = Arc::new(LspClientManager::new());
+        lsp_mgr.attach_client("rust", client);
+        let bridge = Arc::new(LanguageFeatureBridge::new(registry, rpc, lsp_mgr));
+
+        let mut window = WorkbenchWindow::default().with_language_bridge(bridge);
+        window.open_workspace(&tmp);
+        window.open_path(&main_rs, false);
+
+        // Trigger annotations, signature help, peek references, call hierarchy
+        window.trigger_signature_help_at(Position::new(0, 16));
+        window.trigger_references_at(Position::new(0, 13));
+        window.trigger_call_hierarchy_at(Position::new(0, 13), HierarchyMode::CallIncoming);
+        window.trigger_prepare_rename_at(Position::new(0, 13));
+
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            window.poll_runtime_events();
+            let ed = window.view.editor_area.active_editor().unwrap();
+            if ed.signature_help.is_visible
+                && ed.peek_view.is_visible
+                && ed.rename_input.is_visible
+                && !ed.inlay_hints.is_empty()
+                && !ed.code_lenses.is_empty()
+                && !ed.document_links.is_empty()
+                && window.view.hierarchy_view.is_open
+            {
+                break;
+            }
+        }
+
+        let ed = window.view.editor_area.active_editor().unwrap();
+        assert!(ed.signature_help.is_visible);
+        assert!(ed.peek_view.is_visible);
+        assert_eq!(ed.peek_view.items.len(), 2);
+        assert!(ed.rename_input.is_visible);
+        assert_eq!(ed.rename_input.buffer, "foo");
+        assert!(!ed.inlay_hints.is_empty());
+        assert!(!ed.code_lenses.is_empty());
+        assert!(!ed.document_links.is_empty());
+        assert!(window.view.hierarchy_view.is_open);
+
+        let mut surface = MockRenderSurface::new(1200.0, 800.0);
+        let scene = window.render(&mut surface);
+        assert!(scene.contains_text("val:"));
+        assert!(scene.contains_text("1 reference"));
+        assert!(scene.contains_text("CALL HIERARCHY: INCOMING"));
+
+        // Confirm multi-file rename with preview = true -> RefactorPreviewOverlay -> uncheck/keep both & apply -> atomic undo
+        window.trigger_rename_at(Position::new(0, 13), "bar".to_string(), true);
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            window.poll_runtime_events();
+            if window.view.refactor_preview.is_visible {
+                break;
+            }
+        }
+        assert!(window.view.refactor_preview.is_visible);
+        assert_eq!(window.view.refactor_preview.files.len(), 2);
+
+        window.handle_workbench_action(
+            WorkbenchAction::RefactorPreviewAction(RefactorPreviewAction::ApplySelected),
+            &InputEvent::KeyDown(rustcode_platform::render::KeyEvent::new(
+                rustcode_platform::render::KeyCode::Enter,
+                rustcode_platform::keybindings::Modifiers::none(),
+            )),
+            Rect::from_xywh(0.0, 0.0, 1200.0, 800.0),
+        );
+        assert!(!window.view.refactor_preview.is_visible);
+        assert_eq!(
+            window.view.editor_area.editors.get(&main_uri).unwrap().text(),
+            "fn main() { bar(1); }\n"
+        );
+        assert_eq!(
+            window.view.editor_area.editors.get(&lib_uri).unwrap().text(),
+            "pub fn bar(val: i32) {}\n"
+        );
+
+        // Atomic undo restores both main.rs and lib.rs simultaneously
+        assert_eq!(window.undo_last_workspace_edit(), 2);
+        assert_eq!(
+            window.view.editor_area.editors.get(&main_uri).unwrap().text(),
+            "fn main() { foo(1); }\n"
+        );
+        assert_eq!(
+            window.view.editor_area.editors.get(&lib_uri).unwrap().text(),
+            "pub fn foo(val: i32) {}\n"
+        );
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_workbench_window_phase9_m3_commands_keybindings_and_context_menu() {
+        use rustcode_platform::keybindings::Modifiers;
+        use rustcode_platform::render::{KeyCode, KeyEvent, MockRenderSurface, MouseButton, MouseEvent};
+
+        let kb = KeybindingService::new();
+        kb.load_keybindings_json(include_str!("../../../resources/default-keymaps/linux.json"))
+            .unwrap();
+        let mut window = WorkbenchWindow::new(
+            ThemeService::new(),
+            kb,
+            CommandRegistry::new(),
+            ContextKeyService::new(),
+        );
+        let bounds = Rect::from_xywh(0.0, 0.0, 1280.0, 800.0);
+
+        window.handle_builtin_command_effects("workbench.action.toggleMenuBar");
+        assert!(window.view.layout.title_bar_visible);
+
+        // Keybinding Ctrl+Alt+B toggles Secondary Sidebar
+        let ctrl_alt_b = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('b'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: true,
+                meta: false,
+            },
+        ));
+        assert_eq!(window.dispatch_event(&ctrl_alt_b, bounds), EventResult::Consumed);
+        assert!(window.view.layout.secondary_sidebar_visible);
+
+        // Panel position commands
+        window.handle_builtin_command_effects("workbench.action.positionPanelLeft");
+        assert_eq!(
+            window.view.layout.panel_position,
+            crate::layout::PanelPosition::Left
+        );
+        window.handle_builtin_command_effects("workbench.action.positionPanelRight");
+        assert_eq!(
+            window.view.layout.panel_position,
+            crate::layout::PanelPosition::Right
+        );
+
+        // Zoom In/Out/Reset via keybindings
+        let ctrl_eq = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('='),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        let ctrl_0 = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('0'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        window.dispatch_event(&ctrl_eq, bounds);
+        assert_eq!(window.view.layout.zoom_level, 1.0);
+        window.dispatch_event(&ctrl_0, bounds);
+        assert_eq!(window.view.layout.zoom_level, 0.0);
+
+        // Zen Mode chord Ctrl+K Z
+        let ctrl_k = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('k'),
+            Modifiers {
+                ctrl: true,
+                shift: false,
+                alt: false,
+                meta: false,
+            },
+        ));
+        let key_z = InputEvent::KeyDown(KeyEvent::new(KeyCode::Char('z'), Modifiers::none()));
+        window.dispatch_event(&ctrl_k, bounds);
+        window.dispatch_event(&key_z, bounds);
+        assert!(window.view.layout.zen_mode);
+        assert!(!window.view.layout.sidebar_visible);
+        assert!(!window.view.layout.secondary_sidebar_visible);
+        window.handle_builtin_command_effects("workbench.action.toggleZenMode");
+        assert!(!window.view.layout.zen_mode);
+        assert!(window.view.layout.sidebar_visible);
+        assert!(window.view.layout.secondary_sidebar_visible);
+
+        // New Window keybinding sets pending_new_window_request
+        let ctrl_shift_n = InputEvent::KeyDown(KeyEvent::new(
+            KeyCode::Char('n'),
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: false,
+                meta: false,
+            },
+        ));
+        window.dispatch_event(&ctrl_shift_n, bounds);
+        assert!(window.pending_new_window_request);
+
+        // Right-click opens ContextMenu & keyboard Enter executes action
+        window.open_file("file:///m3.rs", "m3.rs", "fn main() {}\n", false);
+        let ed_rect = window.view.compute_regions(bounds).editor_area;
+        window.dispatch_event(
+            &InputEvent::MouseDown(MouseEvent::new(
+                rustcode_platform::render::Point::new(
+                    ed_rect.min_x() + 60.0,
+                    ed_rect.min_y() + 80.0,
+                ),
+                MouseButton::Right,
+            )),
+            bounds,
+        );
+        assert!(window.view.context_menu.is_open);
+        let mut surface = MockRenderSurface::new(1280.0, 800.0);
+        let scene = window.render(&mut surface);
+        assert!(scene.contains_text("Go to Definition"));
     }
 }

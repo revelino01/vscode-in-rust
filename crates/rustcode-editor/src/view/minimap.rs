@@ -276,12 +276,16 @@ pub fn render_minimap(
         && block_h.is_finite()
     {
         let mut highlighter_guard = syntax_highlighter.lock();
-        if let Some(highlighter) = highlighter_guard.as_mut() {
-            let last_cached = highlighter.cache_len();
-            if last_cached < total_lines {
-                for l in last_cached..total_lines {
-                    let content = buf.get_line_content(l).unwrap_or_default();
-                    highlighter.get_line_tokens(l, &content);
+        if total_lines < crate::LARGE_FILE_LINE_THRESHOLD
+            && buf.len() < crate::LARGE_FILE_BYTE_THRESHOLD
+        {
+            if let Some(highlighter) = highlighter_guard.as_mut() {
+                let last_cached = highlighter.cache_len();
+                if last_cached < total_lines {
+                    for l in last_cached..total_lines {
+                        let content = buf.get_line_content(l).unwrap_or_default();
+                        highlighter.get_line_tokens(l, &content);
+                    }
                 }
             }
         }

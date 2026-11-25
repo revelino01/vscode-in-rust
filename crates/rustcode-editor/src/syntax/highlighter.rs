@@ -2,12 +2,16 @@
 
 use crate::syntax::registry::GrammarRegistry;
 use crate::syntax::scope::{Grammar, GrammarState, SyntaxScope, TokenSpan};
+use crate::syntax::semantic::{overlay_semantic_tokens, SemanticTokenOverlay};
 #[cfg(feature = "desktop")]
 use crate::syntax::treesitter::TreeSitterDocument;
 use rustcode_platform::fs::hash_content;
 use rustcode_platform::render::Rgba;
 use rustcode_platform::theme::ColorTheme;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+const MAX_LINE_CACHE_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone)]
 struct LineCacheEntry {
@@ -19,7 +23,8 @@ struct LineCacheEntry {
 pub struct SyntaxHighlighter {
     grammar: Arc<dyn Grammar>,
     theme: ColorTheme,
-    cache: Vec<Option<LineCacheEntry>>,
+    cache: BTreeMap<usize, LineCacheEntry>,
+    semantic_overlay: Option<SemanticTokenOverlay>,
     #[cfg(feature = "desktop")]
     tree_sitter: Option<TreeSitterDocument>,
 }
@@ -29,7 +34,8 @@ impl SyntaxHighlighter {
         Self {
             grammar,
             theme,
-            cache: Vec::new(),
+            cache: BTreeMap::new(),
+            semantic_overlay: None,
             #[cfg(feature = "desktop")]
             tree_sitter: None,
         }
@@ -108,7 +114,7 @@ impl SyntaxHighlighter {
     /// Update theme and re-resolve foreground colors on already-cached tokens without re-parsing.
     pub fn set_theme(&mut self, theme: ColorTheme) {
         self.theme = theme;
-        for entry in self.cache.iter_mut().flatten() {
+        for entry in self.cache.values_mut() {
             for span in &mut entry.tokens {
                 span.color = Some(Self::resolve_span_color(&self.theme, span));
             }
@@ -117,14 +123,34 @@ impl SyntaxHighlighter {
 
     /// Invalidate line cache from a specific line index onwards (e.g. after an edit).
     pub fn invalidate_from(&mut self, line_idx: usize) {
-        if line_idx < self.cache.len() {
-            self.cache.truncate(line_idx);
-        }
+        self.cache.split_off(&line_idx);
     }
 
     /// Clear entire syntax cache.
     pub fn invalidate_all(&mut self) {
         self.cache.clear();
+    }
+
+    /// Replace LSP semantic token overlay and invalidate cached lines.
+    pub fn set_semantic_tokens(&mut self, overlay: SemanticTokenOverlay) {
+        self.semantic_overlay = if overlay.is_empty() {
+            None
+        } else {
+            Some(overlay)
+        };
+        self.cache.clear();
+    }
+
+    /// Clear LSP semantic token overlay and invalidate cached lines.
+    pub fn clear_semantic_tokens(&mut self) {
+        if self.semantic_overlay.take().is_some() {
+            self.cache.clear();
+        }
+    }
+
+    /// Whether an active LSP semantic token overlay is loaded.
+    pub fn has_semantic_tokens(&self) -> bool {
+        self.semantic_overlay.is_some()
     }
 
     /// Number of cached lines.
@@ -136,11 +162,9 @@ impl SyntaxHighlighter {
     pub fn get_line_tokens(&mut self, line_idx: usize, line_text: &str) -> &[TokenSpan] {
         let text_hash = hash_content(line_text);
 
-        if line_idx < self.cache.len() {
-            if let Some(entry) = &self.cache[line_idx] {
-                if entry.text_hash == text_hash {
-                    return &self.cache[line_idx].as_ref().unwrap().tokens;
-                }
+        if let Some(entry) = self.cache.get(&line_idx) {
+            if entry.text_hash == text_hash {
+                return &self.cache[&line_idx].tokens;
             }
         }
 
@@ -148,9 +172,9 @@ impl SyntaxHighlighter {
         let (mut tokens, end_state) = if let Some(ts) = &self.tree_sitter {
             (ts.line_tokens(line_idx, line_text), None)
         } else {
-            let prev_state = if line_idx > 0 && line_idx - 1 < self.cache.len() {
-                self.cache[line_idx - 1]
-                    .as_ref()
+            let prev_state = if line_idx > 0 {
+                self.cache
+                    .get(&(line_idx - 1))
                     .and_then(|e| e.end_state.as_ref())
             } else {
                 None
@@ -160,9 +184,9 @@ impl SyntaxHighlighter {
 
         #[cfg(not(feature = "desktop"))]
         let (mut tokens, end_state) = {
-            let prev_state = if line_idx > 0 && line_idx - 1 < self.cache.len() {
-                self.cache[line_idx - 1]
-                    .as_ref()
+            let prev_state = if line_idx > 0 {
+                self.cache
+                    .get(&(line_idx - 1))
                     .and_then(|e| e.end_state.as_ref())
             } else {
                 None
@@ -170,23 +194,43 @@ impl SyntaxHighlighter {
             self.grammar.tokenize_line(line_text, prev_state)
         };
 
+        if let Some(overlay) = &self.semantic_overlay {
+            let sem_spans = overlay.tokens_for_line(line_idx);
+            if !sem_spans.is_empty() {
+                let lang_id = tokens.first().map_or(0, |t| t.metadata.language_id());
+                tokens = overlay_semantic_tokens(tokens, line_text, sem_spans, lang_id);
+            }
+        }
+
         // Resolve colors for each token span using active theme
         for span in &mut tokens {
             span.color = Some(Self::resolve_span_color(&self.theme, span));
         }
 
-        // Ensure cache capacity
-        if line_idx >= self.cache.len() {
-            self.cache.resize(line_idx + 1, None);
+        // Bound cache capacity for 100 MB+ files by evicting the farthest cached line
+        if self.cache.len() >= MAX_LINE_CACHE_ENTRIES && !self.cache.contains_key(&line_idx) {
+            let first_key = self.cache.keys().next().copied();
+            let last_key = self.cache.keys().next_back().copied();
+            if let (Some(fk), Some(lk)) = (first_key, last_key) {
+                let evict = if fk.abs_diff(line_idx) >= lk.abs_diff(line_idx) {
+                    fk
+                } else {
+                    lk
+                };
+                self.cache.remove(&evict);
+            }
         }
 
-        self.cache[line_idx] = Some(LineCacheEntry {
-            tokens,
-            end_state,
-            text_hash,
-        });
+        self.cache.insert(
+            line_idx,
+            LineCacheEntry {
+                tokens,
+                end_state,
+                text_hash,
+            },
+        );
 
-        &self.cache[line_idx].as_ref().unwrap().tokens
+        &self.cache[&line_idx].tokens
     }
 
     /// Resolve a `TokenSpan`'s foreground color using its exact TextMate scope (if present)

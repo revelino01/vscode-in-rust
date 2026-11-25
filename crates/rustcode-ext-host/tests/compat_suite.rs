@@ -323,9 +323,7 @@ async fn test_compat_code_actions_quickfix_and_workspace_edit_transaction() {
         kind: Some(CodeActionKind::QUICKFIX.to_string()),
         diagnostics: None,
         is_preferred: Some(true),
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-        }),
+        edit: Some(WorkspaceEdit::with_changes(changes)),
         command: None,
     };
 
@@ -669,9 +667,7 @@ async fn test_compat_full_extension_end_to_end_workflow() {
                 kind: Some(CodeActionKind::QUICKFIX.to_string()),
                 diagnostics: None,
                 is_preferred: Some(true),
-                edit: Some(WorkspaceEdit {
-                    changes: Some(changes),
-                }),
+                edit: Some(WorkspaceEdit::with_changes(changes)),
                 command: None,
             }
         ])),

@@ -255,7 +255,7 @@ impl LspClientManager {
 
         let init_params = InitializeParams {
             root_uri,
-            capabilities: ClientCapabilities::default(),
+            capabilities: ClientCapabilities::default_phase9(),
             ..Default::default()
         };
         arc_client.initialize(init_params).await?;
@@ -394,6 +394,240 @@ impl LspClientManager {
     ) -> Result<Vec<SymbolInformation>, LspError> {
         if let Some(client) = self.get_client(language_id) {
             client.document_symbol(uri).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub fn semantic_tokens_legend(&self, language_id: &str) -> Option<SemanticTokensLegend> {
+        self.get_client(language_id)?
+            .server_capabilities()?
+            .semantic_tokens_legend()
+    }
+
+    pub async fn request_signature_help(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Result<Option<SignatureHelp>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.signature_help(uri, position).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn request_references(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+        include_declaration: bool,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.references(uri, position, include_declaration).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_implementation(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.implementation(uri, position).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_type_definition(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Result<Vec<LspLocation>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.type_definition(uri, position).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_prepare_rename(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Result<Option<PrepareRenameResult>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.prepare_rename(uri, position).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn request_rename(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+        new_name: &str,
+    ) -> Result<Option<WorkspaceEdit>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.rename(uri, position, new_name).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn request_semantic_tokens_full(
+        &self,
+        uri: &str,
+        language_id: &str,
+    ) -> Result<Option<SemanticTokens>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.semantic_tokens_full(uri).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn request_semantic_tokens_range(
+        &self,
+        uri: &str,
+        language_id: &str,
+        range: LspRange,
+    ) -> Result<Option<SemanticTokens>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.semantic_tokens_range(uri, range).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn request_inlay_hints(
+        &self,
+        uri: &str,
+        language_id: &str,
+        range: LspRange,
+    ) -> Result<Vec<InlayHint>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.inlay_hints(uri, range).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_code_lens(
+        &self,
+        uri: &str,
+        language_id: &str,
+    ) -> Result<Vec<CodeLens>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.code_lens(uri).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_code_lens_resolve(
+        &self,
+        language_id: &str,
+        lens: &CodeLens,
+    ) -> Result<Option<CodeLens>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.code_lens_resolve(lens).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn request_document_links(
+        &self,
+        uri: &str,
+        language_id: &str,
+    ) -> Result<Vec<DocumentLink>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.document_links(uri).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_prepare_call_hierarchy(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Result<Vec<CallHierarchyItem>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.prepare_call_hierarchy(uri, position).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_call_hierarchy_incoming(
+        &self,
+        language_id: &str,
+        item: &CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyIncomingCall>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.call_hierarchy_incoming(item).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_call_hierarchy_outgoing(
+        &self,
+        language_id: &str,
+        item: &CallHierarchyItem,
+    ) -> Result<Vec<CallHierarchyOutgoingCall>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.call_hierarchy_outgoing(item).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_prepare_type_hierarchy(
+        &self,
+        uri: &str,
+        language_id: &str,
+        position: LspPosition,
+    ) -> Result<Vec<TypeHierarchyItem>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.prepare_type_hierarchy(uri, position).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_type_hierarchy_supertypes(
+        &self,
+        language_id: &str,
+        item: &TypeHierarchyItem,
+    ) -> Result<Vec<TypeHierarchyItem>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.type_hierarchy_supertypes(item).await
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    pub async fn request_type_hierarchy_subtypes(
+        &self,
+        language_id: &str,
+        item: &TypeHierarchyItem,
+    ) -> Result<Vec<TypeHierarchyItem>, LspError> {
+        if let Some(client) = self.get_client(language_id) {
+            client.type_hierarchy_subtypes(item).await
         } else {
             Ok(Vec::new())
         }

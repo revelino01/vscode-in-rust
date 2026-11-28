@@ -3,7 +3,10 @@
 use crate::debug::{DebugToolbarAction, DebugViewAction};
 use crate::editor_area::SplitDirection;
 use crate::explorer::{ContributedViewDescriptor, ExplorerAction};
-use crate::extensions_view::ExtensionsViewAction;
+use crate::extensions_view::{
+    parse_extension_detail_message, render_extension_detail_html, ExtensionDetailContext,
+    ExtensionDetailMessage, ExtensionsViewAction,
+};
 use crate::hierarchy::{HierarchyAction, HierarchyMode};
 use crate::layout::LayoutHandle;
 use crate::notifications::{NotificationUiAction, PromptUiAction};
@@ -25,10 +28,16 @@ use rustcode_editor::{
     Range, RangeEdit, SemanticTokenSpan, SignatureEntry, SignatureParamInfo, TextDocument,
     WordWrapMode,
 };
-use rustcode_ext_host::manifest::{CustomEditorContribution, ViewContribution};
-use rustcode_ext_host::marketplace::ExtensionInstaller;
+use rustcode_ext_host::manifest::{
+    CustomEditorContribution, JsonValidationRegistry, ViewContribution,
+    ViewWelcomeContribution,
+};
+use rustcode_ext_host::marketplace::{
+    ExtensionAutoUpdater, ExtensionInstaller, WorkspaceExtensionsRecommendations,
+};
 use rustcode_ext_host::output::OutputChannelEvent;
 use rustcode_ext_host::provider::{LanguageFeatureBridge, ProviderType};
+use rustcode_ext_host::tasks::ProblemMatcherRegistry;
 use rustcode_ext_host::terminal::{ExtTerminalEvent, ExtTerminalLifecycleEvent};
 use rustcode_ext_host::webview::{CustomEditorEvent, WebviewEvent, WebviewOptions};
 use rustcode_platform::accessibility::AccessibilityTree;
@@ -37,9 +46,10 @@ use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::fs::FileSystemService;
 use rustcode_platform::keybindings::KeybindingService;
 use rustcode_platform::os_ux::{
-    ClipboardBackend, FileDialogBackend, FileDialogOptions, InMemoryClipboardBackend,
+    AppPaths, ClipboardBackend, FileDialogBackend, FileDialogOptions, InMemoryClipboardBackend,
     MockFileDialogBackend,
 };
+use rustcode_platform::profiles::ProfileManager;
 use rustcode_platform::render::{
     EventResult, FontMetrics, InputEvent, Rect, RenderSurface, Scene, View,
     WorkbenchThemeStyles,
@@ -178,10 +188,15 @@ pub struct WorkbenchWindow {
     pub extension_disposables: HashMap<String, DisposableStore>,
     pub custom_editor_contributions: Vec<CustomEditorContribution>,
     pub registered_view_contributions: HashMap<String, Vec<ViewContribution>>,
+    pub registered_view_welcome: Vec<ViewWelcomeContribution>,
+    pub profile_manager: ProfileManager,
+    pub json_validation: JsonValidationRegistry,
+    pub problem_matchers: ProblemMatcherRegistry,
     pub workspace_edit_undo: WorkspaceEditUndoStack,
     synced_output_revision: u64,
     synced_terminal_revision: u64,
     synced_webview_revision: u64,
+    synced_webview_view_revision: u64,
     synced_custom_editor_revision: u64,
     synced_status_bar_revision: AtomicU64,
     render_status_bar_revision: AtomicU64,
@@ -204,6 +219,7 @@ pub struct WorkbenchWindow {
     last_synced_color_theme: Option<String>,
     pub pending_new_window_request: bool,
     pub pending_window_close_request: bool,
+    pub pending_ext_host_restart_request: bool,
 }
 
 impl Default for WorkbenchWindow {
@@ -254,10 +270,15 @@ impl WorkbenchWindow {
             extension_disposables: HashMap::new(),
             custom_editor_contributions: Vec::new(),
             registered_view_contributions: HashMap::new(),
+            registered_view_welcome: Vec::new(),
+            profile_manager: ProfileManager::new(AppPaths::default().profiles_dir()),
+            json_validation: JsonValidationRegistry::new(),
+            problem_matchers: ProblemMatcherRegistry::new(),
             workspace_edit_undo: WorkspaceEditUndoStack::new(),
             synced_output_revision: 0,
             synced_terminal_revision: 0,
             synced_webview_revision: 0,
+            synced_webview_view_revision: 0,
             synced_custom_editor_revision: 0,
             synced_status_bar_revision: AtomicU64::new(0),
             render_status_bar_revision: AtomicU64::new(0),
@@ -280,10 +301,20 @@ impl WorkbenchWindow {
             last_synced_color_theme: initial_theme,
             pending_new_window_request: false,
             pending_window_close_request: false,
+            pending_ext_host_restart_request: false,
         };
         win.sync_configuration();
         win.sync_focus_context_keys();
         win
+    }
+
+    pub fn with_profile_manager(mut self, manager: ProfileManager) -> Self {
+        self.profile_manager = manager;
+        self
+    }
+
+    pub fn set_profile_manager(&mut self, manager: ProfileManager) {
+        self.profile_manager = manager;
     }
 
     pub fn with_config(mut self, config: ConfigurationService) -> Self {
@@ -618,6 +649,7 @@ impl WorkbenchWindow {
                     OutputChannelEvent::Disposed { id, .. } => {
                         self.view.output_panel.remove_channel(&id);
                     }
+                    OutputChannelEvent::LogLevelChanged { .. } => {}
                 }
             }
         }
@@ -694,6 +726,9 @@ impl WorkbenchWindow {
                         self.view.terminal_panel.manager.close_terminal(&local_id);
                     }
                 }
+                ExtTerminalEvent::ShellIntegrationActivated { .. }
+                | ExtTerminalEvent::ShellExecutionStarted { .. }
+                | ExtTerminalEvent::ShellExecutionEnded { .. } => {}
             }
         }
 
@@ -1623,12 +1658,251 @@ impl WorkbenchWindow {
         self.sync_ext_terminals();
         self.sync_custom_editors();
         self.sync_webviews();
+        self.sync_webview_views();
+        self.sync_extension_detail_messages();
         self.sync_status_bar();
         self.sync_window_manager();
         self.sync_test_manager();
         self.sync_tree_views();
         self.sync_document_lifecycle();
         self.sync_diagnostics();
+    }
+
+    pub fn sync_webview_views(&mut self) {
+        let Some(bridge) = self.language_bridge.clone() else {
+            return;
+        };
+        let rev = bridge.webview_view_manager.revision();
+        if rev == self.synced_webview_view_revision {
+            return;
+        }
+        let views = bridge.webview_view_manager.list_views();
+        self.view.sync_webview_views(views);
+        self.synced_webview_view_revision = rev;
+    }
+
+    pub fn open_extension_detail_tab(
+        &mut self,
+        extension_id: &str,
+        readme_md: Option<&str>,
+        changelog_md: Option<&str>,
+    ) {
+        let id = extension_id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let installer_opt = self.view.extensions_view.installer.clone();
+        let installed_ext = installer_opt.as_ref().and_then(|inst| {
+            inst.list_installed().into_iter().find(|e| e.id().eq_ignore_ascii_case(id))
+        });
+        let catalog_meta = self
+            .view
+            .extensions_view
+            .catalog
+            .iter()
+            .find(|m| m.id().eq_ignore_ascii_case(id))
+            .cloned();
+
+        let enabled = installer_opt
+            .as_ref()
+            .map(|inst| inst.is_enabled(id))
+            .unwrap_or(true);
+        let pre_release = installed_ext
+            .as_ref()
+            .and_then(|e| installer_opt.as_ref().and_then(|i| i.read_installed_meta(&e.root_dir)))
+            .map(|m| m.pre_release)
+            .unwrap_or_else(|| {
+                self.view
+                    .extensions_view
+                    .pre_release_ids
+                    .contains(&id.to_ascii_lowercase())
+            });
+        let available_update = self
+            .view
+            .extensions_view
+            .available_updates
+            .get(&id.to_ascii_lowercase())
+            .map(String::as_str);
+
+        let (display_name, publisher, version, description, manifest_ref) =
+            if let Some(ext) = &installed_ext {
+                let dn = ext
+                    .manifest
+                    .display_name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&ext.manifest.name)
+                    .to_string();
+                (
+                    dn,
+                    ext.manifest.publisher.clone(),
+                    ext.manifest.version.clone(),
+                    ext.manifest.description.clone().unwrap_or_default(),
+                    Some(&ext.manifest),
+                )
+            } else if let Some(meta) = &catalog_meta {
+                let dn = meta
+                    .display_name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&meta.name)
+                    .to_string();
+                (
+                    dn,
+                    meta.namespace.clone(),
+                    meta.version.clone(),
+                    meta.description.clone().unwrap_or_default(),
+                    None,
+                )
+            } else {
+                let (p, n) = id.split_once('.').unwrap_or(("", id));
+                (
+                    n.to_string(),
+                    p.to_string(),
+                    "0.0.0".to_string(),
+                    String::new(),
+                    None,
+                )
+            };
+
+        let html = render_extension_detail_html(&ExtensionDetailContext {
+            extension_id: id,
+            display_name: &display_name,
+            publisher: &publisher,
+            version: &version,
+            description: &description,
+            installed: installed_ext.is_some(),
+            enabled,
+            pre_release,
+            available_update,
+            metadata: catalog_meta.as_ref(),
+            manifest: manifest_ref,
+            readme_md,
+            changelog_md,
+        });
+
+        let tab_uri = format!("extension-detail:{}", id.to_ascii_lowercase());
+        let tab_title = format!("Extension: {}", display_name);
+        let wv_mgr = self
+            .language_bridge
+            .as_ref()
+            .map(|b| (*b.webview_manager).clone());
+        self.view.editor_area.open_webview(
+            &tab_uri,
+            &tab_title,
+            "extensionDetail",
+            &html,
+            WebviewOptions {
+                enable_scripts: true,
+                local_resource_roots: Vec::new(),
+            },
+            wv_mgr,
+        );
+    }
+
+    pub fn sync_extension_detail_messages(&mut self) {
+        let mut msgs: Vec<ExtensionDetailMessage> = Vec::new();
+        for (uri, wv) in &mut self.view.editor_area.webviews {
+            if uri.starts_with("extension-detail:") {
+                for raw in wv.drain_messages_to_host() {
+                    if let Some(parsed) = parse_extension_detail_message(&raw) {
+                        msgs.push(parsed);
+                    }
+                }
+            }
+        }
+        for msg in msgs {
+            match msg {
+                ExtensionDetailMessage::Install { extension_id } => {
+                    if let Some((ns, name)) = extension_id.split_once('.') {
+                        if self
+                            .view
+                            .extensions_view
+                            .execute_install_sync(ns, name, None)
+                            .is_ok()
+                        {
+                            self.register_extension_contributions_by_id(&extension_id);
+                        }
+                    }
+                }
+                ExtensionDetailMessage::Uninstall { extension_id } => {
+                    if self
+                        .view
+                        .extensions_view
+                        .uninstall_extension(&extension_id)
+                        .is_ok()
+                    {
+                        self.extension_disposables
+                            .remove(&extension_id.to_ascii_lowercase());
+                    }
+                }
+                ExtensionDetailMessage::Enable { extension_id } => {
+                    if self
+                        .view
+                        .extensions_view
+                        .set_extension_enabled(&extension_id, true)
+                        .is_ok()
+                    {
+                        self.register_extension_contributions_by_id(&extension_id);
+                    }
+                }
+                ExtensionDetailMessage::Disable { extension_id } => {
+                    if self
+                        .view
+                        .extensions_view
+                        .set_extension_enabled(&extension_id, false)
+                        .is_ok()
+                    {
+                        self.extension_disposables
+                            .remove(&extension_id.to_ascii_lowercase());
+                    }
+                }
+                ExtensionDetailMessage::SwitchPreRelease {
+                    extension_id,
+                    pre_release,
+                } => {
+                    self.view
+                        .extensions_view
+                        .mark_pre_release(&extension_id, pre_release);
+                    if let Some((ns, name)) = extension_id.split_once('.') {
+                        if let Some(inst) = self.view.extensions_view.installer.clone() {
+                            if let Ok(rt) = tokio::runtime::Runtime::new() {
+                                let _ = rt.block_on(inst.install_from_marketplace_with_options(
+                                    ns,
+                                    name,
+                                    None,
+                                    pre_release,
+                                ));
+                                self.view.extensions_view.refresh_installed();
+                                self.register_extension_contributions_by_id(&extension_id);
+                            }
+                        }
+                    }
+                }
+                ExtensionDetailMessage::Update { extension_id } => {
+                    if let Some((ns, name)) = extension_id.split_once('.') {
+                        let ver = self
+                            .view
+                            .extensions_view
+                            .available_updates
+                            .get(&extension_id.to_ascii_lowercase())
+                            .cloned();
+                        if self
+                            .view
+                            .extensions_view
+                            .execute_install_sync(ns, name, ver.as_deref())
+                            .is_ok()
+                        {
+                            self.view
+                                .extensions_view
+                                .available_updates
+                                .remove(&extension_id.to_ascii_lowercase());
+                            self.register_extension_contributions_by_id(&extension_id);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub fn sync_all(&mut self) {
@@ -4730,7 +5004,53 @@ impl WorkbenchWindow {
             ExtensionsViewAction::Disable { id } | ExtensionsViewAction::Uninstall { id } => {
                 self.extension_disposables.remove(&id.to_ascii_lowercase());
             }
-            ExtensionsViewAction::Search(_) | ExtensionsViewAction::SelectExtension(_) => {}
+            ExtensionsViewAction::OpenDetail(id) | ExtensionsViewAction::SelectExtension(id) => {
+                if matches!(action, ExtensionsViewAction::OpenDetail(_)) {
+                    self.open_extension_detail_tab(id, None, None);
+                }
+            }
+            ExtensionsViewAction::InstallVsix => {
+                self.handle_builtin_command_effects("workbench.extensions.action.installVSIX");
+            }
+            ExtensionsViewAction::TogglePreRelease(id) => {
+                let next = !self
+                    .view
+                    .extensions_view
+                    .pre_release_ids
+                    .contains(&id.to_ascii_lowercase());
+                self.view.extensions_view.mark_pre_release(id, next);
+            }
+            ExtensionsViewAction::UpdateExtension(id) => {
+                if let Some((ns, name)) = id.split_once('.') {
+                    let ver = self
+                        .view
+                        .extensions_view
+                        .available_updates
+                        .get(&id.to_ascii_lowercase())
+                        .cloned();
+                    if self
+                        .view
+                        .extensions_view
+                        .execute_install_sync(ns, name, ver.as_deref())
+                        .is_ok()
+                    {
+                        self.register_extension_contributions_by_id(id);
+                    }
+                }
+            }
+            ExtensionsViewAction::InstallRecommended(id) => {
+                if let Some((ns, name)) = id.split_once('.') {
+                    if self
+                        .view
+                        .extensions_view
+                        .execute_install_sync(ns, name, None)
+                        .is_ok()
+                    {
+                        self.register_extension_contributions_by_id(id);
+                    }
+                }
+            }
+            ExtensionsViewAction::Search(_) => {}
         }
     }
 
@@ -4760,9 +5080,49 @@ impl WorkbenchWindow {
                 for ce in contribs.custom_editors {
                     self.register_custom_editor_contribution(ce);
                 }
+                if let Some(containers_map) = contribs.views_containers {
+                    for list in containers_map.into_values() {
+                        for c in list {
+                            self.view.register_view_container(c);
+                        }
+                    }
+                }
+                if let Some(welcome) = contribs.views_welcome {
+                    for w in welcome {
+                        self.registered_view_welcome.push(w.clone());
+                        let mut guard = self.view.explorer.contributed_trees.write();
+                        if let Some(view) = guard.views.get_mut(&w.view) {
+                            view.welcome_views.push(w);
+                        }
+                    }
+                }
                 if let Some(views) = contribs.views {
                     for (container_id, view_list) in views {
                         self.register_view_contributions(&container_id, view_list);
+                    }
+                }
+                if let Some(submenus) = contribs.submenus {
+                    self.view.context_menu_registry.register_submenus(&submenus);
+                }
+                if let Some(menus) = contribs.menus {
+                    let mut titles = HashMap::new();
+                    if let Some(cmds) = contribs.commands {
+                        for cmd in cmds {
+                            titles.insert(cmd.command, cmd.title);
+                        }
+                    }
+                    self.view
+                        .context_menu_registry
+                        .register_contributions(&menus, &titles);
+                }
+                if let Some(json_vals) = contribs.json_validation {
+                    for jv in json_vals {
+                        let _ = self.json_validation.register(id, &ext.root_dir, &jv);
+                    }
+                }
+                if let Some(matchers) = contribs.problem_matchers {
+                    for pm in matchers {
+                        let _ = self.problem_matchers.register(pm);
                     }
                 }
             }
@@ -5323,6 +5683,122 @@ impl WorkbenchWindow {
                     }
                 }
             }
+            "workbench.extensions.action.installVSIX" => {
+                let path = self.file_dialog_backend.pick_open_file(&FileDialogOptions {
+                    title: Some("Install from VSIX".to_string()),
+                    filters: vec![("VSIX Packages".to_string(), vec!["vsix".to_string()])],
+                    ..Default::default()
+                });
+                if let Some(vsix_path) = path {
+                    if let Some(installer) = self.view.extensions_view.installer.clone() {
+                        match installer.install_from_vsix_file(&vsix_path) {
+                            Ok(loaded) => {
+                                let ext_id = loaded.id();
+                                self.view.extensions_view.refresh_installed();
+                                self.view.extensions_view.status_message =
+                                    Some(format!("Installed VSIX {}", ext_id));
+                                self.register_extension_contributions_by_id(&ext_id);
+                            }
+                            Err(e) => {
+                                self.view.extensions_view.status_message =
+                                    Some(format!("VSIX install failed: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+            "workbench.extensions.action.showRecommendedExtensions" => {
+                self.view.layout.mutate(|l| {
+                    l.active_sidebar_view = "extensions".to_string();
+                    l.sidebar_visible = true;
+                });
+                self.view.focused_region = FocusedRegion::Sidebar;
+                if let Some(first_ws) = self.view.workspace.folders().first() {
+                    if let Ok(recs) =
+                        WorkspaceExtensionsRecommendations::load_from_workspace(&first_ws.path)
+                    {
+                        self.view
+                            .extensions_view
+                            .set_recommended_extensions(recs.recommendations.clone());
+                        if let Some(first_rec) = recs.recommendations.first() {
+                            self.view.extensions_view.apply_search_query(first_rec);
+                        }
+                    }
+                }
+            }
+            "workbench.extensions.action.checkForUpdates" => {
+                if let Some(installer) = self.view.extensions_view.installer.clone() {
+                    if let Ok(rt) = tokio::runtime::Runtime::new() {
+                        if let Ok(updates) = rt.block_on(
+                            ExtensionAutoUpdater::check_for_updates(&installer, Some(&self.config)),
+                        ) {
+                            self.view.extensions_view.set_available_updates(updates);
+                        }
+                    }
+                }
+            }
+            "workbench.action.showRuntimeExtensions" => {
+                let report = if let Some(bridge) = &self.language_bridge {
+                    bridge.profiler.format_running_extensions_report()
+                } else {
+                    "Extension host bridge not attached.".to_string()
+                };
+                self.open_file("rustcode://running-extensions", "Running Extensions", &report, false);
+            }
+            "workbench.action.restartExtensionHost" => {
+                self.pending_ext_host_restart_request = true;
+            }
+            "workbench.profiles.actions.exportProfile" => {
+                let active_id = self.profile_manager.active_profile_id().to_string();
+                let ext_entries: Vec<rustcode_platform::profiles::ProfileExtensionEntry> = self
+                    .view
+                    .extensions_view
+                    .installed
+                    .iter()
+                    .map(|e| rustcode_platform::profiles::ProfileExtensionEntry {
+                        id: e.id.clone(),
+                        version: Some(e.version.clone()),
+                        enabled: e.enabled,
+                    })
+                    .collect();
+                self.profile_manager.capture_current_into_active(
+                    &self.config,
+                    Some(&self.keybindings),
+                    ext_entries,
+                    Default::default(),
+                );
+                if let Ok(exported) = self.profile_manager.export_code_profile(&active_id) {
+                    self.open_file(
+                        &format!("rustcode://profile/{}.code-profile", active_id),
+                        &format!("{}.code-profile", active_id),
+                        &exported,
+                        false,
+                    );
+                }
+            }
+            "workbench.profiles.actions.switchProfile" => {
+                let ids: Vec<String> = self
+                    .profile_manager
+                    .list_profiles()
+                    .iter()
+                    .map(|p| p.id.clone())
+                    .collect();
+                if ids.len() > 1 {
+                    let cur = self.profile_manager.active_profile_id().to_string();
+                    let next_idx = ids
+                        .iter()
+                        .position(|id| id == &cur)
+                        .map(|i| (i + 1) % ids.len())
+                        .unwrap_or(0);
+                    let next_id = ids[next_idx].clone();
+                    let _ = self.profile_manager.switch_profile(
+                        &next_id,
+                        &self.config,
+                        Some(&self.keybindings),
+                    );
+                    self.sync_configuration();
+                }
+            }
             _ => {}
         }
     }
@@ -5332,6 +5808,27 @@ impl WorkbenchWindow {
             "workbench.view.extensions" => "View: Show Extensions".to_string(),
             "workbench.extensions.action.showInstalledExtensions" => {
                 "Extensions: Show Installed".to_string()
+            }
+            "workbench.extensions.action.installVSIX" => {
+                "Extensions: Install from VSIX...".to_string()
+            }
+            "workbench.extensions.action.checkForUpdates" => {
+                "Check for Updates (Extensions)".to_string()
+            }
+            "workbench.extensions.action.showRecommendedExtensions" => {
+                "Extensions: Show Recommendations".to_string()
+            }
+            "workbench.action.showRuntimeExtensions" => {
+                "Developer: Show Running Extensions".to_string()
+            }
+            "workbench.action.restartExtensionHost" => {
+                "Developer: Restart Extension Host".to_string()
+            }
+            "workbench.profiles.actions.exportProfile" => {
+                "Profiles: Export Profile".to_string()
+            }
+            "workbench.profiles.actions.switchProfile" => {
+                "Profiles: Switch Profile".to_string()
             }
             "editor.action.startFindReplaceAction" => "Find and Replace".to_string(),
             _ => cmd_id
@@ -6470,10 +6967,7 @@ mod tests {
                     name: "one".to_string(),
                     version: "1.0.0".to_string(),
                     display_name: Some("Only One".to_string()),
-                    description: None,
-                    download_url: None,
-                    files: None,
-                    all_versions: None,
+                    ..Default::default()
                 }],
             },
         );

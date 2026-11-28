@@ -25,16 +25,19 @@ use crate::statusbar::{StatusBar, StatusBarAction, StatusBarAlignment, StatusBar
 use crate::terminal_panel::{TerminalAction, TerminalPanelView};
 use crate::testing::{decode_test_uri_to_path, TestingAction, TestingSidebarView};
 use crate::titlebar::{TitleBarAction, TitleBarView};
-use crate::webview::WebviewElementKind;
+use crate::webview::{WebviewEditorView, WebviewElementKind};
 use crate::workspace::Workspace;
 use parking_lot::RwLock;
 use rustcode_base::context_key::ContextKeyService;
+use rustcode_ext_host::manifest::ViewContainerContribution;
+use rustcode_ext_host::webview::{WebviewOptions, WebviewViewState};
 use rustcode_platform::accessibility::{AccessibilityTree, AccessibleNode, AccessibleRole};
 use rustcode_platform::configuration::ConfigurationService;
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, MouseButton, Point, Quad, Rect,
     Rgba, Scene, View, WorkbenchThemeStyles,
 };
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -120,6 +123,9 @@ pub struct WorkbenchView {
     pub context_menu: WorkbenchContextMenu,
     pub active_sash: Option<WorkbenchSash>,
     pub cached_context_keys: Option<ContextKeyService>,
+    pub view_containers: Vec<ViewContainerContribution>,
+    pub webview_views: HashMap<String, WebviewViewState>,
+    pub sidebar_webview_editors: HashMap<String, WebviewEditorView>,
     pub focused_region: FocusedRegion,
     pub last_action: Option<WorkbenchAction>,
     pub pending_settings_open: Arc<AtomicBool>,
@@ -174,11 +180,55 @@ impl WorkbenchView {
             context_menu: WorkbenchContextMenu::new(),
             active_sash: None,
             cached_context_keys: None,
+            view_containers: Vec::new(),
+            webview_views: HashMap::new(),
+            sidebar_webview_editors: HashMap::new(),
             focused_region: FocusedRegion::Editor,
             last_action: None,
             pending_settings_open: Arc::new(AtomicBool::new(false)),
             cached_config: None,
             pending_ext_status_bar: RwLock::new(None),
+        }
+    }
+
+    pub fn register_view_container(&mut self, container: ViewContainerContribution) {
+        self.view_containers.retain(|c| c.id != container.id);
+        self.view_containers.push(container.clone());
+        if !self
+            .activity_bar
+            .model
+            .items
+            .iter()
+            .any(|i| i.view_container_id == container.id)
+        {
+            self.activity_bar.model.items.push(crate::activitybar::ActivityBarItem {
+                id: format!("workbench.view.extension.{}", container.id),
+                title: container.title.clone(),
+                icon: container.icon.clone().unwrap_or_else(|| "extensions".to_string()),
+                view_container_id: container.id,
+                badge: None,
+            });
+        }
+    }
+
+    pub fn sync_webview_views(&mut self, views: Vec<WebviewViewState>) {
+        for v in views {
+            let vid = v.view_id.clone();
+            let title = v.title.clone().unwrap_or_else(|| vid.clone());
+            let html = v.html.clone();
+            let ed = WebviewEditorView::new(
+                &vid,
+                &vid,
+                &title,
+                &html,
+                WebviewOptions {
+                    enable_scripts: v.options.enable_scripts,
+                    local_resource_roots: v.options.local_resource_roots.clone(),
+                },
+                None,
+            );
+            self.webview_views.insert(vid.clone(), v);
+            self.sidebar_webview_editors.insert(vid, ed);
         }
     }
 
@@ -1669,6 +1719,8 @@ impl View for WorkbenchView {
                 self.testing_view.render(regions.sidebar, theme, font, scene);
             } else if view_id == "hierarchy" || view_id == "workbench.view.hierarchy" {
                 self.hierarchy_view.render(regions.sidebar, theme, font, scene);
+            } else if let Some(wv_ed) = self.sidebar_webview_editors.get(view_id) {
+                wv_ed.render(regions.sidebar, theme, font, scene);
             } else {
                 self.explorer.render(regions.sidebar, theme, font, scene);
             }

@@ -499,14 +499,43 @@ const rpc = {
       const path = require('path');
       const vscodeApiIndex = path.resolve(__dirname, 'vscode-api', 'index.js');
       const origResolveFilename = Module._resolveFilename;
+      if (!bridgeState.hookStats) {
+        bridgeState.hookStats = {
+          vscodeHits: 0,
+          nativePassthroughHits: 0,
+          isRealNode: Boolean(typeof process !== 'undefined' && process.versions && process.versions.node),
+          nodeVersion: (typeof process !== 'undefined' && process.versions && process.versions.node) || null,
+        };
+      }
       Module._resolveFilename = function (request, parent, isMain, options) {
-        if (request === 'vscode') {
+        if (request === 'vscode' || request === 'vscode/index') {
+          bridgeState.hookStats.vscodeHits += 1;
           return vscodeApiIndex;
+        }
+        if (
+          typeof request === 'string' &&
+          (request.startsWith('node:') ||
+            (Array.isArray(Module.builtinModules) && Module.builtinModules.includes(request)))
+        ) {
+          bridgeState.hookStats.nativePassthroughHits += 1;
         }
         return origResolveFilename.call(this, request, parent, isMain, options);
       };
       bridgeState.moduleHookInstalled = true;
     } catch (_) {}
+  },
+
+  getModuleResolutionDiagnostics() {
+    const isNode = Boolean(typeof process !== 'undefined' && process.versions && process.versions.node);
+    const stats = bridgeState.hookStats || {};
+    return {
+      hookInstalled: Boolean(bridgeState.moduleHookInstalled),
+      mode: isNode ? 'native-node' : 'shim',
+      nodeVersion: isNode ? process.versions.node : null,
+      vscodeHits: stats.vscodeHits || 0,
+      nativePassthroughHits: stats.nativePassthroughHits || 0,
+      nativeBuiltinsAvailable: isNode,
+    };
   },
 
   registerInitHook(fn) {
@@ -952,10 +981,24 @@ const rpc = {
   // Handle incoming request dispatched from Rust Core
   async handleIncomingRequest(method, params = {}) {
     if (method === 'extHost.ping') {
+      const m = typeof process !== 'undefined' && typeof process.memoryUsage === 'function'
+        ? process.memoryUsage()
+        : null;
       return {
         pong: true,
         pid: typeof process !== 'undefined' ? process.pid : 0,
         echo: params || {},
+        uptimeMs: typeof process !== 'undefined' && typeof process.uptime === 'function'
+          ? Math.round(process.uptime() * 1000)
+          : 0,
+        memory: m
+          ? {
+            rssBytes: m.rss,
+            heapTotalBytes: m.heapTotal,
+            heapUsedBytes: m.heapUsed,
+            externalBytes: m.external || 0,
+          }
+          : null,
       };
     }
     if (method === 'languages.provideDocumentFormattingEdits' || method === 'DocumentFormatting.provideDocumentFormattingEdits') {
@@ -1497,6 +1540,22 @@ const rpc = {
       }
       const res = await validator(value);
       return res === undefined ? null : res;
+    }
+    if (typeof method === 'string' && method.startsWith('vfs.')) {
+      const ws = require('./vscode-api/workspace');
+      return await ws._dispatchVfsRequest(method, params || {});
+    }
+    if (method === 'window.resolveWebviewView') {
+      const win = require('./vscode-api/window');
+      return await win._resolveWebviewView(params || {});
+    }
+    if (method === 'treeView.handleDrag') {
+      const win = require('./vscode-api/window');
+      return await win._handleTreeDrag(params || {});
+    }
+    if (method === 'treeView.handleDrop') {
+      const win = require('./vscode-api/window');
+      return await win._handleTreeDrop(params || {});
     }
     if (method === 'extensions.activate') {
       const envApi = require('./vscode-api/env');

@@ -36,6 +36,10 @@ pub struct RustCodeContext {
     pub language_configs: rustcode_editor::LanguageConfigurationRegistry,
     pub snippets: rustcode_editor::SnippetRegistry,
     pub context_menus: rustcode_workbench::context_menu::ContextMenuRegistry,
+    pub profile_manager: Arc<Mutex<rustcode_platform::profiles::ProfileManager>>,
+    pub json_validation: rustcode_ext_host::manifest::JsonValidationRegistry,
+    pub problem_matchers: rustcode_ext_host::tasks::ProblemMatcherRegistry,
+    pub recommended_extensions: Vec<String>,
     pub file_system: Arc<FileSystemService>,
     pub language_bridge: Arc<LanguageFeatureBridge>,
     pub disposables: Arc<Mutex<DisposableStore>>,
@@ -86,6 +90,14 @@ impl RustCodeContext {
         let language_configs = rustcode_editor::LanguageConfigurationRegistry::new();
         let snippets = rustcode_editor::SnippetRegistry::new();
         let context_menus = rustcode_workbench::context_menu::ContextMenuRegistry::new();
+        let profile_manager = Arc::new(Mutex::new(
+            rustcode_platform::profiles::ProfileManager::new(
+                rustcode_platform::AppPaths::default().profiles_dir(),
+            ),
+        ));
+        let json_validation = rustcode_ext_host::manifest::JsonValidationRegistry::new();
+        let problem_matchers = rustcode_ext_host::tasks::ProblemMatcherRegistry::new();
+        let recommended_extensions = Vec::new();
         let file_system = Arc::new(FileSystemService::new());
         let language_bridge = Arc::new(
             LanguageFeatureBridge::new(
@@ -113,6 +125,10 @@ impl RustCodeContext {
             language_configs,
             snippets,
             context_menus,
+            profile_manager,
+            json_validation,
+            problem_matchers,
+            recommended_extensions,
             file_system,
             language_bridge,
             disposables,
@@ -475,6 +491,43 @@ impl RustCodeContext {
             "extensions",
             json!({ "view": "extensions", "filter": "installed" }),
         );
+        self.register_queue_command(
+            &mut store,
+            "workbench.extensions.action.installVSIX",
+            json!({ "installVsix": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.extensions.action.checkForUpdates",
+            json!({ "checkForUpdates": true }),
+        );
+        self.register_sidebar_view_command(
+            &mut store,
+            &app_layout,
+            "workbench.extensions.action.showRecommendedExtensions",
+            "extensions",
+            json!({ "view": "extensions", "filter": "recommended" }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.action.showRuntimeExtensions",
+            json!({ "showRuntimeExtensions": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.action.restartExtensionHost",
+            json!({ "restartExtensionHost": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.profiles.actions.exportProfile",
+            json!({ "exportProfile": true }),
+        );
+        self.register_queue_command(
+            &mut store,
+            "workbench.profiles.actions.switchProfile",
+            json!({ "switchProfile": true }),
+        );
         self.register_sidebar_view_command(
             &mut store,
             &app_layout,
@@ -669,16 +722,40 @@ impl RustCodeContext {
         window.view.editor_area.language_configs = self.language_configs.clone();
         window.view.editor_area.snippet_registry = self.snippets.clone();
         window.view.context_menu_registry = self.context_menus.clone();
+        window.profile_manager = self.profile_manager.lock().clone();
+        window.json_validation = self.json_validation.clone();
+        window.problem_matchers = self.problem_matchers.clone();
+        if !self.recommended_extensions.is_empty() {
+            window
+                .view
+                .extensions_view
+                .set_recommended_extensions(self.recommended_extensions.clone());
+        }
 
         for ext in self.ext_loader.loaded_extensions() {
             if let Some(contribs) = &ext.manifest.contributes {
                 for ce in &contribs.custom_editors {
                     window.register_custom_editor_contribution(ce.clone());
                 }
+                if let Some(containers_map) = &contribs.views_containers {
+                    for list in containers_map.values() {
+                        for c in list {
+                            window.view.register_view_container(c.clone());
+                        }
+                    }
+                }
+                if let Some(welcome) = &contribs.views_welcome {
+                    for w in welcome {
+                        window.registered_view_welcome.push(w.clone());
+                    }
+                }
                 if let Some(views) = &contribs.views {
                     for (container_id, view_list) in views {
                         window.register_view_contributions(container_id, view_list.clone());
                     }
+                }
+                if let Some(submenus) = &contribs.submenus {
+                    window.view.context_menu_registry.register_submenus(submenus);
                 }
                 if let Some(menus) = &contribs.menus {
                     let mut titles = std::collections::HashMap::new();

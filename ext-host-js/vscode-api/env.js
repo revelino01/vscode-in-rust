@@ -2,7 +2,7 @@
 
 const path = require('path');
 const rpc = require('../rpc-bridge');
-const { Uri, UIKind } = require('./types');
+const { Uri, UIKind, EventEmitter } = require('./types');
 
 const BRIDGE_STATE_SYMBOL = Symbol.for('rustcode.rpcBridgeState');
 const rootGlobal = typeof globalThis !== 'undefined'
@@ -129,9 +129,47 @@ function createEnvironmentVariableCollection() {
   };
 }
 
+function createSecretStorage(extensionId) {
+  const extId = String(extensionId || 'default-extension');
+  const localCache = new Map();
+  const emitter = new EventEmitter();
+  const hasTransport = () => rpc.isLiveStdioMode() || rpc.hasSyncTransport() || hasDenoOps;
+
+  return {
+    onDidChange: emitter.event,
+    async get(key) {
+      if (hasTransport()) {
+        try {
+          const res = await rpc.call('secrets.get', { extensionId: extId, key: String(key) });
+          return res && res.value !== undefined && res.value !== null ? res.value : undefined;
+        } catch (_) {}
+      }
+      return localCache.has(key) ? localCache.get(key) : undefined;
+    },
+    async store(key, value) {
+      const k = String(key);
+      const v = String(value);
+      localCache.set(k, v);
+      if (hasTransport()) {
+        await rpc.call('secrets.store', { extensionId: extId, key: k, value: v });
+      }
+      emitter.fire({ key: k });
+    },
+    async delete(key) {
+      const k = String(key);
+      localCache.delete(k);
+      if (hasTransport()) {
+        await rpc.call('secrets.delete', { extensionId: extId, key: k });
+      }
+      emitter.fire({ key: k });
+    },
+  };
+}
+
 function createExtensionContext(ext) {
   const extPath = ext.extensionPath || '';
   const extUri = ext.extensionUri || Uri.file(extPath);
+  const secrets = createSecretStorage(ext.id || (ext.packageJSON && ext.packageJSON.name) || 'ext');
   return {
     subscriptions: [],
     extensionPath: extPath,
@@ -150,12 +188,7 @@ function createExtensionContext(ext) {
     globalStorageUri: extPath ? Uri.file(path.join(extPath, '.globalStorage')) : undefined,
     logPath: extPath ? path.join(extPath, '.logs') : undefined,
     logUri: extPath ? Uri.file(path.join(extPath, '.logs')) : undefined,
-    secrets: {
-      async get() { return undefined; },
-      async store() {},
-      async delete() {},
-      onDidChange: () => ({ dispose() {} }),
-    },
+    secrets,
   };
 }
 
@@ -205,7 +238,29 @@ async function _activateLocalModule(ext) {
       context = createExtensionContext(ext);
       mod = require(entryPath);
       if (mod && typeof mod.activate === 'function') {
-        exportsVal = await mod.activate(context);
+        const t0 = Date.now();
+        try {
+          exportsVal = await mod.activate(context);
+          if (rpc.isLiveStdioMode() || rpc.hasSyncTransport() || hasDenoOps) {
+            rpc.fireAndForget('extHost.recordActivation', {
+              extensionId: ext.id,
+              activationEvent: '*',
+              durationMs: Math.max(0, Date.now() - t0),
+              succeeded: true,
+            });
+          }
+        } catch (actErr) {
+          if (rpc.isLiveStdioMode() || rpc.hasSyncTransport() || hasDenoOps) {
+            rpc.fireAndForget('extHost.recordActivation', {
+              extensionId: ext.id,
+              activationEvent: '*',
+              durationMs: Math.max(0, Date.now() - t0),
+              succeeded: false,
+              error: String((actErr && actErr.message) || actErr),
+            });
+          }
+          throw actErr;
+        }
       }
     }
 

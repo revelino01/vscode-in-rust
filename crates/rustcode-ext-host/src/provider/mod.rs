@@ -4,7 +4,8 @@ pub mod bridge;
 
 pub use bridge::{
     DiagnosticCollectionManager, ExtStatusBarItem, ExtStatusBarManager, ExtWorkspaceFolder,
-    LanguageFeatureBridge, OpenDocumentSnapshot, TreeItem, TreeItemCollapsibleState,
+    LanguageFeatureBridge, OpenDocumentSnapshot, TreeItem, TreeItemCheckbox,
+    TreeItemCollapsibleState,
 };
 use parking_lot::{Mutex, RwLock};
 use rustcode_base::event::Emitter;
@@ -42,6 +43,10 @@ pub enum ProviderType {
     TestController,
     Authentication,
     CustomEditor,
+    FileSystem,
+    TextDocumentContent,
+    WebviewView,
+    TreeDragAndDrop,
 }
 
 impl ProviderType {
@@ -73,9 +78,29 @@ impl ProviderType {
             "TestController" => Some(Self::TestController),
             "Authentication" => Some(Self::Authentication),
             "CustomEditor" => Some(Self::CustomEditor),
+            "FileSystem" => Some(Self::FileSystem),
+            "TextDocumentContent" => Some(Self::TextDocumentContent),
+            "WebviewView" => Some(Self::WebviewView),
+            "TreeDragAndDrop" => Some(Self::TreeDragAndDrop),
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeViewOptionsMeta {
+    pub view_id: String,
+    #[serde(default)]
+    pub show_collapse_all: bool,
+    #[serde(default)]
+    pub can_select_many: bool,
+    #[serde(default)]
+    pub drag_mime_types: Vec<String>,
+    #[serde(default)]
+    pub drop_mime_types: Vec<String>,
+    #[serde(default)]
+    pub manage_checkbox_state_manually: bool,
 }
 
 #[derive(Debug, Clone)]

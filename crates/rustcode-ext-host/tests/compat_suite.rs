@@ -395,6 +395,7 @@ async fn test_compat_tree_view_provider_hierarchical_items() {
             resource_uri: None,
             context_value: Some("folder".to_string()),
             command: None,
+            checkbox_state: None,
         },
         TreeItem {
             id: Some("node_cargo".to_string()),
@@ -410,6 +411,7 @@ async fn test_compat_tree_view_provider_hierarchical_items() {
                 command: "workbench.action.openFile".to_string(),
                 arguments: Some(vec![json!("Cargo.toml")]),
             }),
+            checkbox_state: None,
         },
     ];
 
@@ -442,6 +444,7 @@ async fn test_compat_tree_view_provider_hierarchical_items() {
             resource_uri: None,
             context_value: Some("file".to_string()),
             command: None,
+            checkbox_state: None,
         },
         TreeItem {
             id: Some("node_lib".to_string()),
@@ -453,6 +456,7 @@ async fn test_compat_tree_view_provider_hierarchical_items() {
             resource_uri: None,
             context_value: Some("file".to_string()),
             command: None,
+            checkbox_state: None,
         },
     ];
 
@@ -5279,6 +5283,477 @@ exports.activate = function(context) {{
         "Node exited non-zero: {:?}",
         status
     );
+    assert!(
+        proc.stderr_tail().is_empty(),
+        "Unexpected stderr during clean shutdown: {:?}",
+        proc.stderr_tail()
+    );
+    drop(proc);
+}
+
+#[tokio::test]
+async fn test_compat_phase10_vfs_and_text_document_content_provider() {
+    use rustcode_ext_host::VfsEvent;
+
+    let bridge = LanguageFeatureBridge::with_defaults();
+    let rpc = Arc::new(RpcBridge::new());
+    let bridge = LanguageFeatureBridge::new(
+        bridge.provider_registry().clone(),
+        rpc.clone(),
+        bridge.lsp_manager().clone(),
+    );
+
+    // Register custom FS scheme & TextDocumentContentProvider scheme via RPC messages
+    let _ = bridge
+        .handle_rpc_message_result(
+            "workspace.registerFileSystemProvider",
+            json!({
+                "scheme": "memfs",
+                "options": { "isCaseSensitive": true, "isReadonly": false }
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(bridge.vfs_manager().has_file_system_scheme("memfs:///a.txt"));
+
+    let _ = bridge
+        .handle_rpc_message_result(
+            "workspace.registerTextDocumentContentProvider",
+            json!({ "scheme": "virtualdoc" }),
+        )
+        .await
+        .unwrap();
+    assert!(bridge
+        .vfs_manager()
+        .has_text_content_scheme("virtualdoc:///diff.rs"));
+
+    // Resolve virtualdoc via workspace.openTextDocument RPC backed by vfs.provideTextDocumentContent
+    let rpc_clone = rpc.clone();
+    let vfs = bridge.vfs_manager().clone();
+    let content_task = tokio::spawn(async move {
+        vfs.request_provide_text_document_content(&rpc_clone, "virtualdoc:///diff.rs")
+            .await
+    });
+    tokio::task::yield_now().await;
+    let pending = rpc.take_outbound_requests();
+    assert_eq!(pending.len(), 1);
+    if let RpcMessage::Request { id, method, params } = &pending[0] {
+        assert_eq!(method, "vfs.provideTextDocumentContent");
+        assert_eq!(params["uri"], json!("virtualdoc:///diff.rs"));
+        rpc.handle_incoming_response(*id, Some(json!("fn virtual_ok() {}")), None);
+    } else {
+        panic!("expected RpcMessage::Request");
+    }
+    let resolved = content_task.await.unwrap().unwrap();
+    assert_eq!(resolved, "fn virtual_ok() {}");
+
+    let events = bridge.vfs_manager().take_pending_events();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        VfsEvent::FileSystemRegistered { scheme, .. } if scheme == "memfs"
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        VfsEvent::TextContentRegistered { scheme } if scheme == "virtualdoc"
+    )));
+}
+
+#[tokio::test]
+async fn test_compat_phase10_webview_view_and_log_output_channel() {
+    use rustcode_ext_host::output::ExtLogLevel;
+
+    let bridge = LanguageFeatureBridge::with_defaults();
+
+    // 1. WebviewView registration, HTML update, bidirectional message queues
+    bridge
+        .handle_rpc_message_result(
+            "window.registerWebviewViewProvider",
+            json!({
+                "viewId": "compat.sidebarView",
+                "options": { "webviewOptions": { "retainContextWhenHidden": true } }
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(bridge
+        .webview_view_manager()
+        .has_provider("compat.sidebarView"));
+
+    bridge
+        .handle_rpc_message_result(
+            "window.setWebviewViewHtml",
+            json!({ "viewId": "compat.sidebarView", "html": "<h1>Sidebar</h1>" }),
+        )
+        .await
+        .unwrap();
+    let view = bridge
+        .webview_view_manager()
+        .get_view("compat.sidebarView")
+        .unwrap();
+    assert_eq!(view.html, "<h1>Sidebar</h1>");
+
+    bridge
+        .handle_rpc_message_result(
+            "window.postMessageToWebviewView",
+            json!({ "viewId": "compat.sidebarView", "message": { "ready": true } }),
+        )
+        .await
+        .unwrap();
+    let outbound = bridge
+        .webview_view_manager()
+        .drain_outbound_messages("compat.sidebarView");
+    assert_eq!(outbound, vec![json!({ "ready": true })]);
+
+    // 2. LogOutputChannel filtering
+    bridge
+        .handle_rpc_message_result(
+            "window.createOutputChannel",
+            json!({ "id": "log_1", "name": "CompatLog", "log": true }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message_result(
+            "window.setOutputChannelLogLevel",
+            json!({ "id": "log_1", "logLevel": 4 }), // Warning
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message_result(
+            "window.logOutputChannelMessage",
+            json!({ "id": "log_1", "level": 2, "message": "suppressed debug" }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message_result(
+            "window.logOutputChannelMessage",
+            json!({ "id": "log_1", "level": 5, "message": "visible error" }),
+        )
+        .await
+        .unwrap();
+
+    let ch = bridge.output_manager().get_channel("log_1").unwrap();
+    assert_eq!(ch.log_level, ExtLogLevel::Warning);
+    assert!(!ch.content.contains("suppressed debug"));
+    assert!(ch.content.contains("[ERROR] visible error"));
+}
+
+#[tokio::test]
+async fn test_compat_phase10_secrets_isolation_and_tree_checkbox_dnd() {
+    use rustcode_ext_host::provider::TreeItemCheckbox;
+
+    let bridge = LanguageFeatureBridge::with_defaults();
+
+    // 1. SecretStorage isolation across extensions
+    bridge
+        .secret_manager()
+        .store("pub.extA", "token", "secret_a")
+        .unwrap();
+    bridge
+        .secret_manager()
+        .store("pub.extB", "token", "secret_b")
+        .unwrap();
+    assert_eq!(
+        bridge.secret_manager().get("pub.extA", "token").unwrap().as_deref(),
+        Some("secret_a")
+    );
+    assert_eq!(
+        bridge.secret_manager().get("pub.extB", "token").unwrap().as_deref(),
+        Some("secret_b")
+    );
+    bridge.secret_manager().delete("pub.extA", "token").unwrap();
+    assert!(bridge.secret_manager().get("pub.extA", "token").unwrap().is_none());
+    assert_eq!(
+        bridge.secret_manager().get("pub.extB", "token").unwrap().as_deref(),
+        Some("secret_b")
+    );
+
+    // 2. TreeItemCheckbox deserialization (numeric & object forms) + TreeViewOptionsMeta
+    let cb_num: TreeItemCheckbox = serde_json::from_value(json!(1)).unwrap();
+    assert_eq!(cb_num.state, 1);
+    assert!(cb_num.tooltip.is_none());
+
+    let cb_obj: TreeItemCheckbox =
+        serde_json::from_value(json!({ "state": 0, "tooltip": "Toggle check" })).unwrap();
+    assert_eq!(cb_obj.state, 0);
+    assert_eq!(cb_obj.tooltip.as_deref(), Some("Toggle check"));
+
+    bridge
+        .handle_rpc_message_result(
+            "treeView.setOptions",
+            json!({
+                "viewId": "compat.dndView",
+                "showCollapseAll": true,
+                "canSelectMany": true,
+                "dragMimeTypes": ["text/plain"],
+                "dropMimeTypes": ["application/vnd.code.tree.compat"],
+                "manageCheckboxStateManually": false
+            }),
+        )
+        .await
+        .unwrap();
+    let opts = bridge.tree_view_options("compat.dndView").unwrap();
+    assert!(opts.show_collapse_all);
+    assert!(opts.can_select_many);
+    assert_eq!(opts.drag_mime_types, vec!["text/plain".to_string()]);
+}
+
+#[tokio::test]
+async fn test_compat_phase10_problem_matchers_and_custom_execution_tasks() {
+    use rustcode_ext_host::tasks::ExtTaskEvent;
+
+    let bridge = LanguageFeatureBridge::with_defaults();
+    let diag_mgr = bridge.diagnostic_manager();
+    let matchers = bridge.task_manager().problem_matchers();
+
+    let count = matchers
+        .apply_task_output_to_diagnostics(
+            "$tsc",
+            None,
+            "src/app.ts(14,5): error TS2322: Type 'string' is not assignable to type 'number'.",
+            diag_mgr,
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+
+    let diags = diag_mgr.get_diagnostics_for_uri("file://src/app.ts");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(diags[0].severity, Some(DiagnosticSeverity::Error));
+    assert!(diags[0].message.contains("not assignable"));
+
+    // CustomExecution write & close RPCs
+    bridge
+        .handle_rpc_message_result(
+            "tasks.executeTask",
+            json!({
+                "id": "custom_task_1",
+                "task": { "name": "CustomBuild", "source": "ext", "definition": { "type": "custom" } }
+            }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message_result(
+            "tasks.writeCustomExecution",
+            json!({ "id": "custom_task_1", "data": "Building...\r\n" }),
+        )
+        .await
+        .unwrap();
+    bridge
+        .handle_rpc_message_result(
+            "tasks.closeCustomExecution",
+            json!({ "id": "custom_task_1", "exitCode": 0 }),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        bridge.task_manager().execution_output("custom_task_1").as_deref(),
+        Some("Building...\r\n")
+    );
+    let events = bridge.task_manager().take_pending_events();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        ExtTaskEvent::CustomExecutionClose { id, exit_code: Some(0) } if id == "custom_task_1"
+    )));
+}
+
+#[test]
+fn test_compat_phase10_profiler_watchdog_and_node_runtime_check() {
+    use rustcode_ext_host::profiler::ExtHostProfiler;
+    use rustcode_ext_host::runtime_health::{inspect_node_runtime, ExtHostWatchdog, MINIMUM_NODE_MAJOR};
+    use std::time::Duration;
+
+    assert_eq!(MINIMUM_NODE_MAJOR, 18);
+    let status = inspect_node_runtime(None, None);
+    if status.binary_path.is_some() {
+        assert!(status.meets_minimum);
+    }
+
+    let profiler = ExtHostProfiler::new();
+    profiler.begin_activation("test.ext", "onStartupFinished");
+    profiler.finish_activation("test.ext", true, None);
+    profiler.record_rpc_call("workspace.openTextDocument", Duration::from_millis(2), true);
+    let report = profiler.format_running_extensions_report();
+    assert!(report.contains("test.ext"));
+
+    let mut wd = ExtHostWatchdog::new(Duration::from_millis(20), Duration::from_millis(60), 2);
+    let t0 = std::time::Instant::now();
+    wd.mark_ping_sent(t0);
+    wd.record_ack(t0 + Duration::from_millis(5), 5);
+    assert!(matches!(
+        wd.check_health(t0 + Duration::from_millis(10)),
+        rustcode_ext_host::runtime_health::WatchdogHealth::Healthy { .. }
+    ));
+}
+
+#[tokio::test]
+async fn test_compat_phase10_live_node_vfs_webview_log_and_secrets_roundtrip() {
+    use parking_lot::RwLock;
+    use rustcode_ext_host::output::ExtLogLevel;
+    use rustcode_ext_host::{ExtensionLoader, NodeExtHostConfig, NodeExtHostProcess, RpcWireFormat};
+    use std::time::Duration;
+
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+
+    let guard = TempDirGuard::new("rustcode_phase10_live");
+    let ext_dir = guard.path().join("phase10_probe");
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::write(
+        ext_dir.join("package.json"),
+        json!({
+            "name": "phase10-probe",
+            "publisher": "rustcode",
+            "version": "1.0.0",
+            "main": "./extension.js",
+            "activationEvents": ["*"]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let probe_js = r#"const vscode = require('vscode');
+
+exports.activate = async function(context) {
+  const files = new Map([['/hello.txt', Buffer.from('from-live-memfs', 'utf8')]]);
+  const vfsDisp = vscode.workspace.registerFileSystemProvider('memfs', {
+    onDidChangeFile: new vscode.EventEmitter().event,
+    stat: (u) => ({ type: vscode.FileType.File, ctime: 1, mtime: 1, size: (files.get(u.path) || Buffer.alloc(0)).length }),
+    readDirectory: () => [['hello.txt', vscode.FileType.File]],
+    createDirectory: () => {},
+    readFile: (u) => files.get(u.path) || Buffer.from(''),
+    writeFile: (u, b) => { files.set(u.path, Buffer.from(b)); },
+    delete: (u) => { files.delete(u.path); },
+    rename: () => {}
+  });
+
+  const docDisp = vscode.workspace.registerTextDocumentContentProvider('vdoc', {
+    provideTextDocumentContent: (u) => 'virtual:' + u.path
+  });
+
+  const received = [];
+  const wvDisp = vscode.window.registerWebviewViewProvider('phase10.liveView', {
+    resolveWebviewView(wv) {
+      wv.title = 'Live Sidebar';
+      wv.webview.html = '<section>Loaded</section>';
+      wv.webview.onDidReceiveMessage((m) => received.push(m));
+    }
+  });
+
+  const log = vscode.window.createOutputChannel('Phase10Live', { log: true });
+  log.setLogLevel(vscode.LogLevel.Warning);
+  log.debug('dropped-debug');
+  log.error('live-error-entry');
+
+  const cmdDisp = vscode.commands.registerCommand('phase10.checkSecretsAndView', async () => {
+    await context.secrets.store('apiKey', 'secret-xyz');
+    const fetched = await context.secrets.get('apiKey');
+    await context.secrets.delete('apiKey');
+    const afterDelete = await context.secrets.get('apiKey');
+    return {
+      fetched,
+      afterDelete: afterDelete === undefined ? null : afterDelete,
+      receivedCount: received.length
+    };
+  });
+
+  context.subscriptions.push(vfsDisp, docDisp, wvDisp, log, cmdDisp);
+  return { ok: true };
+};
+"#;
+    std::fs::write(ext_dir.join("extension.js"), probe_js).unwrap();
+
+    let mut loader = ExtensionLoader::new();
+    loader.load_from_dir(&ext_dir).unwrap();
+    let shared_loader = Arc::new(RwLock::new(loader));
+
+    let bridge = Arc::new(
+        LanguageFeatureBridge::with_defaults()
+            .with_shared_extension_loader(shared_loader),
+    );
+    let mut proc = NodeExtHostProcess::spawn(
+        bridge.clone(),
+        NodeExtHostConfig {
+            args: vec![],
+            cwd: Some(repo_root),
+            wire_format: RpcWireFormat::ContentLengthJson,
+            ..Default::default()
+        },
+    )
+    .expect("Failed to spawn Node extension host");
+
+    let ping_ms = bridge.ping_ext_host().await.expect("ping_ext_host failed");
+    assert!(ping_ms < 5_000);
+    assert!(bridge.profiler().snapshot().memory.is_some());
+
+    bridge
+        .activate_extension("rustcode.phase10-probe")
+        .await
+        .expect("activate_extension failed");
+
+    for _ in 0..50 {
+        if bridge.vfs_manager().has_file_system_scheme("memfs")
+            && bridge.vfs_manager().has_text_content_scheme("vdoc")
+            && bridge.webview_view_manager().has_provider("phase10.liveView")
+            && bridge.command_registry().has_command("phase10.checkSecretsAndView")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let read_bytes = bridge
+        .vfs_manager()
+        .request_read_file(bridge.rpc_bridge(), "memfs:///hello.txt")
+        .await
+        .expect("vfs readFile failed");
+    assert_eq!(String::from_utf8(read_bytes).unwrap(), "from-live-memfs");
+
+    let resolved_vdoc = bridge
+        .vfs_manager()
+        .request_provide_text_document_content(bridge.rpc_bridge(), "vdoc:///readme.md")
+        .await
+        .expect("provideTextDocumentContent failed");
+    assert_eq!(resolved_vdoc, "virtual:/readme.md");
+
+    let resolved_wv = bridge
+        .webview_view_manager()
+        .request_resolve_webview_view(bridge.rpc_bridge(), "phase10.liveView", Some("Live Sidebar"))
+        .await
+        .expect("resolveWebviewView failed");
+    assert_eq!(resolved_wv["resolved"], json!(true));
+
+    bridge
+        .webview_view_manager()
+        .dispatch_message_to_js(bridge.rpc_bridge(), "phase10.liveView", json!({ "ping": 9 }))
+        .await
+        .expect("dispatch_message_to_js failed");
+
+    let cmd_res = bridge
+        .request_execute_command("phase10.checkSecretsAndView", vec![])
+        .await
+        .expect("command execution failed");
+    assert_eq!(cmd_res["fetched"], json!("secret-xyz"));
+    assert_eq!(cmd_res["afterDelete"], json!(null));
+    assert!(cmd_res["receivedCount"].as_u64().unwrap_or(0) >= 1);
+
+    let log_ch = bridge
+        .output_manager()
+        .get_channel_by_name("Phase10Live")
+        .expect("Phase10Live output channel missing");
+    assert_eq!(log_ch.log_level, ExtLogLevel::Warning);
+    assert!(!log_ch.content.contains("dropped-debug"));
+    assert!(log_ch.content.contains("[ERROR] live-error-entry"));
+
+    let status = proc.shutdown().await.expect("shutdown failed");
+    assert!(status.is_some_and(|s| s.success()));
     assert!(
         proc.stderr_tail().is_empty(),
         "Unexpected stderr during clean shutdown: {:?}",

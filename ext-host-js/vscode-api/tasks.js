@@ -159,6 +159,7 @@ const tasks = {
   async executeTask(task) {
     const executionId = `task_exec_${nextTaskExecutionId++}`;
     await rpc.call('tasks.executeTask', { id: executionId, task });
+    let customPty = null;
     const exec = {
       id: executionId,
       task,
@@ -166,6 +167,11 @@ const tasks = {
         const idx = activeExecutions.indexOf(exec);
         if (idx !== -1) {
           activeExecutions.splice(idx, 1);
+        }
+        if (customPty && typeof customPty.close === 'function') {
+          try {
+            customPty.close();
+          } catch (_) {}
         }
         rpc.fireAndForget('tasks.terminateTask', {
           id: executionId,
@@ -175,6 +181,40 @@ const tasks = {
       },
     };
     activeExecutions.push(exec);
+
+    if (
+      task &&
+      task.execution &&
+      task.execution instanceof CustomExecution &&
+      typeof task.execution.callback === 'function'
+    ) {
+      Promise.resolve(task.execution.callback(task.definition))
+        .then((pty) => {
+          customPty = pty;
+          if (!pty || typeof pty !== 'object') return;
+          if (typeof pty.onDidWrite === 'function') {
+            pty.onDidWrite((data) => {
+              rpc.fireAndForget('tasks.writeCustomExecution', {
+                id: executionId,
+                data: String(data ?? ''),
+              });
+            });
+          }
+          if (typeof pty.onDidClose === 'function') {
+            pty.onDidClose((exitCode) => {
+              rpc.fireAndForget('tasks.closeCustomExecution', {
+                id: executionId,
+                exitCode: typeof exitCode === 'number' ? exitCode : 0,
+              });
+            });
+          }
+          if (typeof pty.open === 'function') {
+            pty.open({ columns: 80, rows: 24 });
+          }
+        })
+        .catch(() => {});
+    }
+
     return exec;
   },
 

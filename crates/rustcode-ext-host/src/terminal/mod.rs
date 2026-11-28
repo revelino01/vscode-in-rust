@@ -27,6 +27,30 @@ pub struct ExtTerminalState {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub has_exited: bool,
+    #[serde(default)]
+    pub shell_integration: Option<ExtTerminalShellIntegrationInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtTerminalShellExecutionRecord {
+    pub command_line: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtTerminalShellIntegrationInfo {
+    pub active: bool,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub executions: Vec<ExtTerminalShellExecutionRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +88,20 @@ pub enum ExtTerminalEvent {
     },
     Disposed {
         id: String,
+    },
+    ShellIntegrationActivated {
+        id: String,
+        cwd: Option<String>,
+    },
+    ShellExecutionStarted {
+        id: String,
+        command_line: String,
+        cwd: Option<String>,
+    },
+    ShellExecutionEnded {
+        id: String,
+        command_line: String,
+        exit_code: Option<i32>,
     },
 }
 
@@ -154,6 +192,7 @@ impl ExtHostTerminalManager {
             cols: None,
             exit_code: None,
             has_exited: false,
+            shell_integration: None,
         };
 
         {
@@ -394,6 +433,87 @@ impl ExtHostTerminalManager {
                     .ok_or_else(|| "Missing terminal id".to_string())?;
                 let disposed = self.dispose_terminal(id);
                 Ok(json!({ "disposed": disposed, "id": id }))
+            }
+            "window.reportTerminalShellIntegration" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing terminal id".to_string())?;
+                let cwd = params
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                {
+                    let mut terminals = self.terminals.write();
+                    let term = terminals
+                        .get_mut(id)
+                        .ok_or_else(|| format!("Terminal '{}' not found", id))?;
+                    let si = term
+                        .shell_integration
+                        .get_or_insert_with(ExtTerminalShellIntegrationInfo::default);
+                    si.active = true;
+                    if let Some(c) = &cwd {
+                        si.cwd = Some(c.clone());
+                    }
+                }
+                self.emit(ExtTerminalEvent::ShellIntegrationActivated {
+                    id: id.to_string(),
+                    cwd,
+                });
+                Ok(json!({ "activated": true, "id": id }))
+            }
+            "window.executeTerminalCommand" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing terminal id".to_string())?;
+                let command_line = params
+                    .get("commandLine")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing commandLine".to_string())?
+                    .to_string();
+                let exit_code = params
+                    .get("exitCode")
+                    .and_then(|v| v.as_i64())
+                    .map(|c| c as i32);
+                let output = params
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let cwd = self.get_terminal(id).and_then(|t| t.cwd);
+                self.emit(ExtTerminalEvent::ShellExecutionStarted {
+                    id: id.to_string(),
+                    command_line: command_line.clone(),
+                    cwd: cwd.clone(),
+                });
+                {
+                    let mut terminals = self.terminals.write();
+                    if let Some(term) = terminals.get_mut(id) {
+                        let si = term
+                            .shell_integration
+                            .get_or_insert_with(ExtTerminalShellIntegrationInfo::default);
+                        si.active = true;
+                        si.executions.push(ExtTerminalShellExecutionRecord {
+                            command_line: command_line.clone(),
+                            cwd: si.cwd.clone().or(cwd),
+                            exit_code,
+                            output: output.clone(),
+                        });
+                    }
+                }
+                self.emit(ExtTerminalEvent::ShellExecutionEnded {
+                    id: id.to_string(),
+                    command_line: command_line.clone(),
+                    exit_code,
+                });
+                Ok(json!({
+                    "executed": true,
+                    "id": id,
+                    "commandLine": command_line,
+                    "exitCode": exit_code,
+                    "output": output,
+                }))
             }
             _ => Err(format!("Unsupported terminal RPC method: {}", method)),
         }

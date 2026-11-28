@@ -1,4 +1,9 @@
-//! Extension Host Task Manager (`vscode.tasks.*`).
+//! Extension Host Task Manager (`vscode.tasks.*` and Problem Matchers).
+
+pub mod problem_matcher;
+pub use problem_matcher::{
+    ProblemMatcherContribution, ProblemMatcherRegistry, ProblemPattern, ProblemPatternSpec,
+};
 
 use crate::rpc::RpcBridge;
 use parking_lot::RwLock;
@@ -59,6 +64,14 @@ pub enum ExtTaskEvent {
         id: String,
         exit_code: i32,
     },
+    CustomExecutionWrite {
+        id: String,
+        data: String,
+    },
+    CustomExecutionClose {
+        id: String,
+        exit_code: Option<i32>,
+    },
 }
 
 pub type TaskEventListener = Arc<dyn Fn(&ExtTaskEvent) + Send + Sync>;
@@ -67,16 +80,29 @@ pub type TaskEventListener = Arc<dyn Fn(&ExtTaskEvent) + Send + Sync>;
 pub struct ExtHostTaskManager {
     providers: Arc<RwLock<HashMap<String, ExtTaskProviderInfo>>>,
     executions: Arc<RwLock<HashMap<String, ExtTaskExecutionState>>>,
+    execution_outputs: Arc<RwLock<HashMap<String, String>>>,
     execution_order: Arc<RwLock<Vec<String>>>,
     listeners: Arc<RwLock<Vec<TaskEventListener>>>,
     pending_events: Arc<RwLock<Vec<ExtTaskEvent>>>,
+    problem_matchers: Arc<ProblemMatcherRegistry>,
     revision: Arc<AtomicU64>,
     next_exec_seq: Arc<AtomicU64>,
 }
 
 impl ExtHostTaskManager {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            problem_matchers: Arc::new(ProblemMatcherRegistry::new()),
+            ..Self::default()
+        }
+    }
+
+    pub fn problem_matchers(&self) -> &Arc<ProblemMatcherRegistry> {
+        &self.problem_matchers
+    }
+
+    pub fn execution_output(&self, id: &str) -> Option<String> {
+        self.execution_outputs.read().get(id).cloned()
     }
 
     pub fn revision(&self) -> u64 {
@@ -309,6 +335,48 @@ impl ExtHostTaskManager {
                     exit_code,
                 });
                 Ok(json!({ "recorded": true, "id": id, "exitCode": exit_code }))
+            }
+            "tasks.writeCustomExecution" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing task execution id".to_string())?;
+                let data = params
+                    .get("data")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                self.execution_outputs
+                    .write()
+                    .entry(id.to_string())
+                    .or_default()
+                    .push_str(data);
+                self.emit(ExtTaskEvent::CustomExecutionWrite {
+                    id: id.to_string(),
+                    data: data.to_string(),
+                });
+                Ok(json!({ "written": true, "id": id }))
+            }
+            "tasks.closeCustomExecution" => {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| "Missing task execution id".to_string())?;
+                let exit_code = params
+                    .get("exitCode")
+                    .and_then(|v| v.as_i64())
+                    .map(|c| c as i32);
+                {
+                    let mut map = self.executions.write();
+                    if let Some(exec) = map.get_mut(id) {
+                        exec.exit_code = exit_code;
+                        exec.status = "exited".to_string();
+                    }
+                }
+                self.emit(ExtTaskEvent::CustomExecutionClose {
+                    id: id.to_string(),
+                    exit_code,
+                });
+                Ok(json!({ "closed": true, "id": id, "exitCode": exit_code }))
             }
             _ => Err(format!("Unsupported task RPC method: {}", method)),
         }

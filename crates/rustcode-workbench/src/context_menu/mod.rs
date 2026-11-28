@@ -2,7 +2,7 @@
 
 use crate::explorer::evaluate_when_clause;
 use rustcode_base::context_key::ContextKeyService;
-use rustcode_ext_host::manifest::MenuContribution;
+use rustcode_ext_host::manifest::{MenuContribution, SubmenuContribution};
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, MouseButton, Point, Quad, Rect,
     Rgba, Scene, Shadow, View, WorkbenchThemeStyles,
@@ -60,6 +60,7 @@ pub enum MenuDisplayEntry {
 #[derive(Debug, Clone)]
 pub struct ContextMenuRegistry {
     items_by_location: HashMap<String, Vec<RegisteredMenuItem>>,
+    submenus: HashMap<String, SubmenuContribution>,
 }
 
 impl Default for ContextMenuRegistry {
@@ -104,9 +105,22 @@ impl ContextMenuRegistry {
     pub fn new() -> Self {
         let mut reg = Self {
             items_by_location: HashMap::new(),
+            submenus: HashMap::new(),
         };
         reg.seed_builtin_menus();
         reg
+    }
+
+    pub fn register_submenus(&mut self, submenus: &[SubmenuContribution]) {
+        for sm in submenus {
+            if !sm.id.trim().is_empty() {
+                self.submenus.insert(sm.id.clone(), sm.clone());
+            }
+        }
+    }
+
+    pub fn get_submenu(&self, id: &str) -> Option<&SubmenuContribution> {
+        self.submenus.get(id)
     }
 
     fn push_builtin(
@@ -285,6 +299,34 @@ impl ContextMenuRegistry {
             let bucket = self.items_by_location.entry(location.clone()).or_default();
             for entry in entries {
                 let (group, order) = parse_group_and_order(entry.group.as_deref());
+                if let Some(submenu_id) = entry.submenu.as_deref().filter(|s| !s.trim().is_empty())
+                {
+                    let label = self
+                        .submenus
+                        .get(submenu_id)
+                        .map(|sm| format!("{} ▶", sm.label))
+                        .unwrap_or_else(|| format!("{} ▶", humanize_command_id(submenu_id)));
+                    let cmd_key = format!("submenu:{}", submenu_id);
+                    if let Some(existing) = bucket.iter_mut().find(|i| i.command == cmd_key) {
+                        existing.label = label;
+                        existing.when = entry.when.clone();
+                        existing.group = group;
+                        existing.order = order;
+                    } else {
+                        bucket.push(RegisteredMenuItem {
+                            command: cmd_key,
+                            label,
+                            shortcut: None,
+                            when: entry.when.clone(),
+                            group,
+                            order,
+                        });
+                    }
+                    continue;
+                }
+                if entry.command.trim().is_empty() {
+                    continue;
+                }
                 let label = command_titles
                     .get(&entry.command)
                     .cloned()
@@ -641,12 +683,14 @@ mod tests {
             vec![
                 MenuContribution {
                     command: "ext.firstNav".to_string(),
+                    submenu: None,
                     when: Some("resourceExtname == '.rs'".to_string()),
                     group: Some("navigation@0".to_string()),
                     alt: None,
                 },
                 MenuContribution {
                     command: "ext.hidden".to_string(),
+                    submenu: None,
                     when: Some("resourceExtname == '.py'".to_string()),
                     group: Some("z_custom@1".to_string()),
                     alt: None,

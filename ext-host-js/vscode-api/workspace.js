@@ -5,11 +5,15 @@ const {
   Uri,
   Position,
   Range,
+  Disposable,
   EventEmitter,
   FileType,
   FileSystemError,
   EndOfLine,
 } = require('./types');
+
+const _fsProviders = new Map();
+const _contentProviders = new Map();
 
 function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key);
@@ -523,6 +527,13 @@ function mapFsRpcError(err, uri) {
 const workspaceFs = {
   async stat(uri) {
     const u = uriFromInput(uri);
+    const localProvider = u.scheme && u.scheme !== 'file' ? _fsProviders.get(u.scheme.toLowerCase()) : null;
+    if (localProvider && typeof localProvider.provider.stat === 'function') {
+      return await localProvider.provider.stat(u);
+    }
+    if (u.scheme && u.scheme !== 'file') {
+      return await rpc.call('workspace.fs.stat', { uri: u.toString() });
+    }
     try {
       const st = await rpc.call('fs.stat', { path: u.toString() });
       if (!st) {
@@ -545,6 +556,13 @@ const workspaceFs = {
 
   async readDirectory(uri) {
     const u = uriFromInput(uri);
+    const localProvider = u.scheme && u.scheme !== 'file' ? _fsProviders.get(u.scheme.toLowerCase()) : null;
+    if (localProvider && typeof localProvider.provider.readDirectory === 'function') {
+      return await localProvider.provider.readDirectory(u);
+    }
+    if (u.scheme && u.scheme !== 'file') {
+      return await rpc.call('workspace.fs.readDirectory', { uri: u.toString() });
+    }
     try {
       const entries = await rpc.call('fs.readdir', { path: u.toString(), withFileTypes: true });
       if (!Array.isArray(entries)) {
@@ -567,6 +585,16 @@ const workspaceFs = {
 
   async createDirectory(uri) {
     const u = uriFromInput(uri);
+    const localProvider = u.scheme && u.scheme !== 'file' ? _fsProviders.get(u.scheme.toLowerCase()) : null;
+    if (localProvider) {
+      if (localProvider.options.isReadonly) {
+        throw FileSystemError.NoPermissions(u);
+      }
+      if (typeof localProvider.provider.createDirectory === 'function') {
+        await localProvider.provider.createDirectory(u);
+        return;
+      }
+    }
     try {
       await rpc.call('fs.mkdir', { path: u.toString(), options: { recursive: true } });
     } catch (err) {
@@ -576,6 +604,16 @@ const workspaceFs = {
 
   async readFile(uri) {
     const u = uriFromInput(uri);
+    const localProvider = u.scheme && u.scheme !== 'file' ? _fsProviders.get(u.scheme.toLowerCase()) : null;
+    if (localProvider && typeof localProvider.provider.readFile === 'function') {
+      return await localProvider.provider.readFile(u);
+    }
+    if (u.scheme && u.scheme !== 'file') {
+      const bytes = await rpc.call('workspace.fs.readFile', { uri: u.toString() });
+      if (bytes instanceof Uint8Array) return bytes;
+      if (Array.isArray(bytes)) return Uint8Array.from(bytes);
+      return Buffer.from(String(bytes ?? ''), 'utf8');
+    }
     try {
       const bytes = await rpc.call('fs.readFile', { path: u.toString(), encoding: null });
       if (bytes instanceof Uint8Array) return bytes;
@@ -589,6 +627,22 @@ const workspaceFs = {
 
   async writeFile(uri, content) {
     const u = uriFromInput(uri);
+    const localProvider = u.scheme && u.scheme !== 'file' ? _fsProviders.get(u.scheme.toLowerCase()) : null;
+    if (localProvider) {
+      if (localProvider.options.isReadonly) {
+        throw FileSystemError.NoPermissions(u);
+      }
+      if (typeof localProvider.provider.writeFile === 'function') {
+        const bytes = content instanceof Uint8Array ? content : Buffer.from(String(content ?? ''), 'utf8');
+        await localProvider.provider.writeFile(u, bytes, { create: true, overwrite: true });
+        return;
+      }
+    }
+    if (u.scheme && u.scheme !== 'file') {
+      const data = content instanceof Uint8Array ? Array.from(content) : Array.from(Buffer.from(String(content ?? ''), 'utf8'));
+      await rpc.call('workspace.fs.writeFile', { uri: u.toString(), content: data, options: { create: true, overwrite: true } });
+      return;
+    }
     try {
       const data = content instanceof Uint8Array
         ? Array.from(content)
@@ -601,6 +655,16 @@ const workspaceFs = {
 
   async delete(uri, options = {}) {
     const u = uriFromInput(uri);
+    const localProvider = u.scheme && u.scheme !== 'file' ? _fsProviders.get(u.scheme.toLowerCase()) : null;
+    if (localProvider) {
+      if (localProvider.options.isReadonly) {
+        throw FileSystemError.NoPermissions(u);
+      }
+      if (typeof localProvider.provider.delete === 'function') {
+        await localProvider.provider.delete(u, { recursive: Boolean(options && options.recursive) });
+        return;
+      }
+    }
     try {
       await rpc.call('fs.rm', {
         path: u.toString(),
@@ -617,6 +681,16 @@ const workspaceFs = {
   async rename(source, target, options = {}) {
     const src = uriFromInput(source);
     const dst = uriFromInput(target);
+    const localProvider = src.scheme && src.scheme !== 'file' ? _fsProviders.get(src.scheme.toLowerCase()) : null;
+    if (localProvider) {
+      if (localProvider.options.isReadonly) {
+        throw FileSystemError.NoPermissions(src);
+      }
+      if (typeof localProvider.provider.rename === 'function') {
+        await localProvider.provider.rename(src, dst, { overwrite: Boolean(options && options.overwrite) });
+        return;
+      }
+    }
     try {
       if (!(options && options.overwrite)) {
         try {
@@ -646,7 +720,10 @@ const workspaceFs = {
   },
 
   isWritableFileSystem(scheme) {
-    return scheme === 'file' ? true : undefined;
+    if (scheme === 'file') return true;
+    const entry = scheme ? _fsProviders.get(String(scheme).toLowerCase()) : null;
+    if (!entry) return undefined;
+    return !entry.options.isReadonly;
   },
 };
 
@@ -788,6 +865,74 @@ const workspace = {
     return res.map((u) => Uri.parse(u));
   },
 
+  registerFileSystemProvider(scheme, provider, options = {}) {
+    if (typeof scheme !== 'string' || !scheme.trim()) {
+      throw new Error('registerFileSystemProvider requires a non-empty scheme');
+    }
+    if (!provider || typeof provider !== 'object') {
+      throw new Error('registerFileSystemProvider requires a provider object');
+    }
+    const normScheme = scheme.trim().toLowerCase();
+    const normOpts = {
+      isCaseSensitive: options.isCaseSensitive !== false,
+      isReadonly: Boolean(options.isReadonly),
+    };
+    _fsProviders.set(normScheme, { provider, options: normOpts });
+    let changeSub = null;
+    if (typeof provider.onDidChangeFile === 'function') {
+      changeSub = provider.onDidChangeFile((changes) => {
+        const serialized = Array.isArray(changes)
+          ? changes.map((c) => ({
+            type: c.type || 1,
+            uri: c.uri ? c.uri.toString() : '',
+          }))
+          : [];
+        rpc.fireAndForget('workspace.onDidChangeFileSystem', {
+          scheme: normScheme,
+          changes: serialized,
+        });
+      });
+    }
+    rpc.fireAndForget('workspace.registerFileSystemProvider', {
+      scheme: normScheme,
+      options: normOpts,
+    });
+    return new Disposable(() => {
+      if (changeSub && typeof changeSub.dispose === 'function') {
+        changeSub.dispose();
+      }
+      _fsProviders.delete(normScheme);
+      rpc.fireAndForget('workspace.unregisterFileSystemProvider', { scheme: normScheme });
+    });
+  },
+
+  registerTextDocumentContentProvider(scheme, provider) {
+    if (typeof scheme !== 'string' || !scheme.trim()) {
+      throw new Error('registerTextDocumentContentProvider requires a non-empty scheme');
+    }
+    if (!provider || typeof provider.provideTextDocumentContent !== 'function') {
+      throw new Error('registerTextDocumentContentProvider requires provideTextDocumentContent()');
+    }
+    const normScheme = scheme.trim().toLowerCase();
+    _contentProviders.set(normScheme, provider);
+    let changeSub = null;
+    if (typeof provider.onDidChange === 'function') {
+      changeSub = provider.onDidChange((uri) => {
+        rpc.fireAndForget('workspace.onDidChangeTextDocumentContent', {
+          uri: uri ? uri.toString() : `${normScheme}://`,
+        });
+      });
+    }
+    rpc.fireAndForget('workspace.registerTextDocumentContentProvider', { scheme: normScheme });
+    return new Disposable(() => {
+      if (changeSub && typeof changeSub.dispose === 'function') {
+        changeSub.dispose();
+      }
+      _contentProviders.delete(normScheme);
+      rpc.fireAndForget('workspace.unregisterTextDocumentContentProvider', { scheme: normScheme });
+    });
+  },
+
   // Events
   onDidChangeWorkspaceFolders: _onDidChangeWorkspaceFolders.event,
   onDidChangeConfiguration: _onDidChangeConfiguration.event,
@@ -811,6 +956,59 @@ Object.defineProperty(workspace, '_uriFromInput', {
 });
 Object.defineProperty(workspace, '_upsertDocumentProxy', {
   value: upsertDocumentProxy,
+  enumerable: false,
+});
+Object.defineProperty(workspace, '_dispatchVfsRequest', {
+  value: async function _dispatchVfsRequest(method, params) {
+    const rawUri = params && params.uri ? String(params.uri) : '';
+    const uri = Uri.parse(rawUri);
+    const scheme = (uri.scheme || '').toLowerCase();
+    if (method === 'vfs.provideTextDocumentContent') {
+      const provider = _contentProviders.get(scheme);
+      if (!provider) {
+        throw new Error(`TextDocumentContentProvider not registered for scheme '${scheme}'`);
+      }
+      const content = await provider.provideTextDocumentContent(uri, params.token || { isCancellationRequested: false });
+      return content === undefined || content === null ? '' : String(content);
+    }
+    const entry = _fsProviders.get(scheme);
+    if (!entry || !entry.provider) {
+      throw new Error(`FileSystemProvider not registered for scheme '${scheme}'`);
+    }
+    const p = entry.provider;
+    switch (method) {
+      case 'vfs.stat':
+        return await p.stat(uri);
+      case 'vfs.readDirectory':
+        return await p.readDirectory(uri);
+      case 'vfs.readFile': {
+        const bytes = await p.readFile(uri);
+        return bytes instanceof Uint8Array ? Array.from(bytes) : Array.from(Buffer.from(String(bytes ?? ''), 'utf8'));
+      }
+      case 'vfs.writeFile': {
+        if (entry.options.isReadonly) {
+          throw FileSystemError.NoPermissions(uri);
+        }
+        const rawBytes = Array.isArray(params.content) ? Uint8Array.from(params.content) : Buffer.from(String(params.content ?? ''), 'utf8');
+        await p.writeFile(uri, rawBytes, params.options || { create: true, overwrite: true });
+        return { written: true };
+      }
+      case 'vfs.delete':
+        if (entry.options.isReadonly) throw FileSystemError.NoPermissions(uri);
+        await p.delete(uri, params.options || { recursive: false });
+        return { deleted: true };
+      case 'vfs.createDirectory':
+        if (entry.options.isReadonly) throw FileSystemError.NoPermissions(uri);
+        await p.createDirectory(uri);
+        return { created: true };
+      case 'vfs.rename':
+        if (entry.options.isReadonly) throw FileSystemError.NoPermissions(uri);
+        await p.rename(uri, Uri.parse(params.newUri || ''), params.options || { overwrite: false });
+        return { renamed: true };
+      default:
+        throw new Error(`Unknown VFS method '${method}'`);
+    }
+  },
   enumerable: false,
 });
 

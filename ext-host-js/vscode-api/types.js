@@ -979,6 +979,87 @@ class TypeHierarchyItem {
   }
 }
 
+const LogLevel = {
+  Off: 0,
+  Trace: 1,
+  Debug: 2,
+  Info: 3,
+  Warning: 4,
+  Error: 5,
+};
+
+const FileChangeType = {
+  Changed: 1,
+  Created: 2,
+  Deleted: 3,
+};
+
+const TreeItemCheckboxState = {
+  Unchecked: 0,
+  Checked: 1,
+};
+
+class DataTransferItem {
+  constructor(value) {
+    this.value = value;
+  }
+
+  asString() {
+    if (typeof this.value === 'string') {
+      return Promise.resolve(this.value);
+    }
+    if (this.value instanceof Uint8Array || (typeof Buffer !== 'undefined' && Buffer.isBuffer(this.value))) {
+      return Promise.resolve(Buffer.from(this.value).toString('utf8'));
+    }
+    return Promise.resolve(JSON.stringify(this.value ?? ''));
+  }
+
+  asFile() {
+    return this.value && typeof this.value === 'object' && this.value.name ? this.value : undefined;
+  }
+}
+
+class DataTransfer {
+  constructor(initialEntries = []) {
+    this._map = new Map();
+    if (Array.isArray(initialEntries)) {
+      for (const [mime, val] of initialEntries) {
+        this.set(mime, val instanceof DataTransferItem ? val : new DataTransferItem(val));
+      }
+    } else if (initialEntries && typeof initialEntries === 'object') {
+      for (const [mime, val] of Object.entries(initialEntries)) {
+        this.set(mime, val instanceof DataTransferItem ? val : new DataTransferItem(val));
+      }
+    }
+  }
+
+  get(mimeType) {
+    return this._map.get(mimeType);
+  }
+
+  set(mimeType, value) {
+    this._map.set(mimeType, value instanceof DataTransferItem ? value : new DataTransferItem(value));
+  }
+
+  forEach(cb, thisArg) {
+    for (const [mime, item] of this._map.entries()) {
+      cb.call(thisArg, item, mime, this);
+    }
+  }
+
+  [Symbol.iterator]() {
+    return this._map.entries();
+  }
+
+  toJSON() {
+    const out = {};
+    for (const [mime, item] of this._map.entries()) {
+      out[mime] = item && item.value !== undefined ? item.value : null;
+    }
+    return out;
+  }
+}
+
 module.exports = {
   Position,
   Range,
@@ -1031,4 +1112,9 @@ module.exports = {
   CallHierarchyIncomingCall,
   CallHierarchyOutgoingCall,
   TypeHierarchyItem,
+  LogLevel,
+  FileChangeType,
+  TreeItemCheckboxState,
+  DataTransferItem,
+  DataTransfer,
 };

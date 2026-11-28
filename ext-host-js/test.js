@@ -2067,6 +2067,89 @@ exec.end(true, 200);
     [d1, d2, d3, d4, d5, d6, d7, d8, d9, d10, d11].forEach((d) => d.dispose());
   }
 
+  console.log('[Test] Testing Phase 10 M1/M2 APIs (VFS, WebviewView, LogOutputChannel, Tree D&D, SecretStorage, CustomExecution, Node Hook)...');
+  {
+    assert(vscode.LogLevel.Trace === 1 && vscode.LogLevel.Error === 5, 'LogLevel enum mismatch');
+    assert(vscode.FileChangeType.Created === 2 && vscode.FileChangeType.Deleted === 3, 'FileChangeType mismatch');
+    assert(vscode.TreeItemCheckboxState.Checked === 1, 'TreeItemCheckboxState mismatch');
+
+    // 1. VFS FileSystemProvider + TextDocumentContentProvider
+    const memFiles = new Map([['/hello.txt', Buffer.from('hello vfs', 'utf8')]]);
+    const vfsDisp = vscode.workspace.registerFileSystemProvider('memfs', {
+      onDidChangeFile: new vscode.EventEmitter().event,
+      stat: () => ({ type: vscode.FileType.File, ctime: 0, mtime: 1, size: 9 }),
+      readDirectory: () => [['hello.txt', vscode.FileType.File]],
+      createDirectory() {},
+      readFile: (u) => memFiles.get(u.path) || Buffer.from(''),
+      writeFile: (u, bytes) => { memFiles.set(u.path, Buffer.from(bytes)); },
+      delete: (u) => { memFiles.delete(u.path); },
+      rename() {},
+    });
+    const readBytes = await rpc.handleIncomingRequest('vfs.readFile', { uri: 'memfs:///hello.txt' });
+    assert(Buffer.from(readBytes).toString('utf8') === 'hello vfs', 'vfs.readFile failed');
+    await vscode.workspace.fs.writeFile(vscode.Uri.parse('memfs:///new.txt'), Buffer.from('abc'));
+    const newRead = await vscode.workspace.fs.readFile(vscode.Uri.parse('memfs:///new.txt'));
+    assert(Buffer.from(newRead).toString('utf8') === 'abc', 'workspace.fs custom scheme write/read failed');
+    vfsDisp.dispose();
+
+    const docDisp = vscode.workspace.registerTextDocumentContentProvider('git-show', {
+      provideTextDocumentContent: (uri) => `content for ${uri.path}`,
+    });
+    const resolvedDoc = await rpc.handleIncomingRequest('vfs.provideTextDocumentContent', { uri: 'git-show:///lib.rs' });
+    assert(resolvedDoc === 'content for /lib.rs', 'TextDocumentContentProvider RPC failed');
+    docDisp.dispose();
+
+    // 2. WebviewViewProvider
+    const receivedWvMsgs = [];
+    const wvDisp = vscode.window.registerWebviewViewProvider('rustcode.explorerAssistant', {
+      resolveWebviewView(wv) {
+        wv.title = 'Assistant';
+        wv.webview.html = '<h1>Ready</h1>';
+        wv.webview.onDidReceiveMessage((m) => receivedWvMsgs.push(m));
+      },
+    });
+    const resWv = await rpc.handleIncomingRequest('window.resolveWebviewView', { viewId: 'rustcode.explorerAssistant' });
+    assert(resWv.resolved === true && resWv.html === '<h1>Ready</h1>', 'resolveWebviewView failed');
+    vscode.window._dispatchWebviewViewMessage({ viewId: 'rustcode.explorerAssistant', message: { ping: 42 } });
+    assert(receivedWvMsgs.length === 1 && receivedWvMsgs[0].ping === 42, 'WebviewView inbound message failed');
+    wvDisp.dispose();
+
+    // 3. LogOutputChannel + TreeView DragAndDrop
+    const logCh = vscode.window.createOutputChannel('Phase10Log', { log: true });
+    logCh.setLogLevel(vscode.LogLevel.Warning);
+    assert(logCh.logLevel === vscode.LogLevel.Warning, 'LogOutputChannel setLogLevel failed');
+    logCh.warn('disk almost full');
+    logCh.dispose();
+
+    let droppedPayload = null;
+    const tvDnd = vscode.window.createTreeView('phase10.dndTree', {
+      dragAndDropController: {
+        dragMimeTypes: ['text/plain'],
+        dropMimeTypes: ['text/plain'],
+        handleDrag(sources, dt) { dt.set('text/plain', sources.join(',')); },
+        handleDrop(target, dt) { droppedPayload = dt.get('text/plain').value + '@' + target; },
+      },
+    });
+    const dragData = await rpc.handleIncomingRequest('treeView.handleDrag', {
+      viewId: 'phase10.dndTree',
+      sourceElementIds: ['a', 'b'],
+    });
+    assert(dragData['text/plain'] === 'a,b', 'treeView.handleDrag failed');
+    await rpc.handleIncomingRequest('treeView.handleDrop', {
+      viewId: 'phase10.dndTree',
+      targetElementId: 'folder',
+      dataTransfer: dragData,
+    });
+    assert(droppedPayload === 'a,b@folder', 'treeView.handleDrop failed');
+    tvDnd.dispose();
+
+    // 4. ping & Module Resolution Diagnostics
+    const pong = await rpc.handleIncomingRequest('extHost.ping', {});
+    assert(pong.pong === true && pong.memory && typeof pong.memory.rssBytes === 'number', 'extHost.ping failed');
+    const diag = rpc.getModuleResolutionDiagnostics();
+    assert(diag.hookInstalled === true && diag.mode === 'native-node' && diag.nativeBuiltinsAvailable === true, 'module resolution diagnostics failed');
+  }
+
   console.log('All JavaScript extension host tests passed successfully!');
 })();
 

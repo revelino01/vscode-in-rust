@@ -83,6 +83,7 @@ impl ConfigurationService {
             "workbench": {
                 "colorTheme": "Default Dark+",
                 "iconTheme": "vs-seti",
+                "productIconTheme": "Default",
                 "sideBar": {
                     "location": "left"
                 }
@@ -110,7 +111,8 @@ impl ConfigurationService {
                 "enableSmartCommit": false
             },
             "extensions": {
-                "autoUpdate": "true"
+                "autoUpdate": "true",
+                "autoCheckUpdates": true
             },
             "window": {
                 "zoomLevel": 0
@@ -373,6 +375,11 @@ impl ConfigurationService {
             }
         }
         merged
+    }
+
+    /// Return a cloned snapshot of the User configuration layer JSON object.
+    pub fn user_layer(&self) -> Value {
+        self.user.read().clone()
     }
 
     /// Inspect a configuration key across defaults, user, workspace, and workspace folder layers.

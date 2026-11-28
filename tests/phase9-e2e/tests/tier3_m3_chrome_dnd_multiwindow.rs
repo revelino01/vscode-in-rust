@@ -58,6 +58,7 @@ fn tier3_m3_secondary_sidebar_panel_positions_titlebar_context_menu_zoom_zen() {
             when: Some("editorTextFocus".to_string()),
             group: Some("navigation@0".to_string()),
             alt: None,
+            submenu: None,
         }],
     );
     let mut titles = HashMap::new();

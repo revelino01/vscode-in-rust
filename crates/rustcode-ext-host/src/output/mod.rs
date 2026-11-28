@@ -7,6 +7,55 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum ExtLogLevel {
+    Off = 0,
+    Trace = 1,
+    Debug = 2,
+    #[default]
+    Info = 3,
+    Warning = 4,
+    Error = 5,
+}
+
+impl ExtLogLevel {
+    pub fn from_wire(val: &Value) -> Self {
+        if let Some(n) = val.as_u64() {
+            return match n {
+                0 => Self::Off,
+                1 => Self::Trace,
+                2 => Self::Debug,
+                4 => Self::Warning,
+                5 => Self::Error,
+                _ => Self::Info,
+            };
+        }
+        if let Some(s) = val.as_str() {
+            return match s.trim().to_ascii_lowercase().as_str() {
+                "off" => Self::Off,
+                "trace" => Self::Trace,
+                "debug" => Self::Debug,
+                "warning" | "warn" => Self::Warning,
+                "error" | "err" => Self::Error,
+                _ => Self::Info,
+            };
+        }
+        Self::Info
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "OFF",
+            Self::Trace => "TRACE",
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warning => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct OutputChannelState {
@@ -18,6 +67,8 @@ pub struct OutputChannelState {
     pub is_visible: bool,
     pub preserve_focus: bool,
     pub is_disposed: bool,
+    #[serde(default)]
+    pub log_level: ExtLogLevel,
 }
 
 impl OutputChannelState {
@@ -66,6 +117,11 @@ pub enum OutputChannelEvent {
     Disposed {
         id: String,
         name: String,
+    },
+    LogLevelChanged {
+        id: String,
+        name: String,
+        log_level: ExtLogLevel,
     },
 }
 
@@ -128,6 +184,7 @@ impl ExtHostOutputManager {
             is_visible: false,
             preserve_focus: false,
             is_disposed: false,
+            log_level: ExtLogLevel::Info,
         };
 
         {
@@ -407,6 +464,51 @@ impl ExtHostOutputManager {
                 let id = self.resolve_channel_id(params)?;
                 let disposed = self.dispose_channel(&id);
                 Ok(json!({ "disposed": disposed, "id": id }))
+            }
+            "window.setOutputChannelLogLevel" => {
+                let id = self.resolve_channel_id(params)?;
+                let level = params
+                    .get("logLevel")
+                    .map(ExtLogLevel::from_wire)
+                    .unwrap_or(ExtLogLevel::Info);
+                let name = {
+                    let mut channels = self.channels.write();
+                    let ch = channels
+                        .get_mut(&id)
+                        .ok_or_else(|| format!("Output channel '{}' not found", id))?;
+                    ch.log_level = level;
+                    ch.name.clone()
+                };
+                self.emit(OutputChannelEvent::LogLevelChanged {
+                    id: id.clone(),
+                    name,
+                    log_level: level,
+                });
+                Ok(json!({ "id": id, "logLevel": level as u8 }))
+            }
+            "window.logOutputChannelMessage" => {
+                let id = self.resolve_channel_id(params)?;
+                let level = params
+                    .get("level")
+                    .map(ExtLogLevel::from_wire)
+                    .unwrap_or(ExtLogLevel::Info);
+                let message = params
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let current_level = self
+                    .channels
+                    .read()
+                    .get(&id)
+                    .map(|c| c.log_level)
+                    .ok_or_else(|| format!("Output channel '{}' not found", id))?;
+                let written = if current_level != ExtLogLevel::Off && level >= current_level {
+                    self.append(&id, &format!("[{}] {}\n", level.label(), message))?;
+                    true
+                } else {
+                    false
+                };
+                Ok(json!({ "written": written, "id": id, "level": level as u8 }))
             }
             _ => Err(format!("Unsupported output channel RPC method: {}", method)),
         }

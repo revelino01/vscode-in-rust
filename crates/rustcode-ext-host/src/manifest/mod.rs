@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtensionManifest {
     pub name: String,
     #[serde(default)]
@@ -17,6 +17,22 @@ pub struct ExtensionManifest {
     pub main: Option<String>,
     #[serde(rename = "activationEvents", default)]
     pub activation_events: Vec<String>,
+    #[serde(rename = "extensionPack", default)]
+    pub extension_pack: Vec<String>,
+    #[serde(rename = "extensionDependencies", default)]
+    pub extension_dependencies: Vec<String>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub engines: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub repository: Option<Value>,
     pub contributes: Option<Contributions>,
 }
 
@@ -29,6 +45,10 @@ pub struct Contributions {
     pub keybindings: Option<Vec<KeybindingContribution>>,
     pub configuration: Option<Value>,
     pub views: Option<std::collections::HashMap<String, Vec<ViewContribution>>>,
+    #[serde(rename = "viewsContainers", default)]
+    pub views_containers: Option<std::collections::HashMap<String, Vec<ViewContainerContribution>>>,
+    #[serde(rename = "viewsWelcome", default)]
+    pub views_welcome: Option<Vec<ViewWelcomeContribution>>,
     #[serde(default)]
     pub debuggers: Option<Vec<DebuggerContribution>>,
     #[serde(rename = "taskDefinitions", default)]
@@ -41,6 +61,191 @@ pub struct Contributions {
     pub snippets: Option<Vec<SnippetContribution>>,
     #[serde(default)]
     pub menus: Option<std::collections::HashMap<String, Vec<MenuContribution>>>,
+    #[serde(default)]
+    pub submenus: Option<Vec<SubmenuContribution>>,
+    #[serde(rename = "jsonValidation", default)]
+    pub json_validation: Option<Vec<JsonValidationContribution>>,
+    #[serde(rename = "problemMatchers", default)]
+    pub problem_matchers: Option<Vec<crate::tasks::ProblemMatcherContribution>>,
+    #[serde(rename = "iconThemes", default)]
+    pub icon_themes: Option<Vec<IconThemeContribution>>,
+    #[serde(rename = "productIconThemes", default)]
+    pub product_icon_themes: Option<Vec<ProductIconThemeContribution>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewContainerContribution {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub icon: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ViewWelcomeContribution {
+    pub view: String,
+    pub contents: String,
+    #[serde(default)]
+    pub when: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubmenuContribution {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub icon: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JsonValidationContribution {
+    #[serde(default)]
+    pub file_match: JsonValidationFileMatch,
+    #[serde(default)]
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum JsonValidationFileMatch {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+impl Default for JsonValidationFileMatch {
+    fn default() -> Self {
+        Self::Multiple(Vec::new())
+    }
+}
+
+impl JsonValidationFileMatch {
+    pub fn patterns(&self) -> Vec<&str> {
+        match self {
+            Self::Single(s) => vec![s.as_str()],
+            Self::Multiple(v) => v.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
+/// Validates and maps `contributes.jsonValidation` file matchers to local or remote schemas.
+#[derive(Debug, Clone, Default)]
+pub struct JsonValidationRegistry {
+    rules: Vec<JsonValidationEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct JsonValidationEntry {
+    pub extension_id: String,
+    pub patterns: Vec<String>,
+    pub schema_url: String,
+    pub resolved_path: Option<PathBuf>,
+}
+
+impl JsonValidationRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(
+        &mut self,
+        extension_id: &str,
+        extension_root: &Path,
+        contrib: &JsonValidationContribution,
+    ) -> Result<(), String> {
+        let raw_url = contrib.url.trim();
+        if raw_url.is_empty() {
+            return Err("jsonValidation url cannot be empty".to_string());
+        }
+        let resolved_path = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+            None
+        } else {
+            let rel = raw_url.trim_start_matches("./");
+            if rel.contains("..") || Path::new(rel).is_absolute() {
+                return Err(format!(
+                    "Unsafe local jsonValidation schema path '{}'",
+                    raw_url
+                ));
+            }
+            Some(extension_root.join(rel))
+        };
+        let patterns: Vec<String> = contrib
+            .file_match
+            .patterns()
+            .into_iter()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if patterns.is_empty() {
+            return Ok(());
+        }
+        self.rules.push(JsonValidationEntry {
+            extension_id: extension_id.to_string(),
+            patterns,
+            schema_url: raw_url.to_string(),
+            resolved_path,
+        });
+        Ok(())
+    }
+
+    pub fn schemas_for_filename(&self, file_name: &str) -> Vec<&JsonValidationEntry> {
+        let normalized = file_name.replace('\\', "/");
+        let base = normalized.rsplit('/').next().unwrap_or(&normalized);
+        self.rules
+            .iter()
+            .filter(|rule| {
+                rule.patterns.iter().any(|pat| {
+                    let p = pat.trim();
+                    if p == base || p == normalized {
+                        return true;
+                    }
+                    if let Some(sub) = p.strip_prefix('/') {
+                        return normalized.ends_with(sub) || glob_match(sub, base);
+                    }
+                    if p.contains('/') {
+                        return glob_match(p, &normalized);
+                    }
+                    glob_match(p, base)
+                })
+            })
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    pub fn remove_extension(&mut self, extension_id: &str) {
+        self.rules
+            .retain(|r| !r.extension_id.eq_ignore_ascii_case(extension_id));
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IconThemeContribution {
+    pub id: String,
+    pub label: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProductIconThemeContribution {
+    pub id: String,
+    pub label: String,
+    pub path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -51,7 +256,10 @@ pub struct SnippetContribution {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MenuContribution {
+    #[serde(default)]
     pub command: String,
+    #[serde(default)]
+    pub submenu: Option<String>,
     #[serde(default)]
     pub when: Option<String>,
     #[serde(default)]
@@ -177,12 +385,19 @@ pub struct AuthenticationContribution {
     pub label: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct ViewContribution {
     pub id: String,
     pub name: String,
     #[serde(default)]
     pub when: Option<String>,
+    #[serde(rename = "type", default)]
+    pub view_type: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub contextual_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -47,7 +47,8 @@ pub use editor_area::{
 };
 pub use explorer::{ExplorerAction, ExplorerRow, FileExplorer, FileExplorerView, FileTreeNode};
 pub use extensions_view::{
-    curated_marketplace_extensions, ExtensionsClickTarget, ExtensionsSidebarLayout,
+    curated_marketplace_extensions, parse_extension_detail_message, render_extension_detail_html,
+    ExtensionDetailContext, ExtensionDetailMessage, ExtensionsClickTarget, ExtensionsSidebarLayout,
     ExtensionsSidebarView, ExtensionsViewAction, InstalledExtensionItem,
     MarketplaceExtensionItem,
 };

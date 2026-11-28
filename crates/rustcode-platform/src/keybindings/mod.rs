@@ -144,17 +144,20 @@ pub struct ResolvedKeybinding {
     pub when: Option<ContextKeyExpr>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct KeybindingEntryRaw {
     key: String,
     command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     args: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     when: Option<String>,
 }
 
 #[derive(Clone)]
 pub struct KeybindingService {
     bindings: Arc<RwLock<Vec<ResolvedKeybinding>>>,
+    raw_entries: Arc<RwLock<Vec<KeybindingEntryRaw>>>,
     pending_chord: Arc<RwLock<Option<KeyCombo>>>,
 }
 
@@ -168,12 +171,19 @@ impl KeybindingService {
     pub fn new() -> Self {
         Self {
             bindings: Arc::new(RwLock::new(Vec::new())),
+            raw_entries: Arc::new(RwLock::new(Vec::new())),
             pending_chord: Arc::new(RwLock::new(None)),
         }
     }
 
     /// Register a single keybinding.
     pub fn register(&self, binding: ResolvedKeybinding) {
+        self.raw_entries.write().push(KeybindingEntryRaw {
+            key: binding.chord.to_display_string(),
+            command: binding.command.clone(),
+            args: binding.args.clone(),
+            when: None,
+        });
         self.bindings.write().push(binding);
     }
 
@@ -188,23 +198,52 @@ impl KeybindingService {
         None
     }
 
-    /// Load keybindings from a JSON string matching VS Code's `keybindings.json` format (supports JSONC).
-    pub fn load_keybindings_json(&self, json_str: &str) -> Result<(), String> {
-        let stripped = crate::configuration::strip_json_comments(json_str);
-        let entries: Vec<KeybindingEntryRaw> = serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
-        let mut list = self.bindings.write();
+    /// Export currently loaded keybindings as a JSON array matching `keybindings.json`.
+    pub fn export_json(&self) -> Value {
+        let entries = self.raw_entries.read();
+        serde_json::to_value(&*entries).unwrap_or_else(|_| Value::Array(Vec::new()))
+    }
 
-        for raw in entries {
+    /// Replace all loaded keybindings from a JSON string (supports JSONC).
+    pub fn replace_from_json(&self, json_str: &str) -> Result<(), String> {
+        let (resolved, raw) = Self::parse_entries(json_str)?;
+        *self.bindings.write() = resolved;
+        *self.raw_entries.write() = raw;
+        *self.pending_chord.write() = None;
+        Ok(())
+    }
+
+    /// Clear all registered keybindings.
+    pub fn clear(&self) {
+        self.bindings.write().clear();
+        self.raw_entries.write().clear();
+        *self.pending_chord.write() = None;
+    }
+
+    fn parse_entries(json_str: &str) -> Result<(Vec<ResolvedKeybinding>, Vec<KeybindingEntryRaw>), String> {
+        let stripped = crate::configuration::strip_json_comments(json_str);
+        let entries: Vec<KeybindingEntryRaw> =
+            serde_json::from_str(&stripped).map_err(|e| e.to_string())?;
+        let mut resolved = Vec::new();
+        for raw in &entries {
             if let Some(chord) = KeyChord::parse(&raw.key) {
-                let when = raw.when.and_then(|w| ContextKeyExpr::parse(&w).ok());
-                list.push(ResolvedKeybinding {
+                let when = raw.when.as_deref().and_then(|w| ContextKeyExpr::parse(w).ok());
+                resolved.push(ResolvedKeybinding {
                     chord,
-                    command: raw.command,
-                    args: raw.args,
+                    command: raw.command.clone(),
+                    args: raw.args.clone(),
                     when,
                 });
             }
         }
+        Ok((resolved, entries))
+    }
+
+    /// Load keybindings from a JSON string matching VS Code's `keybindings.json` format (supports JSONC).
+    pub fn load_keybindings_json(&self, json_str: &str) -> Result<(), String> {
+        let (resolved, raw) = Self::parse_entries(json_str)?;
+        self.bindings.write().extend(resolved);
+        self.raw_entries.write().extend(raw);
         Ok(())
     }
 

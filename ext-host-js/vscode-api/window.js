@@ -9,6 +9,8 @@ const {
   Range,
   Selection,
   WorkspaceEdit,
+  LogLevel,
+  DataTransfer,
 } = require('./types');
 const workspace = require('./workspace');
 
@@ -76,11 +78,43 @@ class OutputChannelProxy {
     this._name = name;
     this._languageId = languageId;
     this._log = log;
+    this._logLevel = LogLevel.Info;
+    this._onDidChangeLogLevel = new EventEmitter();
+    this.onDidChangeLogLevel = this._onDidChangeLogLevel.event;
     this._disposed = false;
   }
 
   get name() {
     return this._name;
+  }
+
+  get logLevel() {
+    return this._logLevel;
+  }
+
+  setLogLevel(level) {
+    if (this._disposed) return;
+    this._logLevel = Number(level);
+    rpc.fireAndForget('window.setOutputChannelLogLevel', {
+      id: this._id,
+      name: this._name,
+      logLevel: this._logLevel,
+    });
+    this._onDidChangeLogLevel.fire(this._logLevel);
+  }
+
+  _emitLog(level, prefix, message) {
+    if (this._disposed) return;
+    if (this._log) {
+      rpc.fireAndForget('window.logOutputChannelMessage', {
+        id: this._id,
+        name: this._name,
+        level,
+        message: String(message ?? ''),
+      });
+      return;
+    }
+    this.appendLine(`[${prefix}] ${message ?? ''}`);
   }
 
   append(value) {
@@ -156,23 +190,23 @@ class OutputChannelProxy {
   }
 
   trace(message) {
-    this.appendLine(`[trace] ${message ?? ''}`);
+    this._emitLog(LogLevel.Trace, 'trace', message);
   }
 
   debug(message) {
-    this.appendLine(`[debug] ${message ?? ''}`);
+    this._emitLog(LogLevel.Debug, 'debug', message);
   }
 
   info(message) {
-    this.appendLine(`[info] ${message ?? ''}`);
+    this._emitLog(LogLevel.Info, 'info', message);
   }
 
   warn(message) {
-    this.appendLine(`[warn] ${message ?? ''}`);
+    this._emitLog(LogLevel.Warning, 'warn', message);
   }
 
   error(message) {
-    this.appendLine(`[error] ${message ?? ''}`);
+    this._emitLog(LogLevel.Error, 'error', message);
   }
 }
 
@@ -275,6 +309,13 @@ let _activeTextEditorFromSync = false;
 let _visibleTextEditors = [];
 const _onDidChangeActiveTextEditor = new EventEmitter();
 const _onDidChangeVisibleTextEditors = new EventEmitter();
+const _webviewViewProviders = new Map();
+const _webviewViews = new Map();
+const _treeDndControllers = new Map();
+const _terminalProxies = new Map();
+const _onDidChangeTerminalShellIntegration = new EventEmitter();
+const _onDidStartTerminalShellExecution = new EventEmitter();
+const _onDidEndTerminalShellExecution = new EventEmitter();
 
 function wrapTextEditor(raw) {
   if (!raw || typeof raw !== 'object' || !raw.document) {
@@ -561,6 +602,19 @@ const window = {
     const providerDisposable = options && options.treeDataProvider
       ? this.registerTreeDataProvider(viewId, options.treeDataProvider)
       : new Disposable(() => {});
+    const checkboxEmitter = new EventEmitter();
+    if (options && options.dragAndDropController) {
+      _treeDndControllers.set(viewId, options.dragAndDropController);
+    }
+    const dnd = options && options.dragAndDropController;
+    rpc.fireAndForget('treeView.setOptions', {
+      viewId,
+      showCollapseAll: Boolean(options && options.showCollapseAll),
+      canSelectMany: Boolean(options && options.canSelectMany),
+      dragMimeTypes: dnd && Array.isArray(dnd.dragMimeTypes) ? dnd.dragMimeTypes : [],
+      dropMimeTypes: dnd && Array.isArray(dnd.dropMimeTypes) ? dnd.dropMimeTypes : [],
+      manageCheckboxStateManually: Boolean(options && options.manageCheckboxStateManually),
+    });
     return {
       viewId,
       visible: true,
@@ -569,8 +623,10 @@ const window = {
       onDidCollapseElement: rpc.createEvent(`treeView.onDidCollapseElement.${viewId}`),
       onDidChangeSelection: rpc.createEvent(`treeView.onDidChangeSelection.${viewId}`),
       onDidChangeVisibility: rpc.createEvent(`treeView.onDidChangeVisibility.${viewId}`),
+      onDidChangeCheckboxState: checkboxEmitter.event,
       async reveal() {},
       dispose() {
+        _treeDndControllers.delete(viewId);
         providerDisposable.dispose();
       },
     };
@@ -603,8 +659,39 @@ const window = {
     const id = `term_${Date.now()}_${nextTerminalId++}`;
     rpc.fireAndForget('window.createTerminal', { id, ...options });
 
-    return {
+    const shellIntegration = {
+      cwd: options.cwd ? (typeof options.cwd === 'string' ? workspace._uriFromInput(options.cwd) : options.cwd) : undefined,
+      async executeCommand(commandLine, args) {
+        const cmdText = Array.isArray(args) && args.length > 0
+          ? `${commandLine} ${args.join(' ')}`
+          : String(commandLine || '');
+        const execution = {
+          commandLine: { value: cmdText, isTrusted: true, confidence: 2 },
+          cwd: shellIntegration.cwd,
+          read() {
+            async function* gen() {
+              const res = await rpc.call('window.executeTerminalCommand', {
+                id,
+                commandLine: cmdText,
+              });
+              if (res && typeof res.output === 'string' && res.output) {
+                yield res.output;
+              }
+            }
+            return gen();
+          },
+        };
+        const res = await rpc.call('window.executeTerminalCommand', { id, commandLine: cmdText });
+        _onDidStartTerminalShellExecution.fire({ terminal: proxy, execution });
+        _onDidEndTerminalShellExecution.fire({ terminal: proxy, execution, exitCode: res ? res.exitCode : 0 });
+        return execution;
+      },
+    };
+
+    const proxy = {
+      id,
       name: options.name || 'Terminal',
+      shellIntegration,
       show(preserveFocus = false) {
         rpc.fireAndForget('window.showTerminal', { id, preserveFocus: Boolean(preserveFocus) });
       },
@@ -612,9 +699,12 @@ const window = {
         rpc.fireAndForget('window.sendTerminalText', { id, text, addNewLine });
       },
       dispose() {
+        _terminalProxies.delete(id);
         rpc.fireAndForget('window.disposeTerminal', { id });
-      }
+      },
     };
+    _terminalProxies.set(id, proxy);
+    return proxy;
   },
 
   // Webview
@@ -622,6 +712,23 @@ const window = {
     const id = `webview_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     rpc.fireAndForget('window.createWebviewPanel', { id, viewType, title, showOptions, options });
     return rpc.createWebviewPanelProxy(id, viewType, title, options);
+  },
+
+  // WebviewView (Sidebar / Panel contributed views)
+  registerWebviewViewProvider(viewId, provider, options = {}) {
+    if (typeof viewId !== 'string' || !viewId.trim()) {
+      throw new Error('registerWebviewViewProvider requires a non-empty viewId');
+    }
+    if (!provider || typeof provider.resolveWebviewView !== 'function') {
+      throw new Error('registerWebviewViewProvider requires provider.resolveWebviewView()');
+    }
+    _webviewViewProviders.set(viewId, { provider, options });
+    rpc.fireAndForget('window.registerWebviewViewProvider', { viewId, options });
+    return new Disposable(() => {
+      _webviewViewProviders.delete(viewId);
+      _webviewViews.delete(viewId);
+      rpc.fireAndForget('window.unregisterWebviewViewProvider', { viewId });
+    });
   },
 
   // Custom Editors
@@ -668,6 +775,114 @@ const window = {
   onDidChangeActiveTextEditor: _onDidChangeActiveTextEditor.event,
   onDidChangeVisibleTextEditors: _onDidChangeVisibleTextEditors.event,
   onDidChangeTextEditorSelection: rpc.createEvent('window.onDidChangeTextEditorSelection'),
+  onDidChangeTerminalShellIntegration: _onDidChangeTerminalShellIntegration.event,
+  onDidStartTerminalShellExecution: _onDidStartTerminalShellExecution.event,
+  onDidEndTerminalShellExecution: _onDidEndTerminalShellExecution.event,
+
+  async _resolveWebviewView(params) {
+    const viewId = params && params.viewId;
+    const entry = viewId ? _webviewViewProviders.get(viewId) : null;
+    if (!entry || !entry.provider) {
+      throw new Error(`WebviewViewProvider not registered: ${viewId}`);
+    }
+    const msgEmitter = new EventEmitter();
+    const disposeEmitter = new EventEmitter();
+    const visEmitter = new EventEmitter();
+    let _html = '';
+    let _title = (params && params.title) || undefined;
+    let _description = undefined;
+    let _badge = undefined;
+    let _options = { enableScripts: true };
+    const view = {
+      viewType: viewId,
+      visible: true,
+      get title() { return _title; },
+      set title(v) {
+        _title = v;
+        rpc.fireAndForget('window.setWebviewViewMeta', { viewId, title: v });
+      },
+      get description() { return _description; },
+      set description(v) {
+        _description = v;
+        rpc.fireAndForget('window.setWebviewViewMeta', { viewId, description: v });
+      },
+      get badge() { return _badge; },
+      set badge(v) {
+        _badge = v;
+        rpc.fireAndForget('window.setWebviewViewMeta', { viewId, badge: v });
+      },
+      onDidDispose: disposeEmitter.event,
+      onDidChangeVisibility: visEmitter.event,
+      show() {
+        rpc.fireAndForget('window.showWebviewView', { viewId });
+      },
+      webview: {
+        get options() { return _options; },
+        set options(v) {
+          _options = v || {};
+          rpc.fireAndForget('window.setWebviewViewMeta', { viewId, options: _options });
+        },
+        get html() { return _html; },
+        set html(v) {
+          _html = String(v ?? '');
+          rpc.fireAndForget('window.setWebviewViewHtml', { viewId, html: _html });
+        },
+        onDidReceiveMessage: msgEmitter.event,
+        async postMessage(message) {
+          await rpc.call('window.postMessageToWebviewView', { viewId, message });
+          return true;
+        },
+        asWebviewUri(uri) { return uri; },
+        cspSource: 'https://*.vscode-cdn.net',
+      },
+      _msgEmitter: msgEmitter,
+    };
+    _webviewViews.set(viewId, view);
+    await entry.provider.resolveWebviewView(
+      view,
+      { state: undefined },
+      params.token || { isCancellationRequested: false }
+    );
+    return { resolved: true, viewId, html: _html };
+  },
+
+  _dispatchWebviewViewMessage(payload) {
+    const viewId = payload && payload.viewId;
+    const view = viewId ? _webviewViews.get(viewId) : null;
+    if (view && view._msgEmitter) {
+      view._msgEmitter.fire(payload.message);
+    }
+  },
+
+  async _handleTreeDrag(params) {
+    const viewId = params && params.viewId;
+    const ctrl = viewId ? _treeDndControllers.get(viewId) : null;
+    if (!ctrl || typeof ctrl.handleDrag !== 'function') {
+      return {};
+    }
+    const dt = new DataTransfer();
+    await ctrl.handleDrag(
+      Array.isArray(params.sourceElementIds) ? params.sourceElementIds : [],
+      dt,
+      params.token || { isCancellationRequested: false }
+    );
+    return dt.toJSON();
+  },
+
+  async _handleTreeDrop(params) {
+    const viewId = params && params.viewId;
+    const ctrl = viewId ? _treeDndControllers.get(viewId) : null;
+    if (!ctrl || typeof ctrl.handleDrop !== 'function') {
+      return { dropped: false };
+    }
+    const dt = new DataTransfer((params && params.dataTransfer) || {});
+    await ctrl.handleDrop(
+      params ? params.targetElementId : undefined,
+      dt,
+      params.token || { isCancellationRequested: false }
+    );
+    return { dropped: true };
+  },
 };
 
 rpc.createEvent('window.onDidChangeActiveTextEditor')((payload) => {
@@ -681,6 +896,10 @@ rpc.createEvent('window.onDidChangeVisibleTextEditors')((payload) => {
   const list = Array.isArray(payload) ? payload.map(wrapTextEditor).filter(Boolean) : [];
   _visibleTextEditors = list;
   _onDidChangeVisibleTextEditors.fire(list);
+});
+
+rpc.createEvent('window.onDidReceiveWebviewViewMessage')((payload) => {
+  window._dispatchWebviewViewMessage(payload);
 });
 
 if (typeof rpc.registerInitHook === 'function') {

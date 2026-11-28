@@ -7,10 +7,21 @@ use crate::manifest::{ExtensionLoader, LoadedExtension};
 use rustcode_base::disposable::DisposableStore;
 use rustcode_platform::commands::CommandRegistry;
 use rustcode_platform::theme::ThemeService;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledExtensionMeta {
+    pub pre_release: bool,
+    pub installed_from_vsix: bool,
+    pub installed_version: String,
+    #[serde(default)]
+    pub installed_at_epoch_secs: u64,
+}
 
 pub struct ExtensionInstaller {
     client: Arc<MarketplaceClient>,
@@ -237,12 +248,62 @@ impl ExtensionInstaller {
 
         let target_dir = self.validate_target_dir(&folder_name)?;
         let unpacked_manifest = ExtensionDownloader::unpack_vsix(vsix_bytes, &target_dir)?;
+        let _ = self.write_installed_meta(
+            &target_dir,
+            &InstalledExtensionMeta {
+                pre_release: false,
+                installed_from_vsix: true,
+                installed_version: unpacked_manifest.version.clone(),
+                installed_at_epoch_secs: now_epoch_secs(),
+            },
+        );
 
         Ok(LoadedExtension {
             root_dir: target_dir,
             manifest: unpacked_manifest,
             is_activated: false,
         })
+    }
+
+    /// Install an extension directly from a `.vsix` file path on disk.
+    pub fn install_from_vsix_file(
+        &self,
+        vsix_path: &Path,
+    ) -> Result<LoadedExtension, MarketplaceError> {
+        if !vsix_path.is_file() {
+            return Err(MarketplaceError::NotFound(format!(
+                "VSIX file not found: {}",
+                vsix_path.display()
+            )));
+        }
+        let is_vsix = vsix_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("vsix"));
+        if !is_vsix {
+            return Err(MarketplaceError::InvalidManifest(format!(
+                "Expected a .vsix package file, got '{}'",
+                vsix_path.display()
+            )));
+        }
+        let bytes = std::fs::read(vsix_path)?;
+        self.install_from_vsix(&bytes, None)
+    }
+
+    pub fn read_installed_meta(&self, root_dir: &Path) -> Option<InstalledExtensionMeta> {
+        let raw = std::fs::read_to_string(root_dir.join(".metadata.json")).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    pub fn write_installed_meta(
+        &self,
+        root_dir: &Path,
+        meta: &InstalledExtensionMeta,
+    ) -> Result<(), MarketplaceError> {
+        let content = serde_json::to_string_pretty(meta)
+            .map_err(|e| MarketplaceError::Serialization(e.to_string()))?;
+        std::fs::write(root_dir.join(".metadata.json"), content)?;
+        Ok(())
     }
 
     /// Download and install an extension from Open VSX by namespace and extension name.
@@ -252,12 +313,26 @@ impl ExtensionInstaller {
         name: &str,
         version: Option<&str>,
     ) -> Result<LoadedExtension, MarketplaceError> {
+        self.install_from_marketplace_with_options(namespace, name, version, false)
+            .await
+    }
+
+    /// Download and install an extension from Open VSX with explicit pre-release option.
+    pub async fn install_from_marketplace_with_options(
+        &self,
+        namespace: &str,
+        name: &str,
+        version: Option<&str>,
+        pre_release: bool,
+    ) -> Result<LoadedExtension, MarketplaceError> {
         Self::validate_path_segment(namespace, false, "namespace")?;
         Self::validate_path_segment(name, false, "name")?;
 
         let meta = if let Some(v) = version {
             Self::validate_path_segment(v, false, "version")?;
             self.client.get_version_metadata(namespace, name, v).await?
+        } else if pre_release {
+            self.client.get_prerelease_metadata(namespace, name).await?
         } else {
             self.client.get_extension_metadata(namespace, name).await?
         };
@@ -273,12 +348,68 @@ impl ExtensionInstaller {
         let target_dir = self.validate_target_dir(&folder_name)?;
 
         let manifest = ExtensionDownloader::unpack_vsix(&vsix_bytes, &target_dir)?;
+        let _ = self.write_installed_meta(
+            &target_dir,
+            &InstalledExtensionMeta {
+                pre_release: pre_release || meta.pre_release,
+                installed_from_vsix: false,
+                installed_version: manifest.version.clone(),
+                installed_at_epoch_secs: now_epoch_secs(),
+            },
+        );
 
         Ok(LoadedExtension {
             root_dir: target_dir,
             manifest,
             is_activated: false,
         })
+    }
+
+    /// Install an extension along with any transitive `extensionPack` and `extensionDependencies`,
+    /// protecting against dependency cycles and skipping already-installed extensions.
+    pub async fn install_with_pack(
+        &self,
+        namespace: &str,
+        name: &str,
+        pre_release: bool,
+    ) -> Result<Vec<LoadedExtension>, MarketplaceError> {
+        let mut visited: HashSet<String> = HashSet::new();
+        for existing in self.list_installed() {
+            visited.insert(existing.id().to_ascii_lowercase());
+        }
+
+        let mut queue: VecDeque<(String, String, bool)> = VecDeque::new();
+        let root_id = Self::extension_id(namespace, name).to_ascii_lowercase();
+        visited.remove(&root_id);
+        queue.push_back((namespace.to_string(), name.to_string(), pre_release));
+
+        let mut installed = Vec::new();
+        while let Some((ns, ext_name, is_pre)) = queue.pop_front() {
+            let id_lower = Self::extension_id(&ns, &ext_name).to_ascii_lowercase();
+            if !visited.insert(id_lower) {
+                continue;
+            }
+            let ext = self
+                .install_from_marketplace_with_options(&ns, &ext_name, None, is_pre)
+                .await?;
+
+            for dep_id in ext
+                .manifest
+                .extension_pack
+                .iter()
+                .chain(ext.manifest.extension_dependencies.iter())
+            {
+                if let Some((dep_ns, dep_name)) = dep_id.trim().split_once('.') {
+                    let dep_lower = dep_id.trim().to_ascii_lowercase();
+                    if !visited.contains(&dep_lower) {
+                        queue.push_back((dep_ns.to_string(), dep_name.to_string(), false));
+                    }
+                }
+            }
+            installed.push(ext);
+        }
+
+        Ok(installed)
     }
 
     /// List installed extensions by scanning `self.extensions_dir` subdirectories for `package.json`.
@@ -541,7 +672,42 @@ impl ExtensionInstaller {
                 }
             }
 
-            // 3. Register contributed grammars
+            // 3. Register contributed icon themes & product icon themes
+            if let Some(icon_themes) = &contributes.icon_themes {
+                for it in icon_themes {
+                    let icon_path =
+                        Self::resolve_contribution_path(&ext.root_dir, &it.path, "iconTheme")?;
+                    if let Some(ts) = theme_service.as_deref_mut() {
+                        if icon_path.exists()
+                            && ts
+                                .load_icon_theme_from_disk(&it.id, &it.label, &icon_path)
+                                .is_ok()
+                        {
+                            registered_count += 1;
+                        }
+                    }
+                }
+            }
+            if let Some(prod_themes) = &contributes.product_icon_themes {
+                for pt in prod_themes {
+                    let pt_path = Self::resolve_contribution_path(
+                        &ext.root_dir,
+                        &pt.path,
+                        "productIconTheme",
+                    )?;
+                    if let Some(ts) = theme_service.as_deref_mut() {
+                        if pt_path.exists()
+                            && ts
+                                .load_product_icon_theme_from_disk(&pt.id, &pt.label, &pt_path)
+                                .is_ok()
+                        {
+                            registered_count += 1;
+                        }
+                    }
+                }
+            }
+
+            // 4. Register contributed grammars
             if let Some(grammars) = &contributes.grammars {
                 for g in grammars {
                     let grammar_path =
@@ -556,4 +722,11 @@ impl ExtensionInstaller {
 
         Ok((registered_count, store))
     }
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }

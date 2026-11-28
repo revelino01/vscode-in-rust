@@ -168,6 +168,11 @@ impl RpcMessage {
 
 type PendingResponseMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
+enum IncomingNotifWork {
+    Notification { channel: String, data: Value },
+    Barrier(oneshot::Sender<()>),
+}
+
 struct PendingRequestGuard<'a> {
     bridge: &'a RpcBridge,
     id: u64,
@@ -204,6 +209,7 @@ pub struct RpcBridge {
     outbound_notify: Arc<Notify>,
     has_active_transport: AtomicBool,
     reader_closed: AtomicBool,
+    notif_barrier_tx: Mutex<Option<mpsc::UnboundedSender<IncomingNotifWork>>>,
 }
 
 impl Default for RpcBridge {
@@ -222,6 +228,24 @@ impl RpcBridge {
             outbound_notify: Arc::new(Notify::new()),
             has_active_transport: AtomicBool::new(false),
             reader_closed: AtomicBool::new(false),
+            notif_barrier_tx: Mutex::new(None),
+        }
+    }
+
+    /// Wait until all incoming notifications already queued by the transport
+    /// reader have finished executing on the notification worker.
+    pub async fn sync_incoming_notifications(&self) {
+        let rx = {
+            let guard = self.notif_barrier_tx.lock();
+            guard.as_ref().and_then(|tx| {
+                let (fence_tx, fence_rx) = oneshot::channel();
+                tx.send(IncomingNotifWork::Barrier(fence_tx))
+                    .ok()
+                    .map(|()| fence_rx)
+            })
+        };
+        if let Some(rx) = rx {
+            let _ = rx.await;
         }
     }
 
@@ -835,11 +859,6 @@ impl NodeExtHostProcess {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        enum IncomingNotifWork {
-            Notification { channel: String, data: Value },
-            Barrier(oneshot::Sender<()>),
-        }
-
         let is_running = Arc::new(AtomicBool::new(true));
         rpc_bridge.set_reader_closed(false);
         rpc_bridge.set_transport_active(true);
@@ -847,6 +866,7 @@ impl NodeExtHostProcess {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (response_tx, mut response_rx) = mpsc::unbounded_channel::<RpcMessage>();
         let (notif_tx, mut notif_rx) = mpsc::unbounded_channel::<IncomingNotifWork>();
+        *rpc_bridge.notif_barrier_tx.lock() = Some(notif_tx.clone());
 
         struct AbortHandleOnDrop(Option<JoinHandle<()>>);
         impl AbortHandleOnDrop {
@@ -1000,6 +1020,7 @@ impl NodeExtHostProcess {
                     changed = reader_shutdown_rx.changed() => {
                         if changed.is_err() || *reader_shutdown_rx.borrow() {
                             reader_bridge.set_reader_closed(true);
+                            *reader_bridge.notif_barrier_tx.lock() = None;
                             drop(notif_tx.take());
                             notif_worker.abort();
                             in_flight.abort_all();
@@ -1054,6 +1075,7 @@ impl NodeExtHostProcess {
                     Ok(None) => {
                         reader_bridge.set_reader_closed(true);
                         reader_bridge.fail_all_pending("Extension host transport closed");
+                        *reader_bridge.notif_barrier_tx.lock() = None;
                         drop(notif_tx.take());
                         notif_worker.join().await;
                         while in_flight.join_next().await.is_some() {}
@@ -1065,6 +1087,7 @@ impl NodeExtHostProcess {
                     }
                     Err(err) => {
                         reader_bridge.set_reader_closed(true);
+                        *reader_bridge.notif_barrier_tx.lock() = None;
                         drop(notif_tx.take());
                         notif_worker.abort();
                         in_flight.abort_all();

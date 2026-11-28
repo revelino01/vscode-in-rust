@@ -3827,6 +3827,7 @@ version = "0.1.0"
 dependencies = [
  "flate2",
  "parking_lot",
+ "regex",
  "rmp-serde",
  "rustcode-base",
  "rustcode-platform",

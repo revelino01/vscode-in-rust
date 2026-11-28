@@ -4,15 +4,21 @@ pub mod catalog;
 pub mod client;
 pub mod downloader;
 pub mod installer;
+pub mod recommendations;
 pub mod transport;
 pub mod types;
+pub mod updater;
 
 pub use catalog::{curated_catalog, search_curated_catalog};
 pub use client::MarketplaceClient;
 pub use downloader::ExtensionDownloader;
-pub use installer::ExtensionInstaller;
+pub use installer::{ExtensionInstaller, InstalledExtensionMeta};
+pub use recommendations::WorkspaceExtensionsRecommendations;
 pub use transport::{CurlHttpTransport, HttpTransport, MockHttpTransport};
 pub use types::{ExtensionFiles, ExtensionMetadata, MarketplaceError, SearchResponse};
+pub use updater::{
+    is_newer_version, ExtensionAutoUpdater, ExtensionUpdateAvailable, SemverVersion,
+};
 
 #[cfg(test)]
 mod tests {

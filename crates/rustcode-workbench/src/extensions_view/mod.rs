@@ -4,17 +4,24 @@
 //! and interactive Install / Enable / Disable / Uninstall controls wired to
 //! `rustcode_ext_host::marketplace`.
 
+pub mod detail;
+
+pub use detail::{
+    parse_extension_detail_message, render_extension_detail_html, ExtensionDetailContext,
+    ExtensionDetailMessage,
+};
+
 use parking_lot::RwLock;
 use rustcode_ext_host::manifest::LoadedExtension;
 use rustcode_ext_host::marketplace::{
     curated_catalog, search_curated_catalog, ExtensionInstaller, ExtensionMetadata,
-    MarketplaceClient, MarketplaceError, SearchResponse,
+    ExtensionUpdateAvailable, MarketplaceClient, MarketplaceError, SearchResponse,
 };
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, KeyEvent, MouseButton, Point,
     Quad, Rect, Scene, View, WorkbenchThemeStyles,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -120,6 +127,11 @@ pub enum ExtensionsViewAction {
         id: String,
     },
     SelectExtension(String),
+    OpenDetail(String),
+    InstallVsix,
+    TogglePreRelease(String),
+    UpdateExtension(String),
+    InstallRecommended(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +159,9 @@ pub struct ExtensionsSidebarView {
     pub installed: Vec<InstalledExtensionItem>,
     pub marketplace_results: Vec<MarketplaceExtensionItem>,
     pub catalog: Vec<ExtensionMetadata>,
+    pub recommended_extensions: Vec<String>,
+    pub available_updates: HashMap<String, String>,
+    pub pre_release_ids: HashSet<String>,
     pub selected_id: Option<String>,
     pub status_message: Option<String>,
     pub is_loading: bool,
@@ -184,6 +199,9 @@ impl ExtensionsSidebarView {
             installed: Vec::new(),
             marketplace_results,
             catalog,
+            recommended_extensions: Vec::new(),
+            available_updates: HashMap::new(),
+            pre_release_ids: HashSet::new(),
             selected_id: None,
             status_message: None,
             is_loading: false,
@@ -217,6 +235,32 @@ impl ExtensionsSidebarView {
 
     pub fn set_client(&mut self, client: Arc<MarketplaceClient>) {
         self.client = Some(client);
+    }
+
+    pub fn set_recommended_extensions(&mut self, ids: Vec<String>) {
+        self.recommended_extensions = ids;
+    }
+
+    pub fn set_available_updates(&mut self, updates: Vec<ExtensionUpdateAvailable>) {
+        self.available_updates.clear();
+        for upd in updates {
+            self.available_updates
+                .insert(upd.id.to_ascii_lowercase(), upd.available_version);
+        }
+    }
+
+    pub fn mark_pre_release(&mut self, id: &str, pre_release: bool) {
+        let key = id.trim().to_ascii_lowercase();
+        if pre_release {
+            self.pre_release_ids.insert(key);
+        } else {
+            self.pre_release_ids.remove(&key);
+        }
+    }
+
+    pub fn open_detail(&mut self, id: &str) {
+        self.selected_id = Some(id.to_string());
+        self.last_action = Some(ExtensionsViewAction::OpenDetail(id.to_string()));
     }
 
     fn installed_id_set(&self) -> HashSet<String> {

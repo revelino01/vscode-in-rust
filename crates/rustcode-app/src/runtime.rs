@@ -8,7 +8,9 @@ use parking_lot::{Mutex, RwLock};
 use rustcode_base::disposable::Disposable;
 use rustcode_editor::{AutoSaveConfig, AutoSaveMode, AutoSaveService, Position};
 use rustcode_ext_host::manifest::ExtensionLoader;
+use rustcode_ext_host::marketplace::WorkspaceExtensionsRecommendations;
 use rustcode_ext_host::rpc::{NodeExtHostConfig, NodeExtHostProcess, RpcWireFormat};
+use rustcode_ext_host::runtime_health::{ExtHostWatchdog, WatchdogHealth};
 use rustcode_ext_host::window::NotificationSeverity;
 use rustcode_platform::fs::{
     file_uri_to_path, is_file_uri, path_to_file_uri, strip_windows_verbatim_prefix,
@@ -346,6 +348,47 @@ pub fn load_extension_menus(
     }
 }
 
+/// Register `contributes.{iconThemes,productIconThemes,jsonValidation,problemMatchers,submenus}` from loaded extensions.
+pub fn load_extension_phase10_contribs(ctx: &mut RustCodeContext) {
+    for ext in ctx.ext_loader.loaded_extensions() {
+        let ext_id = ext.id();
+        let Some(contribs) = &ext.manifest.contributes else {
+            continue;
+        };
+        if let Some(icon_themes) = &contribs.icon_themes {
+            for it in icon_themes {
+                if let Some(path) = resolve_contained_extension_path(&ext.root_dir, &it.path) {
+                    let _ = ctx
+                        .theme
+                        .load_icon_theme_from_disk(&it.id, &it.label, &path);
+                }
+            }
+        }
+        if let Some(prod_themes) = &contribs.product_icon_themes {
+            for pt in prod_themes {
+                if let Some(path) = resolve_contained_extension_path(&ext.root_dir, &pt.path) {
+                    let _ = ctx
+                        .theme
+                        .load_product_icon_theme_from_disk(&pt.id, &pt.label, &path);
+                }
+            }
+        }
+        if let Some(json_vals) = &contribs.json_validation {
+            for jv in json_vals {
+                let _ = ctx.json_validation.register(&ext_id, &ext.root_dir, jv);
+            }
+        }
+        if let Some(matchers) = &contribs.problem_matchers {
+            for pm in matchers {
+                let _ = ctx.problem_matchers.register(pm.clone());
+            }
+        }
+        if let Some(submenus) = &contribs.submenus {
+            ctx.context_menus.register_submenus(submenus);
+        }
+    }
+}
+
 /// Load user settings, user keybindings, workspace settings, built-in themes, and extension discovery.
 pub fn load_disk_resources(
     ctx: &mut RustCodeContext,
@@ -353,6 +396,11 @@ pub fn load_disk_resources(
     workspace_roots: &[PathBuf],
     disable_extensions: bool,
 ) {
+    {
+        let mut pm = rustcode_platform::profiles::ProfileManager::new(app_paths.profiles_dir());
+        let _ = pm.load_from_disk();
+        *ctx.profile_manager.lock() = pm;
+    }
     if let Err(err) = ctx
         .config
         .load_user_settings_from_disk(&app_paths.settings_file)
@@ -384,9 +432,21 @@ pub fn load_disk_resources(
         if !disable_extensions {
             scan_extensions_dir(&mut ctx.ext_loader, &ws_paths.extensions_dir);
         }
+        if let Ok(recs) = WorkspaceExtensionsRecommendations::load_from_workspace(root) {
+            for rec in recs.recommendations {
+                if !ctx
+                    .recommended_extensions
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(&rec))
+                {
+                    ctx.recommended_extensions.push(rec);
+                }
+            }
+        }
     }
 
     load_extension_themes(&mut ctx.theme, &ctx.ext_loader);
+    load_extension_phase10_contribs(ctx);
     load_extension_snippets(&mut ctx.snippets, &ctx.ext_loader);
     load_extension_language_configs(&mut ctx.language_configs, &ctx.ext_loader);
     load_extension_menus(&mut ctx.context_menus, &ctx.ext_loader);
@@ -723,6 +783,14 @@ pub fn bootstrap_app(
         .language_bridge
         .env_manager
         .set_platform_clipboard(Arc::clone(&clipboard_backend));
+    if use_os_backends {
+        context.language_bridge.secret_manager.set_backend(Arc::new(
+            rustcode_platform::OsKeyringSecretStorageBackend::new(
+                "rustcode",
+                app_paths.secrets_dir(),
+            ),
+        ));
+    }
 
     load_disk_resources(
         &mut context,
@@ -760,6 +828,8 @@ pub fn bootstrap_app(
     })
 }
 
+type PendingHeartbeatSlot = Arc<Mutex<Option<(Instant, Result<u64, String>)>>>;
+
 /// Live Tokio runtime loop driving `FileSystemWatcher`, `AutoSaveService`,
 /// `NodeExtHostProcess` auto-activation/crash recovery, and `WorkbenchWindow::poll_runtime_events()`.
 pub struct RuntimeLoop {
@@ -786,6 +856,9 @@ pub struct RuntimeLoop {
     pending_command_activations: Arc<Mutex<Vec<String>>>,
     conflict_notified_paths: HashSet<PathBuf>,
     last_auto_save_setting: Option<(String, u64)>,
+    watchdog: ExtHostWatchdog,
+    pending_heartbeat_result: PendingHeartbeatSlot,
+    watchdog_warning_shown: bool,
 }
 
 impl RuntimeLoop {
@@ -837,7 +910,50 @@ impl RuntimeLoop {
             pending_command_activations: Arc::new(Mutex::new(Vec::new())),
             conflict_notified_paths: HashSet::new(),
             last_auto_save_setting: None,
+            watchdog: ExtHostWatchdog::default(),
+            pending_heartbeat_result: Arc::new(Mutex::new(None)),
+            watchdog_warning_shown: false,
         })
+    }
+
+    pub fn watchdog_health(&self) -> WatchdogHealth {
+        self.watchdog.check_health(Instant::now())
+    }
+
+    pub fn restart_ext_host(&mut self, window: &mut WorkbenchWindow) -> bool {
+        if let Some(mut proc) = self.ext_host_process.take() {
+            if let RuntimeHandle::Owned(ref rt) = self.runtime {
+                let _ = rt.block_on(proc.shutdown());
+            } else {
+                drop(proc);
+            }
+        }
+        {
+            let mut loader = self.ext_loader.write();
+            let ids: Vec<String> = loader
+                .loaded_extensions()
+                .iter()
+                .map(|e| e.id())
+                .collect();
+            for id in ids {
+                loader.deactivate(&id);
+            }
+        }
+        self.activating_extension_ids.lock().clear();
+        self.ext_host_spawn_failed_permanently = false;
+        self.ext_host_next_restart_at = None;
+        self.watchdog.reset_restart_budget(Instant::now());
+        self.watchdog_warning_shown = false;
+        if self.spawn_ext_host(window) {
+            self.ext_host_restart_count += 1;
+            let to_reactivate: Vec<String> = self.activated_extension_ids.iter().cloned().collect();
+            for ext_id in to_reactivate {
+                self.spawn_activate_extension(window, &ext_id);
+            }
+            true
+        } else {
+            false
+        }
     }
 
     pub fn tokio_handle(&self) -> &tokio::runtime::Handle {
@@ -1168,8 +1284,25 @@ impl RuntimeLoop {
     }
 
     fn process_ext_host(&mut self, window: &mut WorkbenchWindow) {
+        if window.pending_ext_host_restart_request {
+            window.pending_ext_host_restart_request = false;
+            let _ = self.restart_ext_host(window);
+            return;
+        }
         if self.config.disable_extensions {
             return;
+        }
+
+        if let Some((ack_at, res)) = self.pending_heartbeat_result.lock().take() {
+            match res {
+                Ok(lat) => {
+                    self.watchdog.record_ack(ack_at, lat);
+                    self.watchdog_warning_shown = false;
+                }
+                Err(_) => {
+                    self.watchdog.record_miss();
+                }
+            }
         }
 
         // Check if running ext host exited unexpectedly (crash detection)
@@ -1201,10 +1334,42 @@ impl RuntimeLoop {
                     );
                 }
             } else if proc.is_running() {
+                let now = Instant::now();
+                if self.watchdog.should_send_heartbeat(now) {
+                    if let Some(bridge) = window.language_bridge.clone() {
+                        self.watchdog.mark_ping_sent(now);
+                        let slot = Arc::clone(&self.pending_heartbeat_result);
+                        self.runtime.handle().spawn(async move {
+                            let res = bridge.ping_ext_host().await;
+                            *slot.lock() = Some((Instant::now(), res));
+                        });
+                    }
+                }
+                match self.watchdog.check_health(now) {
+                    WatchdogHealth::Healthy { .. } => {}
+                    WatchdogHealth::Unresponsive { .. } => {
+                        if !self.watchdog_warning_shown {
+                            self.watchdog_warning_shown = true;
+                            push_warning_notification(
+                                window,
+                                "Extension Host unresponsive — use 'Developer: Restart Extension Host' to restart.",
+                            );
+                        }
+                    }
+                    WatchdogHealth::RestartLimitReached { .. } => {
+                        if !self.watchdog_warning_shown {
+                            self.watchdog_warning_shown = true;
+                            push_warning_notification(
+                                window,
+                                "Extension Host unresponsive and reached auto-restart limit.",
+                            );
+                        }
+                    }
+                }
                 if let Some(since) = self.ext_host_last_healthy_at {
                     if since.elapsed() >= self.config.ext_host_healthy_reset_after {
                         self.ext_host_restart_count = 0;
-                        self.ext_host_last_healthy_at = Some(Instant::now());
+                        self.ext_host_last_healthy_at = Some(now);
                     }
                 }
             }

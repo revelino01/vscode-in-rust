@@ -10,6 +10,7 @@ pub mod configuration;
 pub mod fs;
 pub mod keybindings;
 pub mod os_ux;
+pub mod profiles;
 pub mod render;
 pub mod storage;
 pub mod theme;
@@ -31,8 +32,13 @@ pub use keybindings::{KeyChord, KeyCombo, KeybindingService, Modifiers, Resolved
 pub use os_ux::RfdFileDialogBackend;
 pub use os_ux::{
     AppPaths, ArboardClipboardBackend, ClipboardBackend, FileDialogBackend, FileDialogCallback,
-    FileDialogOptions, FileDialogRequestKind, InMemoryClipboardBackend, MockFileDialogBackend,
-    RecordedDialogRequest, WorkspacePaths,
+    FileDialogOptions, FileDialogRequestKind, InMemoryClipboardBackend,
+    InMemorySecretStorageBackend, MockFileDialogBackend, OsKeyringSecretStorageBackend,
+    RecordedDialogRequest, SecretStorageBackend, WorkspacePaths,
+};
+pub use profiles::{
+    ProfileExtensionEntry, ProfileManager, ProfileSnapshot, UserProfile, DEFAULT_PROFILE_ID,
+    DEFAULT_PROFILE_NAME,
 };
 pub use render::geometry::MAX_RECT_COORD;
 pub use render::{
@@ -47,7 +53,10 @@ pub use storage::{
     InMemoryStorageBackend, MementoScope, PersistedTabState, PersistedWorkspaceState,
     StorageBackend, StorageError, DEFAULT_MAX_RECENT_WORKSPACES,
 };
-pub use theme::{ColorTheme, ThemeKind, ThemeService, TokenColorRule};
+pub use theme::{
+    ColorTheme, IconDefinition, IconTheme, ProductIconDefinition, ProductIconTheme, ThemeKind,
+    ThemeService, TokenColorRule,
+};
 
 #[doc(hidden)]
 pub mod bench_support {

@@ -796,6 +796,378 @@ impl ExtHostCustomEditorManager {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebviewViewProviderInfo {
+    pub view_id: String,
+    #[serde(default)]
+    pub retain_context_when_hidden: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebviewViewState {
+    pub view_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub badge: Option<Value>,
+    pub html: String,
+    pub options: WebviewOptions,
+    pub visible: bool,
+    pub is_disposed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum WebviewViewEvent {
+    ProviderRegistered {
+        view_id: String,
+        retain_context_when_hidden: bool,
+    },
+    ProviderUnregistered {
+        view_id: String,
+    },
+    ViewResolved {
+        view_id: String,
+    },
+    HtmlUpdated {
+        view_id: String,
+        html: String,
+    },
+    MessagePosted {
+        view_id: String,
+        message: Value,
+    },
+    VisibilityChanged {
+        view_id: String,
+        visible: bool,
+    },
+    Disposed {
+        view_id: String,
+    },
+}
+
+pub type WebviewViewEventListener = Arc<dyn Fn(&WebviewViewEvent) + Send + Sync>;
+
+/// Manages `vscode.window.registerWebviewViewProvider` sidebar/panel webviews.
+#[derive(Clone, Default)]
+pub struct ExtHostWebviewViewManager {
+    providers: Arc<RwLock<HashMap<String, WebviewViewProviderInfo>>>,
+    views: Arc<RwLock<HashMap<String, WebviewViewState>>>,
+    inbound_listeners: Arc<RwLock<HashMap<String, Vec<WebviewMessageListener>>>>,
+    inbound_messages: Arc<RwLock<HashMap<String, Vec<Value>>>>,
+    outbound_messages: Arc<RwLock<HashMap<String, Vec<Value>>>>,
+    event_listeners: Arc<RwLock<Vec<WebviewViewEventListener>>>,
+    pending_events: Arc<RwLock<Vec<WebviewViewEvent>>>,
+    revision: Arc<AtomicU64>,
+}
+
+impl ExtHostWebviewViewManager {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::SeqCst)
+    }
+
+    pub fn on_webview_view_event<F>(&self, listener: F)
+    where
+        F: Fn(&WebviewViewEvent) + Send + Sync + 'static,
+    {
+        self.event_listeners.write().push(Arc::new(listener));
+    }
+
+    pub fn take_pending_events(&self) -> Vec<WebviewViewEvent> {
+        std::mem::take(&mut *self.pending_events.write())
+    }
+
+    fn emit(&self, ev: WebviewViewEvent) {
+        self.revision.fetch_add(1, Ordering::SeqCst);
+        self.pending_events.write().push(ev.clone());
+        let listeners = self.event_listeners.read().clone();
+        for cb in listeners {
+            cb(&ev);
+        }
+    }
+
+    pub fn register_provider(
+        &self,
+        view_id: impl Into<String>,
+        retain_context_when_hidden: bool,
+    ) -> WebviewViewProviderInfo {
+        let view_id = view_id.into();
+        let info = WebviewViewProviderInfo {
+            view_id: view_id.clone(),
+            retain_context_when_hidden,
+        };
+        self.providers.write().insert(view_id.clone(), info.clone());
+        self.views.write().entry(view_id.clone()).or_insert_with(|| WebviewViewState {
+            view_id: view_id.clone(),
+            title: None,
+            description: None,
+            badge: None,
+            html: String::new(),
+            options: WebviewOptions::default(),
+            visible: true,
+            is_disposed: false,
+        });
+        self.emit(WebviewViewEvent::ProviderRegistered {
+            view_id,
+            retain_context_when_hidden,
+        });
+        info
+    }
+
+    pub fn unregister_provider(&self, view_id: &str) -> bool {
+        let removed = self.providers.write().remove(view_id).is_some();
+        if removed {
+            self.emit(WebviewViewEvent::ProviderUnregistered {
+                view_id: view_id.to_string(),
+            });
+        }
+        removed
+    }
+
+    pub fn has_provider(&self, view_id: &str) -> bool {
+        self.providers.read().contains_key(view_id)
+    }
+
+    pub fn list_providers(&self) -> Vec<WebviewViewProviderInfo> {
+        self.providers.read().values().cloned().collect()
+    }
+
+    pub fn get_view(&self, view_id: &str) -> Option<WebviewViewState> {
+        self.views.read().get(view_id).cloned()
+    }
+
+    pub fn list_views(&self) -> Vec<WebviewViewState> {
+        self.views
+            .read()
+            .values()
+            .filter(|v| !v.is_disposed)
+            .cloned()
+            .collect()
+    }
+
+    pub fn set_html(&self, view_id: &str, html: impl Into<String>) -> bool {
+        let html_str = html.into();
+        {
+            let mut views = self.views.write();
+            let view = views.entry(view_id.to_string()).or_insert_with(|| WebviewViewState {
+                view_id: view_id.to_string(),
+                title: None,
+                description: None,
+                badge: None,
+                html: String::new(),
+                options: WebviewOptions::default(),
+                visible: true,
+                is_disposed: false,
+            });
+            if view.is_disposed {
+                return false;
+            }
+            view.html = html_str.clone();
+        }
+        self.emit(WebviewViewEvent::HtmlUpdated {
+            view_id: view_id.to_string(),
+            html: html_str,
+        });
+        true
+    }
+
+    pub fn post_message_to_view(&self, view_id: &str, message: Value) -> Result<(), String> {
+        let views = self.views.read();
+        let Some(view) = views.get(view_id) else {
+            return Err(format!("WebviewView '{}' not found", view_id));
+        };
+        if view.is_disposed {
+            return Err(format!("WebviewView '{}' is disposed", view_id));
+        }
+        drop(views);
+        self.outbound_messages
+            .write()
+            .entry(view_id.to_string())
+            .or_default()
+            .push(message.clone());
+        self.emit(WebviewViewEvent::MessagePosted {
+            view_id: view_id.to_string(),
+            message,
+        });
+        Ok(())
+    }
+
+    pub fn receive_message_from_view(&self, view_id: &str, message: Value) -> Result<(), String> {
+        if !self.views.read().contains_key(view_id) {
+            return Err(format!("WebviewView '{}' not found", view_id));
+        }
+        self.inbound_messages
+            .write()
+            .entry(view_id.to_string())
+            .or_default()
+            .push(message.clone());
+        let listeners = self
+            .inbound_listeners
+            .read()
+            .get(view_id)
+            .cloned()
+            .unwrap_or_default();
+        for cb in listeners {
+            cb(message.clone());
+        }
+        Ok(())
+    }
+
+    pub fn drain_outbound_messages(&self, view_id: &str) -> Vec<Value> {
+        self.outbound_messages
+            .write()
+            .remove(view_id)
+            .unwrap_or_default()
+    }
+
+    pub fn drain_inbound_messages(&self, view_id: &str) -> Vec<Value> {
+        self.inbound_messages
+            .write()
+            .remove(view_id)
+            .unwrap_or_default()
+    }
+
+    pub fn handle_rpc_call(&self, method: &str, params: &Value) -> Result<Value, String> {
+        match method {
+            "window.registerWebviewViewProvider" => {
+                let view_id = params
+                    .get("viewId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("Missing or empty viewId")?;
+                let retain = params
+                    .get("options")
+                    .and_then(|o| o.get("webviewOptions"))
+                    .and_then(|w| w.get("retainContextWhenHidden"))
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| {
+                        params
+                            .get("options")
+                            .and_then(|o| o.get("retainContextWhenHidden"))
+                            .and_then(|v| v.as_bool())
+                    })
+                    .unwrap_or(false);
+                let info = self.register_provider(view_id, retain);
+                serde_json::to_value(info).map_err(|e| e.to_string())
+            }
+            "window.unregisterWebviewViewProvider" => {
+                let view_id = params
+                    .get("viewId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("Missing or empty viewId")?;
+                let removed = self.unregister_provider(view_id);
+                Ok(json!({ "unregistered": removed, "viewId": view_id }))
+            }
+            "window.setWebviewViewHtml" => {
+                let view_id = params
+                    .get("viewId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("Missing or empty viewId")?;
+                let html = params.get("html").and_then(|v| v.as_str()).unwrap_or("");
+                let updated = self.set_html(view_id, html);
+                Ok(json!({ "updated": updated, "viewId": view_id }))
+            }
+            "window.setWebviewViewMeta" => {
+                let view_id = params
+                    .get("viewId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("Missing or empty viewId")?;
+                let mut views = self.views.write();
+                if let Some(view) = views.get_mut(view_id) {
+                    if let Some(t) = params.get("title").and_then(|v| v.as_str()) {
+                        view.title = Some(t.to_string());
+                    }
+                    if let Some(d) = params.get("description").and_then(|v| v.as_str()) {
+                        view.description = Some(d.to_string());
+                    }
+                    if let Some(b) = params.get("badge") {
+                        view.badge = if b.is_null() { None } else { Some(b.clone()) };
+                    }
+                    if let Some(opts) = params.get("options") {
+                        if let Ok(parsed) = serde_json::from_value::<WebviewOptions>(opts.clone()) {
+                            view.options = parsed;
+                        }
+                    }
+                }
+                Ok(json!({ "updated": true, "viewId": view_id }))
+            }
+            "window.postMessageToWebviewView" => {
+                let view_id = params
+                    .get("viewId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("Missing or empty viewId")?;
+                let msg = params.get("message").cloned().unwrap_or(Value::Null);
+                self.post_message_to_view(view_id, msg)?;
+                Ok(json!({ "posted": true, "viewId": view_id }))
+            }
+            "window.showWebviewView" | "window.revealWebviewView" => {
+                let view_id = params
+                    .get("viewId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or("Missing or empty viewId")?;
+                if let Some(v) = self.views.write().get_mut(view_id) {
+                    v.visible = true;
+                }
+                self.emit(WebviewViewEvent::VisibilityChanged {
+                    view_id: view_id.to_string(),
+                    visible: true,
+                });
+                Ok(json!({ "shown": true, "viewId": view_id }))
+            }
+            _ => Err(format!("Unsupported webviewView RPC method '{}'", method)),
+        }
+    }
+
+    pub async fn request_resolve_webview_view(
+        &self,
+        rpc_bridge: &RpcBridge,
+        view_id: &str,
+        title: Option<&str>,
+    ) -> Result<Value, String> {
+        let res = rpc_bridge
+            .request(
+                "window.resolveWebviewView",
+                json!({
+                    "viewId": view_id,
+                    "title": title,
+                }),
+                std::time::Duration::from_millis(800),
+            )
+            .await?;
+        self.emit(WebviewViewEvent::ViewResolved {
+            view_id: view_id.to_string(),
+        });
+        Ok(res)
+    }
+
+    pub async fn dispatch_message_to_js(
+        &self,
+        rpc_bridge: &RpcBridge,
+        view_id: &str,
+        message: Value,
+    ) -> Result<(), String> {
+        self.receive_message_from_view(view_id, message.clone())?;
+        rpc_bridge.notify(
+            "window.onDidReceiveWebviewViewMessage",
+            json!({
+                "viewId": view_id,
+                "message": message,
+            }),
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

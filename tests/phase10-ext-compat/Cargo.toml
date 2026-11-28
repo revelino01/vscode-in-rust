@@ -1,0 +1,23 @@
+[workspace]
+
+[package]
+name = "phase10-ext-compat"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "9.6.1", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+rustcode-app = { path = "../../crates/rustcode-app" }
+rustcode-workbench = { path = "../../crates/rustcode-workbench" }
+rustcode-ext-host = { path = "../../crates/rustcode-ext-host" }
+rustcode-platform = { path = "../../crates/rustcode-platform" }
+rustcode-base = { path = "../../crates/rustcode-base" }
+rustcode-terminal = { path = "../../crates/rustcode-terminal" }
+rustcode-protocols = { path = "../../crates/rustcode-protocols" }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["full"] }

@@ -5,10 +5,14 @@
 
 pub mod grid;
 pub mod pty;
+pub mod shell_integration;
 
 pub use grid::{TerminalCell, TerminalCellGrid, TerminalGridSnapshot};
 pub use pty::{
     HeadlessPtyBackend, PortablePtyBackend, PtyBackend, PtySpawnConfig, TerminalSignal,
+};
+pub use shell_integration::{
+    Osc633Parser, ShellExecutionRecord, ShellIntegrationEvent, TerminalShellIntegrationState,
 };
 
 use parking_lot::Mutex as FastMutex;
@@ -306,6 +310,10 @@ pub struct TerminalInstance {
     grid: TerminalCellGrid,
     #[serde(skip)]
     pty: Option<Arc<FastMutex<Box<dyn PtyBackend>>>>,
+    #[serde(default)]
+    shell_integration: TerminalShellIntegrationState,
+    #[serde(skip)]
+    osc633_parser: Osc633Parser,
 }
 
 impl std::fmt::Debug for TerminalInstance {
@@ -353,6 +361,8 @@ impl Clone for TerminalInstance {
             cols: self.cols,
             grid,
             pty: self.pty.clone(),
+            shell_integration: self.shell_integration.clone(),
+            osc633_parser: Osc633Parser::new(),
         }
     }
 }
@@ -437,6 +447,8 @@ impl TerminalInstance {
                 DEFAULT_MAX_SCROLLBACK,
             ),
             pty: None,
+            shell_integration: TerminalShellIntegrationState::default(),
+            osc633_parser: Osc633Parser::new(),
         }
     }
 
@@ -522,8 +534,22 @@ impl TerminalInstance {
         if bytes.is_empty() {
             return;
         }
+        self.osc633_parser
+            .feed_bytes(bytes, &mut self.shell_integration);
         self.grid.feed_bytes(bytes);
         self.sync_lines_from_grid();
+    }
+
+    pub fn shell_integration(&self) -> &TerminalShellIntegrationState {
+        &self.shell_integration
+    }
+
+    pub fn shell_integration_mut(&mut self) -> &mut TerminalShellIntegrationState {
+        &mut self.shell_integration
+    }
+
+    pub fn drain_shell_integration_events(&mut self) -> Vec<ShellIntegrationEvent> {
+        self.shell_integration.drain_events()
     }
 
     pub fn send_pty_input(&mut self, data: &[u8]) -> Result<(), String> {
@@ -551,6 +577,8 @@ impl TerminalInstance {
             guard.read_output()
         };
         if !bytes.is_empty() {
+            self.osc633_parser
+                .feed_bytes(&bytes, &mut self.shell_integration);
             self.grid.feed_bytes(&bytes);
             let pty_writes = self.grid.drain_pty_writes();
             if !pty_writes.is_empty() {
@@ -573,6 +601,8 @@ impl TerminalInstance {
                 guard.read_output()
             };
             if !tail_bytes.is_empty() {
+                self.osc633_parser
+                    .feed_bytes(&tail_bytes, &mut self.shell_integration);
                 self.grid.feed_bytes(&tail_bytes);
                 self.sync_lines_from_grid();
                 changed = true;

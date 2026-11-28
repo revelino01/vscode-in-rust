@@ -226,7 +226,41 @@ impl<'de> Deserialize<'de> for TreeItemCollapsibleState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TreeItemCheckbox {
+    /// 0 = Unchecked, 1 = Checked (matches `vscode.TreeItemCheckboxState`).
+    pub state: u8,
+    #[serde(default)]
+    pub tooltip: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for TreeItemCheckbox {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            StateOnly(u8),
+            Full {
+                state: u8,
+                #[serde(default)]
+                tooltip: Option<String>,
+            },
+        }
+        match Wire::deserialize(deserializer)? {
+            Wire::StateOnly(state) => Ok(Self {
+                state,
+                tooltip: None,
+            }),
+            Wire::Full { state, tooltip } => Ok(Self { state, tooltip }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TreeItem {
     pub id: Option<String>,
     #[serde(default)]
@@ -242,6 +276,8 @@ pub struct TreeItem {
     #[serde(rename = "contextValue", alias = "context_value")]
     pub context_value: Option<String>,
     pub command: Option<LspCommand>,
+    #[serde(rename = "checkboxState", default)]
+    pub checkbox_state: Option<TreeItemCheckbox>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -467,6 +503,10 @@ pub struct LanguageFeatureBridge {
     pub auth_manager: Arc<crate::auth::ExtHostAuthManager>,
     pub webview_manager: Arc<crate::webview::ExtHostWebviewManager>,
     pub custom_editor_manager: Arc<crate::webview::ExtHostCustomEditorManager>,
+    pub webview_view_manager: Arc<crate::webview::ExtHostWebviewViewManager>,
+    pub vfs_manager: Arc<crate::vfs::ExtHostVfsManager>,
+    pub secret_manager: Arc<crate::secrets::ExtHostSecretManager>,
+    pub profiler: Arc<crate::profiler::ExtHostProfiler>,
     pub window_manager: Arc<crate::window::ExtHostWindowManager>,
     pub env_manager: Arc<crate::env::ExtHostEnvManager>,
     pub configuration_service: ConfigurationService,
@@ -475,6 +515,7 @@ pub struct LanguageFeatureBridge {
     fs_root: Option<PathBuf>,
     workspace_folders: Arc<RwLock<Vec<ExtWorkspaceFolder>>>,
     open_documents: Arc<RwLock<HashMap<String, OpenDocumentSnapshot>>>,
+    tree_view_options: Arc<RwLock<HashMap<String, super::TreeViewOptionsMeta>>>,
     pending_workspace_edits: Arc<Mutex<Vec<Value>>>,
     command_disposables: Arc<Mutex<HashMap<String, Box<dyn Disposable>>>>,
     js_commands: Arc<RwLock<HashSet<String>>>,
@@ -522,6 +563,10 @@ impl LanguageFeatureBridge {
             auth_manager: Arc::new(crate::auth::ExtHostAuthManager::new()),
             webview_manager: Arc::new(crate::webview::ExtHostWebviewManager::new()),
             custom_editor_manager: Arc::new(crate::webview::ExtHostCustomEditorManager::new()),
+            webview_view_manager: Arc::new(crate::webview::ExtHostWebviewViewManager::new()),
+            vfs_manager: Arc::new(crate::vfs::ExtHostVfsManager::new()),
+            secret_manager: Arc::new(crate::secrets::ExtHostSecretManager::new()),
+            profiler: Arc::new(crate::profiler::ExtHostProfiler::new()),
             window_manager: Arc::new(crate::window::ExtHostWindowManager::new()),
             env_manager: Arc::new(crate::env::ExtHostEnvManager::new()),
             configuration_service: ConfigurationService::new(),
@@ -530,6 +575,7 @@ impl LanguageFeatureBridge {
             fs_root: None,
             workspace_folders: Arc::new(RwLock::new(Vec::new())),
             open_documents: Arc::new(RwLock::new(HashMap::new())),
+            tree_view_options: Arc::new(RwLock::new(HashMap::new())),
             pending_workspace_edits: Arc::new(Mutex::new(Vec::new())),
             command_disposables: Arc::new(Mutex::new(HashMap::new())),
             js_commands: Arc::new(RwLock::new(HashSet::new())),
@@ -647,6 +693,100 @@ impl LanguageFeatureBridge {
     ) -> Self {
         self.custom_editor_manager = cem;
         self
+    }
+
+    pub fn with_webview_view_manager(
+        mut self,
+        wvm: Arc<crate::webview::ExtHostWebviewViewManager>,
+    ) -> Self {
+        self.webview_view_manager = wvm;
+        self
+    }
+
+    pub fn with_vfs_manager(mut self, vfs: Arc<crate::vfs::ExtHostVfsManager>) -> Self {
+        self.vfs_manager = vfs;
+        self
+    }
+
+    pub fn with_secret_manager(mut self, sm: Arc<crate::secrets::ExtHostSecretManager>) -> Self {
+        self.secret_manager = sm;
+        self
+    }
+
+    pub fn with_profiler(mut self, profiler: Arc<crate::profiler::ExtHostProfiler>) -> Self {
+        self.profiler = profiler;
+        self
+    }
+
+    pub fn vfs_manager(&self) -> &Arc<crate::vfs::ExtHostVfsManager> {
+        &self.vfs_manager
+    }
+
+    pub fn secret_manager(&self) -> &Arc<crate::secrets::ExtHostSecretManager> {
+        &self.secret_manager
+    }
+
+    pub fn webview_view_manager(&self) -> &Arc<crate::webview::ExtHostWebviewViewManager> {
+        &self.webview_view_manager
+    }
+
+    pub fn profiler(&self) -> &Arc<crate::profiler::ExtHostProfiler> {
+        &self.profiler
+    }
+
+    pub fn tree_view_options(&self, view_id: &str) -> Option<super::TreeViewOptionsMeta> {
+        self.tree_view_options.read().get(view_id).cloned()
+    }
+
+    pub async fn request_tree_handle_drag(
+        &self,
+        view_id: &str,
+        source_element_ids: &[String],
+    ) -> Result<Value, String> {
+        self.rpc_bridge
+            .request(
+                "treeView.handleDrag",
+                json!({
+                    "viewId": view_id,
+                    "sourceElementIds": source_element_ids,
+                }),
+                Duration::from_millis(800),
+            )
+            .await
+    }
+
+    pub async fn request_tree_handle_drop(
+        &self,
+        view_id: &str,
+        target_element_id: Option<&str>,
+        data_transfer: Value,
+    ) -> Result<Value, String> {
+        self.rpc_bridge
+            .request(
+                "treeView.handleDrop",
+                json!({
+                    "viewId": view_id,
+                    "targetElementId": target_element_id,
+                    "dataTransfer": data_transfer,
+                }),
+                Duration::from_millis(800),
+            )
+            .await
+    }
+
+    pub async fn ping_ext_host(&self) -> Result<u64, String> {
+        let started = std::time::Instant::now();
+        let res = self
+            .rpc_bridge
+            .request("extHost.ping", json!({}), Duration::from_secs(3))
+            .await?;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        if let Some(mem) = res.get("memory") {
+            if let Ok(stats) = serde_json::from_value::<crate::profiler::ExtHostMemoryStats>(mem.clone()) {
+                self.profiler.update_memory(stats);
+            }
+        }
+        Ok(latency_ms)
     }
 
     pub fn scm_manager(&self) -> &Arc<crate::scm::ExtHostScmManager> {
@@ -1035,6 +1175,25 @@ impl LanguageFeatureBridge {
         &self,
         id: &str,
     ) -> Result<crate::manifest::ExtensionSnapshot, RpcError> {
+        let initial_snap = self
+            .env_manager
+            .get_extension(id)
+            .ok_or_else(|| RpcError::new("NOT_FOUND", format!("Extension '{}' not found", id)))?;
+        if self.rpc_bridge.has_active_transport() {
+            self.rpc_bridge
+                .request(
+                    "extensions.activate",
+                    json!({
+                        "id": initial_snap.id,
+                        "extensionPath": initial_snap.extension_path,
+                        "packageJSON": initial_snap.package_json,
+                    }),
+                    Duration::from_secs(5),
+                )
+                .await
+                .map_err(|e| RpcError::new("EXTENSION_ACTIVATION_FAILED", e))?;
+            self.rpc_bridge.sync_incoming_notifications().await;
+        }
         let snap = self
             .env_manager
             .activate_extension(id)
@@ -1043,20 +1202,6 @@ impl LanguageFeatureBridge {
             "extensions.onDidChange",
             json!(self.env_manager.list_extensions()),
         );
-        if self.rpc_bridge.has_active_transport() {
-            self.rpc_bridge
-                .request(
-                    "extensions.activate",
-                    json!({
-                        "id": snap.id,
-                        "extensionPath": snap.extension_path,
-                        "packageJSON": snap.package_json,
-                    }),
-                    Duration::from_secs(5),
-                )
-                .await
-                .map_err(|e| RpcError::new("EXTENSION_ACTIVATION_FAILED", e))?;
-        }
         Ok(snap)
     }
 
@@ -2382,7 +2527,71 @@ impl LanguageFeatureBridge {
         method: &str,
         params: impl std::borrow::Borrow<serde_json::Value>,
     ) -> Result<serde_json::Value, RpcError> {
-        let params = params.borrow();
+        let started = std::time::Instant::now();
+        let res = self.dispatch_rpc_message_result(method, params.borrow()).await;
+        self.profiler
+            .record_rpc_call(method, started.elapsed(), res.is_ok());
+        res
+    }
+
+    async fn dispatch_rpc_message_result(
+        &self,
+        method: &str,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        if method == "extHost.ping" {
+            if let Some(mem) = params.get("memory") {
+                if let Ok(stats) =
+                    serde_json::from_value::<crate::profiler::ExtHostMemoryStats>(mem.clone())
+                {
+                    self.profiler.update_memory(stats);
+                }
+            }
+            return Ok(json!({ "pong": true }));
+        }
+
+        if method == "extHost.getProfile" {
+            return serde_json::to_value(self.profiler.snapshot())
+                .map_err(|e| RpcError::internal(e.to_string()));
+        }
+
+        if method == "extHost.recordActivation" {
+            let ext_id = params
+                .get("extensionId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| RpcError::invalid_params("Missing extensionId"))?;
+            let event = params
+                .get("activationEvent")
+                .and_then(|v| v.as_str())
+                .unwrap_or("*");
+            let duration_ms = params
+                .get("durationMs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let succeeded = params
+                .get("succeeded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            let error = params
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            self.profiler.record_activation_duration(
+                ext_id,
+                event,
+                Duration::from_millis(duration_ms),
+                succeeded,
+                error,
+            );
+            return Ok(json!({ "recorded": true, "extensionId": ext_id }));
+        }
+
+        if method.starts_with("secrets.") {
+            return self
+                .secret_manager
+                .handle_rpc_call(method, params)
+                .map_err(|e| map_manager_error(method, e));
+        }
 
         if matches!(
             method,
@@ -2535,7 +2744,9 @@ impl LanguageFeatureBridge {
             | "window.clearOutputChannel"
             | "window.showOutputChannel"
             | "window.hideOutputChannel"
-            | "window.disposeOutputChannel" => {
+            | "window.disposeOutputChannel"
+            | "window.setOutputChannelLogLevel"
+            | "window.logOutputChannelMessage" => {
                 return self
                     .output_manager
                     .handle_rpc_call(method, params)
@@ -2544,7 +2755,11 @@ impl LanguageFeatureBridge {
             "window.createTerminal"
             | "window.showTerminal"
             | "window.sendTerminalText"
-            | "window.disposeTerminal" => {
+            | "window.resizeTerminal"
+            | "window.exitTerminal"
+            | "window.disposeTerminal"
+            | "window.reportTerminalShellIntegration"
+            | "window.executeTerminalCommand" => {
                 return self
                     .terminal_manager
                     .handle_rpc_call(method, params)
@@ -2560,13 +2775,57 @@ impl LanguageFeatureBridge {
                     .handle_rpc_call(method, params.clone())
                     .map_err(|e| map_manager_error(method, e));
             }
+            "window.registerWebviewViewProvider"
+            | "window.unregisterWebviewViewProvider"
+            | "window.setWebviewViewHtml"
+            | "window.setWebviewViewMeta"
+            | "window.postMessageToWebviewView"
+            | "window.showWebviewView"
+            | "window.revealWebviewView" => {
+                let res = self
+                    .webview_view_manager
+                    .handle_rpc_call(method, params)
+                    .map_err(|e| map_manager_error(method, e))?;
+                if method == "window.registerWebviewViewProvider" {
+                    if let Some(view_id) = params.get("viewId").and_then(|v| v.as_str()) {
+                        self.provider_registry.register(super::ProviderRegistration {
+                            id: view_id.to_string(),
+                            provider_type: ProviderType::WebviewView,
+                            language_selector: None,
+                        });
+                    }
+                } else if method == "window.unregisterWebviewViewProvider" {
+                    if let Some(view_id) = params.get("viewId").and_then(|v| v.as_str()) {
+                        self.provider_registry.unregister(view_id);
+                    }
+                }
+                return Ok(res);
+            }
             "window.registerCustomEditorProvider"
             | "window.unregisterCustomEditorProvider"
-            | "window.openCustomEditor" => {
+            | "window.openCustomEditor"
+            | "window.closeCustomEditor" => {
                 return self
                     .custom_editor_manager
                     .handle_rpc_call(method, params, Some(&self.webview_manager))
                     .map_err(|e| map_manager_error(method, e));
+            }
+            "treeView.setOptions" => {
+                let meta: super::TreeViewOptionsMeta = serde_json::from_value(params.clone())
+                    .map_err(|e| RpcError::invalid_params(format!("Invalid treeView options: {}", e)))?;
+                let view_id = meta.view_id.clone();
+                if !meta.drag_mime_types.is_empty() || !meta.drop_mime_types.is_empty() {
+                    self.provider_registry.register(super::ProviderRegistration {
+                        id: format!("treeDnd:{}", view_id),
+                        provider_type: ProviderType::TreeDragAndDrop,
+                        language_selector: Some(view_id.clone()),
+                    });
+                }
+                self.tree_view_options.write().insert(view_id.clone(), meta);
+                return Ok(json!({ "recorded": true, "viewId": view_id }));
+            }
+            "treeView.onDidChangeCheckboxState" => {
+                return Ok(json!({ "recorded": true }));
             }
             _ => {}
         }
@@ -3182,6 +3441,138 @@ impl LanguageFeatureBridge {
             }
             "workspace.applyEdit" => self.handle_apply_edit_rpc(params).await,
             "workspace.findFiles" => self.handle_find_files_rpc(params),
+            "workspace.registerFileSystemProvider"
+            | "workspace.unregisterFileSystemProvider"
+            | "workspace.registerTextDocumentContentProvider"
+            | "workspace.unregisterTextDocumentContentProvider"
+            | "workspace.onDidChangeFileSystem"
+            | "workspace.onDidChangeTextDocumentContent" => {
+                let res = self
+                    .vfs_manager
+                    .handle_rpc_call(method, params)
+                    .map_err(|e| map_manager_error(method, e))?;
+                if method == "workspace.registerFileSystemProvider" {
+                    if let Some(scheme) = res.get("scheme").and_then(|v| v.as_str()) {
+                        self.provider_registry.register(super::ProviderRegistration {
+                            id: format!("vfs:{}", scheme),
+                            provider_type: ProviderType::FileSystem,
+                            language_selector: Some(scheme.to_string()),
+                        });
+                    }
+                } else if method == "workspace.unregisterFileSystemProvider" {
+                    if let Some(scheme) = res.get("scheme").and_then(|v| v.as_str()) {
+                        self.provider_registry.unregister(&format!("vfs:{}", scheme.to_ascii_lowercase()));
+                    }
+                } else if method == "workspace.registerTextDocumentContentProvider" {
+                    if let Some(scheme) = res.get("scheme").and_then(|v| v.as_str()) {
+                        self.provider_registry.register(super::ProviderRegistration {
+                            id: format!("textContent:{}", scheme),
+                            provider_type: ProviderType::TextDocumentContent,
+                            language_selector: Some(scheme.to_string()),
+                        });
+                    }
+                } else if method == "workspace.unregisterTextDocumentContentProvider" {
+                    if let Some(scheme) = res.get("scheme").and_then(|v| v.as_str()) {
+                        self.provider_registry.unregister(&format!(
+                            "textContent:{}",
+                            scheme.to_ascii_lowercase()
+                        ));
+                    }
+                }
+                Ok(res)
+            }
+            "workspace.fs.readFile" => {
+                let uri = params
+                    .get("uri")
+                    .or_else(|| params.get("path"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RpcError::invalid_params("Missing string 'uri' parameter"))?;
+                if self.vfs_manager.has_file_system_scheme(uri) {
+                    let bytes = self
+                        .vfs_manager
+                        .request_read_file(&self.rpc_bridge, uri)
+                        .await
+                        .map_err(|e| RpcError::new("VFS_ERROR", e))?;
+                    Ok(json!(bytes))
+                } else {
+                    let path_str = decode_file_uri(uri).to_string_lossy().into_owned();
+                    self.handle_fs_rpc("fs.readFile", &json!({ "path": path_str, "encoding": Value::Null }))
+                        .await
+                        .map_err(RpcError::from_prefixed_string)
+                }
+            }
+            "workspace.fs.stat" => {
+                let uri = params
+                    .get("uri")
+                    .or_else(|| params.get("path"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RpcError::invalid_params("Missing string 'uri' parameter"))?;
+                if self.vfs_manager.has_file_system_scheme(uri) {
+                    self.vfs_manager
+                        .request_stat(&self.rpc_bridge, uri)
+                        .await
+                        .map_err(|e| RpcError::new("VFS_ERROR", e))
+                } else {
+                    let path_str = decode_file_uri(uri).to_string_lossy().into_owned();
+                    self.handle_fs_rpc("fs.stat", &json!({ "path": path_str }))
+                        .await
+                        .map_err(RpcError::from_prefixed_string)
+                }
+            }
+            "workspace.fs.readDirectory" => {
+                let uri = params
+                    .get("uri")
+                    .or_else(|| params.get("path"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RpcError::invalid_params("Missing string 'uri' parameter"))?;
+                if self.vfs_manager.has_file_system_scheme(uri) {
+                    self.vfs_manager
+                        .request_read_directory(&self.rpc_bridge, uri)
+                        .await
+                        .map_err(|e| RpcError::new("VFS_ERROR", e))
+                } else {
+                    let path_str = decode_file_uri(uri).to_string_lossy().into_owned();
+                    self.handle_fs_rpc(
+                        "fs.readdir",
+                        &json!({ "path": path_str, "withFileTypes": true }),
+                    )
+                    .await
+                    .map_err(RpcError::from_prefixed_string)
+                }
+            }
+            "workspace.fs.writeFile" => {
+                let uri = params
+                    .get("uri")
+                    .or_else(|| params.get("path"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| RpcError::invalid_params("Missing string 'uri' parameter"))?;
+                if self.vfs_manager.has_file_system_scheme(uri) {
+                    let bytes: Vec<u8> = params
+                        .get("content")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                    let create = params
+                        .get("options")
+                        .and_then(|o| o.get("create"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    let overwrite = params
+                        .get("options")
+                        .and_then(|o| o.get("overwrite"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true);
+                    self.vfs_manager
+                        .request_write_file(&self.rpc_bridge, uri, &bytes, create, overwrite)
+                        .await
+                        .map_err(|e| RpcError::new("VFS_ERROR", e))
+                } else {
+                    let path_str = decode_file_uri(uri).to_string_lossy().into_owned();
+                    let data = params.get("content").cloned().unwrap_or(json!([]));
+                    self.handle_fs_rpc("fs.writeFile", &json!({ "path": path_str, "data": data }))
+                        .await
+                        .map_err(RpcError::from_prefixed_string)
+                }
+            }
             _ => Err(RpcError::method_not_found(method)),
         }
     }
@@ -3261,6 +3652,55 @@ impl LanguageFeatureBridge {
         let raw = raw_uri_opt.ok_or_else(|| {
             RpcError::invalid_params("Missing 'uri', 'fileName', or 'path'")
         })?;
+        if self.vfs_manager.has_text_content_scheme(raw) {
+            let text = self
+                .vfs_manager
+                .request_provide_text_document_content(&self.rpc_bridge, raw)
+                .await
+                .map_err(|e| RpcError::new("VFS_CONTENT_ERROR", e))?;
+            let snap = OpenDocumentSnapshot::from_parts(
+                raw.to_string(),
+                raw.to_string(),
+                "plaintext".to_string(),
+                1,
+                text,
+                false,
+                false,
+            );
+            self.open_documents
+                .write()
+                .insert(raw.to_string(), snap.clone());
+            self.rpc_bridge
+                .notify("workspace.onDidOpenTextDocument", snap.to_json());
+            return Ok(snap.to_json());
+        }
+        if self.vfs_manager.has_file_system_scheme(raw) {
+            let bytes = self
+                .vfs_manager
+                .request_read_file(&self.rpc_bridge, raw)
+                .await
+                .map_err(|e| RpcError::new("VFS_READ_ERROR", e))?;
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let ext = Path::new(raw)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            let snap = OpenDocumentSnapshot::from_parts(
+                raw.to_string(),
+                raw.to_string(),
+                rustcode_base::map_ext_to_lang_id(ext),
+                1,
+                text,
+                false,
+                false,
+            );
+            self.open_documents
+                .write()
+                .insert(raw.to_string(), snap.clone());
+            self.rpc_bridge
+                .notify("workspace.onDidOpenTextDocument", snap.to_json());
+            return Ok(snap.to_json());
+        }
         let path = decode_file_uri(raw);
         let normalized_uri = rustcode_platform::path_to_file_uri(&path);
         let canonical_uri = if rustcode_platform::is_file_uri(raw) {

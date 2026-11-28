@@ -22,15 +22,17 @@ pub enum MarketplaceError {
     MissingDownloadUrl(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtensionFiles {
     pub download: Option<String>,
     pub icon: Option<String>,
     pub manifest: Option<String>,
     pub readme: Option<String>,
+    #[serde(default)]
+    pub changelog: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExtensionMetadata {
     pub namespace: String,
     pub name: String,
@@ -43,9 +45,41 @@ pub struct ExtensionMetadata {
     pub files: Option<ExtensionFiles>,
     #[serde(rename = "allVersions", default)]
     pub all_versions: Option<HashMap<String, String>>,
+    #[serde(rename = "preRelease", default)]
+    pub pre_release: bool,
+    #[serde(rename = "downloadCount", default)]
+    pub download_count: Option<u64>,
+    #[serde(rename = "averageRating", default)]
+    pub average_rating: Option<f64>,
+    #[serde(rename = "reviewCount", default)]
+    pub review_count: Option<u64>,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub license: Option<String>,
+    #[serde(default)]
+    pub repository: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(rename = "extensionPack", default)]
+    pub extension_pack: Vec<String>,
+    #[serde(rename = "extensionDependencies", default)]
+    pub extension_dependencies: Vec<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 impl ExtensionMetadata {
+    pub fn id(&self) -> String {
+        if self.namespace.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}.{}", self.namespace, self.name)
+        }
+    }
+
     pub fn resolved_download_url(&self) -> Option<String> {
         if let Some(url) = &self.download_url {
             if !url.is_empty() {

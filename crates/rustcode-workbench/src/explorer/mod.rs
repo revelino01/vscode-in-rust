@@ -2,8 +2,9 @@
 
 use parking_lot::RwLock;
 use rustcode_base::context_key::ContextKeyService;
-use rustcode_ext_host::manifest::ViewContribution;
-use rustcode_ext_host::provider::{TreeItem, TreeItemCollapsibleState};
+use rustcode_ext_host::manifest::{ViewContribution, ViewWelcomeContribution};
+use rustcode_ext_host::provider::{TreeItem, TreeItemCheckbox, TreeItemCollapsibleState};
+use rustcode_ext_host::TreeViewOptionsMeta;
 use rustcode_platform::accessibility::{AccessibleNode, AccessibleRole};
 use rustcode_platform::render::{
     Edges, EventResult, FontMetrics, GlyphRun, InputEvent, KeyCode, MouseButton, Point, Quad,
@@ -379,6 +380,7 @@ pub struct ContributedTreeNode {
     pub collapsible_state: TreeItemCollapsibleState,
     pub command: Option<LspCommand>,
     pub resource_uri: Option<String>,
+    pub checkbox_state: Option<TreeItemCheckbox>,
 }
 
 /// Extract a clean basename from a `resourceUri` (supporting Windows `C:\...`, POSIX `/...`, and `file:///` URIs).
@@ -444,6 +446,8 @@ pub struct ContributedViewState {
     pub loading_root: bool,
     pub loaded_parents: HashSet<String>,
     pub loading_parents: HashSet<String>,
+    pub welcome_views: Vec<ViewWelcomeContribution>,
+    pub options_meta: Option<TreeViewOptionsMeta>,
 }
 
 impl ContributedViewState {
@@ -462,7 +466,39 @@ impl ContributedViewState {
             loading_root: false,
             loaded_parents: HashSet::new(),
             loading_parents: HashSet::new(),
+            welcome_views: Vec::new(),
+            options_meta: None,
         }
+    }
+
+    pub fn active_welcome_contents(&self, context_keys: &ContextKeyService) -> Vec<String> {
+        self.welcome_views
+            .iter()
+            .filter(|w| evaluate_when_clause(context_keys, w.when.as_deref()))
+            .map(|w| w.contents.clone())
+            .collect()
+    }
+
+    pub fn toggle_node_checkbox(&mut self, node_id: &str) -> Option<u8> {
+        for node in &mut self.root_items {
+            if node.node_id == node_id {
+                if let Some(cb) = &mut node.checkbox_state {
+                    cb.state = if cb.state == 0 { 1 } else { 0 };
+                    return Some(cb.state);
+                }
+            }
+        }
+        for list in self.children_by_parent.values_mut() {
+            for node in list {
+                if node.node_id == node_id {
+                    if let Some(cb) = &mut node.checkbox_state {
+                        cb.state = if cb.state == 0 { 1 } else { 0 };
+                        return Some(cb.state);
+                    }
+                }
+            }
+        }
+        None
     }
 
     fn convert_items(
@@ -495,6 +531,7 @@ impl ContributedViewState {
                     collapsible_state: item.collapsible_state,
                     command: item.command,
                     resource_uri: item.resource_uri,
+                    checkbox_state: item.checkbox_state,
                 }
             })
             .collect()
@@ -1816,7 +1853,12 @@ impl View for FileExplorerView {
                     _ if is_expanded => "v ",
                     _ => "> ",
                 };
-                let full_label = format!("{}{}", prefix, node.label);
+                let cb_prefix = match &node.checkbox_state {
+                    Some(cb) if cb.state != 0 => "[x] ",
+                    Some(_) => "[ ] ",
+                    None => "",
+                };
+                let full_label = format!("{}{}{}", prefix, cb_prefix, node.label);
                 let lw = font
                     .text_width(&full_label)
                     .min((item_rect.max_x() - indent_x).max(0.0));
@@ -2614,6 +2656,7 @@ mod tests {
             resource_uri: None,
             context_value: None,
             command: None,
+            checkbox_state: None,
         };
         let win_uri_item = TreeItem {
             id: Some("w1".to_string()),
@@ -2625,6 +2668,7 @@ mod tests {
             resource_uri: Some("C:\\Users\\dev\\repo\\src\\win_entry.rs".to_string()),
             context_value: None,
             command: None,
+            checkbox_state: None,
         };
 
         let mut view_state = ContributedViewState::new(ContributedViewDescriptor {

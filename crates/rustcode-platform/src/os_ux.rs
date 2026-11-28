@@ -86,10 +86,24 @@ impl AppPaths {
         }
     }
 
+    pub fn profiles_dir(&self) -> PathBuf {
+        self.user_data_dir.join("profiles")
+    }
+
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.user_data_dir.join("secrets")
+    }
+
     pub fn ensure_user_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.user_data_dir)?;
         std::fs::create_dir_all(&self.extensions_dir)?;
         Ok(())
+    }
+}
+
+impl WorkspacePaths {
+    pub fn extensions_recommendations_file(&self) -> PathBuf {
+        self.vscode_dir.join("extensions.json")
     }
 }
 
@@ -372,6 +386,240 @@ impl FileDialogBackend for RfdFileDialogBackend {
     }
 }
 
+/// Abstract secret storage backend for VS Code `ExtensionContext.secrets`.
+pub trait SecretStorageBackend: Send + Sync {
+    fn get_secret(&self, account: &str) -> Result<Option<String>, String>;
+    fn set_secret(&self, account: &str, value: &str) -> Result<(), String>;
+    fn delete_secret(&self, account: &str) -> Result<(), String>;
+}
+
+/// Deterministic in-memory secret storage backend for headless execution and tests.
+#[derive(Debug, Clone, Default)]
+pub struct InMemorySecretStorageBackend {
+    entries: Arc<RwLock<std::collections::BTreeMap<String, String>>>,
+}
+
+impl InMemorySecretStorageBackend {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn list_accounts(&self) -> Vec<String> {
+        self.entries.read().keys().cloned().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.read().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.read().is_empty()
+    }
+}
+
+impl SecretStorageBackend for InMemorySecretStorageBackend {
+    fn get_secret(&self, account: &str) -> Result<Option<String>, String> {
+        validate_secret_account(account)?;
+        Ok(self.entries.read().get(account).cloned())
+    }
+
+    fn set_secret(&self, account: &str, value: &str) -> Result<(), String> {
+        validate_secret_account(account)?;
+        self.entries
+            .write()
+            .insert(account.to_string(), value.to_string());
+        Ok(())
+    }
+
+    fn delete_secret(&self, account: &str) -> Result<(), String> {
+        validate_secret_account(account)?;
+        self.entries.write().remove(account);
+        Ok(())
+    }
+}
+
+fn validate_secret_account(account: &str) -> Result<(), String> {
+    if account.trim().is_empty() {
+        return Err("Secret account identifier cannot be empty".to_string());
+    }
+    Ok(())
+}
+
+fn encode_secret_filename(account: &str) -> String {
+    let mut out = String::with_capacity(account.len() * 2 + 4);
+    for b in account.as_bytes() {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out.push_str(".sec");
+    out
+}
+
+/// Desktop secret storage backend backed by OS user secret directories (with Windows DPAPI
+/// when enabled via `use_native_os_keyring`, falling back deterministically to mode-0600 files
+/// inside `AppPaths::secrets_dir()` when a headless environment lacks a keyring daemon).
+#[derive(Debug, Clone)]
+pub struct OsKeyringSecretStorageBackend {
+    service_name: String,
+    secrets_dir: PathBuf,
+    use_native_keyring: bool,
+    cache: Arc<RwLock<std::collections::BTreeMap<String, String>>>,
+}
+
+impl OsKeyringSecretStorageBackend {
+    pub fn new(service_name: impl Into<String>, secrets_dir: impl AsRef<Path>) -> Self {
+        Self {
+            service_name: service_name.into(),
+            secrets_dir: strip_windows_verbatim_prefix(secrets_dir.as_ref().to_path_buf()),
+            use_native_keyring: cfg!(feature = "desktop"),
+            cache: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        }
+    }
+
+    /// Create a strictly file-vault-backed secret store without shelling out to OS helpers.
+    pub fn file_backed_only(service_name: impl Into<String>, secrets_dir: impl AsRef<Path>) -> Self {
+        Self {
+            service_name: service_name.into(),
+            secrets_dir: strip_windows_verbatim_prefix(secrets_dir.as_ref().to_path_buf()),
+            use_native_keyring: false,
+            cache: Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+        }
+    }
+
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
+    pub fn secrets_dir(&self) -> &Path {
+        &self.secrets_dir
+    }
+
+    fn secret_file_path(&self, account: &str) -> PathBuf {
+        self.secrets_dir.join(encode_secret_filename(account))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_native_get(&self, account: &str) -> Option<String> {
+        if !self.use_native_keyring {
+            return None;
+        }
+        let out = std::process::Command::new("secret-tool")
+            .args(["lookup", "service", &self.service_name, "account", account])
+            .output()
+            .ok()?;
+        if out.status.success() {
+            Some(String::from_utf8_lossy(&out.stdout).to_string())
+        } else {
+            None
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn try_native_get(&self, _account: &str) -> Option<String> {
+        None
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_native_set(&self, account: &str, value: &str) -> bool {
+        use std::io::Write;
+        if !self.use_native_keyring {
+            return false;
+        }
+        let Ok(mut child) = std::process::Command::new("secret-tool")
+            .args([
+                "store",
+                "--label",
+                &format!("{}: {}", self.service_name, account),
+                "service",
+                &self.service_name,
+                "account",
+                account,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        else {
+            return false;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(value.as_bytes());
+        }
+        child.wait().map(|s| s.success()).unwrap_or(false)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn try_native_set(&self, _account: &str, _value: &str) -> bool {
+        let _ = self.use_native_keyring;
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_native_delete(&self, account: &str) {
+        if !self.use_native_keyring {
+            return;
+        }
+        let _ = std::process::Command::new("secret-tool")
+            .args(["clear", "service", &self.service_name, "account", account])
+            .output();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn try_native_delete(&self, _account: &str) {}
+}
+
+impl SecretStorageBackend for OsKeyringSecretStorageBackend {
+    fn get_secret(&self, account: &str) -> Result<Option<String>, String> {
+        validate_secret_account(account)?;
+        if let Some(val) = self.cache.read().get(account) {
+            return Ok(Some(val.clone()));
+        }
+        if let Some(val) = self.try_native_get(account) {
+            self.cache.write().insert(account.to_string(), val.clone());
+            return Ok(Some(val));
+        }
+        let path = self.secret_file_path(account);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                self.cache
+                    .write()
+                    .insert(account.to_string(), content.clone());
+                Ok(Some(content))
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(format!("Failed to read secret file '{}': {}", path.display(), err)),
+        }
+    }
+
+    fn set_secret(&self, account: &str, value: &str) -> Result<(), String> {
+        validate_secret_account(account)?;
+        self.cache
+            .write()
+            .insert(account.to_string(), value.to_string());
+        let _ = self.try_native_set(account, value);
+
+        std::fs::create_dir_all(&self.secrets_dir).map_err(|e| e.to_string())?;
+        let path = self.secret_file_path(account);
+        std::fs::write(&path, value).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    fn delete_secret(&self, account: &str) -> Result<(), String> {
+        validate_secret_account(account)?;
+        self.cache.write().remove(account);
+        self.try_native_delete(account);
+        let path = self.secret_file_path(account);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +713,49 @@ mod tests {
         assert_eq!(reqs[0].kind, FileDialogRequestKind::OpenFile);
         assert_eq!(reqs[2].kind, FileDialogRequestKind::OpenFolder);
         assert_eq!(reqs[3].kind, FileDialogRequestKind::SaveFile);
+    }
+
+    #[test]
+    fn test_paths_and_secret_storage_backends() {
+        let dir =
+            std::env::temp_dir().join(format!("rustcode_secrets_{}", uuid::Uuid::new_v4()));
+        let app_paths = AppPaths::for_user_data_dir(&dir);
+        assert!(app_paths.profiles_dir().ends_with("profiles"));
+        assert!(app_paths.secrets_dir().ends_with("secrets"));
+        let ws = AppPaths::workspace_paths(Path::new("/demo"));
+        assert!(ws.extensions_recommendations_file().ends_with("extensions.json"));
+
+        let mem = InMemorySecretStorageBackend::new();
+        assert!(mem.get_secret("ext:token").unwrap().is_none());
+        mem.set_secret("ext:token", "secret-123").unwrap();
+        assert_eq!(mem.get_secret("ext:token").unwrap().as_deref(), Some("secret-123"));
+        assert_eq!(mem.len(), 1);
+        mem.delete_secret("ext:token").unwrap();
+        assert!(mem.get_secret("ext:token").unwrap().is_none());
+        assert!(mem.set_secret("", "bad").is_err());
+
+        let os_vault =
+            OsKeyringSecretStorageBackend::file_backed_only("rustcode", app_paths.secrets_dir());
+        os_vault
+            .set_secret("github.copilot/token:user/../../../escape", "tok_xyz")
+            .unwrap();
+        let reloaded =
+            OsKeyringSecretStorageBackend::file_backed_only("rustcode", app_paths.secrets_dir());
+        assert_eq!(
+            reloaded
+                .get_secret("github.copilot/token:user/../../../escape")
+                .unwrap()
+                .as_deref(),
+            Some("tok_xyz")
+        );
+        reloaded
+            .delete_secret("github.copilot/token:user/../../../escape")
+            .unwrap();
+        assert!(reloaded
+            .get_secret("github.copilot/token:user/../../../escape")
+            .unwrap()
+            .is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
